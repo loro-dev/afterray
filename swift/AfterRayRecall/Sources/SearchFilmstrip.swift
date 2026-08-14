@@ -50,14 +50,28 @@ struct SearchFilmstrip: View {
             ZStack(alignment: .leading) {
                 Color.black.opacity(0.001)
 
-                cells(layout: layout, nowMs: nowMs)
-                    .offset(x: layout.offset(forIndex: session.selectedIndex))
+                // The fade has to be anchored to the viewport, so it is applied
+                // to a viewport-sized container rather than to the cells. A
+                // mask on the offset row would follow the row's *pre-offset*
+                // layout frame and erase the cells instead of their edges.
+                ZStack(alignment: .leading) {
+                    cells(layout: layout, nowMs: nowMs)
+                        .offset(x: layout.offset(forIndex: session.selectedIndex))
+                }
+                .frame(width: width, height: Self.stripHeight, alignment: .leading)
+                // Cells are pictures, so a hard cut at the viewport edge reads
+                // as broken in a way a cut colour bar does not.
+                .mask(edgeFade(width: width))
 
+                // A short tick, not a full-height rule: the app timeline draws
+                // its playhead through a continuous bar, but the same line
+                // across a thumbnail bisects the picture and strikes out the
+                // caption under it. The selected cell is already unmistakable.
                 Rectangle()
                     .fill(RecallPalette.ray)
-                    .frame(width: 2, height: SearchFilmstripLayout.cellHeight + 12)
-                    .position(x: width / 2, y: Self.stripHeight / 2)
-                    .shadow(color: RecallPalette.ray.opacity(0.9), radius: 7)
+                    .frame(width: 2, height: 7)
+                    .position(x: width / 2, y: 3.5)
+                    .shadow(color: RecallPalette.ray.opacity(0.9), radius: 5)
                     .allowsHitTesting(false)
             }
             .contentShape(Rectangle())
@@ -65,6 +79,22 @@ struct SearchFilmstrip: View {
             .onAppear { onViewportWidthChange(width) }
             .onChange(of: width) { _, newWidth in onViewportWidthChange(newWidth) }
         }
+    }
+
+    /// Fades roughly one cell's worth at each edge so partially visible
+    /// thumbnails dissolve instead of being sliced.
+    private func edgeFade(width: CGFloat) -> some View {
+        let fade = min(SearchFilmstripLayout.cellWidth, max(width / 6, 1)) / max(width, 1)
+        return LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0),
+                .init(color: .black, location: fade),
+                .init(color: .black, location: 1 - fade),
+                .init(color: .clear, location: 1),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
     }
 
     private func cells(layout: SearchFilmstripLayout, nowMs: Int64) -> some View {

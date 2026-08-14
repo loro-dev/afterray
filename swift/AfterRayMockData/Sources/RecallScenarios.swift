@@ -94,7 +94,7 @@ public enum MockSearchData {
     /// Where `MockArtifactFactory` draws the frame title, in Vision's
     /// bottom-left-origin unit square. Keeping this next to the drawing code is
     /// what makes the overlay land on the actual glyphs.
-    static let titleRegion = OcrRegion(
+    public static let titleRegion = OcrRegion(
         text: "Moment",
         confidence: 0.96,
         x: 0.093,
@@ -102,7 +102,7 @@ public enum MockSearchData {
         width: 0.209,
         height: 0.068
     )
-    static let bodyRegion = OcrRegion(
+    public static let bodyRegion = OcrRegion(
         text: "capture pipeline",
         confidence: 0.81,
         x: 0.093,
@@ -197,7 +197,7 @@ public enum MockArtifactFactory {
         return try renderFrame(index: index)
     }
 
-    static func renderFrame(index: Int) throws -> Data {
+    public static func renderFrame(index: Int) throws -> Data {
         let size = NSSize(width: 1_280, height: 800)
         let image = NSImage(size: size)
         image.lockFocus()

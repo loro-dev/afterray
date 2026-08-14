@@ -1,0 +1,415 @@
+import AfterRayMockData
+import AfterRayRecall
+import AppKit
+import SwiftUI
+
+/// Renders recall surfaces to PNG offscreen, on mock data only.
+///
+/// The Visual Lab is for a human with a mouse; this is for reviewing pixels in
+/// a terminal, in CI, or from an agent. Nothing here starts the daemon, asks
+/// for a permission, or captures a screen.
+///
+/// One known blind spot: the full-resolution still is drawn by an
+/// `AVSampleBufferDisplayLayer`, which does not render through
+/// `cacheDisplay(in:to:)`. Chrome snapshots therefore show every overlay over
+/// an empty picture. The `highlight-*` scenes exist to cover what that hides —
+/// they draw a real mock frame and place boxes with the same `OcrHighlight`
+/// math the app uses.
+@MainActor
+enum SnapshotRunner {
+    static func main() {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        // The overlay only ever runs dark. Without this the offscreen host
+        // defaults to Aqua and unstyled labels render black on black.
+        application.appearance = NSAppearance(named: .darkAqua)
+
+        let outputDirectory = URL(
+            fileURLWithPath: CommandLine.arguments.dropFirst().first
+                ?? "/tmp/afterray-snapshots"
+        )
+        try? FileManager.default.createDirectory(
+            at: outputDirectory,
+            withIntermediateDirectories: true
+        )
+
+        for scene in SnapshotScene.all {
+            let url = outputDirectory.appendingPathComponent("\(scene.name).png")
+            render(scene: scene, to: url)
+            print("wrote \(url.path)")
+        }
+        print("\n\(SnapshotScene.all.count) snapshot(s) in \(outputDirectory.path)")
+    }
+
+    private static func render(scene: SnapshotScene, to url: URL) {
+        let window = NSWindow(
+            // Far offscreen: the view must be in a window to lay out and to run
+            // its `.task` blocks, but it must never appear on a display.
+            contentRect: NSRect(x: -30_000, y: -30_000, width: scene.size.width, height: scene.size.height),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.backgroundColor = .black
+        window.appearance = NSAppearance(named: .darkAqua)
+
+        let hosting = NSHostingView(rootView: scene.content)
+        hosting.appearance = NSAppearance(named: .darkAqua)
+        hosting.frame = NSRect(origin: .zero, size: scene.size)
+        window.contentView = hosting
+        window.orderFrontRegardless()
+
+        // Let async work land: thumbnail decodes, `.task` blocks, and the
+        // highlight blink settling on its resting opacity.
+        pumpRunLoop(seconds: scene.settleSeconds)
+
+        hosting.layoutSubtreeIfNeeded()
+        guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
+            print("!! could not allocate a bitmap for \(scene.name)")
+            return
+        }
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            print("!! could not encode \(scene.name)")
+            return
+        }
+        try? png.write(to: url)
+        window.orderOut(nil)
+    }
+
+    private static func pumpRunLoop(seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+    }
+}
+
+struct SnapshotScene {
+    let name: String
+    let size: CGSize
+    let settleSeconds: TimeInterval
+    let content: AnyView
+
+    @MainActor
+    static var all: [SnapshotScene] {
+        chromeScenes + highlightScenes + stampScene
+    }
+}
+
+// MARK: - Real RecallView, driven by mock data
+
+@MainActor
+private func chromeScene(
+    name: String,
+    size: CGSize = CGSize(width: 1_440, height: 900),
+    moments: [RecallMoment],
+    session: RecallSearchSession?,
+    playheadMs: Int64
+) -> SnapshotScene {
+    SnapshotScene(
+        name: name,
+        size: size,
+        settleSeconds: 2.2,
+        content: AnyView(
+            RecallView(
+                moments: moments,
+                playheadMs: .constant(playheadMs),
+                isLive: .constant(false),
+                imageLoader: MockArtifactFactory.loader,
+                searchSession: session,
+                thumbnailLoader: MockSearchData.thumbnailLoader,
+                ocrLoader: MockSearchData.ocrLoader
+            )
+            .frame(width: size.width, height: size.height)
+        )
+    )
+}
+
+@MainActor
+private var chromeScenes: [SnapshotScene] {
+    let searchMoments = RecallScenario.search.moments
+    let session = RecallScenario.search.searchSession
+
+    var scenes: [SnapshotScene] = []
+
+    // Newest match selected — what you see right after pressing return.
+    if let session, let first = session.selectedFrame,
+       let moment = searchMoments.first(where: { $0.id == first.momentId })
+    {
+        scenes.append(
+            chromeScene(
+                name: "01-search-newest-selected",
+                moments: searchMoments,
+                session: session,
+                playheadMs: moment.capturedAtMs
+            )
+        )
+    }
+
+    // Mid-strip: cells on both sides of the playhead, older stamps in view.
+    if var session, session.frames.count > 6 {
+        session.selectedIndex = 5
+        if let moment = searchMoments.first(where: {
+            $0.id == session.frames[5].momentId
+        }) {
+            scenes.append(
+                chromeScene(
+                    name: "02-search-middle-selected",
+                    moments: searchMoments,
+                    session: session,
+                    playheadMs: moment.capturedAtMs
+                )
+            )
+        }
+    }
+
+    // Oldest match: the strip has run out on the right.
+    if var session, let last = session.frames.indices.last {
+        session.selectedIndex = last
+        if let moment = searchMoments.first(where: {
+            $0.id == session.frames[last].momentId
+        }) {
+            scenes.append(
+                chromeScene(
+                    name: "03-search-oldest-selected",
+                    moments: searchMoments,
+                    session: session,
+                    playheadMs: moment.capturedAtMs
+                )
+            )
+        }
+    }
+
+    // Small result sets: the strip must not look broken with one or two cells.
+    for count in [1, 2, 3] {
+        let subset = Array(searchMoments.suffix(count))
+        let hits = subset.map { moment in
+            RecallSearchHit(
+                momentId: moment.id,
+                sessionId: "session-search",
+                capturedAtMs: moment.capturedAtMs,
+                source: "ocr",
+                text: moment.ocrText ?? "",
+                score: 1
+            )
+        }
+        if let session = RecallSearchSession.make(query: "Moment", hits: hits),
+           let selected = session.selectedFrame,
+           let moment = subset.first(where: { $0.id == selected.momentId })
+        {
+            scenes.append(
+                chromeScene(
+                    name: "04-search-\(count)-result",
+                    moments: searchMoments,
+                    session: session,
+                    playheadMs: moment.capturedAtMs
+                )
+            )
+        }
+    }
+
+    // No search: the app timeline must be untouched by all of this.
+    let longDay = RecallScenario.long.moments
+    scenes.append(
+        chromeScene(
+            name: "05-no-search-app-timeline",
+            moments: longDay,
+            session: nil,
+            playheadMs: longDay[40].capturedAtMs
+        )
+    )
+
+    // Header stress: the identity capsule with no title, a normal title, and a
+    // title long enough to threaten the rest of the chrome row.
+    scenes.append(contentsOf: headerScenes())
+
+    // A narrow window, where the filmstrip has least room.
+    if let session {
+        scenes.append(
+            chromeScene(
+                name: "09-search-narrow-window",
+                size: CGSize(width: 900, height: 640),
+                moments: searchMoments,
+                session: session,
+                playheadMs: searchMoments.last?.capturedAtMs ?? 0
+            )
+        )
+    }
+
+    return scenes
+}
+
+@MainActor
+private func headerScenes() -> [SnapshotScene] {
+    let titles: [(String, String?)] = [
+        ("06-header-no-title", nil),
+        ("07-header-normal-title", "RecallView.swift — AfterRay"),
+        (
+            "08-header-very-long-title",
+            "Q3 planning · roadmap review · search presentation and timeline rebuild — Google Docs"
+        ),
+    ]
+    return titles.map { name, title in
+        let moment = RecallMoment(
+            id: "header-moment",
+            sessionId: "session-header",
+            capturedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            imageArtifactId: "mock://frame/1",
+            isFavorite: false,
+            ocrText: "Header check",
+            applicationName: "Xcode",
+            bundleIdentifier: "com.apple.dt.Xcode",
+            windowTitle: title
+        )
+        return chromeScene(
+            name: name,
+            size: CGSize(width: 1_280, height: 420),
+            moments: [moment],
+            session: nil,
+            playheadMs: moment.capturedAtMs
+        )
+    }
+}
+
+// MARK: - Highlight geometry over a real picture
+
+/// Draws a mock frame exactly as the app letterboxes it, with boxes placed by
+/// the shipping `OcrHighlight` math.
+///
+/// `.resizeAspect` on the video layer and `.aspectRatio(contentMode: .fit)`
+/// here produce the same rectangle, so if a box sits on the glyphs in this
+/// picture it sits on them in the app.
+private struct HighlightProof: View {
+    let image: NSImage
+    let regions: [OcrRegion]
+    let query: String
+
+    var body: some View {
+        GeometryReader { geometry in
+            let pixelSize = image.size
+            let content = OcrHighlight.contentRect(
+                pixelSize: pixelSize,
+                viewSize: geometry.size
+            )
+            let matched = OcrHighlight.matching(regions: regions, query: query)
+
+            ZStack(alignment: .topLeading) {
+                Color.black
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+
+                // Every region in white so the letterbox mapping is visible,
+                // then the query matches in ray red on top.
+                ForEach(Array(regions.enumerated()), id: \.offset) { _, region in
+                    box(OcrHighlight.rect(for: region, in: content), color: .white.opacity(0.5))
+                }
+                ForEach(Array(matched.enumerated()), id: \.offset) { _, region in
+                    box(OcrHighlight.rect(for: region, in: content), color: RecallPalette.ray)
+                }
+
+                Rectangle()
+                    .strokeBorder(.cyan.opacity(0.7), lineWidth: 1)
+                    .frame(width: content.width, height: content.height)
+                    .offset(x: content.minX, y: content.minY)
+            }
+        }
+    }
+
+    private func box(_ rect: CGRect, color: Color) -> some View {
+        RoundedRectangle(cornerRadius: 3, style: .continuous)
+            .strokeBorder(color, lineWidth: 2)
+            .frame(width: rect.width, height: rect.height)
+            .offset(x: rect.minX, y: rect.minY)
+    }
+}
+
+@MainActor
+private var highlightScenes: [SnapshotScene] {
+    guard
+        let data = try? MockArtifactFactory.renderFrame(index: 2),
+        let image = NSImage(data: data)
+    else { return [] }
+
+    let regions = [MockSearchData.titleRegion, MockSearchData.bodyRegion]
+
+    // The mock frame is 1280x800. Each view aspect exercises a different branch
+    // of the letterbox: bars top/bottom, bars left/right, and an exact fit.
+    let cases: [(String, CGSize)] = [
+        ("10-highlight-letterbox-tall-view", CGSize(width: 900, height: 900)),
+        ("11-highlight-letterbox-wide-view", CGSize(width: 1_400, height: 620)),
+        ("12-highlight-exact-fit", CGSize(width: 1_280, height: 800)),
+    ]
+
+    return cases.map { name, size in
+        SnapshotScene(
+            name: name,
+            size: size,
+            settleSeconds: 0.4,
+            content: AnyView(
+                HighlightProof(image: image, regions: regions, query: MockSearchData.query)
+                    .frame(width: size.width, height: size.height)
+            )
+        )
+    }
+}
+
+// MARK: - Relative stamps
+
+/// The caption ladder on its own, so the wording can be judged without hunting
+/// across filmstrip cells.
+private struct StampLadder: View {
+    private let now = Int64(Date().timeIntervalSince1970 * 1_000)
+    private let ages: [(String, Int64)] = [
+        ("just now", 5_000),
+        ("1 min", 60_000),
+        ("7 min", 7 * 60_000),
+        ("59 min", 59 * 60_000),
+        ("1 hour", 3_600_000),
+        ("9 hours", 9 * 3_600_000),
+        ("1 day", 86_400_000),
+        ("6 days", 6 * 86_400_000),
+        ("2 weeks", 14 * 86_400_000),
+        ("1 year", 365 * 86_400_000),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("RelativeStamp.short")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.6))
+            ForEach(ages, id: \.0) { label, age in
+                HStack(spacing: 14) {
+                    Text(RelativeStamp.short(fromMs: now - age, nowMs: now))
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                        .frame(width: 56, alignment: .leading)
+                    Text(label)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+            }
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(RecallPalette.background)
+    }
+}
+
+@MainActor
+private var stampScene: [SnapshotScene] {
+    [
+        SnapshotScene(
+            name: "13-relative-stamps",
+            size: CGSize(width: 340, height: 400),
+            settleSeconds: 0.3,
+            content: AnyView(StampLadder())
+        )
+    ]
+}
+
+MainActor.assumeIsolated { SnapshotRunner.main() }

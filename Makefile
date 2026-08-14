@@ -1,4 +1,4 @@
-.PHONY: check test build daemon status models visual-lab settings-lab dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app
+.PHONY: check test build daemon status models visual-lab settings-lab snapshots dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app
 
 check:
 	cargo check --workspace
@@ -31,6 +31,12 @@ visual-lab:
 
 settings-lab:
 	swift run afterray-visual-lab -- --settings --models
+
+# Offscreen PNGs of the recall surfaces on mock data. No daemon, no capture,
+# no window on screen. Override the destination: make snapshots OUT=/tmp/x
+OUT ?= /tmp/afterray-snapshots
+snapshots:
+	swift run afterray-visual-snapshots $(OUT)
 
 dev:
 	./scripts/dev.sh

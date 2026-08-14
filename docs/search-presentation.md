@@ -102,4 +102,14 @@ Schema 10 → 12（11 = 窗口标题索引，12 = 缩略图列），两步都是
 ## 验证
 
 - `cargo test --workspace` / `swift test` / `scripts/verify-gop-e2e.sh`
-- Visual Lab 的 `Search` 场景（`make dev-ui`）：结果跨越分钟到周，可以脱离 daemon 检查胶片条排布、相对时间、闪烁节奏、letterbox 下的框位置
+- Visual Lab 的 `Search` 场景（`make dev-ui`）：交互式检查
+- **`make snapshots`**：离屏渲染 PNG，不启 daemon、不申请权限、不在屏幕上开窗
+
+### 为什么需要离屏快照
+
+单测能覆盖 `OcrHighlight`、`SearchFilmstripLayout`、`RecallSearchSession` 的数学，但覆盖不了 SwiftUI 的渲染语义。这一轮快照抓到了两个纯逻辑测试不可能发现的问题：
+
+1. **`.mask()` 用在 `.offset()` 之后，会锚定到偏移前的布局 frame。** 边缘渐隐因此遮住的是空白区域，把真正的格子抹掉了 —— 结果少时整条胶片条完全消失，结果多时右侧被静默截断。修法是把渐隐作用在一个视口尺寸的容器上，而不是作用在被偏移的那一行上。
+2. **时间戳文本没有显式前景色。** 依赖继承的配色方案，在任何没有把 dark appearance 传下来的宿主里都会渲染成黑底黑字。覆盖层永远画在深色内容上，所以直接写死 `RecallPalette.textPrimary`。
+
+已知盲区：全分辨率画面由 `AVSampleBufferDisplayLayer` 绘制，不走 `cacheDisplay(in:to:)`，所以 chrome 快照里画面是空的。`highlight-*` 那几张场景专门补这个洞 —— 它们画真实的 mock 帧，并用**同一套** `OcrHighlight` 数学摆放框，覆盖 letterbox 的三个分支（上下黑边、左右黑边、精确贴合）。

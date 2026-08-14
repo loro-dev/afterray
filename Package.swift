@@ -11,6 +11,7 @@ let package = Package(
         .executable(name: "afterray-app", targets: ["AfterRayApp"]),
         .executable(name: "afterray-native-model-worker", targets: ["AfterRayNativeModelWorker"]),
         .executable(name: "afterray-visual-lab", targets: ["AfterRayVisualLab"]),
+        .executable(name: "afterray-visual-snapshots", targets: ["AfterRayVisualSnapshots"]),
     ],
     targets: [
         .target(
@@ -35,6 +36,11 @@ let package = Package(
             name: "AfterRayVisualLab",
             dependencies: ["AfterRayRecall", "AfterRayMockData"],
             path: "apps/AfterRayVisualLab/Sources"
+        ),
+        .executableTarget(
+            name: "AfterRayVisualSnapshots",
+            dependencies: ["AfterRayRecall", "AfterRayMockData"],
+            path: "apps/AfterRayVisualSnapshots/Sources"
         ),
         .testTarget(
             name: "AfterRayRecallTests",

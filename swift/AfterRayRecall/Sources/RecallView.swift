@@ -1089,6 +1089,10 @@ struct PlayheadTimestamp: View {
             Text(isLive ? "NOW" : date.formatted(date: .omitted, time: .standard))
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .monospacedDigit()
+                // Explicit, not `.primary`: this always sits on dark chrome, and
+                // relying on the inherited scheme renders it black-on-black in
+                // any host that does not carry the dark appearance through.
+                .foregroundStyle(RecallPalette.textPrimary)
             Text(
                 isLive
                     ? "Swipe right to enter history"

@@ -9,3 +9,6 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# Offscreen visual snapshots (make snapshots)
+/snapshots/
