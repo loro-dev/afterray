@@ -880,8 +880,11 @@ button.sa-chip.sa-chip-active {
   background: var(--accent-soft);
   border-color: var(--accent);
 }
-.sa-presets {
-  margin-top: 0;
+.sa-try {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
   margin-bottom: 0.9rem;
 }
 .cli-cmds {
@@ -890,24 +893,83 @@ button.sa-chip.sa-chip-active {
   flex-wrap: wrap;
   margin-bottom: 0.8rem;
 }
-.sa-row {
-  padding: 0.7rem 0;
+.sa-found {
+  margin-top: 1.2rem;
+  margin-bottom: 0.1rem;
+}
+/* a hit is a moment: a stamp of the captured window, what it was, and the
+   phrase the query actually landed on */
+.sa-hit {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: 0.85rem;
+  padding: 0.8rem 0;
   border-top: 1px solid var(--line);
 }
-.sa-row-head {
+.sa-hit-head {
   display: flex;
   align-items: baseline;
-  gap: 0.8rem;
-  margin-bottom: 0.25rem;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.3rem;
 }
 .sa-src {
   color: var(--accent);
   font-size: 0.62rem;
   letter-spacing: 0.1em;
 }
-.sa-row p {
+.sa-hit-text p {
   color: var(--ink-dim);
   font-size: 0.82rem;
+  line-height: 1.5;
+}
+.sa-hit mark {
+  background: none;
+  color: var(--ink);
+  border-bottom: 1px solid var(--accent);
+  padding-bottom: 1px;
+}
+.sa-replay {
+  font-size: 0.6rem;
+  color: var(--ink-faint);
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  padding: 0.2rem 0.5rem;
+  white-space: nowrap;
+}
+.sa-frame {
+  display: block;
+  width: 54px;
+  height: 38px;
+  flex: none;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #131218;
+  box-shadow: 0 0 0 1px oklch(1 0 0 / 0.1);
+}
+.sa-frame-bar {
+  display: flex;
+  align-items: center;
+  height: 13px;
+  padding-inline: 4px;
+  background: color-mix(in oklab, var(--tint) 38%, #131218);
+  color: rgba(26, 5, 3, 0.7);
+}
+.sa-frame-bar svg {
+  width: 8px;
+  height: 8px;
+}
+.sa-frame-body {
+  display: block;
+  padding: 5px 5px 0;
+}
+.sa-frame-body i {
+  display: block;
+  height: 3px;
+  border-radius: 2px;
+  margin-bottom: 3px;
+  background: rgba(242, 237, 226, 0.22);
 }
 .sa-a {
   font-size: 0.9rem;
@@ -1114,6 +1176,13 @@ button.sa-chip.sa-chip-active {
 @media (max-width: 560px) {
   .pillar-grid {
     grid-template-columns: 1fr;
+  }
+  /* the replay chip is the first thing to go when the row gets tight */
+  .sa-hit {
+    grid-template-columns: auto 1fr;
+  }
+  .sa-replay {
+    display: none;
   }
   /* the mock window takes most of the stage width on phones */
   .rc-window {
