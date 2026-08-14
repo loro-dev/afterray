@@ -53,7 +53,7 @@ private struct VisualLabView: View {
     init() {
         let hotKeys = RecallHotKeyStore(storageKey: "dev.afterray.visual-lab.hotkey")
         _labHotKeys = State(initialValue: hotKeys)
-        _onboardingModel = State(initialValue: AfterRayOnboardingModel(hotKeys: hotKeys))
+        _onboardingModel = State(initialValue: Self.makeOnboardingModel(hotKeys: hotKeys))
     }
 
     private var moments: [RecallMoment] {
@@ -139,7 +139,84 @@ private struct VisualLabView: View {
     private static let labGreetings = ["Good morning.", "Good afternoon.", "Good evening.", "Still up?"]
 
     private func replayOnboarding() {
-        onboardingModel = AfterRayOnboardingModel(hotKeys: labHotKeys)
+        onboardingModel = Self.makeOnboardingModel(hotKeys: labHotKeys)
+    }
+
+    @MainActor
+    private static func makeOnboardingModel(hotKeys: RecallHotKeyStore) -> AfterRayOnboardingModel {
+        let models = PreviewOnboardingModels()
+        return AfterRayOnboardingModel(
+            hotKeys: hotKeys,
+            cliActions: AfterRayOnboardingCliActions(
+                status: { "Preview CLI is ready." },
+                isInstalled: { true },
+                install: {}
+            ),
+            modelActions: AfterRayOnboardingModelActions(
+                status: { models.library },
+                download: { packID in models.install(packID) }
+            )
+        )
+    }
+
+    @MainActor
+    private final class PreviewOnboardingModels {
+        var library = ModelLibrary(
+            directory: "/Users/demo/Library/Application Support/AfterRay/Models",
+            packs: [
+                ModelPack(
+                    id: "asr",
+                    name: "Qwen3 ASR",
+                    capability: "asr",
+                    path: "/tmp/Qwen3-ASR-1.7B",
+                    present: false,
+                    bytes: 0,
+                    required: true,
+                    expectedBytes: 4_200_000_000
+                ),
+                ModelPack(
+                    id: "embedding",
+                    name: "Text embeddings",
+                    capability: "embedding",
+                    path: "/tmp/nomic.gguf",
+                    present: true,
+                    bytes: 274_000_000,
+                    required: true,
+                    expectedBytes: 274_000_000
+                ),
+                ModelPack(
+                    id: "llm",
+                    name: "Qwen3.6 27B",
+                    capability: "llm",
+                    path: "/tmp/qwen.gguf",
+                    present: false,
+                    bytes: 0,
+                    required: false,
+                    expectedBytes: 16_817_244_384
+                ),
+            ]
+        )
+
+        func install(_ packID: String) -> ModelLibrary {
+            library = ModelLibrary(
+                directory: library.directory,
+                packs: library.packs.map { pack in
+                    guard pack.id == packID else { return pack }
+                    return ModelPack(
+                        id: pack.id,
+                        name: pack.name,
+                        capability: pack.capability,
+                        path: pack.path,
+                        present: true,
+                        bytes: pack.expectedBytes ?? pack.bytes,
+                        required: pack.required,
+                        note: pack.note,
+                        expectedBytes: pack.expectedBytes
+                    )
+                }
+            )
+            return library
+        }
     }
 
     private var settingsLab: some View {

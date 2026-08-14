@@ -39,6 +39,20 @@ final class OnboardingController: ObservableObject {
                     _ = try AfterRayCliInstall.install()
                 },
                 pathExportLine: { AfterRayCliInstall.pathExportLine() }
+            ),
+            modelActions: AfterRayOnboardingModelActions(
+                status: {
+                    _ = try await DaemonSupervisor.shared.startIfNeeded()
+                    return try await UnixSocketDaemonClient(
+                        socketPath: DaemonSupervisor.shared.socketPath
+                    ).modelLibrary()
+                },
+                download: { packID in
+                    _ = try await DaemonSupervisor.shared.startIfNeeded()
+                    return try await UnixSocketDaemonClient(
+                        socketPath: DaemonSupervisor.shared.socketPath
+                    ).downloadModels(packID: packID)
+                }
             )
         )
     }

@@ -3,6 +3,7 @@ import SwiftUI
 public enum AfterRayOnboardingStage: Equatable, Sendable {
     case hotKey
     case cli
+    case models
 }
 
 /// Optional PATH install hooks. The app host fills these; previews can omit them.
@@ -27,6 +28,21 @@ public struct AfterRayOnboardingCliActions: Sendable {
     }
 }
 
+/// Model-library hooks supplied by the app host. Keeping the daemon client out
+/// of this view makes onboarding usable in previews and tests.
+public struct AfterRayOnboardingModelActions: Sendable {
+    public var status: @MainActor @Sendable () async throws -> ModelLibrary
+    public var download: @MainActor @Sendable (_ packID: String) async throws -> ModelLibrary
+
+    public init(
+        status: @escaping @MainActor @Sendable () async throws -> ModelLibrary,
+        download: @escaping @MainActor @Sendable (_ packID: String) async throws -> ModelLibrary
+    ) {
+        self.status = status
+        self.download = download
+    }
+}
+
 /// First-run state. The app owns one of these so the global hotkey handler can
 /// tell the window "they just pressed it" while the lesson is on screen.
 @MainActor
@@ -37,13 +53,24 @@ public final class AfterRayOnboardingModel: ObservableObject {
     @Published public private(set) var cliInstalled = false
     @Published public private(set) var isInstallingCli = false
     @Published public var cliMessage: String?
+    @Published public private(set) var modelLibrary: ModelLibrary?
+    @Published public private(set) var isLoadingModels = false
+    @Published public private(set) var isDownloadingModels = false
+    @Published public private(set) var downloadingPackID: String?
+    @Published public var modelMessage: String?
 
     public let hotKeys: RecallHotKeyStore
     public let cliActions: AfterRayOnboardingCliActions?
+    public let modelActions: AfterRayOnboardingModelActions?
 
-    public init(hotKeys: RecallHotKeyStore, cliActions: AfterRayOnboardingCliActions? = nil) {
+    public init(
+        hotKeys: RecallHotKeyStore,
+        cliActions: AfterRayOnboardingCliActions? = nil,
+        modelActions: AfterRayOnboardingModelActions? = nil
+    ) {
         self.hotKeys = hotKeys
         self.cliActions = cliActions
+        self.modelActions = modelActions
         refreshCli()
     }
 
@@ -62,7 +89,17 @@ public final class AfterRayOnboardingModel: ObservableObject {
         if cliActions != nil {
             stage = .cli
             refreshCli()
+        } else if modelActions != nil {
+            stage = .models
+            Task { await refreshModels() }
         }
+    }
+
+    public func advanceFromCli() {
+        guard stage == .cli else { return }
+        guard modelActions != nil else { return }
+        stage = .models
+        Task { await refreshModels() }
     }
 
     public func refreshCli() {
@@ -92,6 +129,76 @@ public final class AfterRayOnboardingModel: ObservableObject {
 
     public var pathExportLine: String {
         cliActions?.pathExportLine() ?? #"export PATH="$HOME/.local/bin:$PATH""#
+    }
+
+    public var requiredModelPacks: [ModelPack] {
+        modelLibrary?.packs.filter(\.required) ?? []
+    }
+
+    public var missingRequiredModelPacks: [ModelPack] {
+        requiredModelPacks.filter { !$0.present }
+    }
+
+    public var requiredModelsReady: Bool {
+        guard modelLibrary != nil else { return false }
+        return missingRequiredModelPacks.isEmpty
+    }
+
+    public var modelDownloadProgress: Double? {
+        modelLibrary?.download?.fraction
+    }
+
+    public func refreshModels() async {
+        guard let modelActions else { return }
+        isLoadingModels = true
+        defer { isLoadingModels = false }
+        do {
+            modelLibrary = try await modelActions.status()
+            modelMessage = nil
+        } catch {
+            modelMessage = error.localizedDescription
+        }
+    }
+
+    public func downloadRequiredModels() async {
+        guard let modelActions, !isDownloadingModels else { return }
+        if modelLibrary == nil { await refreshModels() }
+        let packIDs = missingRequiredModelPacks.map(\.id)
+        guard !packIDs.isEmpty else { return }
+
+        isDownloadingModels = true
+        modelMessage = nil
+        defer {
+            isDownloadingModels = false
+            downloadingPackID = nil
+        }
+
+        do {
+            for packID in packIDs {
+                downloadingPackID = packID
+                let progress = Task { @MainActor in
+                    while !Task.isCancelled {
+                        if let next = try? await modelActions.status() {
+                            modelLibrary = next
+                        }
+                        try? await Task.sleep(for: .milliseconds(350))
+                    }
+                }
+                do {
+                    modelLibrary = try await modelActions.download(packID)
+                } catch {
+                    progress.cancel()
+                    _ = await progress.result
+                    throw error
+                }
+                progress.cancel()
+                _ = await progress.result
+            }
+            modelLibrary = try await modelActions.status()
+            modelMessage = "Required models are ready."
+        } catch {
+            modelMessage = error.localizedDescription
+        }
     }
 }
 
@@ -139,6 +246,7 @@ public struct AfterRayOnboardingView: View {
             headline
             Spacer(minLength: 22)
             stageBody
+                .frame(maxWidth: .infinity, minHeight: 220, alignment: .topLeading)
             Spacer(minLength: 20)
             footer
         }
@@ -165,7 +273,7 @@ public struct AfterRayOnboardingView: View {
             Rectangle()
                 .fill(RecallPalette.ray)
                 .frame(width: 18, height: 2)
-            Text(model.stage == .cli ? "LOCAL ONLY / CLI" : "LOCAL ONLY / AFTERRAY")
+            Text(eyebrowTitle)
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 .tracking(1.1)
         }
@@ -190,6 +298,16 @@ public struct AfterRayOnboardingView: View {
             return "Press this to open AfterRay."
         case .cli:
             return "Let other agents use your history."
+        case .models:
+            return "Prepare AfterRay's local models."
+        }
+    }
+
+    private var eyebrowTitle: String {
+        switch model.stage {
+        case .hotKey: "LOCAL ONLY / AFTERRAY"
+        case .cli: "LOCAL ONLY / CLI"
+        case .models: "LOCAL ONLY / MODELS"
         }
     }
 
@@ -200,6 +318,8 @@ public struct AfterRayOnboardingView: View {
             hotKeyStage
         case .cli:
             cliStage
+        case .models:
+            modelsStage
         }
     }
 
@@ -286,6 +406,69 @@ public struct AfterRayOnboardingView: View {
         .frame(maxWidth: .infinity, minHeight: 142, alignment: .topLeading)
     }
 
+    private var modelsStage: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Transcription and search need two on-device model packs. They stay on this Mac and can be removed later in Settings.")
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(RecallPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if model.isLoadingModels, model.modelLibrary == nil {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking installed models…")
+                }
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(RecallPalette.textTertiary)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(model.requiredModelPacks.enumerated()), id: \.element.id) { index, pack in
+                        if index > 0 { Divider().overlay(.white.opacity(0.08)) }
+                        modelPackRow(pack)
+                    }
+                }
+                .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+
+            if model.isDownloadingModels {
+                ProgressView(value: model.modelDownloadProgress ?? 0)
+                    .progressViewStyle(.linear)
+                    .tint(RecallPalette.ray)
+            }
+
+            Text(model.modelMessage ?? "The optional local assistant is about 17 GB and can be installed later in Settings.")
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundStyle(model.modelMessage == nil ? RecallPalette.textTertiary : RecallPalette.ray)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func modelPackRow(_ pack: ModelPack) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: pack.present ? "checkmark.circle.fill" : "arrow.down.circle")
+                .foregroundStyle(pack.present ? .white.opacity(0.9) : RecallPalette.ray)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(pack.name)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(RecallPalette.textPrimary)
+                Text(pack.present ? "Installed" : "Download · \(modelSize(pack.expectedBytes))")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(RecallPalette.textTertiary)
+            }
+            Spacer()
+            if model.downloadingPackID == pack.id {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 48)
+    }
+
+    private func modelSize(_ bytes: UInt64?) -> String {
+        guard let bytes else { return "size unavailable" }
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
     @ViewBuilder
     private var hotKeyHint: some View {
         if let failure = hotKeys.failure {
@@ -330,6 +513,8 @@ public struct AfterRayOnboardingView: View {
             hotKeyFooter
         case .cli:
             cliFooter
+        case .models:
+            modelsFooter
         }
     }
 
@@ -357,7 +542,7 @@ public struct AfterRayOnboardingView: View {
 
     private var cliFooter: some View {
         HStack(spacing: 10) {
-            Button("Skip") { finish() }
+            Button("Skip CLI") { continueFromCli() }
                 .buttonStyle(OnboardingQuietButtonStyle())
             Spacer(minLength: 8)
             if !model.cliInstalled {
@@ -367,9 +552,36 @@ public struct AfterRayOnboardingView: View {
                 .buttonStyle(OnboardingQuietButtonStyle())
                 .disabled(model.isInstallingCli)
             }
-            Button(model.cliInstalled ? "Here we go" : "Done", action: finish)
+            Button("Continue", action: continueFromCli)
                 .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: model.cliInstalled))
                 .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    private var modelsFooter: some View {
+        HStack(spacing: 10) {
+            if !model.requiredModelsReady {
+                Button("Skip for now", action: finish)
+                    .buttonStyle(OnboardingQuietButtonStyle())
+                    .disabled(model.isDownloadingModels)
+            }
+            Spacer(minLength: 8)
+            if model.modelLibrary == nil, !model.isLoadingModels {
+                Button("Check again") { Task { await model.refreshModels() } }
+                    .buttonStyle(OnboardingQuietButtonStyle())
+            }
+            if model.requiredModelsReady {
+                Button("Start using AfterRay", action: finish)
+                    .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
+                    .keyboardShortcut(.defaultAction)
+            } else if model.modelLibrary != nil {
+                Button(model.isDownloadingModels ? "Downloading…" : "Download required models") {
+                    Task { await model.downloadRequiredModels() }
+                }
+                .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
+                .disabled(model.isDownloadingModels)
+                .keyboardShortcut(.defaultAction)
+            }
         }
     }
 
@@ -397,8 +609,17 @@ public struct AfterRayOnboardingView: View {
 
     private func continueFromHotKey() {
         guard model.stage == .hotKey, !isClosing else { return }
-        if model.cliActions != nil {
+        if model.cliActions != nil || model.modelActions != nil {
             model.advanceFromHotKey()
+        } else {
+            finish()
+        }
+    }
+
+    private func continueFromCli() {
+        guard model.stage == .cli, !isClosing else { return }
+        if model.modelActions != nil {
+            model.advanceFromCli()
         } else {
             finish()
         }
