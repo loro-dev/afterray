@@ -1594,9 +1594,11 @@ impl Vault {
             )?;
             statement
                 .query_map([excess], |row| {
-                    let owned: Vec<Option<String>> =
-                        vec![row.get(1)?, row.get(2)?, row.get(3)?];
-                    Ok((row.get::<_, String>(0)?, owned.into_iter().flatten().collect()))
+                    let owned: Vec<Option<String>> = vec![row.get(1)?, row.get(2)?, row.get(3)?];
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        owned.into_iter().flatten().collect(),
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -3009,7 +3011,17 @@ mod tests {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
         let evidence = vault
-            .insert_text_evidence(&session.id, None, None, "ocr", "test", 1, None, "ocr-model", None)
+            .insert_text_evidence(
+                &session.id,
+                None,
+                None,
+                "ocr",
+                "test",
+                1,
+                None,
+                "ocr-model",
+                None,
+            )
             .unwrap();
         assert!(matches!(
             vault.insert_embedding(&evidence, &[], "embedding-model"),
@@ -3154,8 +3166,8 @@ mod tests {
                     10_000 * i64::from(index),
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
             ids.push(moment.id);
         }
@@ -3394,8 +3406,8 @@ mod tests {
                     moment.captured_at_ms,
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
         }
         let policy = PackPolicy {
@@ -3759,7 +3771,8 @@ mod tests {
         let moment = vault
             .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
             .unwrap();
-        let layout = r#"[{"text":"Hello","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.05}]"#;
+        let layout =
+            r#"[{"text":"Hello","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.05}]"#;
         vault
             .insert_text_evidence(
                 &session.id,
@@ -3975,6 +3988,226 @@ mod tests {
         vault.enforce_retention().unwrap();
         assert!(vault.read_artifact(&thumbnail).is_err());
         assert!(!vault.artifact_path(&thumbnail).exists());
+    }
+
+    /// Upgrading must not cost a user their history.
+    ///
+    /// Every other migration test starts from an empty vault, which cannot
+    /// catch a migration that silently drops or rebuilds rows. This one fills a
+    /// vault the way a real one fills up — stills, OCR boxes, transcripts,
+    /// audio, favorites, memories, and a moment already packed into a cold GOP
+    /// — winds the schema back to 10, and reopens.
+    struct SeededVault {
+        session_id: String,
+        hot_moment: String,
+        packed_moment: String,
+        still_artifact: String,
+    }
+
+    /// Fills a vault the way a real one fills up, then winds the schema back to
+    /// 10 so reopening it exercises the upgrade path.
+    fn seed_then_downgrade_to_schema_10(config: &VaultConfig, key: [u8; 32]) -> SeededVault {
+        let vault = Vault::open_with_key(config.clone(), key).unwrap();
+        let session = vault.create_session_sync(1_000).unwrap();
+
+        let hot = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"hot-still-bytes")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("Quarterly roadmap.key", Some("https://example.com/deck")),
+                Some("Keynote"),
+                Some("com.apple.iWork.Keynote"),
+            )
+            .unwrap()
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&hot.id),
+                None,
+                "ocr",
+                "revenue projection",
+                1_000,
+                None,
+                "vision-ocr",
+                Some(r#"[{"text":"revenue","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.05}]"#),
+            )
+            .unwrap();
+        vault.set_favorite(&hot.id, true).unwrap();
+
+        // A moment that already lives in a cold GOP: its still is gone, so
+        // the new delete/retention paths must tolerate the NULL.
+        let packed = vault
+            .insert_moment(&session.id, 2_000, "image/jpeg", b"packed-still")
+            .unwrap();
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE moments
+                    SET image_artifact_id = NULL, gop_segment_id = 'seg-1', gop_index = 3
+                  WHERE id = ?1",
+                [&packed.id],
+            )
+            .unwrap();
+
+        vault
+            .insert_memory(&Memory {
+                id: "mem-upgrade".into(),
+                start_ms: 1_000,
+                end_ms: 2_000,
+                moment_id: Some(hot.id.clone()),
+                application_name: Some("Keynote".into()),
+                bundle_identifier: Some("com.apple.iWork.Keynote".into()),
+                window_title: Some("Quarterly roadmap.key".into()),
+                url: None,
+                document: None,
+                summary: "Reviewed the deck".into(),
+                fingerprint: "fp-1".into(),
+            })
+            .unwrap();
+
+        // Wind the schema back to what a pre-upgrade vault looks like.
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE moments DROP COLUMN thumbnail_artifact_id;
+                 DROP INDEX IF EXISTS text_evidence_session_source;
+                 UPDATE schema_meta SET version = 10;",
+            )
+            .unwrap();
+
+        SeededVault {
+            session_id: session.id,
+            hot_moment: hot.id,
+            packed_moment: packed.id,
+            still_artifact: hot.image_artifact_id.clone().unwrap(),
+        }
+    }
+
+    /// Upgrading must not cost a user their history. Every other migration test
+    /// starts from an empty vault, which cannot catch a migration that silently
+    /// drops or rebuilds rows.
+    #[test]
+    fn schema_12_upgrade_preserves_a_populated_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [11_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            max_unstarred_moments: 100,
+        };
+        let seeded = seed_then_downgrade_to_schema_10(&config, key);
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+
+        let version: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+
+        // The two things schema 11 and 12 add.
+        let columns = moment_column_names(&vault.connection.lock().unwrap()).unwrap();
+        assert!(columns.iter().any(|name| name == "thumbnail_artifact_id"));
+        let has_index: bool = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'index' AND name = 'text_evidence_session_source'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        assert!(has_index, "schema 11 index missing after upgrade");
+
+        // Nothing was lost.
+        let moments = vault.moments_sync(&seeded.session_id).unwrap();
+        assert_eq!(moments.len(), 2, "a moment went missing across the upgrade");
+
+        let hot = moments
+            .iter()
+            .find(|moment| moment.id == seeded.hot_moment)
+            .expect("hot moment survived");
+        assert_eq!(hot.window_title.as_deref(), Some("Quarterly roadmap.key"));
+        assert_eq!(hot.url.as_deref(), Some("https://example.com/deck"));
+        assert_eq!(hot.application_name.as_deref(), Some("Keynote"));
+        assert!(hot.is_favorite, "favorite flag survived");
+        assert_eq!(hot.ocr_text.as_deref(), Some("revenue projection"));
+
+        let packed = moments
+            .iter()
+            .find(|moment| moment.id == seeded.packed_moment)
+            .expect("packed moment survived");
+        assert!(packed.image_artifact_id.is_none());
+        // Read the raw columns: the segment row itself is not part of this
+        // fixture, so `moments_sync` cannot materialise a `GopRef`. What the
+        // migration owes us is that the claim on the segment survived.
+        let claim: (Option<String>, Option<i64>) = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT gop_segment_id, gop_index FROM moments WHERE id = ?1",
+                [&seeded.packed_moment],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, (Some("seg-1".to_owned()), Some(3)));
+
+        // Artifacts still decrypt: the key hierarchy was not disturbed.
+        assert_eq!(
+            vault.read_artifact(&seeded.still_artifact).unwrap().bytes,
+            b"hot-still-bytes"
+        );
+
+        // FTS and OCR layout came through intact.
+        let hits = vault.search("revenue", 10).unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.moment_id == seeded.hot_moment),
+            "OCR evidence is no longer searchable after the upgrade"
+        );
+        assert!(
+            vault
+                .ocr_layout_for_moment(&seeded.hot_moment)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            vault
+                .search("roadmap", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.source == WINDOW_EVIDENCE_SOURCE),
+            "window-title evidence written before the upgrade is still indexed"
+        );
+
+        assert_eq!(vault.memories(0, 10_000, 10).unwrap().len(), 1);
+
+        // And the new column is usable on the migrated vault, including for a
+        // moment whose still is already gone.
+        let thumbnail = vault
+            .set_thumbnail(&seeded.packed_moment, b"thumb")
+            .unwrap();
+        assert_eq!(vault.read_artifact(&thumbnail).unwrap().bytes, b"thumb");
+        vault
+            .delete_moment_and_artifacts(&seeded.packed_moment)
+            .unwrap();
+        assert!(
+            !vault.artifact_path(&thumbnail).exists(),
+            "thumbnail leaked when a packed moment was deleted"
+        );
     }
 
     #[test]
