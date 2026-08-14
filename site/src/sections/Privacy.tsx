@@ -6,7 +6,6 @@ export default function Privacy() {
   return (
     <section className="section privacy" id="privacy">
       <Reveal className="privacy-statement">
-        <p className="eyebrow mono">{t.eyebrow}</p>
         <h2 className="statement">
           <span className="zero mono">0</span>
           {t.statementA}
@@ -18,7 +17,6 @@ export default function Privacy() {
       <div className="pillar-grid">
         {t.pillars.map((p, i) => (
           <Reveal key={p.title} className="pillar" delay={i * 90}>
-            <span className="pillar-num mono">0{i + 1}</span>
             <h3>{p.title}</h3>
             <p>{p.body}</p>
           </Reveal>

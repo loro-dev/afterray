@@ -7,7 +7,6 @@ export default function Specs() {
     <>
       <section className="section pipeline">
         <Reveal>
-          <p className="eyebrow mono">{t.specs.eyebrow}</p>
           <h2 className="pipeline-title">
             <Rich parts={t.specs.title} />
           </h2>
@@ -34,7 +33,6 @@ export default function Specs() {
 
       <section className="final-cta" id="download">
         <Reveal>
-          <p className="eyebrow mono">{t.final.eyebrow}</p>
           <h2 className="final-title">
             <Rich parts={t.final.titleA} />
             <br />
@@ -53,7 +51,7 @@ export default function Specs() {
       </section>
 
       <footer className="footer">
-        <span className="mono">AFTERRAY</span>
+        <span className="mono">AfterRay</span>
         <span className="dim">{t.footer.tagline}</span>
         <span className="mono dim">{t.footer.rights}</span>
       </footer>

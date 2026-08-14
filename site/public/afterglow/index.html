@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Afterglow shader lab</title>
+<style>
+  :root {
+    --bg: #060607;
+    --ink: #f2ede2;
+    --ink-dim: rgba(242, 237, 226, 0.55);
+    --accent: #ff4a3d;
+    --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--ink); overflow: hidden; font-family: -apple-system, 'PingFang SC', sans-serif; }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* candidate 5: pure CSS mesh-gradient afterglow (no WebGL at all) */
+  #cssGlow { position: fixed; inset: 0; display: none; overflow: hidden; }
+  #cssGlow .blob {
+    position: absolute; width: 90vmax; height: 90vmax; border-radius: 50%;
+    filter: blur(9vmax); opacity: 0.8;
+  }
+  #cssGlow .b1 {
+    right: -25vmax; bottom: -35vmax;
+    background: radial-gradient(circle, rgba(255, 74, 61, 0.6), rgba(179, 35, 24, 0.22) 45%, transparent 70%);
+    animation: drift1 26s ease-in-out infinite alternate;
+  }
+  #cssGlow .b2 {
+    left: -30vmax; top: -30vmax;
+    background: radial-gradient(circle, rgba(255, 122, 61, 0.3), transparent 65%);
+    animation: drift2 34s ease-in-out infinite alternate;
+  }
+  @keyframes drift1 { to { transform: translate(-12vmax, -8vmax) scale(1.15); } }
+  @keyframes drift2 { to { transform: translate(10vmax, 9vmax) scale(0.9); } }
+
+  .hud {
+    position: fixed; left: 2rem; bottom: 2rem; z-index: 2; max-width: 30rem;
+    text-shadow: 0 1px 12px rgba(0, 0, 0, 0.8);
+  }
+  .hud .idx { font-family: var(--mono); font-size: 0.72rem; color: var(--accent); letter-spacing: 0.14em; }
+  .hud h1 { font-size: 1.6rem; font-weight: 600; margin: 0.3rem 0 0.4rem; }
+  .hud p { color: var(--ink-dim); font-size: 0.88rem; line-height: 1.6; }
+  .hud .cost { font-family: var(--mono); font-size: 0.68rem; color: var(--ink-dim); margin-top: 0.5rem; }
+  .hint {
+    position: fixed; top: 1.4rem; right: 2rem; z-index: 2;
+    font-family: var(--mono); font-size: 0.7rem; color: var(--ink-dim);
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="cssGlow"><div class="blob b1"></div><div class="blob b2"></div></div>
+<div class="hint">← / → 切换（数字键 1–9 直达）</div>
+<div class="hud">
+  <div class="idx" id="idx"></div>
+  <h1 id="name"></h1>
+  <p id="desc"></p>
+  <div class="cost" id="cost"></div>
+</div>
+
+<script type="module">
+const PRELUDE = `
+precision highp float;
+uniform vec2 u_res;
+uniform float u_time;
+uniform vec2 u_mouse;
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash12(i);
+  float b = hash12(i + vec2(1.0, 0.0));
+  float c = hash12(i + vec2(0.0, 1.0));
+  float d = hash12(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0;
+  float a = 0.5;
+  for (int i = 0; i < 4; i++) {
+    v += a * vnoise(p);
+    p = p * 2.13 + vec2(17.3, 9.1);
+    a *= 0.5;
+  }
+  return v;
+}
+float dither() {
+  return (hash12(gl_FragCoord.xy + fract(u_time) * 61.7) - 0.5) * (4.0 / 255.0);
+}
+`
+
+const CANDIDATES = [
+  {
+    name: '霞光 · Crepuscular rays',
+    desc: '低垂光源向外散开的扇形光束，角向噪声让光束缓慢呼吸。最接近「余晖万道」的意象，仪式感强。',
+    cost: '每像素 2 次 fbm · 无循环步进 · 开销极低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  vec2 sun = vec2(0.42, -0.30) + u_mouse * 0.04;
+  vec2 d = frag - sun;
+  float dist = length(d);
+  float ang = atan(d.y, d.x);
+  float t = u_time * 0.05;
+  float beams = fbm(vec2(ang * 2.5, t)) * 0.7 + fbm(vec2(ang * 6.0, -t * 1.7)) * 0.3;
+  float ray = pow(smoothstep(0.32, 0.95, beams), 1.8);
+  float fall = exp(-dist * 1.9);
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col += vec3(1.0, 0.29, 0.24) * ray * fall * 0.85;
+  col += vec3(1.0, 0.62, 0.38) * exp(-dist * 3.5) * 0.8;
+  col += vec3(1.0, 0.88, 0.72) * exp(-dist * 11.0) * 0.8;
+  col = col / (1.0 + col * 0.55);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '流霞 · Domain-warped dusk',
+    desc: '噪声扭曲噪声，晚霞像缓慢流动的丝绸。没有明确光源，整块天空都是质感，适合做安静的背景。',
+    cost: '每像素 3 次 fbm · 开销低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  vec2 p = frag * 1.2 + u_mouse * 0.05;
+  float t = u_time * 0.04;
+  vec2 q = vec2(fbm(p + t), fbm(p + vec2(5.2, 1.3) - t));
+  vec2 r = vec2(fbm(p + 2.2 * q + vec2(1.7, 9.2) + t * 1.6),
+                fbm(p + 2.2 * q + vec2(8.3, 2.8) - t * 1.2));
+  float f = fbm(p + 2.5 * r);
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col = mix(col, vec3(0.22, 0.05, 0.05), clamp(f * f * 1.8, 0.0, 0.8));
+  col = mix(col, vec3(1.0, 0.29, 0.24), clamp(r.y * r.y * 1.2, 0.0, 1.0) * 0.28);
+  col = mix(col, vec3(1.0, 0.72, 0.45), clamp(q.x * q.x * q.x * 2.0, 0.0, 1.0) * 0.16);
+  col = col / (1.0 + col * 0.35);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '像素流霞 · Pixel domain-warp',
+    desc: '流霞的像素化变体：同一个域扭曲场，但按方块网格量化采样，晚霞变成缓慢流动的马赛克色块，复古显示器质感。',
+    cost: '每像素 3 次 fbm · 开销低（与流霞相同）',
+    fs: `
+void main() {
+  // quantize the sampling point to a chunky grid — the whole warp field
+  // then moves coherently block by block
+  float px = 14.0;
+  vec2 fc = (floor(gl_FragCoord.xy / px) + 0.5) * px;
+  vec2 frag = (fc * 2.0 - u_res) / min(u_res.x, u_res.y);
+  vec2 p = frag * 1.2 + u_mouse * 0.05;
+  float t = u_time * 0.04;
+  vec2 q = vec2(fbm(p + t), fbm(p + vec2(5.2, 1.3) - t));
+  vec2 r = vec2(fbm(p + 2.2 * q + vec2(1.7, 9.2) + t * 1.6),
+                fbm(p + 2.2 * q + vec2(8.3, 2.8) - t * 1.2));
+  float f = fbm(p + 2.5 * r);
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col = mix(col, vec3(0.22, 0.05, 0.05), clamp(f * f * 1.8, 0.0, 0.8));
+  col = mix(col, vec3(1.0, 0.29, 0.24), clamp(r.y * r.y * 1.2, 0.0, 1.0) * 0.28);
+  col = mix(col, vec3(1.0, 0.72, 0.45), clamp(q.x * q.x * q.x * 2.0, 0.0, 1.0) * 0.16);
+  col = col / (1.0 + col * 0.35);
+  // posterize into visible steps — the retro pixel feel comes as much from
+  // quantized color as from the block grid (and it replaces dithering)
+  col = floor(col * 14.0 + 0.5) / 14.0;
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '落日 · Horizon afterglow',
+    desc: '地平线附近的一道暖色亮带加落日光晕，上方渐暗并透出稀疏星点。构图感最强，可以把文案放在上半部分。',
+    cost: '每像素 1 次 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 uv = gl_FragCoord.xy / u_res;
+  float y = uv.y;
+  vec3 col = mix(vec3(0.05, 0.03, 0.05), vec3(0.024, 0.024, 0.027), smoothstep(0.0, 0.75, y));
+  float hz = 0.30;
+  float band = exp(-abs(y - hz) * 5.0);
+  col += vec3(0.9, 0.25, 0.15) * band * 0.5;
+  col += vec3(1.0, 0.55, 0.30) * exp(-abs(y - hz) * 14.0) * 0.45;
+  vec2 sp = vec2(0.62 + u_mouse.x * 0.015, hz - 0.02 + u_mouse.y * 0.01);
+  float sd = length((uv - sp) * vec2(u_res.x / u_res.y, 1.0));
+  col += vec3(1.0, 0.72, 0.45) * exp(-sd * 7.0) * 1.0;
+  col += vec3(1.0, 0.90, 0.75) * exp(-sd * 26.0) * 0.9;
+  float cl = fbm(vec2(uv.x * 3.0 + u_time * 0.008, uv.y * 14.0));
+  float streak = smoothstep(0.55, 0.8, cl) * smoothstep(hz + 0.28, hz, y) * 0.4;
+  col = mix(col, vec3(0.03, 0.02, 0.03), streak);
+  col += vec3(1.0, 0.5, 0.3) * streak * band * 0.7;
+  vec2 sp2 = uv * vec2(160.0, 90.0);
+  vec2 cell = floor(sp2);
+  float h = hash12(cell);
+  float sdist = length(fract(sp2) - 0.5);
+  float star = step(0.997, h) * (1.0 - smoothstep(0.06, 0.22, sdist)) * smoothstep(0.5, 0.9, y);
+  col += vec3(0.8, 0.85, 1.0) * star * 0.5;
+  col = col / (1.0 + col * 0.4);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '余烬 · Rising embers',
+    desc: '暗色底上缓慢上升、明灭的暖色微粒，像熄灭前最后的火星。动感最强，也最有「消散前留存」的隐喻。',
+    cost: '每像素 2 层粒子网格 · 无 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 uv = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col += vec3(0.10, 0.04, 0.03) * exp(-length(uv - vec2(0.3, -0.7)) * 1.2);
+  // embers thin out with height — they rise from below and die out
+  float hf = smoothstep(1.3, 0.1, uv.y);
+  for (int L = 0; L < 2; L++) {
+    float fl = float(L);
+    float scale = L == 0 ? 7.0 : 13.0;
+    vec2 p = uv * scale + vec2(u_mouse.x * 0.3 * (fl + 1.0), -u_time * (0.12 + 0.09 * fl));
+    vec2 id = floor(p);
+    vec2 f = fract(p) - 0.5;
+    vec2 off = (vec2(hash12(id + 1.31 + fl * 7.7), hash12(id + 2.73 + fl * 7.7)) - 0.5) * 0.6;
+    off.x += sin(u_time * 0.5 + hash12(id + 4.17) * 6.28) * 0.15;
+    float h = hash12(id + fl * 13.1);
+    float d = length(f - off);
+    float tw = 0.55 + 0.45 * sin(u_time * (0.8 + 2.0 * hash12(id + 5.3)) + h * 40.0);
+    float e = (1.0 - smoothstep(0.0, 0.08 + 0.07 * h, d)) * step(0.72, h) * hf;
+    col += vec3(1.0, 0.42, 0.20) * e * tw * (L == 0 ? 0.75 : 0.4);
+    col += vec3(1.0, 0.75, 0.45) * e * e * tw * 0.4;
+  }
+  col = col / (1.0 + col * 0.5);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '薄暮 · CSS mesh gradient',
+    desc: '不用 WebGL：两团巨大的径向渐变加高斯模糊，CSS 动画缓慢漂移。成本几乎为零，也最「平面图设」。',
+    cost: '零 shader · 仅靠合成器 · 开销可忽略',
+    fs: null,
+  },
+  {
+    name: '日冕 · Eclipse corona',
+    desc: '一轮暗盘，边缘是不规则的绯色日冕和向外流动的光流。和之前黑洞的构图一脉相承，但开销只有零头。',
+    cost: '每像素 2 次 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  frag -= vec2(0.3, 0.05);
+  float dist = length(frag);
+  float ang = atan(frag.y, frag.x);
+  float R = 0.40;
+  float out_ = max(dist - R, 0.0);
+  float n = fbm(vec2(ang * 3.0, dist * 2.0 - u_time * 0.06));
+  float corona = exp(-out_ * 4.5) * (0.55 + 0.45 * n);
+  float streams = pow(fbm(vec2(ang * 6.0, dist * 1.2 - u_time * 0.1)), 2.0) * exp(-out_ * 2.0);
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col += vec3(1.0, 0.30, 0.20) * corona * 0.65;
+  col += vec3(1.0, 0.60, 0.35) * streams * 0.7;
+  col += vec3(1.0, 0.85, 0.60) * exp(-abs(dist - R) * 28.0) * 1.1;
+  if (dist < R) col = vec3(0.012, 0.012, 0.014);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '绯幕 · Scarlet curtains',
+    desc: '极光帷幕换成绯色：几道缓慢扭动的光帘垂在暗色天空里，下方带垂直的光丝。飘逸、有仙气。',
+    cost: '每像素 3 次 fbm · 开销低',
+    fs: `
+void main() {
+  vec2 uv = gl_FragCoord.xy / u_res;
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  for (int i = 0; i < 3; i++) {
+    float fi = float(i);
+    float n = fbm(vec2(uv.x * (2.0 + fi), u_time * (0.05 + fi * 0.017) + fi * 3.7));
+    float y = 0.42 + fi * 0.16 + (n - 0.5) * 0.55;
+    float d = uv.y - y;
+    float band = exp(-d * d * 160.0) * (0.55 - fi * 0.12);
+    // vertical shimmer falling from the band
+    float rays = fbm(vec2(uv.x * 12.0 + fi * 7.0, u_time * 0.08));
+    float fall = d < 0.0 ? exp(d * 6.0) * rays * 0.35 : 0.0;
+    col += vec3(1.0, 0.32, 0.20) * (band + fall) * 0.6;
+    col += vec3(1.0, 0.68, 0.42) * band * band * 0.55;
+  }
+  col = col / (1.0 + col * 0.4);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '涟漪 · Wave interference',
+    desc: '三个不可见波源的圆形波纹相互干涉，亮线是波峰叠加的地方。安静但有数学的秩序感。',
+    cost: '每像素 3 次 sin + 1 次 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  float amp = 0.65 + 0.35 * fbm(frag * 1.4 + u_time * 0.04);
+  float w = 0.0;
+  w += sin(length(frag - vec2(0.45, -0.25)) * 16.0 - u_time * 1.1);
+  w += sin(length(frag - vec2(-0.55, 0.30)) * 21.0 - u_time * 0.85);
+  w += sin(length(frag - vec2(0.05, 0.65)) * 13.0 - u_time * 1.4);
+  w = w / 3.0 * 0.5 + 0.5;
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col += vec3(1.0, 0.30, 0.20) * pow(w, 4.0) * amp * 0.85;
+  col += vec3(1.0, 0.65, 0.40) * pow(w, 10.0) * amp * 0.7;
+  col = col / (1.0 + col * 0.4);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '熔岩 · Lava lamp',
+    desc: '几团缓慢漂移、聚散的光斑，互相靠近时融合成更大的光团。有机、慵懒，六十年代熔岩灯的数字版。',
+    cost: '每像素 6 次距离场累加 · 无 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  float field = 0.0;
+  for (int i = 0; i < 6; i++) {
+    float fi = float(i);
+    vec2 c = vec2(sin(u_time * (0.10 + fi * 0.043) + fi * 2.1) * (0.55 + fi * 0.06),
+                  cos(u_time * (0.08 + fi * 0.037) + fi * 1.7) * 0.42);
+    c += u_mouse * 0.05;
+    vec2 d = frag - c;
+    field += 0.03 / (dot(d, d) + 1e-4);
+  }
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col += vec3(0.35, 0.06, 0.05) * smoothstep(0.5, 1.3, field);
+  col += vec3(1.0, 0.30, 0.20) * smoothstep(1.3, 3.0, field) * 0.6;
+  col += vec3(1.0, 0.72, 0.45) * smoothstep(3.0, 7.0, field) * 0.7;
+  col = col / (1.0 + col * 0.35);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '等高线 · Dusk contours',
+    desc: '把晚霞噪声场画成发光等高线，像一张缓慢变动的暮色地形图。最有「平面设计」感，和网格排版很搭。',
+    cost: '每像素 1 次 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  float f = fbm(frag * 1.3 + vec2(u_time * 0.03, -u_time * 0.02));
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  col += vec3(0.16, 0.04, 0.04) * f;
+  float lv = fract(f * 7.0);
+  float edge = min(lv, 1.0 - lv);
+  float line = 1.0 - smoothstep(0.015, 0.06, edge);
+  col += vec3(1.0, 0.35, 0.22) * line * 0.4;
+  float lv2 = fract(f * 28.0);
+  float edge2 = min(lv2, 1.0 - lv2);
+  col += vec3(1.0, 0.55, 0.35) * (1.0 - smoothstep(0.01, 0.05, edge2)) * 0.08;
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '黑洞 · 2D lensed（返场）',
+    desc: '不做光线步进：偏转角是碰撞参数的一维函数，直接解析旋转采样点得到透镜扭曲。光子环、吸积盘缠绕、多普勒增亮都在，开销不到原来的 5%。',
+    cost: '每像素 1 次旋转 + 2 次 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  frag.x -= 0.35;
+  frag -= u_mouse * 0.03;
+
+  float b = length(frag);
+
+  // deflection: a 1D function of impact parameter — diverges at the
+  // photon sphere, so near-critical rays wrap and paint the Einstein ring
+  float bc = 0.42;
+  float alpha = 0.5 / (b - bc + 0.18);
+  float ca = cos(alpha), sa = sin(alpha);
+  vec2 len = vec2(frag.x * ca - frag.y * sa, frag.x * sa + frag.y * ca);
+
+  // scene, sampled in lensed space
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  float neb = fbm(len * 1.8 + vec2(0.0, u_time * 0.01));
+  col += vec3(0.09, 0.09, 0.13) * neb * neb;
+  vec2 sp = len * 90.0;
+  vec2 sc = floor(sp);
+  float h = hash12(sc);
+  float star = step(0.992, h) * (1.0 - smoothstep(0.05, 0.3, length(fract(sp) - 0.5)));
+  col += vec3(0.9, 0.93, 1.0) * star * 0.8;
+
+  // accretion disk: an inclined annulus in scene space — the lens map
+  // wraps its far side over the top of the hole for free
+  vec2 duv = vec2(len.x, len.y * 3.2);
+  float r = length(duv);
+  float da = atan(duv.y, duv.x);
+  float u = (r - 0.68) / 1.45;
+  if (u > 0.0 && u < 1.2) {
+    vec2 circ = vec2(cos(da), sin(da));
+    float streak = fbm(vec2(circ.x * 2.0 + r * 1.6, circ.y * 2.0 + r * 7.0) + vec2(u_time * 0.06, 0.0));
+    float density = pow(clamp(streak * 1.1, 0.0, 1.4), 1.8);
+    float radial = smoothstep(0.0, 0.12, u) * exp(-u * 1.8);
+    float dop = clamp(1.0 - 0.55 * (len.x / max(r, 0.2)), 0.3, 1.8);
+    vec3 diskCol = mix(vec3(1.0, 0.85, 0.70), vec3(0.9, 0.15, 0.08), smoothstep(0.05, 0.6, u));
+    col += diskCol * density * radial * dop * 1.2;
+  }
+
+  // photon ring + halo, then the shadow itself with a soft rim
+  col += vec3(1.0, 0.45, 0.25) * exp(-abs(b - bc) * 30.0) * 0.9;
+  col += vec3(1.0, 0.40, 0.22) * exp(-max(b - bc, 0.0) * 5.0) * 0.22;
+  float edge = smoothstep(bc * 0.90, bc * 1.04, b);
+  col = mix(vec3(0.010, 0.010, 0.012), col, edge);
+
+  col = col / (1.0 + col * 0.5);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+  {
+    name: '黑洞 · Logo 同源',
+    desc: '按 logo 的构图重排：纯净阴影 + 细光子环 + 一条斜穿的光。光在透镜空间里采样，靠近黑洞时自然被掰弯——logo 的签名动作，现在是活的。',
+    cost: '每像素 1 次旋转 + 2 次 fbm · 开销极低',
+    fs: `
+void main() {
+  vec2 frag = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  frag.x -= 0.35;
+  frag -= u_mouse * 0.03;
+  float b = length(frag);
+
+  // deflection falls off fast — the ray bends only near the hole,
+  // staying straight and logo-like further out
+  float bc = 0.42;
+  float alpha = 0.30 / pow(b - bc + 0.10, 1.4);
+  float ca = cos(alpha), sa = sin(alpha);
+  vec2 len = vec2(frag.x * ca - frag.y * sa, frag.x * sa + frag.y * ca);
+
+  vec3 col = vec3(0.024, 0.024, 0.027);
+  vec3 red = vec3(1.0, 0.16, 0.12);
+  vec3 hot = vec3(1.0, 0.55, 0.42);
+
+  // the ray: a diagonal line sampled in lensed space — near the hole
+  // the lens map bends it around the shadow
+  vec2 nd = normalize(vec2(-0.48, 0.88));
+  float dl = abs(dot(len, nd));
+  float along = dot(len, vec2(-nd.y, nd.x));
+  float streak = exp(-dl * 22.0) * (0.55 + 0.45 * fbm(vec2(along * 2.0, u_time * 0.05)));
+  col += red * streak * 0.9;
+  col += hot * exp(-dl * 60.0) * 0.8;
+
+  // thin wisps hugging the ring
+  float wisp = fbm(vec2(atan(len.y, len.x) * 3.0, b * 6.0 - u_time * 0.08));
+  col += red * exp(-max(b - bc, 0.0) * 3.0) * wisp * 0.35;
+
+  // photon ring + outer halo
+  col += hot * exp(-abs(b - bc) * 30.0) * 1.0;
+  col += red * exp(-max(b - bc, 0.0) * 5.0) * 0.25;
+
+  float edge = smoothstep(bc * 0.90, bc * 1.04, b);
+  col = mix(vec3(0.008, 0.004, 0.005), col, edge);
+
+  col = col / (1.0 + col * 0.45);
+  col += dither();
+  gl_FragColor = vec4(col, 1.0);
+}`,
+  },
+]
+
+const canvas = document.getElementById('gl')
+const cssGlow = document.getElementById('cssGlow')
+const gl = canvas.getContext('webgl', { antialias: false, depth: false, stencil: false, alpha: false })
+
+const VERT = `attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`
+
+function compile(type, src) {
+  const sh = gl.createShader(type)
+  gl.shaderSource(sh, src)
+  gl.compileShader(sh)
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(sh) || 'compile failed')
+  }
+  return sh
+}
+
+const programs = new Map()
+function getProgram(i) {
+  if (programs.has(i)) return programs.get(i)
+  const prog = gl.createProgram()
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT))
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, PRELUDE + CANDIDATES[i].fs))
+  gl.linkProgram(prog)
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(prog) || 'link failed')
+  }
+  const entry = {
+    prog,
+    uRes: gl.getUniformLocation(prog, 'u_res'),
+    uTime: gl.getUniformLocation(prog, 'u_time'),
+    uMouse: gl.getUniformLocation(prog, 'u_mouse'),
+  }
+  programs.set(i, entry)
+  return entry
+}
+
+if (gl) {
+  const buf = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf)
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW)
+}
+
+let current = Math.min(
+  Math.max(parseInt(new URLSearchParams(location.search).get('i') || '1', 10) - 1, 0),
+  CANDIDATES.length - 1,
+)
+const mouse = { x: 0, y: 0 }
+const start = performance.now()
+
+function resize() {
+  const scale = Math.min(window.devicePixelRatio || 1, 2)
+  canvas.width = Math.floor(canvas.clientWidth * scale)
+  canvas.height = Math.floor(canvas.clientHeight * scale)
+}
+
+function show(i) {
+  current = (i + CANDIDATES.length) % CANDIDATES.length
+  const c = CANDIDATES[current]
+  document.getElementById('idx').textContent = `${current + 1} / ${CANDIDATES.length}`
+  document.getElementById('name').textContent = c.name
+  document.getElementById('desc').textContent = c.desc
+  document.getElementById('cost').textContent = c.cost
+  const useCss = !c.fs || !gl
+  canvas.style.display = useCss ? 'none' : 'block'
+  cssGlow.style.display = useCss ? 'block' : 'none'
+  history.replaceState(null, '', `?i=${current + 1}`)
+}
+
+function frame(now) {
+  const c = CANDIDATES[current]
+  if (c.fs && gl) {
+    resize()
+    const { prog, uRes, uTime, uMouse } = getProgram(current)
+    gl.useProgram(prog)
+    const loc = gl.getAttribLocation(prog, 'a_pos')
+    gl.enableVertexAttribArray(loc)
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0)
+    gl.viewport(0, 0, canvas.width, canvas.height)
+    gl.uniform2f(uRes, canvas.width, canvas.height)
+    gl.uniform1f(uTime, (now - start) / 1000)
+    gl.uniform2f(uMouse, mouse.x, mouse.y)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
+  }
+  requestAnimationFrame(frame)
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') show(current + 1)
+  else if (e.key === 'ArrowLeft') show(current - 1)
+  else if (e.key >= '1' && e.key <= String(CANDIDATES.length)) show(parseInt(e.key, 10) - 1)
+})
+window.addEventListener('mousemove', (e) => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1
+  mouse.y = -((e.clientY / window.innerHeight) * 2 - 1)
+})
+window.addEventListener('resize', resize)
+
+resize()
+show(current)
+requestAnimationFrame(frame)
+</script>
+</body>
+</html>

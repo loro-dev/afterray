@@ -1,10 +1,10 @@
 import { LangProvider, useLang, useCopy } from './i18n'
 import Hero from './sections/Hero'
 import Privacy from './sections/Privacy'
-import Rewind from './sections/Rewind'
-import Search from './sections/Search'
-import Summary from './sections/Summary'
-import Skills from './sections/Skills'
+import Recall from './sections/Recall'
+import SearchAsk from './sections/SearchAsk'
+import Cli from './sections/Cli'
+import Agents from './sections/Agents'
 import Specs from './sections/Specs'
 
 function Nav() {
@@ -14,16 +14,16 @@ function Nav() {
     <nav className="nav">
       <a className="nav-logo" href="#top">
         <img src="/logo.png" alt="AfterRay logo" className="logo-img" />
-        <span className="mono">AFTERRAY</span>
+        <span className="mono">AfterRay</span>
       </a>
-      <div className="nav-links mono">
+      <div className="nav-links">
         <a href="#features">{t.features}</a>
-        <a href="#skills">{t.skills}</a>
+        <a href="#cli">{t.cli}</a>
         <a href="#privacy">{t.privacy}</a>
       </div>
       <div className="nav-actions">
         <button
-          className="lang-toggle mono"
+          className="lang-toggle"
           onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
           aria-label="Switch language"
         >
@@ -45,10 +45,10 @@ export default function App() {
         <Hero />
         <main>
           <Privacy />
-          <Rewind />
-          <Search />
-          <Summary />
-          <Skills />
+          <Recall />
+          <SearchAsk />
+          <Cli />
+          <Agents />
           <Specs />
         </main>
         <div className="grain" aria-hidden="true" />

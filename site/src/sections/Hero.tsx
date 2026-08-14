@@ -1,12 +1,9 @@
-import BlackHole from '../blackhole/BlackHole'
 import { Rich, useCopy } from '../i18n'
 
 export default function Hero() {
   const t = useCopy().hero
   return (
     <header className="hero">
-      <BlackHole className="hero-canvas" />
-      <div className="hero-scrim" />
       <div className="hero-content">
         <p className="hero-eyebrow anim-in" style={{ animationDelay: '0.1s' }}>
           {t.eyebrow}
