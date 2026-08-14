@@ -1003,15 +1003,18 @@ button.sa-chip.sa-chip-active {
   font-size: 0.76rem;
   line-height: 1.65;
 }
+/* terminals keep their own alignment: scroll rather than wrap mid-token */
+.cli-line,
+.cli-out {
+  white-space: pre;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
 .cli-line {
   color: var(--ink);
-  white-space: pre-wrap;
-  word-break: break-all;
 }
 .cli-out {
   color: var(--ink-dim);
-  white-space: pre-wrap;
-  word-break: break-all;
   margin-top: 0.35rem;
   font-family: inherit;
   font-size: 0.72rem;

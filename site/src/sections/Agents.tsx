@@ -48,11 +48,6 @@ export default function Agents() {
             <Rich parts={t.titleB} />
           </h2>
           <p className="feature-body">{t.body}</p>
-          <ul className="feature-points">
-            {t.points.map((p) => (
-              <li key={p}>{p}</li>
-            ))}
-          </ul>
           <p className="agents-label dim">{t.toolsLabel}</p>
           <p className="agents-tools">{t.tools.join(' · ')}</p>
         </Reveal>
