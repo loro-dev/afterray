@@ -270,6 +270,25 @@ button:focus-visible {
   flex-wrap: wrap;
   justify-content: flex-start;
 }
+/* the fact strip replaces the privacy claims that used to be scattered
+   across five sections — one honest line, right under the CTAs */
+.hero-facts {
+  margin-top: 1.7rem;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.5rem;
+  font-size: 0.7rem;
+}
+.hero-facts li {
+  position: relative;
+}
+.hero-facts li + li::before {
+  content: '·';
+  position: absolute;
+  inset-inline-start: -0.9rem;
+  color: var(--ink-faint);
+}
 .hero-eyebrow {
   font-size: 0.82rem;
   letter-spacing: 0.02em;
@@ -321,9 +340,35 @@ button:focus-visible {
   padding: 8rem 2rem;
 }
 
-/* ---------------- privacy ---------------- */
+/* ---------------- jobs-to-be-done ---------------- */
+.jtbd {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3rem;
+  padding-block: 5.5rem;
+}
+.jtbd-item h2 {
+  font-size: 1.12rem;
+  font-weight: 600;
+  line-height: 1.35;
+  margin-bottom: 0.55rem;
+}
+.jtbd-item p {
+  font-size: 0.92rem;
+  color: var(--ink-dim);
+}
+
+/* ---------------- privacy / closer ---------------- */
 .privacy {
   text-align: start;
+}
+/* the pipeline and spec table fold into the closer, left-aligned with it */
+.privacy .pipe-row {
+  justify-content: flex-start;
+  margin: 6rem 0 3rem;
+}
+.privacy .spec-grid {
+  margin-inline: 0;
 }
 .privacy-statement {
   max-width: 46rem;
@@ -417,9 +462,11 @@ button:focus-visible {
 .recall-section {
   padding-top: 0;
 }
+/* the headline sits above the stage, so the reader knows what they are
+   about to drag before they touch it */
 .recall-section .rail-head {
-  padding-top: 3.25rem;
-  padding-bottom: 5rem;
+  padding-top: 0;
+  padding-bottom: 3rem;
   margin-bottom: 0;
 }
 .recall-bleed {
@@ -430,10 +477,6 @@ button:focus-visible {
 }
 .recall-bleed .rc-stage {
   min-height: 540px;
-}
-/* recall rail — the time-rail demo stage */
-.recall-rail {
-  text-align: center;
 }
 .rail-head {
   max-width: 46rem;
@@ -734,13 +777,6 @@ button:focus-visible {
   font-size: 0.6rem;
   font-weight: 500;
 }
-.rail-points {
-  flex-direction: row;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 0.7rem 2.2rem;
-  margin-top: 2.6rem;
-}
 .rc-status {
   display: inline-flex;
   align-items: center;
@@ -757,6 +793,43 @@ button:focus-visible {
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
+}
+
+/* memories mock — the day written back, hour by hour */
+.mem-panel {
+  padding: 1.1rem 1.2rem;
+}
+.mem-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.9rem;
+}
+.mem-head .mono {
+  font-size: 0.64rem;
+  letter-spacing: 0.14em;
+}
+.mem-row {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr;
+  gap: 1rem;
+  padding: 0.85rem 0;
+  border-top: 1px solid var(--line);
+}
+.mem-span {
+  font-size: 0.64rem;
+  color: var(--ink-faint);
+  padding-top: 0.2rem;
+}
+.mem-body p {
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+.mem-apps {
+  display: block;
+  font-size: 0.62rem;
+  margin-top: 0.3rem;
 }
 
 /* search & ask mock — reproduces the two glass panels */
@@ -836,10 +909,6 @@ button.sa-chip.sa-chip-active {
   color: var(--ink-dim);
   font-size: 0.82rem;
 }
-.sa-answer .sa-q {
-  font-size: 0.72rem;
-  margin-bottom: 0.7rem;
-}
 .sa-a {
   font-size: 0.9rem;
   line-height: 1.6;
@@ -872,9 +941,6 @@ button.sa-chip.sa-chip-active {
   font-size: 0.76rem;
   line-height: 1.65;
 }
-.cli-block {
-  margin-bottom: 1.1rem;
-}
 .cli-line {
   color: var(--ink);
   white-space: pre-wrap;
@@ -903,13 +969,12 @@ button.sa-chip.sa-chip-active {
 }
 
 /* ---------------- agents ---------------- */
-.agents-head {
-  max-width: 44rem;
-  margin-bottom: 2.6rem;
+.agents-install {
+  margin-bottom: 1rem;
 }
 .agents-label {
   font-size: 0.82rem;
-  margin-top: 1.6rem;
+  margin-top: 1.8rem;
   margin-bottom: 0.4rem;
 }
 .agents-tools {
@@ -917,29 +982,12 @@ button.sa-chip.sa-chip-active {
   color: var(--ink);
   max-width: 40rem;
 }
-.agents-mock {
-  max-width: 44rem;
-}
-.agents-ask {
-  margin-top: 1.1rem;
-}
-.agents-reply {
-  color: var(--ink-dim);
-  margin-top: 0.35rem;
-}
 .agents-note {
   margin-top: 0.85rem;
   font-size: 0.78rem;
 }
 
 /* ---------------- pipeline / specs ---------------- */
-.pipeline {
-  text-align: center;
-}
-.pipeline-title {
-  font-size: clamp(2rem, 4.5vw, 3.4rem);
-  font-weight: 600;
-}
 .pipe-row {
   margin: 3.5rem auto 4rem;
   display: flex;
@@ -1030,6 +1078,14 @@ button.sa-chip.sa-chip-active {
   .pillar-grid {
     column-gap: 2rem;
     row-gap: 2rem;
+  }
+  .jtbd {
+    grid-template-columns: 1fr;
+    gap: 2.2rem;
+    padding-block: 3.5rem;
+  }
+  .privacy .pipe-row {
+    margin-top: 4rem;
   }
   .nav-links {
     display: none;

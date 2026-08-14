@@ -1,16 +1,33 @@
 import Reveal from '../components/Reveal'
 import { Rich, useCopy } from '../i18n'
 
-export default function Specs() {
+/**
+ * The closer: privacy is the reason it is safe to say yes, so it lands here
+ * rather than opening the page. Pipeline and specs fold in behind it.
+ */
+export default function Closer() {
   const t = useCopy()
   return (
     <>
-      <section className="section pipeline">
-        <Reveal>
-          <h2 className="pipeline-title">
-            <Rich parts={t.specs.title} />
+      <section className="section privacy" id="privacy">
+        <Reveal className="privacy-statement">
+          <h2 className="statement">
+            <span className="zero mono">0</span>
+            {t.privacy.statementA}
+            <br />
+            {t.privacy.statementB}
           </h2>
+          <p className="statement-sub">{t.privacy.sub}</p>
         </Reveal>
+        <div className="pillar-grid">
+          {t.privacy.pillars.map((p, i) => (
+            <Reveal key={p.title} className="pillar" delay={i * 90}>
+              <h3>{p.title}</h3>
+              <p>{p.body}</p>
+            </Reveal>
+          ))}
+        </div>
+
         <Reveal delay={120}>
           <div className="pipe-row">
             {t.specs.steps.map((step, i) => (

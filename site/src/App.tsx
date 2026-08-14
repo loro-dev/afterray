@@ -1,11 +1,11 @@
 import { LangProvider, useLang, useCopy } from './i18n'
 import Hero from './sections/Hero'
+import Jtbd from './sections/Jtbd'
 import Recall from './sections/Recall'
-import Privacy from './sections/Privacy'
+import Memories from './sections/Memories'
 import SearchAsk from './sections/SearchAsk'
-import Cli from './sections/Cli'
 import Agents from './sections/Agents'
-import Specs from './sections/Specs'
+import Closer from './sections/Closer'
 
 function Nav() {
   const { lang, setLang } = useLang()
@@ -54,12 +54,12 @@ export default function App() {
         <Nav />
         <Hero />
         <main id="main">
+          <Jtbd />
           <Recall />
-          <Privacy />
+          <Memories />
           <SearchAsk />
-          <Cli />
           <Agents />
-          <Specs />
+          <Closer />
         </main>
         <div className="grain" aria-hidden="true" />
       </div>

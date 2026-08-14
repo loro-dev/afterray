@@ -26,6 +26,11 @@ export default function Hero() {
             {t.ctaSecondary}
           </a>
         </div>
+        <ul className="hero-facts mono dim anim-in" style={{ animationDelay: '0.5s' }}>
+          {t.facts.map((f) => (
+            <li key={f}>{f}</li>
+          ))}
+        </ul>
       </div>
     </header>
   )

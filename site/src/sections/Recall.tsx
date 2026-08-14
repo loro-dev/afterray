@@ -122,9 +122,6 @@ export default function Recall() {
   const t = useCopy().recall
   return (
     <section className="recall-section" id="features">
-      <div className="recall-bleed">
-        <RecallStage />
-      </div>
       <div className="section rail-head">
         <Reveal>
           <h2 className="feature-title">
@@ -134,6 +131,9 @@ export default function Recall() {
           </h2>
           <p className="feature-body">{t.body}</p>
         </Reveal>
+      </div>
+      <div className="recall-bleed">
+        <RecallStage />
       </div>
     </section>
   )
