@@ -43,7 +43,12 @@ export default function Specs() {
             <a className="btn btn-primary" href="#download">
               {t.final.ctaPrimary}
             </a>
-            <a className="btn btn-ghost" href="https://github.com" target="_blank" rel="noreferrer">
+            <a
+              className="btn btn-ghost"
+              href="https://github.com/loro-dev/afterray"
+              target="_blank"
+              rel="noreferrer"
+            >
               {t.final.ctaSecondary}
             </a>
           </div>

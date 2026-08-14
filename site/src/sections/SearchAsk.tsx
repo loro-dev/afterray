@@ -1,8 +1,28 @@
+import { useEffect, useMemo, useState } from 'react'
 import Reveal from '../components/Reveal'
-import { Rich, useCopy } from '../i18n'
+import { Rich, useCopy, useLang } from '../i18n'
 
 export default function SearchAsk() {
   const t = useCopy().searchAsk
+  const { lang } = useLang()
+  const [queryText, setQueryText] = useState(t.mock.queries[0].query)
+  const [presetIdx, setPresetIdx] = useState(0)
+
+  useEffect(() => {
+    setQueryText(t.mock.queries[0].query)
+    setPresetIdx(0)
+  }, [lang, t.mock.queries])
+
+  const active = useMemo(() => {
+    const q = queryText.toLowerCase()
+    return (
+      t.mock.queries.find((c) => c.keys.some((k) => q.includes(k.toLowerCase()))) ??
+      t.mock.queries[0]
+    )
+  }, [queryText, t.mock.queries])
+
+  const preset = t.mock.presets[presetIdx]
+
   return (
     <section className="section feature feature-flip">
       <Reveal className="feature-mock" delay={150}>
@@ -14,9 +34,15 @@ export default function SearchAsk() {
                 <circle cx="11" cy="11" r="7" />
                 <path d="m20 20-3.8-3.8" />
               </svg>
-              {t.mock.query}
+              <input
+                className="sa-input"
+                value={queryText}
+                onChange={(e) => setQueryText(e.target.value)}
+                aria-label={t.mock.searchHead}
+                spellCheck={false}
+              />
             </div>
-            {t.mock.results.map((r) => (
+            {active.results.map((r) => (
               <div key={r.time} className="sa-row">
                 <div className="sa-row-head">
                   <span className="sa-src mono">{r.src}</span>
@@ -28,11 +54,22 @@ export default function SearchAsk() {
           </div>
           <div className="mock sa-panel sa-answer">
             <div className="sa-head mono accent">{t.mock.askHead}</div>
-            <p className="sa-q mono dim">✦ {t.mock.question}</p>
-            <p className="sa-a">{t.mock.answer}</p>
+            <div className="sa-cites sa-presets">
+              {t.mock.presets.map((p, i) => (
+                <button
+                  type="button"
+                  key={p.q}
+                  className={`sa-chip mono ${i === presetIdx ? 'sa-chip-active' : ''}`}
+                  onClick={() => setPresetIdx(i)}
+                >
+                  {p.q}
+                </button>
+              ))}
+            </div>
+            <p className="sa-a">{preset.a}</p>
             <div className="sa-cites">
-              {t.mock.citations.map((c) => (
-                <span key={c} className="sa-chip mono">
+              {preset.cites.map((c) => (
+                <span key={c} className="sa-cite mono">
                   {c}
                 </span>
               ))}

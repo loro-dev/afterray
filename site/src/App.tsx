@@ -1,7 +1,7 @@
 import { LangProvider, useLang, useCopy } from './i18n'
 import Hero from './sections/Hero'
-import Privacy from './sections/Privacy'
 import Recall from './sections/Recall'
+import Privacy from './sections/Privacy'
 import SearchAsk from './sections/SearchAsk'
 import Cli from './sections/Cli'
 import Agents from './sections/Agents'
@@ -13,7 +13,7 @@ function Nav() {
   return (
     <nav className="nav">
       <a className="nav-logo" href="#top">
-        <img src="/logo.png" alt="AfterRay logo" className="logo-img" />
+        <img src="/logo.png" alt="" className="logo-img" />
         <span className="mono">AfterRay</span>
       </a>
       <div className="nav-links">
@@ -23,9 +23,10 @@ function Nav() {
       </div>
       <div className="nav-actions">
         <button
+          type="button"
           className="lang-toggle"
           onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
-          aria-label="Switch language"
+          aria-label={lang === 'en' ? 'Switch to Chinese' : '切换到英文'}
         >
           {lang === 'en' ? '中文' : 'EN'}
         </button>
@@ -37,15 +38,24 @@ function Nav() {
   )
 }
 
+function SkipLink() {
+  return (
+    <a className="skip-link" href="#main">
+      {useCopy().nav.skip}
+    </a>
+  )
+}
+
 export default function App() {
   return (
     <LangProvider>
       <div className="app" id="top">
+        <SkipLink />
         <Nav />
         <Hero />
-        <main>
-          <Privacy />
+        <main id="main">
           <Recall />
+          <Privacy />
           <SearchAsk />
           <Cli />
           <Agents />
