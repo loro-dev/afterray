@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +47,16 @@ pub enum Request {
         segment_id: String,
         index: u16,
         mode: GopReadMode,
+    },
+    /// Smallest available pixels for a moment, for the search filmstrip.
+    ///
+    /// Usually a cached `image/jpeg` thumbnail. Moments packed into a cold GOP
+    /// before thumbnails existed answer with the IVF frame instead — the
+    /// daemon cannot decode AV1 — so callers must honour `content_type`.
+    ReadThumbnail {
+        moment_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_edge: Option<u32>,
     },
     PackStatus,
     GopShow {

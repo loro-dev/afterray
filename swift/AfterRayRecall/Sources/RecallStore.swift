@@ -111,16 +111,36 @@ public final class RecallStore: ObservableObject {
     }
 
     public func openSearchHit(_ hit: RecallSearchHit) async {
+        await openMoment(id: hit.momentId)
+    }
+
+    /// Reloads the timeline and parks the playhead on `momentID`.
+    ///
+    /// The full reload is the point: a search hit is routinely outside the
+    /// window currently in memory.
+    public func openMoment(id momentID: String) async {
         let requestGeneration = sensitiveGeneration
         do {
             let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
             guard sensitiveGeneration == requestGeneration else { return }
-            apply(loaded, selecting: hit.momentId)
+            apply(loaded, selecting: momentID)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) { return }
             loadState = .failed(message: error.localizedDescription)
         }
+    }
+
+    /// Moves the playhead to a moment already in memory.
+    ///
+    /// Returns `false` when it is not loaded, so callers stepping through
+    /// search results can fall back to `openMoment` instead of paying for a
+    /// full timeline reload on every step.
+    @discardableResult
+    public func selectLoaded(momentID: String) -> Bool {
+        guard let moment = moments.first(where: { $0.id == momentID }) else { return false }
+        applyPlayhead(moment.capturedAtMs)
+        return true
     }
 
     public func select(playheadMs ms: Int64) {
@@ -210,6 +230,17 @@ public actor RecallImageRepository {
             inFlight[artifactID] = nil
             throw error
         }
+    }
+
+    /// Filmstrip pixels. Cached alongside stills because the daemon may answer
+    /// with a full IVF frame for moments packed before thumbnails existed, and
+    /// re-fetching one of those is the expensive case worth avoiding.
+    public func thumbnail(momentID: String) async throws -> ArtifactPayload {
+        try await daemon.thumbnail(momentID: momentID, maxEdge: nil)
+    }
+
+    public func ocrEvidence(momentID: String) async throws -> OcrEvidence {
+        try await daemon.evidenceOcr(momentID: momentID)
     }
 
     public func prefetch(artifactIDs: [String]) async {

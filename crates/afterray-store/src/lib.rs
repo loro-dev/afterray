@@ -56,7 +56,18 @@ pub use memory::{
     AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
 };
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 12;
+
+/// `text_evidence.source` for the synthetic rows that put window titles in FTS.
+pub const WINDOW_EVIDENCE_SOURCE: &str = "window";
+/// A window usually stays put for minutes while capture fires every ~10s.
+/// Re-indexing a title only after this long keeps the index from filling with
+/// thousands of identical rows, and collapses A↔B window flapping too.
+const WINDOW_TITLE_DEDUPE_MS: i64 = 600_000;
+
+/// Thumbnails are always JPEG, whatever the still they were derived from.
+pub const THUMBNAIL_CONTENT_TYPE: &str = "image/jpeg";
+
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
@@ -91,6 +102,8 @@ pub enum StoreError {
     GopNotFound(String),
     #[error("gop commit raced with retention")]
     GopStale,
+    #[error("moment not found: {0}")]
+    MomentNotFound(String),
 }
 
 pub trait KeyProvider: Send + Sync {
@@ -728,7 +741,68 @@ impl Vault {
             self.delete_moment_and_artifacts(&moment_id)?;
             return Ok(None);
         }
+        self.index_window_title(session_id, &moment_id, moment_time, &context)?;
         Ok(Some(artifact_id))
+    }
+
+    /// Makes a moment findable by what its window was *called*.
+    ///
+    /// Titles land in `moments.window_title`, but `evidence_fts` only indexes
+    /// `text_evidence`, so search could never reach them. Mirroring the title
+    /// into a synthetic evidence row puts it through the same FTS, ranking, and
+    /// hit-opening path that OCR and transcripts already use.
+    fn index_window_title(
+        &self,
+        session_id: &str,
+        moment_id: &str,
+        captured_at_ms: i64,
+        context: &activity::ActivityContext,
+    ) -> Result<(), StoreError> {
+        let Some(title) = trimmed(context.window_title.as_deref()) else {
+            return Ok(());
+        };
+        // The URL is the stronger recall handle for a browser window, and it is
+        // never on screen as OCR text when the address bar is hidden.
+        let text = match trimmed(context.url.as_deref()) {
+            Some(url) => format!("{title}\n{url}"),
+            None => title.to_owned(),
+        };
+
+        let seen_recently = {
+            let connection = self.connection.lock().unwrap();
+            connection
+                .query_row(
+                    "SELECT 1 FROM text_evidence
+                      WHERE session_id = ?1 AND source = ?2 AND text = ?3
+                        AND started_at_ms > ?4
+                      LIMIT 1",
+                    params![
+                        session_id,
+                        WINDOW_EVIDENCE_SOURCE,
+                        text,
+                        captured_at_ms - WINDOW_TITLE_DEDUPE_MS
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+        };
+        if seen_recently {
+            return Ok(());
+        }
+
+        self.insert_text_evidence(
+            session_id,
+            Some(moment_id),
+            None,
+            WINDOW_EVIDENCE_SOURCE,
+            &text,
+            captured_at_ms,
+            None,
+            "activity",
+            None,
+        )?;
+        Ok(())
     }
 
     pub fn activity_spans(
@@ -806,10 +880,11 @@ impl Vault {
 
     pub fn delete_moment_and_artifacts(&self, moment_id: &str) -> Result<(), StoreError> {
         let connection = self.connection.lock().unwrap();
-        let artifacts: (Option<String>, Option<String>) = connection.query_row(
-            "SELECT image_artifact_id, accessibility_artifact_id FROM moments WHERE id = ?1",
+        let artifacts: Vec<Option<String>> = connection.query_row(
+            "SELECT image_artifact_id, accessibility_artifact_id, thumbnail_artifact_id
+               FROM moments WHERE id = ?1",
             [moment_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok(vec![row.get(0)?, row.get(1)?, row.get(2)?]),
         )?;
         connection.execute(
             "DELETE FROM evidence_fts WHERE evidence_id IN
@@ -818,11 +893,8 @@ impl Vault {
         )?;
         connection.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
         drop(connection);
-        if let Some(image) = artifacts.0 {
-            self.delete_artifact_record_and_file(&image)?;
-        }
-        if let Some(accessibility) = artifacts.1 {
-            self.delete_artifact_record_and_file(&accessibility)?;
+        for artifact_id in artifacts.into_iter().flatten() {
+            self.delete_artifact_record_and_file(&artifact_id)?;
         }
         Ok(())
     }
@@ -986,6 +1058,51 @@ impl Vault {
             params![id, text],
         )?;
         Ok(id)
+    }
+
+    /// Artifact holding this moment's filmstrip thumbnail, if one was built.
+    pub fn thumbnail_artifact_id(&self, moment_id: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT thumbnail_artifact_id FROM moments WHERE id = ?1",
+                [moment_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into)
+    }
+
+    /// Stores (or replaces) a moment's thumbnail and returns the artifact id.
+    ///
+    /// Thumbnails outlive the still they came from: `drop_unpinned_stills`
+    /// deletes the full-resolution JPEG once a moment is packed into a cold
+    /// GOP, and nothing on the Rust side can decode AV1 to rebuild one.
+    pub fn set_thumbnail(&self, moment_id: &str, bytes: &[u8]) -> Result<String, StoreError> {
+        let previous = self.thumbnail_artifact_id(moment_id)?;
+        let artifact_id = self.put_artifact(THUMBNAIL_CONTENT_TYPE, bytes)?;
+        let updated = self.connection.lock().unwrap().execute(
+            "UPDATE moments SET thumbnail_artifact_id = ?2 WHERE id = ?1",
+            params![moment_id, artifact_id],
+        );
+        match updated {
+            Ok(0) => {
+                // The moment was evicted while the thumbnail was encoding.
+                let _ = self.delete_artifact_record_and_file(&artifact_id);
+                return Err(StoreError::MomentNotFound(moment_id.to_owned()));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = self.delete_artifact_record_and_file(&artifact_id);
+                return Err(error.into());
+            }
+        }
+        if let Some(previous) = previous {
+            self.delete_artifact_record_and_file(&previous)?;
+        }
+        Ok(artifact_id)
     }
 
     /// Returns OCR layout JSON for a moment, if an OCR evidence row stored boxes.
@@ -1469,24 +1586,22 @@ impl Vault {
             return Ok(());
         }
         let transaction = connection.transaction()?;
-        let candidates = {
+        let candidates: Vec<(String, Vec<String>)> = {
             let mut statement = transaction.prepare(
-                "SELECT id, image_artifact_id, accessibility_artifact_id
+                "SELECT id, image_artifact_id, accessibility_artifact_id, thumbnail_artifact_id
                    FROM moments
                  ORDER BY captured_at_ms ASC LIMIT ?1",
             )?;
             statement
                 .query_map([excess], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
+                    let owned: Vec<Option<String>> =
+                        vec![row.get(1)?, row.get(2)?, row.get(3)?];
+                    Ok((row.get::<_, String>(0)?, owned.into_iter().flatten().collect()))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut gop_artifact_ids = Vec::new();
-        for (moment_id, artifact_id, accessibility_artifact_id) in &candidates {
+        for (moment_id, artifact_ids) in &candidates {
             transaction.execute(
                 "DELETE FROM evidence_fts WHERE evidence_id IN
                  (SELECT id FROM text_evidence WHERE moment_id = ?1)",
@@ -1494,14 +1609,8 @@ impl Vault {
             )?;
             transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
             transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
-            if let Some(artifact_id) = artifact_id {
+            for artifact_id in artifact_ids {
                 transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-            }
-            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
-                transaction.execute(
-                    "DELETE FROM artifacts WHERE id = ?1",
-                    [accessibility_artifact_id],
-                )?;
             }
         }
         let empty_segments: Vec<(String, Option<String>)> = {
@@ -1550,12 +1659,9 @@ impl Vault {
         }
         transaction.commit()?;
         drop(connection);
-        for (_, artifact_id, accessibility_artifact_id) in candidates {
-            if let Some(artifact_id) = artifact_id {
+        for (_, artifact_ids) in candidates {
+            for artifact_id in artifact_ids {
                 let _ = fs::remove_file(self.artifact_path(&artifact_id));
-            }
-            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
-                let _ = fs::remove_file(self.artifact_path(&accessibility_artifact_id));
             }
         }
         for artifact_id in gop_artifact_ids {
@@ -1780,6 +1886,8 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_8(connection)?;
     migrate_schema_9(connection)?;
     migrate_schema_10(connection)?;
+    migrate_schema_11(connection)?;
+    migrate_schema_12(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -2084,6 +2192,35 @@ fn migrate_schema_10(connection: &Connection) -> Result<(), StoreError> {
         .collect::<Result<Vec<_>, _>>()?;
     if !columns.iter().any(|name| name == "layout_json") {
         connection.execute("ALTER TABLE text_evidence ADD COLUMN layout_json TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn migrate_schema_11(connection: &Connection) -> Result<(), StoreError> {
+    // Window-title indexing looks up "have I already recorded this title in
+    // this session recently?" on every capture. Without this index that is a
+    // full scan of every OCR and transcript row in the vault.
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS text_evidence_session_source
+           ON text_evidence(session_id, source, started_at_ms);",
+    )?;
+    Ok(())
+}
+
+fn migrate_schema_12(connection: &Connection) -> Result<(), StoreError> {
+    let moment_columns = moment_column_names(connection)?;
+    if !moment_columns
+        .iter()
+        .any(|name| name == "thumbnail_artifact_id")
+    {
+        connection.execute(
+            "ALTER TABLE moments ADD COLUMN thumbnail_artifact_id TEXT REFERENCES artifacts(id)",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -3639,6 +3776,205 @@ mod tests {
         let stored = vault.ocr_layout_for_moment(&moment.id).unwrap();
         assert_eq!(stored.as_deref(), Some(layout));
         assert!(vault.ocr_layout_for_moment("missing").unwrap().is_none());
+    }
+
+    /// Builds an AX snapshot payload carrying just the activity header fields.
+    fn ax_snapshot(window_title: &str, url: Option<&str>) -> Vec<u8> {
+        let mut header = serde_json::json!({ "window_title": window_title });
+        if let Some(url) = url {
+            header["url"] = serde_json::Value::String(url.to_owned());
+        }
+        serde_json::to_vec(&header).unwrap()
+    }
+
+    fn window_evidence_texts(vault: &Vault, session_id: &str) -> Vec<String> {
+        let connection = vault.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT text FROM text_evidence
+                  WHERE session_id = ?1 AND source = 'window'
+                  ORDER BY started_at_ms ASC",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+
+    #[test]
+    fn window_titles_are_indexed_and_searchable() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("Quarterly roadmap.key", Some("https://example.com/deck")),
+                Some("Keynote"),
+                Some("com.apple.iWork.Keynote"),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            window_evidence_texts(&vault, &session.id),
+            vec!["Quarterly roadmap.key\nhttps://example.com/deck".to_owned()]
+        );
+
+        // The whole point: a title that never appeared as OCR text is findable.
+        let hits = vault.search("roadmap", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].moment_id, moment.id);
+        assert_eq!(hits[0].source, WINDOW_EVIDENCE_SOURCE);
+    }
+
+    #[test]
+    fn repeated_window_titles_are_indexed_once_per_dedupe_window() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        // Capture fires every ~10s; the same window title must not produce a
+        // row per frame.
+        for step in 0..4_i64 {
+            let at = 1_000 + step * 10_000;
+            vault
+                .insert_moment(&session.id, at, "image/jpeg", b"screen")
+                .unwrap();
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &ax_snapshot("Inbox", None),
+                    Some("Mail"),
+                    Some("com.apple.mail"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(window_evidence_texts(&vault, &session.id).len(), 1);
+
+        // Past the dedupe window the same title is a genuinely new visit.
+        let later = 1_000 + WINDOW_TITLE_DEDUPE_MS + 10_000;
+        vault
+            .insert_moment(&session.id, later, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                later,
+                "application/json",
+                &ax_snapshot("Inbox", None),
+                Some("Mail"),
+                Some("com.apple.mail"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(window_evidence_texts(&vault, &session.id).len(), 2);
+    }
+
+    #[test]
+    fn moments_without_a_window_title_index_nothing() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("   ", None),
+                Some("Finder"),
+                Some("com.apple.finder"),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(window_evidence_texts(&vault, &session.id).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_moment_drops_its_window_evidence_from_fts() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("Secret project plan", None),
+                Some("Notes"),
+                Some("com.apple.Notes"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(vault.search("Secret", 10).unwrap().len(), 1);
+
+        vault.delete_moment_and_artifacts(&moment.id).unwrap();
+        assert!(vault.search("Secret", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn thumbnails_round_trip_and_replace_cleanly() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        assert!(vault.thumbnail_artifact_id(&moment.id).unwrap().is_none());
+
+        let first = vault.set_thumbnail(&moment.id, b"thumb-one").unwrap();
+        assert_eq!(
+            vault.thumbnail_artifact_id(&moment.id).unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(vault.read_artifact(&first).unwrap().bytes, b"thumb-one");
+
+        let second = vault.set_thumbnail(&moment.id, b"thumb-two").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(vault.read_artifact(&second).unwrap().bytes, b"thumb-two");
+        // The superseded thumbnail must not linger as an orphan artifact.
+        assert!(vault.read_artifact(&first).is_err());
+        assert!(!vault.artifact_path(&first).exists());
+    }
+
+    #[test]
+    fn thumbnails_survive_packing_but_not_deletion() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        let thumbnail = vault.set_thumbnail(&moment.id, b"thumb").unwrap();
+
+        vault.delete_moment_and_artifacts(&moment.id).unwrap();
+        assert!(vault.read_artifact(&thumbnail).is_err());
+        assert!(!vault.artifact_path(&thumbnail).exists());
+    }
+
+    #[test]
+    fn retention_reclaims_thumbnail_artifacts() {
+        let (_directory, vault) = test_vault(1);
+        let session = vault.create_session_sync(1).unwrap();
+        let evicted = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"old")
+            .unwrap();
+        let thumbnail = vault.set_thumbnail(&evicted.id, b"thumb").unwrap();
+        vault
+            .insert_moment(&session.id, 2_000, "image/jpeg", b"new")
+            .unwrap();
+
+        vault.enforce_retention().unwrap();
+        assert!(vault.read_artifact(&thumbnail).is_err());
+        assert!(!vault.artifact_path(&thumbnail).exists());
     }
 
     #[test]

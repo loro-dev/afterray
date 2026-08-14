@@ -4,7 +4,7 @@ mod gop_packer;
 mod memory;
 mod tools;
 
-use afterray_codec::CONTENT_TYPE_IVF_AV01;
+use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
     JobState, LlmRouterAdapter, LlmRuntimeConfig, ModelAdapter, ModelCapability, ModelInput,
     ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig, download_packs,
@@ -15,7 +15,7 @@ use afterray_platform_macos::{
     apply_background_qos,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, HistoryScope, LlmProvider, ModelDownloadProgress,
+    AppSettings, ArtifactPayload, GopReadMode, HistoryScope, LlmProvider, ModelDownloadProgress,
     PROTOCOL_VERSION, PackStatus, RecordingState, Request, Response, SearchHit, Status,
     local_calendar_day_bounds_ms,
 };
@@ -333,6 +333,16 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                 )
                 .await?;
             }
+            Ok(Request::ReadThumbnail {
+                moment_id,
+                max_edge,
+            }) => {
+                write_artifact_response(
+                    &mut write,
+                    read_moment_thumbnail(&state.store, &moment_id, max_edge),
+                )
+                .await?;
+            }
             Ok(request) => {
                 write_json_response(&mut write, &dispatch(request, &state).await).await?;
             }
@@ -410,7 +420,8 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         },
         Request::ReadArtifact { .. }
         | Request::ReadGopSegment { .. }
-        | Request::ReadGopFrame { .. } => Response::failure(
+        | Request::ReadGopFrame { .. }
+        | Request::ReadThumbnail { .. } => Response::failure(
             "artifact reads are framed as a JSON header plus raw bytes and are handled separately",
         ),
         Request::PackStatus => pack_status(state),
@@ -1472,6 +1483,50 @@ fn read_still_artifact(state: &AppState, artifact_id: &str) -> Result<ArtifactPa
     Ok(payload)
 }
 
+/// Smallest pixels available for a moment, for the search filmstrip.
+///
+/// Tries, in order: a cached thumbnail; building one from the hot still; the
+/// cold GOP frame itself. That last case exists only for moments packed before
+/// thumbnails shipped — this process can encode AV1 but not decode it, so the
+/// client has to do the downscaling. The packer thumbnails everything it packs,
+/// so the fallback drains as the legacy corpus ages out.
+fn read_moment_thumbnail(
+    store: &Vault,
+    moment_id: &str,
+    max_edge: Option<u32>,
+) -> Result<ArtifactPayload, StoreError> {
+    if let Some(artifact_id) = store.thumbnail_artifact_id(moment_id)? {
+        return store.read_artifact(&artifact_id);
+    }
+    let moment = store
+        .moment_by_id(moment_id)?
+        .ok_or_else(|| StoreError::MomentNotFound(moment_id.to_owned()))?;
+
+    if let Some(image_artifact_id) = moment.image_artifact_id.as_deref() {
+        let still = store.read_artifact(image_artifact_id)?;
+        let max_edge = max_edge.unwrap_or(DEFAULT_THUMBNAIL_MAX_EDGE);
+        match still_thumbnail(&still.bytes, max_edge) {
+            Ok(bytes) => {
+                let artifact_id = store.set_thumbnail(moment_id, &bytes)?;
+                return store.read_artifact(&artifact_id);
+            }
+            Err(error) => {
+                // A still we cannot re-encode is still a still. Hand over the
+                // original rather than leaving a hole in the filmstrip.
+                eprintln!("thumbnail encode failed for moment {moment_id}: {error}");
+                return Ok(still);
+            }
+        }
+    }
+
+    if let Some(gop) = moment.gop {
+        return gop_packer::read_gop_frame(store, &gop.segment_id, gop.index, GopReadMode::Exact);
+    }
+    Err(StoreError::ArtifactNotFound(format!(
+        "moment {moment_id} has no still, thumbnail, or packed frame"
+    )))
+}
+
 fn pack_status(state: &AppState) -> Response {
     match state.store.pack_status_counts() {
         Ok((running, done, failed, ready)) => Response::success(PackStatus {
@@ -1536,6 +1591,97 @@ mod tests {
         )
         .unwrap();
         (directory, vault)
+    }
+
+    /// A committed 96x64 JPEG so thumbnail tests never depend on ffmpeg.
+    fn fixture_jpeg() -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../afterray-codec/fixtures/still-96x64.jpg");
+        std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    #[test]
+    fn thumbnail_is_built_from_a_hot_still_then_cached() {
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", &fixture_jpeg())
+            .unwrap();
+        assert!(vault.thumbnail_artifact_id(&moment.id).unwrap().is_none());
+
+        let first = read_moment_thumbnail(&vault, &moment.id, Some(48)).unwrap();
+        assert_eq!(first.content_type, "image/jpeg");
+        assert!(first.bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+
+        // The build is cached, so a second read returns the same artifact
+        // instead of decoding the full still again.
+        let cached_id = vault
+            .thumbnail_artifact_id(&moment.id)
+            .unwrap()
+            .expect("thumbnail should have been cached");
+        assert_eq!(cached_id, first.id);
+        let second = read_moment_thumbnail(&vault, &moment.id, Some(48)).unwrap();
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.bytes, first.bytes);
+    }
+
+    #[test]
+    fn thumbnail_of_an_unknown_moment_fails_cleanly() {
+        let (_directory, vault) = test_vault();
+        let error = read_moment_thumbnail(&vault, "nope", None).unwrap_err();
+        assert!(
+            matches!(error, StoreError::MomentNotFound(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn packing_thumbnails_every_still_before_dropping_it() {
+        let jpegs = load_e2e_jpegs();
+        if jpegs.len() < 2 {
+            eprintln!("skip: no JPEG fixtures and ffmpeg unavailable");
+            return;
+        }
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let mut ids = Vec::new();
+        for (index, jpeg) in jpegs.iter().enumerate() {
+            let captured = 1_000 + i64::try_from(index).unwrap() * 10_000;
+            let moment = vault
+                .insert_moment(&session.id, captured, "image/jpeg", jpeg)
+                .unwrap();
+            ids.push(moment.id);
+        }
+        let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
+            archive: true,
+            require_ac: false,
+            policy: afterray_store::PackPolicy {
+                hot_window_ms: 0,
+                hot_min_stills: 0,
+                ocr_grace_ms: 0,
+                keyint: 6,
+            },
+        });
+        packer
+            .pack_one(&vault, 10_000_000)
+            .unwrap()
+            .expect("packer should emit a GOP");
+
+        // Once packed the JPEG is gone, so the thumbnail is the only cheap way
+        // back to these pixels. Every packed moment must already have one.
+        for id in &ids {
+            let moment = vault.moment_by_id(id).unwrap().unwrap();
+            if moment.gop.is_none() {
+                continue;
+            }
+            assert!(
+                moment.image_artifact_id.is_none(),
+                "packed moment kept its still"
+            );
+            let thumbnail = read_moment_thumbnail(&vault, id, None).unwrap();
+            assert_eq!(thumbnail.content_type, "image/jpeg");
+            assert!(thumbnail.bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+        }
     }
 
     fn queue(adapters: Vec<Arc<dyn ModelAdapter>>) -> ModelQueue {

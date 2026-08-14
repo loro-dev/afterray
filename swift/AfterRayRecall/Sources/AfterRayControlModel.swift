@@ -5,7 +5,7 @@ public final class AfterRayControlModel: ObservableObject {
     @Published public private(set) var status: DaemonStatus?
     @Published public private(set) var isChangingRecording = false
     @Published public var searchQuery = ""
-    @Published public private(set) var searchHits: [RecallSearchHit] = []
+    @Published public private(set) var searchSession: RecallSearchSession?
     @Published public private(set) var isSearching = false
     @Published public var askQuestion = ""
     @Published public private(set) var askAnswer: AskAnswer?
@@ -90,31 +90,54 @@ public final class AfterRayControlModel: ObservableObject {
         }
     }
 
-    public func search() async {
+    /// Runs the query and returns the frame to jump to, which is the newest
+    /// match. Returns `nil` when nothing matched or the query was empty.
+    @discardableResult
+    public func search() async -> SearchFrame? {
         let requestGeneration = sensitiveGeneration
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
-            searchHits = []
+            searchSession = nil
             message = nil
-            return
+            return nil
         }
         isSearching = true
         defer { isSearching = false }
         do {
-            let hits = try await daemon.search(query: query, limit: 30)
-            guard sensitiveGeneration == requestGeneration else { return }
-            searchHits = hits
-            message = searchHits.isEmpty ? "No moments matched “\(query)”." : nil
+            let hits = try await daemon.search(query: query, limit: 60)
+            guard sensitiveGeneration == requestGeneration else { return nil }
+            searchSession = RecallSearchSession.make(query: query, hits: hits)
+            message = searchSession == nil ? "No moments matched “\(query)”." : nil
+            return searchSession?.selectedFrame
         } catch {
-            guard sensitiveGeneration == requestGeneration else { return }
-            searchHits = []
+            guard sensitiveGeneration == requestGeneration else { return nil }
+            searchSession = nil
             message = error.localizedDescription
+            return nil
         }
+    }
+
+    /// Moves the filmstrip selection and reports the frame now under it.
+    @discardableResult
+    public func selectFrame(at index: Int) -> SearchFrame? {
+        guard var session = searchSession, session.frames.indices.contains(index) else {
+            return nil
+        }
+        guard index != session.selectedIndex else { return session.selectedFrame }
+        session.selectedIndex = index
+        searchSession = session
+        return session.selectedFrame
+    }
+
+    @discardableResult
+    public func stepFrame(by delta: Int) -> SearchFrame? {
+        guard let session = searchSession else { return nil }
+        return selectFrame(at: session.steppedIndex(by: delta))
     }
 
     public func dismissSearch() {
         searchQuery = ""
-        searchHits = []
+        searchSession = nil
         message = nil
     }
 
@@ -150,7 +173,7 @@ public final class AfterRayControlModel: ObservableObject {
         sensitiveGeneration &+= 1
         status = nil
         searchQuery = ""
-        searchHits = []
+        searchSession = nil
         isSearching = false
         askQuestion = ""
         askAnswer = nil

@@ -23,7 +23,11 @@ stay local.
 - Automatic recording after the required macOS permissions are approved.
 - A native macOS timeline with horizontal drag-to-recall.
 - Screenshot previews, OCR text, transcripts, and audio playback by moment.
-- Full-text and local embedding search across captured evidence.
+- Full-text and local embedding search across captured evidence, including the
+  titles of the windows you had open.
+- A search result set you travel rather than read: pressing return lands on the
+  newest match, the matched words are highlighted in place on the frame, and a
+  filmstrip of matched frames replaces the timeline while the search is open.
 - Local session summaries through a built-in GGUF, local Ollama, or an
   OpenAI-compatible endpoint.
 - Favorites that survive automatic retention cleanup.

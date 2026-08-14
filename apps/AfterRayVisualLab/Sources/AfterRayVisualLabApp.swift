@@ -44,6 +44,7 @@ private struct VisualLabView: View {
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     @State private var tuning = RecallVisualTuning.standard
     @State private var favoriteOverrides: Set<String> = []
+    @State private var searchSession: RecallSearchSession?
     /// A lab-only store so tinkering never rebinds the shipping shortcut.
     @State private var labHotKeys: RecallHotKeyStore
     @State private var onboardingModel: AfterRayOnboardingModel
@@ -85,11 +86,30 @@ private struct VisualLabView: View {
                 onboardingLab
             }
         }
-        .onChange(of: scenario) { _, newScenario in
+        .onChange(of: scenario, initial: true) { _, newScenario in
             favoriteOverrides = []
+            searchSession = newScenario.searchSession
             let moments = newScenario.moments
+            // Search mode opens on its newest match, exactly as the app does.
+            if let frame = searchSession?.selectedFrame,
+               let match = moments.first(where: { $0.id == frame.momentId })
+            {
+                playheadMs = match.capturedAtMs
+                return
+            }
             let index = min(max(moments.count / 2, 0), max(moments.count - 1, 0))
             playheadMs = moments.indices.contains(index) ? moments[index].capturedAtMs : 0
+        }
+    }
+
+    /// Mirrors the app: selecting a filmstrip cell moves the playhead, which
+    /// re-runs the crossfade and re-arms the OCR highlight.
+    private func selectSearchFrame(_ index: Int) {
+        guard var session = searchSession, session.frames.indices.contains(index) else { return }
+        session.selectedIndex = index
+        searchSession = session
+        if let match = moments.first(where: { $0.id == session.frames[index].momentId }) {
+            playheadMs = match.capturedAtMs
         }
     }
 
@@ -102,7 +122,11 @@ private struct VisualLabView: View {
                 tuning: tuning,
                 imageLoader: MockArtifactFactory.loader,
                 onToggleFavorite: toggleFavorite,
-                onToggleAudio: { _ in }
+                onToggleAudio: { _ in },
+                searchSession: searchSession,
+                thumbnailLoader: MockSearchData.thumbnailLoader,
+                ocrLoader: MockSearchData.ocrLoader,
+                onSelectSearchFrame: selectSearchFrame
             )
             .frame(minWidth: 760)
 

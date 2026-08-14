@@ -15,6 +15,7 @@
 mod encoder;
 mod ivf;
 mod jpeg;
+mod thumbnail;
 
 pub use encoder::Rav1eEncoder;
 pub use ivf::{
@@ -22,10 +23,12 @@ pub use ivf::{
     is_ivf, mux_ivf, parse_ivf, slice_ivf,
 };
 pub use jpeg::jpeg_to_i420;
+pub use thumbnail::{DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 
 pub const CODEC_AV01: &str = "av01";
 pub const ENCODER_RAV1E: &str = "rav1e";
 pub const CONTENT_TYPE_IVF_AV01: &str = "video/x-ivf; codec=av01";
+pub const CONTENT_TYPE_JPEG: &str = "image/jpeg";
 
 /// Product defaults measured against the live vault.
 pub const RAV1E_SPEED: u8 = 8;

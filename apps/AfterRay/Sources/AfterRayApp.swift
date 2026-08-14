@@ -906,7 +906,15 @@ private struct AfterRayRootView: View {
             playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
-            chromeTopPadding: controlBarTopPadding
+            chromeTopPadding: controlBarTopPadding,
+            searchSession: control.searchSession,
+            thumbnailLoader: { momentID in
+                try await images.thumbnail(momentID: momentID).bytes
+            },
+            ocrLoader: { momentID in
+                try await images.ocrEvidence(momentID: momentID)
+            },
+            onSelectSearchFrame: selectSearchFrame
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .opacity(permissions.allGranted ? 1 : 0)
@@ -920,7 +928,11 @@ private struct AfterRayRootView: View {
                 ImmersiveControlBar(
                     model: control,
                     onToggleRecording: toggleRecording,
-                    onSearch: { Task { await control.search() } },
+                    onSearch: submitSearch,
+                    onStepResult: { delta in
+                        guard let session = control.searchSession else { return }
+                        selectSearchFrame(session.steppedIndex(by: delta))
+                    },
                     onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
                 )
                 ImmersiveAskBar(
@@ -940,19 +952,6 @@ private struct AfterRayRootView: View {
                 OverlaySettingsButton(action: { AfterRaySettingsController.shared.show() })
                     .padding(.top, controlBarTopPadding)
                     .padding(.trailing, RecallGeometry.overlayChromeMargin)
-            }
-        }
-        .overlay(alignment: .topTrailing) {
-            if !control.searchHits.isEmpty {
-                SearchResultsPanel(
-                    hits: control.searchHits,
-                    onSelect: openSearchHit,
-                    onDismiss: control.dismissSearch
-                )
-                .frame(width: 390)
-                .padding(.top, RecallGeometry.detailsMenuTopPadding(chromeTopPadding: controlBarTopPadding))
-                .padding(.trailing, RecallGeometry.overlayChromeMargin)
-                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
             }
         }
         .overlay {
@@ -1001,7 +1000,7 @@ private struct AfterRayRootView: View {
                 }
             }
         }
-        .animation(.easeOut(duration: 0.14), value: control.searchHits.isEmpty)
+        .animation(.easeOut(duration: 0.14), value: control.searchSession == nil)
         .animation(.easeOut(duration: 0.14), value: control.isAsking)
         .animation(.easeOut(duration: 0.14), value: control.askAnswer == nil)
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
@@ -1120,12 +1119,37 @@ private struct AfterRayRootView: View {
 
     private func openSearchHit(_ hit: RecallSearchHit) {
         control.dismissSearch()
+        enterHistory()
+        Task { await store.openSearchHit(hit) }
+    }
+
+    /// Runs the query and lands on the newest match without a second click.
+    /// Recall almost always means "the thing I just had open".
+    private func submitSearch() {
+        Task {
+            guard let frame = await control.search() else { return }
+            enterHistory()
+            await store.openMoment(id: frame.momentId)
+        }
+    }
+
+    private func selectSearchFrame(_ index: Int) {
+        guard let frame = control.selectFrame(at: index) else { return }
+        enterHistory()
+        // Stepping through results stays cheap: only fall back to a full
+        // timeline reload when the frame is not already in memory.
+        if !store.selectLoaded(momentID: frame.momentId) {
+            Task { await store.openMoment(id: frame.momentId) }
+        }
+    }
+
+    private func enterHistory() {
+        guard isLive else { return }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             isLive = false
         }
-        Task { await store.openSearchHit(hit) }
     }
 
     private func submitAsk() {
@@ -1285,6 +1309,7 @@ private struct ImmersiveControlBar: View {
     @ObservedObject var model: AfterRayControlModel
     let onToggleRecording: () -> Void
     let onSearch: () -> Void
+    let onStepResult: (Int) -> Void
     let onClose: () -> Void
     @FocusState private var isSearchFocused: Bool
 
@@ -1333,6 +1358,10 @@ private struct ImmersiveControlBar: View {
             }
             .frame(width: 224)
 
+            if let session = model.searchSession {
+                searchTally(session)
+            }
+
             Button(action: onClose) {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .semibold))
@@ -1345,6 +1374,45 @@ private struct ImmersiveControlBar: View {
         .padding(.horizontal, 14)
         .frame(height: RecallGeometry.overlayChromeButtonSize)
         .recallGlass(in: .capsule)
+    }
+
+    /// Where you are in the result set, and how big it is. Two numbers because
+    /// hits and frames differ — one frame can match several times over.
+    private func searchTally(_ session: RecallSearchSession) -> some View {
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(.white.opacity(0.12))
+                .frame(width: 1, height: 18)
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text(session.positionLabel)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.92))
+                Text(session.tallyLabel)
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+            .fixedSize()
+
+            HStack(spacing: 2) {
+                stepButton(symbol: "chevron.left", help: "Newer match", delta: -1)
+                    .disabled(session.selectedIndex == 0)
+                stepButton(symbol: "chevron.right", help: "Older match", delta: 1)
+                    .disabled(session.selectedIndex >= session.frames.count - 1)
+            }
+        }
+    }
+
+    private func stepButton(symbol: String, help: String, delta: Int) -> some View {
+        Button { onStepResult(delta) } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .frame(width: 20, height: 20)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.78))
+        .help(help)
     }
 
     private var statusDotColor: Color {
@@ -1589,69 +1657,6 @@ private struct CaptureFailureBanner: View {
     }
 }
 
-private struct SearchResultsPanel: View {
-    let hits: [RecallSearchHit]
-    let onSelect: (RecallSearchHit) -> Void
-    let onDismiss: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("SEARCH RESULTS")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .tracking(1.4)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button(action: onDismiss) { Image(systemName: "xmark") }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(14)
-
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(hits) { hit in
-                        Button { onSelect(hit) } label: {
-                            VStack(alignment: .leading, spacing: 7) {
-                                HStack {
-                                    Label(hit.source.uppercased(), systemImage: sourceIcon(hit.source))
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(.red)
-                                    Spacer()
-                                    Text(formatTimestamp(hit.capturedAtMs))
-                                        .font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text(hit.text)
-                                    .font(.callout)
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(3)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 11)
-                        }
-                        .buttonStyle(SearchResultButtonStyle())
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 8)
-            }
-            .frame(maxHeight: 390)
-        }
-        .recallGlass(in: .rounded(10))
-    }
-
-    private func sourceIcon(_ source: String) -> String {
-        source.lowercased().contains("transcript") ? "waveform" : "text.viewfinder"
-    }
-
-    private func formatTimestamp(_ milliseconds: Int64) -> String {
-        Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
-            .formatted(date: .abbreviated, time: .shortened)
-    }
-}
-
 private struct RecordingButtonStyle: ButtonStyle {
     let isRecording: Bool
 
@@ -1667,11 +1672,3 @@ private struct RecordingButtonStyle: ButtonStyle {
     }
 }
 
-private struct SearchResultButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(configuration.isPressed ? 0.72 : 1)
-            .scaleEffect(configuration.isPressed ? 0.96 : 1)
-            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
-    }
-}

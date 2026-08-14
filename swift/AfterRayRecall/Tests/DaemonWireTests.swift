@@ -286,6 +286,64 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["limit"] as? Int, 30)
     }
 
+    func testThumbnailRequestMatchesRustShape() throws {
+        let request = WireRequest(type: "read_thumbnail", momentID: "m1", maxEdge: 360)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(json["type"] as? String, "read_thumbnail")
+        XCTAssertEqual(json["moment_id"] as? String, "m1")
+        XCTAssertEqual(json["max_edge"] as? Int, 360)
+    }
+
+    func testThumbnailRequestOmitsMaxEdgeWhenUnset() throws {
+        // Rust defaults `max_edge` to None; sending null would not deserialize.
+        let request = WireRequest(type: "read_thumbnail", momentID: "m1")
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(request)) as? [String: Any]
+        )
+        XCTAssertNil(json["max_edge"])
+    }
+
+    func testEvidenceOcrRequestMatchesRustShape() throws {
+        let request = WireRequest(type: "evidence_ocr", momentID: "m1")
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(json["type"] as? String, "evidence_ocr")
+        XCTAssertEqual(json["moment_id"] as? String, "m1")
+    }
+
+    func testOcrEvidenceDecodesVisionBoxes() throws {
+        let json = """
+        {"moment_id":"m1","text":"Roadmap","regions":[
+          {"text":"Roadmap","confidence":0.94,"x":0.1,"y":0.8,"width":0.3,"height":0.05}
+        ]}
+        """
+        let evidence = try JSONDecoder().decode(OcrEvidence.self, from: Data(json.utf8))
+
+        XCTAssertEqual(evidence.momentId, "m1")
+        XCTAssertEqual(evidence.regions.count, 1)
+        XCTAssertEqual(evidence.regions[0].text, "Roadmap")
+        XCTAssertEqual(evidence.regions[0].y, 0.8, accuracy: 0.0001)
+    }
+
+    func testOcrEvidenceToleratesOmittedRegions() throws {
+        // The daemon skips `regions` entirely when a frame produced no boxes.
+        let evidence = try JSONDecoder().decode(
+            OcrEvidence.self,
+            from: Data(#"{"moment_id":"m1","text":"nothing"}"#.utf8)
+        )
+        XCTAssertTrue(evidence.regions.isEmpty)
+    }
+
+    func testClientSpeaksTheCurrentProtocolVersion() throws {
+        // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 6)
+    }
+
     func testRecordResultsDecodeBothDaemonBranches() throws {
         let started = #"{"session":{"id":"s1","started_at_ms":100,"ended_at_ms":null}}"#
         let existing = #"{"session_id":"s1","already_recording":true}"#

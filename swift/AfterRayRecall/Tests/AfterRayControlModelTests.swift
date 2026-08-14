@@ -35,9 +35,12 @@ final class AfterRayControlModelTests: XCTestCase {
         let model = AfterRayControlModel(daemon: daemon)
         model.searchQuery = "  architecture  "
 
-        await model.search()
+        let jumped = await model.search()
 
-        XCTAssertEqual(model.searchHits.map(\.momentId), ["m1"])
+        XCTAssertEqual(model.searchSession?.frames.map(\.momentId), ["m1"])
+        // Search hands back the frame to jump to, so the caller never has to
+        // dig the newest match out of the session itself.
+        XCTAssertEqual(jumped?.momentId, "m1")
         let query = await daemon.lastSearchQuery
         XCTAssertEqual(query, "architecture")
     }
@@ -66,7 +69,7 @@ final class AfterRayControlModelTests: XCTestCase {
 
         XCTAssertNil(model.status)
         XCTAssertEqual(model.searchQuery, "")
-        XCTAssertTrue(model.searchHits.isEmpty)
+        XCTAssertNil(model.searchSession)
         XCTAssertNil(model.message)
     }
 

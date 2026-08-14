@@ -234,6 +234,21 @@ final class RecallDisplayFrame: NSObject {
         self.fallbackImage = fallbackImage
     }
 
+    /// Source pixel dimensions, needed to map OCR boxes back onto the letterboxed
+    /// picture. `.zero` when the frame carries no decoded image.
+    var pixelSize: CGSize {
+        if let pixelBuffer {
+            return CGSize(
+                width: CVPixelBufferGetWidth(pixelBuffer),
+                height: CVPixelBufferGetHeight(pixelBuffer)
+            )
+        }
+        if let fallbackImage {
+            return CGSize(width: fallbackImage.width, height: fallbackImage.height)
+        }
+        return .zero
+    }
+
     var cost: Int {
         if let pixelBuffer {
             let width = CVPixelBufferGetWidth(pixelBuffer)

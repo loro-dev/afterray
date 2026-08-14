@@ -631,6 +631,61 @@ public struct RecallSearchHit: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// One recognized text box on a captured frame.
+///
+/// Coordinates are Apple Vision's: a unit square with the origin at the
+/// **bottom left**, not SwiftUI's top left. `OcrHighlight` does the flip.
+public struct OcrRegion: Codable, Equatable, Sendable {
+    public let text: String
+    public let confidence: Double
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(
+        text: String,
+        confidence: Double,
+        x: Double,
+        y: Double,
+        width: Double,
+        height: Double
+    ) {
+        self.text = text
+        self.confidence = confidence
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+public struct OcrEvidence: Codable, Equatable, Sendable {
+    public let momentId: String
+    public let text: String
+    public let regions: [OcrRegion]
+
+    public init(momentId: String, text: String, regions: [OcrRegion] = []) {
+        self.momentId = momentId
+        self.text = text
+        self.regions = regions
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case momentId = "moment_id"
+        case text
+        case regions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        momentId = try container.decode(String.self, forKey: .momentId)
+        text = try container.decode(String.self, forKey: .text)
+        // The daemon omits `regions` entirely when a frame produced no boxes.
+        regions = try container.decodeIfPresent([OcrRegion].self, forKey: .regions) ?? []
+    }
+}
+
 public enum RecallLoadState: Equatable, Sendable {
     case loading
     case ready
@@ -670,6 +725,9 @@ public enum RecallGeometry {
     public static let overlayChromeMargin: CGFloat = 26
     /// Space between sibling buttons inside one chrome cluster.
     public static let overlayChromeItemGap: CGFloat = 10
+    /// Window titles run long. Cap the identity capsule so one verbose title
+    /// cannot push the rest of the chrome row off screen.
+    public static let appIdentityTitleMaxWidth: CGFloat = 320
 
     public static func controlBarTopPadding(
         safeAreaTop: CGFloat,
