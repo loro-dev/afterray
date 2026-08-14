@@ -11,7 +11,7 @@ export type Part = string | { em: string }
 
 const en = {
   meta: {
-    title: 'AfterRay — Not a summary. The moment itself.',
+    title: 'AfterRay — Watch last Tuesday. Hear it, too.',
     htmlLang: 'en',
   },
   nav: {
@@ -23,9 +23,9 @@ const en = {
   },
   hero: {
     eyebrow: 'Local-first computer history',
-    titleA: ['Not a summary.'] as Part[],
-    titleB: ['The ', { em: 'moment itself.' }] as Part[],
-    sub: 'AfterRay keeps the actual pixels and audio from your week on this Mac. Replay any second, find it from half a phrase, or just ask — every answer points back to a frame you can watch.',
+    titleA: ['Watch last Tuesday.'] as Part[],
+    titleB: ['Hear it, ', { em: 'too.' }] as Part[],
+    sub: 'AfterRay records your screen and audio all day. Go back to any second of any day — replay it, search it, or just ask. All on this Mac.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
     facts: ['macOS 15+ · Apple Silicon', 'No account, no telemetry', 'Nothing leaves this Mac'],
@@ -291,7 +291,7 @@ export type Copy = typeof en
 
 const zh: Copy = {
   meta: {
-    title: 'AfterRay — 不是摘要，是当时那一刻',
+    title: 'AfterRay — 再看一遍上周二，连当时的声音',
     htmlLang: 'zh-CN',
   },
   nav: {
@@ -303,9 +303,9 @@ const zh: Copy = {
   },
   hero: {
     eyebrow: '纯本地的 computer history',
-    titleA: ['不是摘要，'],
-    titleB: ['是当时', { em: '那一刻。' }],
-    sub: 'AfterRay 把你这一周真实的画面和声音留在这台 Mac 上。回放任意一秒，用记得的只言片语找回来，或者干脆问一句——每个回答都指回一帧你能亲眼看到的画面。',
+    titleA: ['再看一遍上周二。'],
+    titleB: ['连当时的', { em: '声音。' }],
+    sub: 'AfterRay 整天记录你的屏幕和声音。回到任意一天的任意一秒——回放它、搜索它，或者干脆问一句。全程在这台 Mac 上。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
     facts: ['macOS 15+ · Apple Silicon', '无账号，无遥测', '数据不出这台 Mac'],
