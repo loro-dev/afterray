@@ -295,8 +295,9 @@ button:focus-visible {
   color: var(--ink-dim);
   margin-bottom: 1.15rem;
 }
+/* sized for a full sentence per line rather than two or three words */
 .hero-title {
-  font-size: clamp(2.8rem, 7.4vw, 5.8rem);
+  font-size: clamp(2.2rem, 5.6vw, 4.6rem);
   font-weight: 600;
   line-height: 1.08;
   letter-spacing: -0.02em;

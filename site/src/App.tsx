@@ -1,10 +1,10 @@
 import { LangProvider, useLang, useCopy } from './i18n'
 import Hero from './sections/Hero'
+import Agents from './sections/Agents'
 import Jtbd from './sections/Jtbd'
 import Recall from './sections/Recall'
 import Memories from './sections/Memories'
 import SearchAsk from './sections/SearchAsk'
-import Agents from './sections/Agents'
 import Closer from './sections/Closer'
 
 function Nav() {
@@ -17,8 +17,8 @@ function Nav() {
         <span className="mono">AfterRay</span>
       </a>
       <div className="nav-links">
-        <a href="#features">{t.features}</a>
         <a href="#cli">{t.cli}</a>
+        <a href="#features">{t.features}</a>
         <a href="#privacy">{t.privacy}</a>
       </div>
       <div className="nav-actions">
@@ -54,11 +54,12 @@ export default function App() {
         <Nav />
         <Hero />
         <main id="main">
+          {/* the hero promises the agent already knows; cash that out first */}
+          <Agents />
           <Jtbd />
           <Recall />
           <Memories />
           <SearchAsk />
-          <Agents />
           <Closer />
         </main>
         <div className="grain" aria-hidden="true" />

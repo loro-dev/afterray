@@ -11,7 +11,7 @@ export type Part = string | { em: string }
 
 const en = {
   meta: {
-    title: "AfterRay — Find anything you've ever seen or heard.",
+    title: 'AfterRay — Stop briefing your agent. It was there.',
     htmlLang: 'en',
   },
   nav: {
@@ -23,25 +23,25 @@ const en = {
   },
   hero: {
     eyebrow: 'Local-first computer history',
-    titleA: ["Find anything you've"] as Part[],
-    titleB: ['ever ', { em: 'seen or heard.' }] as Part[],
-    sub: 'AfterRay records your screen and audio all day. Whatever you read, watched, or were told is one search away — or just ask. All on this Mac.',
+    titleA: ['Stop briefing your agent.'] as Part[],
+    titleB: ['It ', { em: 'was there.' }] as Part[],
+    sub: 'AfterRay records your screen and audio all day, so Claude Code and Codex can look up what you read, watched, and were told — instead of waiting for you to explain it. All on this Mac.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
     facts: ['macOS 15+ · Apple Silicon', 'No account, no telemetry', 'Nothing leaves this Mac'],
   },
   jtbd: [
     {
-      title: 'Pick the thread back up',
-      body: 'You closed the tab, forgot the file name, and lost the sentence someone said on the call. One hotkey brings all three back.',
+      title: 'Pick up where you dropped it',
+      body: 'Ask it to finish the migration you left half-done on Tuesday. It can see which files you touched, and when.',
     },
     {
-      title: 'See where the day went',
-      body: 'AfterRay writes your day back to you hour by hour, and every line opens to the moment behind it.',
+      title: 'Answer from what happened',
+      body: '“What did we decide about retention?” comes back with the moment it came from, not a guess.',
     },
     {
-      title: 'Let your agent look it up',
-      body: 'Claude Code and Codex can query your history directly — read-only, no server, no credentials.',
+      title: 'Draft from what you did',
+      body: 'The standup note, the PR description, the handoff — written from the week, not from memory.',
     },
   ],
   recall: {
@@ -291,7 +291,7 @@ export type Copy = typeof en
 
 const zh: Copy = {
   meta: {
-    title: 'AfterRay — 你看过、听过的一切，都能找回来',
+    title: 'AfterRay — 别再交代背景了，你的 agent 当时就在',
     htmlLang: 'zh-CN',
   },
   nav: {
@@ -303,25 +303,25 @@ const zh: Copy = {
   },
   hero: {
     eyebrow: '纯本地的 computer history',
-    titleA: ['你看过、听过的一切，'],
-    titleB: ['都能', { em: '找回来。' }],
-    sub: 'AfterRay 整天记录你的屏幕和声音。你读过的、看过的、别人跟你说过的，都只隔着一次搜索——或者干脆问一句。全程在这台 Mac 上。',
+    titleA: ['别再交代背景了。'],
+    titleB: ['你的 agent ', { em: '当时就在。' }],
+    sub: 'AfterRay 整天记录你的屏幕和声音，Claude Code、Codex 可以直接查你读过什么、看过什么、别人跟你说过什么——不用你再解释一遍。全程在这台 Mac 上。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
     facts: ['macOS 15+ · Apple Silicon', '无账号，无遥测', '数据不出这台 Mac'],
   },
   jtbd: [
     {
-      title: '把线头接回来',
-      body: '标签页关了，文件名忘了，会上那句话也记不清了。一个快捷键，三样一起回来。',
+      title: '接着上次的活干',
+      body: '让它继续周二没做完的那次迁移。你动过哪些文件、什么时候动的，它都看得到。',
     },
     {
-      title: '看清这一天去哪了',
-      body: 'AfterRay 按小时把这一天写回给你，每一行都能翻到背后那一刻。',
+      title: '答案来自真实发生过的事',
+      body: '「retention 最后怎么定的？」回来的是出处，不是猜测。',
     },
     {
-      title: '让 agent 自己去查',
-      body: 'Claude Code、Codex 可以直接查你的历史——只读，不用服务端，不用凭据。',
+      title: '替你起草',
+      body: '站会记录、PR 描述、交接文档——依据这一周真实发生的事，而不是你的记忆。',
     },
   ],
   recall: {
