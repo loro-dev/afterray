@@ -42,6 +42,11 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_: Notification) {
         AfterRayLog.install()
         AfterRayLog.info("application launched")
+        // Before anything else that could wedge: a hung main thread under a
+        // status-bar-level, all-spaces overlay is a locked screen. The
+        // watchdog samples the stall for the log, then kills the process so
+        // the user gets their machine back.
+        HangWatchdog.shared.start(logDirectory: AfterRayLog.directory)
         installAppMenu()
         AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()
@@ -472,6 +477,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.orderFrontRegardless()
         panel.makeFirstResponder(panel)
         AfterRayMenuBar.shared.setOverlayVisible(true)
+        OverlayVisibility.shared.set(true)
     }
 
     func hide(returnFocus: Bool) {
@@ -481,6 +487,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.orderOut(nil)
         panel.alphaValue = 1
         AfterRayMenuBar.shared.setOverlayVisible(false)
+        OverlayVisibility.shared.set(false)
         application?.activate(options: [])
     }
 
@@ -912,6 +919,12 @@ private struct AfterRayRootView: View {
             onToggleRecording: toggleRecording,
             chromeTopPadding: controlBarTopPadding,
             daySummary: store.daySummary,
+            summaryHistory: store.summaryHistory,
+            summaryHistoryHasMore: store.summaryHistoryHasMore,
+            isLoadingSummaryHistory: store.isLoadingSummaryHistory,
+            onLoadOlderSummaryHistory: {
+                Task { await store.loadOlderSummaryHistory() }
+            },
             onVisibleDayChange: { dayMs in
                 Task { await store.loadDaySummary(dayMs: dayMs) }
             },
@@ -1518,4 +1531,3 @@ private struct RecordingButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
-

@@ -97,11 +97,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while done < slots && index < 96 {
         let slot_start = newest - index * SLOT_DURATION_MS;
         index += 1;
-        let card = vault.slot_card(slot_start, 10_000)?;
+        let mut card = vault.slot_card(slot_start, 10_000)?;
         if card.facts.moment_count == 0 {
             continue;
         }
-        let user = render_t2_prompt(&card, &[], &language);
+        let background = vault.background_stats(&card).unwrap_or_default();
+        afterray_store::attach_entity_candidates(&mut card, &background);
+        let user = render_t2_prompt(&card, &[], &language, &background);
         println!("════════════════════════════════════════════════════");
         println!(
             "slot {} {} · {} moments · prompt {} chars · provider {:?} · model {model} · lang {language}",

@@ -191,6 +191,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
     func updateSettings(
         recordAudio: Bool?,
         excludedBundleIds _: [String]?,
+        excludedDomains _: [String]?,
         llmProvider: LlmProvider?,
         llmBaseUrl: String?,
         llmModel: String?,

@@ -107,6 +107,15 @@ pub enum Request {
     DaySummary {
         day_ms: i64,
     },
+    /// A cursor-paginated run of occupied local days, newest first. The
+    /// cursor is exclusive: pass `next_before_ms` unchanged to get older
+    /// summaries without overlaps.
+    SummaryHistory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_ms: Option<i64>,
+        #[serde(default = "default_summary_history_limit")]
+        limit: usize,
+    },
     EvidenceOcr {
         moment_id: String,
     },
@@ -168,6 +177,8 @@ pub enum Request {
         storage_limit_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         excluded_bundle_ids: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        excluded_domains: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         llm_provider: Option<LlmProvider>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +370,10 @@ pub struct AppSettings {
     pub storage_limit_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_bundle_ids: Vec<String>,
+    /// Hosts whose pages are never recorded. Matched on the URL the
+    /// accessibility snapshot reports, subdomains included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_domains: Vec<String>,
     #[serde(default)]
     pub llm_provider: LlmProvider,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -568,6 +583,10 @@ fn default_still_origin() -> String {
 
 fn default_activity_spans_limit() -> usize {
     100
+}
+
+const fn default_summary_history_limit() -> usize {
+    7
 }
 
 const fn default_true() -> bool {
@@ -886,6 +905,19 @@ mod tests {
     }
 
     #[test]
+    fn summary_history_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::SummaryHistory {
+            before_ms: Some(42),
+            limit: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"summary_history","before_ms":42,"limit":7}"#
+        );
+    }
+
+    #[test]
     fn settings_wire_shape_is_stable() {
         assert_eq!(
             serde_json::to_string(&Request::Settings).unwrap(),
@@ -898,6 +930,7 @@ mod tests {
                 summary_language: None,
                 storage_limit_bytes: None,
                 excluded_bundle_ids: None,
+                excluded_domains: None,
                 llm_provider: None,
                 llm_base_url: None,
                 llm_model: None,
@@ -937,6 +970,7 @@ mod tests {
             summary_language: None,
             storage_limit_bytes: Some(250_000_000_000),
             excluded_bundle_ids: None,
+            excluded_domains: None,
             llm_provider: None,
             llm_base_url: None,
             llm_model: None,

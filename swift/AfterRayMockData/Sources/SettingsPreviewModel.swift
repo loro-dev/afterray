@@ -30,6 +30,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var isClearingHistory = false
     @Published public var recordAudio = true
     @Published public var excludedBundleIds: [String] = []
+    @Published public var excludedDomains: [String] = []
     @Published public var llmProbe: LlmEndpointStatus? = LlmEndpointStatus(
         reachable: true,
         models: [
@@ -182,6 +183,40 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
 
     public func excludeFrontmostApp() async {
         await excludeBundle("com.apple.Safari")
+    }
+
+    /// No file picker in a preview — the lab stands in with the next app that
+    /// is not already on the list, so the button still visibly does something.
+    public func excludeChosenApp() async {
+        let samples = ["com.tinyspeck.slackmacgap", "com.apple.mail", "com.figma.Desktop"]
+        guard let next = samples.first(where: { !excludedBundleIds.contains($0) }) else { return }
+        await excludeBundle(next)
+    }
+
+    /// The preview stands in for the daemon's normaliser, so a pasted URL in
+    /// the lab lands as the same host it would in production.
+    public func excludeDomain(_ input: String) async {
+        guard let host = SettingsPreviewModel.previewHost(input),
+              !excludedDomains.contains(host)
+        else { return }
+        excludedDomains.append(host)
+        excludedDomains.sort()
+    }
+
+    public func includeDomain(_ domain: String) async {
+        excludedDomains.removeAll { $0 == domain }
+    }
+
+    private static func previewHost(_ input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let withoutScheme = trimmed.components(separatedBy: "://").last ?? trimmed
+        let host = withoutScheme
+            .components(separatedBy: CharacterSet(charactersIn: "/?#"))
+            .first?
+            .components(separatedBy: ":").first?
+            .lowercased()
+        guard let host, host.contains("."), !host.isEmpty else { return nil }
+        return host
     }
 
     public func clearHistory(_: HistoryScope) async {

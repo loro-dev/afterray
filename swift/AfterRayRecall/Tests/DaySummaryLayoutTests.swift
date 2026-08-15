@@ -65,6 +65,25 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertEqual(factsText.primary, "Xcode 22m · Safari 6m")
     }
 
+    /// The panel is where a slot card is actually read. Dropping the bullets
+    /// left the user with a title and no way to see what the half hour was.
+    func testRowCarriesTheWholeSummaryBody() {
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let card = DaySlotSummary(
+            slotStartMs: 0,
+            slotEndMs: DaySummaryLayout.slotDurationMs,
+            state: "done",
+            facts: DaySlotFacts(apps: [DayAppFact(name: "Zed", ms: 900_000)], momentCount: 5),
+            title: "Chased a GOP header bug",
+            bullets: ["  Read the IVF length check  ", "", "Patched the packer"]
+        )
+        let text = DaySummaryLayout.rowText(slot: card, timeZone: utc)
+        XCTAssertEqual(text.detail, ["Read the IVF length check", "Patched the packer"])
+
+        let bare = DaySummaryLayout.rowText(slot: slot(start: 0, title: nil), timeZone: utc)
+        XCTAssertTrue(bare.detail.isEmpty)
+    }
+
     func testEmptyFactsHaveAnExplicitLine() {
         XCTAssertEqual(DaySummaryLayout.factLine(apps: []), "Quiet — nothing on screen")
     }

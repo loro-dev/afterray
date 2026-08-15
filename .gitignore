@@ -13,3 +13,9 @@ __pycache__/
 
 # Offscreen visual snapshots (make snapshots)
 /snapshots/
+
+# Agent-session workspaces: pinned eval worktrees, serving shims, recovered
+# fragments. Never repo content; a worktree checked out inside the repo must
+# be ignored or every session reads as a dirty tree.
+/.scratch/
+/.claude/

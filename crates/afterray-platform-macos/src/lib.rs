@@ -6,7 +6,10 @@
 
 #![allow(unsafe_code)]
 
+mod locale;
 mod power;
+
+pub use locale::preferred_languages;
 
 pub use power::{
     apply_background_qos, battery_fraction, load_per_core, on_ac_power, seconds_since_user_input,

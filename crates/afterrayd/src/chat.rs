@@ -80,7 +80,11 @@ pub(crate) async fn handle_send(
         );
     }
 
-    let host = ToolHost { store, models };
+    let host = ToolHost {
+        store,
+        models,
+        now_ms,
+    };
     match agent::run_readonly_agent_traced(models, &host, CHAT_SYSTEM_PROMPT, &user).await {
         Ok(turn) => {
             let tool_log = serialize_tool_log(&turn.tool_calls);

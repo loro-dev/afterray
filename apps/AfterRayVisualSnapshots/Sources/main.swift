@@ -94,7 +94,7 @@ struct SnapshotScene {
 
     @MainActor
     static var all: [SnapshotScene] {
-        chromeScenes + highlightScenes + stampScene
+        chromeScenes + highlightScenes + stampScene + settingsScenes
     }
 }
 
@@ -417,3 +417,32 @@ private var stampScene: [SnapshotScene] {
 }
 
 MainActor.assumeIsolated { SnapshotRunner.main() }
+
+
+/// The exclusion lists, rendered offscreen. They are the one settings surface
+/// where being wrong is a privacy failure rather than an annoyance, so they get
+/// checked against pixels rather than assumed from the code.
+@MainActor
+private var settingsScenes: [SnapshotScene] {
+    let empty = SettingsPreviewModel()
+    let filled = SettingsPreviewModel()
+    filled.excludedBundleIds = ["com.tencent.xinWeChat", "com.tinyspeck.slackmacgap"]
+    filled.excludedDomains = ["bank.example", "mail.example.com"]
+    return [
+        settingsScene(name: "14-settings-exclusions-empty", model: empty),
+        settingsScene(name: "15-settings-exclusions-filled", model: filled),
+    ]
+}
+
+@MainActor
+private func settingsScene(name: String, model: SettingsPreviewModel) -> SnapshotScene {
+    SnapshotScene(
+        name: name,
+        size: CGSize(width: 900, height: 700),
+        settleSeconds: 1.2,
+        content: AnyView(
+            AfterRaySettingsView(model: model, onClose: {}, initialPage: .general)
+                .frame(width: 900, height: 700)
+        )
+    )
+}

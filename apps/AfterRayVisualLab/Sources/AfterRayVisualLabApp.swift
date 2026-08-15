@@ -200,8 +200,18 @@ private struct VisualLabView: View {
     @MainActor
     private static func makeOnboardingModel(hotKeys: RecallHotKeyStore) -> AfterRayOnboardingModel {
         let models = PreviewOnboardingModels()
+        let exclusions = PreviewOnboardingExclusions()
         return AfterRayOnboardingModel(
             hotKeys: hotKeys,
+            privacyActions: AfterRayOnboardingPrivacyActions(
+                excludedApps: { exclusions.apps },
+                excludedDomains: { exclusions.domains },
+                addApp: { exclusions.addSampleApp() },
+                removeApp: { bundleID in exclusions.remove(app: bundleID) },
+                addDomain: { typed in exclusions.add(domain: typed) },
+                removeDomain: { domain in exclusions.remove(domain: domain) },
+                displayName: { PreviewOnboardingExclusions.name(for: $0) }
+            ),
             cliActions: AfterRayOnboardingCliActions(
                 status: { "Preview CLI is ready." },
                 isInstalled: { true },
@@ -212,6 +222,62 @@ private struct VisualLabView: View {
                 download: { packID in models.install(packID) }
             )
         )
+    }
+
+    /// Stands in for the daemon so the privacy step can be exercised in the lab
+    /// — including the normalisation, since a step that silently drops a pasted
+    /// URL would look fine here and fail in production.
+    @MainActor
+    private final class PreviewOnboardingExclusions {
+        var apps: [String] = ["com.tencent.xinWeChat"]
+        var domains: [String] = []
+
+        private let samples = [
+            "com.apple.Safari",
+            "com.tinyspeck.slackmacgap",
+            "com.apple.mail",
+        ]
+
+        func addSampleApp() {
+            guard let next = samples.first(where: { !apps.contains($0) }) else { return }
+            apps.append(next)
+        }
+
+        func remove(app bundleID: String) {
+            apps.removeAll { $0 == bundleID }
+        }
+
+        func add(domain typed: String) {
+            guard let host = Self.host(typed), !domains.contains(host) else { return }
+            domains.append(host)
+            domains.sort()
+        }
+
+        func remove(domain: String) {
+            domains.removeAll { $0 == domain }
+        }
+
+        static func name(for bundleID: String) -> String {
+            switch bundleID {
+            case "com.tencent.xinWeChat": "WeChat"
+            case "com.apple.Safari": "Safari"
+            case "com.tinyspeck.slackmacgap": "Slack"
+            case "com.apple.mail": "Mail"
+            default: bundleID
+            }
+        }
+
+        private static func host(_ input: String) -> String? {
+            let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+            let withoutScheme = trimmed.components(separatedBy: "://").last ?? trimmed
+            let host = withoutScheme
+                .components(separatedBy: CharacterSet(charactersIn: "/?#"))
+                .first?
+                .components(separatedBy: ":").first?
+                .lowercased()
+            guard let host, host.contains(".") else { return nil }
+            return host
+        }
     }
 
     @MainActor

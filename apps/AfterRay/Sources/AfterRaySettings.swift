@@ -75,6 +75,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
     var excludedBundleIds: [String] { settings?.excludedBundleIds ?? [] }
+    var excludedDomains: [String] { settings?.excludedDomains ?? [] }
     var dataDirectoryPath: String {
         settings?.dataDir ?? DaemonSupervisor.shared.dataDirectory.path
     }
@@ -149,6 +150,65 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         await saveExclusions(excludedBundleIds.filter { $0 != bundleID }, message: "Included \(bundleID) again.")
     }
 
+    func excludeDomain(_ input: String) async {
+        // The daemon owns normalisation, so a pasted URL and a typed host end
+        // up as the same entry no matter which surface added it.
+        let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty else { return }
+        await saveDomainExclusions(excludedDomains + [typed], message: "Excluded \(typed).")
+    }
+
+    func includeDomain(_ domain: String) async {
+        await saveDomainExclusions(
+            excludedDomains.filter { $0 != domain },
+            message: "Including \(domain) again."
+        )
+    }
+
+    private func saveDomainExclusions(_ domains: [String], message: String) async {
+        isUpdatingExclusions = true
+        defer { isUpdatingExclusions = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: domains,
+                llmProvider: nil,
+                llmBaseUrl: nil,
+                llmModel: nil,
+                llmApiKey: nil
+            )
+            self.message = message
+        } catch {
+            self.message = error.localizedDescription
+        }
+    }
+
+    /// The frontmost-app shortcut cannot reach an app you are not currently in,
+    /// and while Settings is open the frontmost app is AfterRay. A picker is the
+    /// only way to exclude something deliberately rather than opportunistically.
+    func excludeChosenApp() async {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "Exclude"
+        panel.message = "Choose an app AfterRay should never record."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let bundleID = Bundle(url: url)?.bundleIdentifier else {
+            message = "Could not read that app's identifier."
+            return
+        }
+        guard bundleID != "dev.afterray.app" else {
+            message = "AfterRay does not record its own window."
+            return
+        }
+        await excludeBundle(bundleID)
+    }
+
     func excludeFrontmostApp() async {
         guard
             let application = NSWorkspace.shared.frontmostApplication,
@@ -183,6 +243,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             ).updateSettings(
                 recordAudio: nil,
                 excludedBundleIds: ids,
+                excludedDomains: nil,
                 llmProvider: nil,
                 llmBaseUrl: nil,
                 llmModel: nil,
@@ -205,6 +266,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             ).updateSettings(
                 recordAudio: enabled,
                 excludedBundleIds: nil,
+                excludedDomains: nil,
                 llmProvider: nil,
                 llmBaseUrl: nil,
                 llmModel: nil,
@@ -238,6 +300,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             ).updateSettings(
                 recordAudio: nil,
                 excludedBundleIds: nil,
+                excludedDomains: nil,
                 uiLanguage: uiLanguage,
                 summaryLanguage: summaryLanguage
             )
@@ -265,6 +328,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             ).updateSettings(
                 recordAudio: nil,
                 excludedBundleIds: nil,
+                excludedDomains: nil,
                 storageLimitBytes: bytes
             )
             storage = AfterRayStorageSnapshot.measure(
@@ -357,6 +421,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             settings = try await client.updateSettings(
                 recordAudio: nil,
                 excludedBundleIds: nil,
+                excludedDomains: nil,
                 llmProvider: provider,
                 llmBaseUrl: nil,
                 llmModel: nil,
@@ -380,6 +445,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             settings = try await client.updateSettings(
                 recordAudio: nil,
                 excludedBundleIds: nil,
+                excludedDomains: nil,
                 llmProvider: settings?.llmProvider,
                 llmBaseUrl: draftLlmBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines),
                 llmModel: draftLlmModel.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -444,6 +510,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             ).updateSettings(
                 recordAudio: nil,
                 excludedBundleIds: nil,
+                excludedDomains: nil,
                 llmProvider: nil,
                 llmBaseUrl: nil,
                 llmModel: chosen,

@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         last_capture_ms,
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
+        excluded_domains: std::sync::Mutex::new(persisted.excluded_domains.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
         languages: std::sync::Mutex::new((
             persisted.ui_language.clone(),
@@ -167,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
     });
     spawn_gop_packer(Arc::clone(&state));
     spawn_slot_summarizer(Arc::clone(&state));
+    spawn_text_df_maintainer(Arc::clone(&state));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -336,6 +338,7 @@ struct AppState {
     last_capture_ms: Arc<AtomicI64>,
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
+    excluded_domains: std::sync::Mutex<Vec<String>>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
     /// (ui_language, summary_language) as stored preferences; `auto` until
     /// the user picks, resolved against the system locale at prompt time.
@@ -353,6 +356,8 @@ struct PersistedSettings {
     storage_limit_bytes: u64,
     #[serde(default)]
     excluded_bundle_ids: Vec<String>,
+    #[serde(default)]
+    excluded_domains: Vec<String>,
     #[serde(default)]
     llm_provider: LlmProvider,
     #[serde(default)]
@@ -374,22 +379,30 @@ fn default_language() -> String {
 /// Resolves a stored language preference to the English name a model should
 /// be told to write in. `auto` follows the system language, defaulting to
 /// English when the locale is unset or unrecognised.
+/// The explicit setting always wins. `auto` asks macOS for the user's
+/// ordered language list — a GUI-launched daemon has no `LANG`, so the old
+/// environment sniffing silently answered English for everyone.
 fn resolve_summary_language(stored: &str) -> String {
     if !stored.eq_ignore_ascii_case("auto") {
         return afterray_protocol::language_display_name(stored);
     }
-    let locale = std::env::var("LANG")
-        .or_else(|_| std::env::var("LC_ALL"))
-        .unwrap_or_default();
-    let tag = locale.split(['.', '_']).next().unwrap_or("").to_lowercase();
-    let region = locale.split('.').next().unwrap_or("").to_lowercase();
-    let code = match (tag.as_str(), region.as_str()) {
-        ("zh", region) if region.contains("tw") || region.contains("hk") => "zh-Hant",
-        ("zh", _) => "zh-Hans",
-        (other, _) if !other.is_empty() => other,
-        _ => "en",
+    let tag = afterray_platform_macos::preferred_languages()
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let code = if tag.starts_with("zh") {
+        if tag.contains("hant") || tag.contains("-tw") || tag.contains("-hk") {
+            "zh-Hant".to_owned()
+        } else {
+            "zh-Hans".to_owned()
+        }
+    } else if let Some(primary) = tag.split('-').next().filter(|part| !part.is_empty()) {
+        primary.to_owned()
+    } else {
+        "en".to_owned()
     };
-    afterray_protocol::language_display_name(code)
+    afterray_protocol::language_display_name(&code)
 }
 
 const fn default_record_audio() -> bool {
@@ -406,6 +419,7 @@ impl Default for PersistedSettings {
             record_audio: true,
             storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
             excluded_bundle_ids: Vec::new(),
+            excluded_domains: Vec::new(),
             llm_provider: LlmProvider::Builtin,
             llm_base_url: String::new(),
             llm_model: String::new(),
@@ -595,6 +609,10 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
             into_response(state.store.day_summary(day_ms, interval_ms))
         }
+        Request::SummaryHistory { before_ms, limit } => {
+            let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+            into_response(state.store.summary_history(before_ms, limit, interval_ms))
+        }
         Request::SlotPrompt { at_ms } => match slot_prompt_for(state, at_ms) {
             Ok(prompt) => Response::success(prompt),
             Err(error) => Response::failure(error.to_string()),
@@ -672,6 +690,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             summary_language,
             storage_limit_bytes,
             excluded_bundle_ids,
+            excluded_domains,
             llm_provider,
             llm_base_url,
             llm_model,
@@ -685,6 +704,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     summary_language,
                     storage_limit_bytes,
                     excluded_bundle_ids,
+                    excluded_domains,
                     llm_provider,
                     llm_base_url,
                     llm_model,
@@ -935,6 +955,11 @@ fn current_settings(state: &AppState) -> AppSettings {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default(),
+        excluded_domains: state
+            .excluded_domains
+            .lock()
+            .map(|domains| domains.clone())
+            .unwrap_or_default(),
         llm_provider: llm.provider,
         llm_base_url: llm.base_url,
         llm_model: llm.model,
@@ -968,6 +993,11 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default(),
+        excluded_domains: state
+            .excluded_domains
+            .lock()
+            .map(|domains| domains.clone())
+            .unwrap_or_default(),
         llm_provider: llm.provider,
         llm_base_url: llm.base_url,
         llm_model: llm.model,
@@ -991,6 +1021,7 @@ struct SettingsPatch {
     summary_language: Option<String>,
     storage_limit_bytes: Option<u64>,
     excluded_bundle_ids: Option<Vec<String>>,
+    excluded_domains: Option<Vec<String>>,
     llm_provider: Option<LlmProvider>,
     llm_base_url: Option<String>,
     llm_model: Option<String>,
@@ -1004,6 +1035,7 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         summary_language,
         storage_limit_bytes,
         excluded_bundle_ids,
+        excluded_domains,
         llm_provider,
         llm_base_url,
         llm_model,
@@ -1057,6 +1089,19 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         {
             let mut excluded = state
                 .excluded_bundle_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *excluded = cleaned;
+        }
+        if let Err(error) = persist_current_settings(state) {
+            return Response::failure(format!("could not save settings: {error}"));
+        }
+    }
+    if let Some(domains) = excluded_domains {
+        let cleaned = normalize_domains(domains);
+        {
+            let mut excluded = state
+                .excluded_domains
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             *excluded = cleaned;
@@ -1165,6 +1210,68 @@ fn is_excluded_bundle(state: &AppState, bundle_id: Option<&str>) -> bool {
         .excluded_bundle_ids
         .lock()
         .map(|ids| ids.iter().any(|id| id == bundle_id))
+        .unwrap_or(false)
+}
+
+/// The host part of whatever the user typed. People paste a full URL as often
+/// as they type a bare host, and asking them to know the difference is a way
+/// to get an exclusion that silently never matches.
+fn normalize_domain(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_matches('/');
+    let without_scheme = trimmed
+        .split_once("://")
+        .map_or(trimmed, |(_, rest)| rest);
+    // Drop userinfo, then path/query/fragment, then port.
+    let after_userinfo = without_scheme
+        .rsplit_once('@')
+        .map_or(without_scheme, |(_, rest)| rest);
+    let host = after_userinfo
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once(':')
+        // An IPv6 literal has colons of its own; only strip a numeric port.
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(after_userinfo.split(['/', '?', '#']).next().unwrap_or_default(), |(head, _)| head);
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    Some(host)
+}
+
+fn normalize_domains(inputs: Vec<String>) -> Vec<String> {
+    let mut cleaned = inputs
+        .iter()
+        .filter_map(|input| normalize_domain(input))
+        .collect::<Vec<_>>();
+    cleaned.sort();
+    cleaned.dedup();
+    cleaned
+}
+
+/// Subdomains are covered: excluding `example.com` has to stop
+/// `mail.example.com` too, or the exclusion is a false promise. It must not
+/// stop `notexample.com`, which is a different site entirely.
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn is_excluded_url(state: &AppState, url: Option<&str>) -> bool {
+    let Some(host) = url.and_then(normalize_domain) else {
+        return false;
+    };
+    state
+        .excluded_domains
+        .lock()
+        .map(|domains| {
+            domains
+                .iter()
+                .any(|domain| host_matches_domain(&host, domain))
+        })
         .unwrap_or(false)
 }
 
@@ -1435,7 +1542,12 @@ async fn import_artifact(
         ArtifactKind::Accessibility => {
             let metadata =
                 serde_json::from_slice::<AccessibilityMetadata>(&bytes).unwrap_or_default();
-            if is_excluded_bundle(state, metadata.bundle_identifier.as_deref()) {
+            // The URL only exists in this snapshot, so a page on an excluded
+            // host is identified here or not at all — the screen JPEG has
+            // already landed by now and has to be deleted, not skipped.
+            if is_excluded_bundle(state, metadata.bundle_identifier.as_deref())
+                || is_excluded_url(state, metadata.url.as_deref())
+            {
                 if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
                 {
                     let _ = state.store.delete_moment_and_artifacts(&moment_id);
@@ -1476,6 +1588,10 @@ async fn import_artifact(
 struct AccessibilityMetadata {
     application_name: Option<String>,
     bundle_identifier: Option<String>,
+    /// Present when the foreground app exposes one — browsers do, via the web
+    /// area's `AXURL`. This is the only place a page's address is visible;
+    /// the screenshot itself carries no such thing.
+    url: Option<String>,
 }
 
 fn attach_accessibility_artifact(
@@ -1607,95 +1723,91 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
 /// through the configured model, persist the card. Shared by the RPC and the
 /// background sweeper so both agree on what "summarised" means.
 async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
+    /// Rounds are model calls, so this bounds both cost and transcript
+    /// growth. The transcript is append-only — never clipped — so a
+    /// prefix-caching runtime re-prefills only each round's delta.
+    const T2_MAX_ROUNDS: usize = 8;
+
     let started = std::time::Instant::now();
-    let prompt = slot_prompt_for(state, at_ms).map_err(|error| error.to_string())?;
-    let slot_start_ms = prompt
-        .get("slot_start_ms")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(at_ms);
-    let user = prompt
-        .get("user")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let system = prompt
-        .get("system")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let inputs = slot_t2_inputs(state, at_ms).map_err(|error| error.to_string())?;
+    let slot_start_ms = inputs.card.slot_start_ms;
 
     ensure_remote_llm_model(state).await;
-    let job_id = state
-        .models
-        .submit(ModelInput::Llm {
-            prompt: user.clone(),
-            system: Some(system),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let snapshot = state
-        .models
-        .wait(&job_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    if snapshot.state != JobState::Done {
-        return Err(snapshot
-            .last_error
-            .unwrap_or_else(|| "t2 job did not complete".to_owned()));
-    }
-    let Some(afterray_models::ModelOutput::Llm { text: raw }) = snapshot.output else {
-        return Err("t2 job returned a non-text output".to_owned());
+    let tools = SlotT2Tools {
+        store: &state.store,
+        card: &inputs.card,
     };
+    let turn = agent::run_agent_loop(
+        &state.models,
+        &tools,
+        inputs.system,
+        &inputs.user,
+        agent::AgentLoopConfig {
+            max_rounds: T2_MAX_ROUNDS,
+            clip_chars: None,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let parsed = afterray_store::parse_t2_card(&raw);
-    let card_value = parsed
-        .as_ref()
-        .and_then(|card| serde_json::to_value(card).ok());
+    let mut parsed = afterray_store::parse_t2_card_v2(&turn.answer);
+    // Grounding: a claim may come from the prompt or from anything a tool
+    // returned this turn. Entities that match neither are dropped in code —
+    // the check the prompt alone can never be.
+    let verification = parsed.as_mut().map(|card| {
+        let mut evidence = inputs.user.clone();
+        for result in &turn.tool_results {
+            evidence.push('\n');
+            evidence.push_str(result);
+        }
+        let valid_ids: std::collections::HashSet<String> =
+            inputs.card.evidence.moment_ids.iter().cloned().collect();
+        afterray_store::verify_t2_card(card, &evidence, &valid_ids)
+    });
+
+    let tool_names: Vec<&str> = turn
+        .tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect();
     eprintln!(
-        "slot.t2 slot={slot_start_ms} model={} prompt_chars={} out_chars={} latency_ms={latency_ms} \
-         parsed={}",
-        snapshot.adapter,
-        user.chars().count(),
-        raw.chars().count(),
+        "slot.t2 slot={slot_start_ms} prompt_chars={} rounds={} tools={tool_names:?} \
+         out_chars={} latency_ms={latency_ms} parsed={} entities_dropped={}",
+        inputs.user.chars().count(),
+        turn.tool_calls.len() + 1,
+        turn.answer.chars().count(),
         parsed.is_some(),
+        verification
+            .as_ref()
+            .map_or(0, |report| report.entities_dropped.len()),
     );
 
-    if let Some(t2) = parsed.as_ref() {
-        match slot_card_for(state, at_ms) {
-            Ok(card) => {
-                if let Err(error) = state.store.put_t2_summary(
-                    &card,
-                    t2,
-                    &snapshot.adapter,
-                    now_ms(),
-                    i64::try_from(latency_ms).ok(),
-                ) {
-                    eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "slot.t2 persist skipped, card rebuild failed slot={slot_start_ms}: {error}"
-                );
-            }
-        }
-    }
-
-    if parsed.is_none() {
+    let Some(t2) = parsed else {
         return Err(format!(
             "the model returned no parseable T2 card ({} chars)",
-            raw.chars().count()
+            turn.answer.chars().count()
         ));
+    };
+    if let Err(error) = state.store.put_t2_summary_v2(
+        &inputs.card,
+        &t2,
+        "t2-agent",
+        now_ms(),
+        i64::try_from(latency_ms).ok(),
+    ) {
+        eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
     }
 
     Ok(serde_json::json!({
         "slot_start_ms": slot_start_ms,
-        "model": snapshot.adapter,
         "latency_ms": latency_ms,
-        "prompt_chars": user.chars().count(),
-        "card": card_value,
-        "raw": raw,
+        "prompt_chars": inputs.user.chars().count(),
+        "card": serde_json::to_value(&t2).ok(),
+        "tool_calls": serde_json::to_value(&turn.tool_calls).ok(),
+        "tool_results": turn.tool_results,
+        "verification": serde_json::to_value(&verification).ok(),
+        "raw": turn.answer,
     }))
 }
 
@@ -1717,9 +1829,15 @@ const T2_PER_TICK: usize = 2;
 /// Charge below which T2 waits even on AC — a laptop plugged in at 8% is still
 /// recovering, and a local model is the last thing it needs.
 const T2_MIN_BATTERY: f64 = 0.30;
-/// How long the machine must have been untouched. Long enough that it is not a
-/// pause mid-sentence, short enough to catch a coffee break.
-const T2_MIN_IDLE_SECONDS: f64 = 120.0;
+/// How long the machine must have been untouched. Long enough not to fire
+/// between two keystrokes, short enough to find a gap in a working morning.
+///
+/// Two minutes never opened. On a day of continuous work the idle time hovered
+/// under a minute for hours and four slots went unsummarised — the sweeper
+/// logged the same refusal every five minutes from 08:00 on. The load check
+/// below is the one that actually predicts whether the user will feel a model
+/// start; this one only needs to rule out a pause mid-sentence.
+const T2_MIN_IDLE_SECONDS: f64 = 30.0;
 /// One-minute load average per core. Above this something else already wants
 /// the machine, and the user will feel a local model piling on.
 const T2_MAX_LOAD_PER_CORE: f64 = 0.7;
@@ -1843,6 +1961,45 @@ async fn slot_backfill(state: &Arc<AppState>, days: i64) -> Response {
 /// Closes the loop the day panel was missing: T1 has been marking slots ready
 /// since capture began, but nothing ever ran T2 on them, so every row fell back
 /// to a bare app list. This is the only automatic caller.
+/// Keeps the text DF corpus current: the background frequencies that let T1
+/// tell a slot's own content from the user's everyday chrome. Small batches
+/// on a timer — a cold vault backfills two weeks over a few minutes without
+/// ever holding the store lock long.
+fn spawn_text_df_maintainer(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::spawn(async move {
+        // After the model runtimes settle; this touches only SQLite.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+        let mut total = 0_usize;
+        loop {
+            let processed =
+                match state.store.advance_text_df(now_ms(), interval_ms, 12) {
+                    Ok(processed) => processed,
+                    Err(error) => {
+                        eprintln!("text.df advance failed: {error}");
+                        0
+                    }
+                };
+            total += processed;
+            if processed > 0 && total % 96 < 12 {
+                eprintln!("text.df corpus advanced ({total} slots this run)");
+            }
+            // Drained: check twice a minute for newly closed slots. Behind:
+            // keep pulling with short pauses so a backfill finishes promptly.
+            let pause = if processed == 0 { 30 } else { 2 };
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_secs(pause)) => {}
+            }
+        }
+    });
+}
+
 fn spawn_slot_summarizer(state: Arc<AppState>) {
     let period = Duration::from_secs(
         std::env::var("AFTERRAY_T2_SWEEP_SECONDS")
@@ -1997,14 +2154,19 @@ fn slot_card_for(
     Ok(card)
 }
 
-/// Renders the full T2 prompt: system instructions plus the JSON card view.
-/// `prev_cards` will carry neighbouring T2 titles once slot summaries are
-/// persisted; until then it is empty.
-fn slot_prompt_for(
+/// Everything one T2 pass needs: the card (for the tool host and
+/// persistence) and the rendered prompt pair.
+struct SlotT2Inputs {
+    card: afterray_store::SlotCard,
+    system: &'static str,
+    user: String,
+}
+
+fn slot_t2_inputs(
     state: &AppState,
     at_ms: i64,
-) -> Result<serde_json::Value, afterray_store::StoreError> {
-    let card = slot_card_for(state, at_ms)?;
+) -> Result<SlotT2Inputs, afterray_store::StoreError> {
+    let mut card = slot_card_for(state, at_ms)?;
     let stored = state
         .languages
         .lock()
@@ -2014,20 +2176,167 @@ fn slot_prompt_for(
         .store
         .previous_slot_titles(card.slot_start_ms, 3)
         .unwrap_or_default();
-    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language);
+    // History-aware rendering: the DF corpus decides which lines carry
+    // information and which are the user's everyday chrome. An empty corpus
+    // (first run) degrades to pattern-and-position scoring, never an error.
+    let background = state.store.background_stats(&card).unwrap_or_else(|error| {
+        eprintln!("slot.prompt background stats unavailable: {error}");
+        afterray_store::infoscore::BackgroundStats::empty()
+    });
+    afterray_store::attach_entity_candidates(&mut card, &background);
+    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language, &background);
     eprintln!(
         "slot.prompt slot={} language={language} user_chars={}",
         card.slot_start_ms,
         user.chars().count()
     );
+    Ok(SlotT2Inputs {
+        card,
+        system: afterray_store::T2_SYSTEM_PROMPT_V2,
+        user,
+    })
+}
+
+/// Renders the full T2 prompt: system instructions plus the JSON card view.
+fn slot_prompt_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<serde_json::Value, afterray_store::StoreError> {
+    let inputs = slot_t2_inputs(state, at_ms)?;
     Ok(serde_json::json!({
-        "slot_start_ms": card.slot_start_ms,
-        "slot_end_ms": card.slot_end_ms,
-        "local_day": card.local_day,
-        "state": card.state,
-        "system": afterray_store::T2_SYSTEM_PROMPT,
-        "user": user,
+        "slot_start_ms": inputs.card.slot_start_ms,
+        "slot_end_ms": inputs.card.slot_end_ms,
+        "local_day": inputs.card.local_day,
+        "state": inputs.card.state,
+        "system": inputs.system,
+        "user": inputs.user,
     }))
+}
+
+/// The slot-scoped tools a T2 agent may call. Every tool reads only this
+/// slot's evidence; the summariser has no business elsewhere in the vault.
+struct SlotT2Tools<'a> {
+    store: &'a afterray_store::Vault,
+    card: &'a afterray_store::SlotCard,
+}
+
+/// One page of a paginated tool result.
+const T2_TOOL_PAGE_CHARS: usize = 3_000;
+
+impl SlotT2Tools<'_> {
+    fn run_by_id(&self, id: &str) -> Option<&afterray_store::RunRow> {
+        self.card.timeline.iter().find_map(|entry| match entry {
+            afterray_store::TimelineEntry::Run(run) if run.moment_id == id => Some(run),
+            _ => None,
+        })
+    }
+
+    fn get_run_text(&self, args: &serde_json::Value) -> Result<String, String> {
+        let id = args
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "get_run_text requires id (a run id from the input)".to_owned())?;
+        let offset = args
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let run = self
+            .run_by_id(id)
+            .ok_or_else(|| format!("no run with id `{id}` in this slot"))?;
+        let full = run.lines.join("\n");
+        let total = full.chars().count();
+        if offset >= total {
+            return Ok(format!("(no text beyond offset {offset}; total {total} chars)"));
+        }
+        let page: String = full.chars().skip(offset).take(T2_TOOL_PAGE_CHARS).collect();
+        let next = offset + page.chars().count();
+        if next < total {
+            Ok(format!(
+                "{page}\n…(continues; call again with offset {next}; total {total} chars)"
+            ))
+        } else {
+            Ok(page)
+        }
+    }
+
+    fn get_transcript(&self) -> Result<String, String> {
+        let rows = self
+            .store
+            .transcripts_in_range(self.card.slot_start_ms, self.card.slot_end_ms, 400)
+            .map_err(|error| error.to_string())?;
+        if rows.is_empty() {
+            return Ok("(no speech was recorded in this half hour)".to_owned());
+        }
+        let mut out = String::new();
+        for (at_ms, track, text) in rows {
+            let line = format!(
+                "{} {}: {}\n",
+                afterray_store::slot_clock_label(at_ms),
+                track,
+                text.trim()
+            );
+            if out.chars().count() + line.chars().count() > T2_TOOL_PAGE_CHARS {
+                out.push_str("…(transcript truncated)\n");
+                break;
+            }
+            out.push_str(&line);
+        }
+        Ok(out)
+    }
+
+    fn get_ocr(&self, args: &serde_json::Value) -> Result<String, String> {
+        let id = args
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "get_ocr requires id (a run id from the input)".to_owned())?;
+        // Accept any moment in the slot, not only run anchors: the model may
+        // hold an id from a thread citation.
+        if !self.card.evidence.moment_ids.iter().any(|held| held == id) {
+            return Err(format!("`{id}` is not a frame of this slot"));
+        }
+        let row = self
+            .store
+            .ocr_evidence_for_moment(id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("no OCR stored for `{id}`"))?;
+        let (text, _layout) = row;
+        let clipped: String = text.chars().take(T2_TOOL_PAGE_CHARS).collect();
+        Ok(clipped)
+    }
+
+    fn get_prev_cards(&self, args: &serde_json::Value) -> Result<String, String> {
+        let n = args
+            .get("n")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(3)
+            .clamp(1, 8) as usize;
+        let cards = self
+            .store
+            .previous_slot_titles(self.card.slot_start_ms, n)
+            .map_err(|error| error.to_string())?;
+        if cards.is_empty() {
+            return Ok("(no earlier cards)".to_owned());
+        }
+        Ok(cards
+            .into_iter()
+            .map(|card| format!("{}: {}", card.from_label, card.title))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+impl agent::ToolSurface for SlotT2Tools<'_> {
+    async fn invoke(&self, name: &str, args: &serde_json::Value) -> Result<String, String> {
+        match name {
+            "get_run_text" => self.get_run_text(args),
+            "get_transcript" => self.get_transcript(),
+            "get_ocr" => self.get_ocr(args),
+            "get_prev_cards" => self.get_prev_cards(args),
+            other => Err(format!(
+                "unknown tool `{other}`; available: get_run_text, get_transcript, get_ocr, get_prev_cards"
+            )),
+        }
+    }
 }
 
 fn model_library(state: &AppState) -> afterray_protocol::ModelLibrary {
@@ -2308,6 +2617,71 @@ mod tests {
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
     use tokio::io::AsyncReadExt;
 
+    /// People paste what is in the address bar. Every one of these means the
+    /// same site, and rejecting any of them produces an exclusion that looks
+    /// saved and silently never fires.
+    #[test]
+    fn a_domain_is_recognised_however_it_was_typed() {
+        for input in [
+            "example.com",
+            "  example.com  ",
+            "EXAMPLE.com",
+            "https://example.com",
+            "https://example.com/",
+            "http://example.com/inbox?q=1#top",
+            "example.com:8443",
+            "https://user:pw@example.com/path",
+            "example.com.",
+        ] {
+            assert_eq!(
+                normalize_domain(input).as_deref(),
+                Some("example.com"),
+                "{input}"
+            );
+        }
+    }
+
+    /// A bare word is a typo, not a host. Storing it would leave a row in the
+    /// list that can never match anything.
+    #[test]
+    fn things_that_are_not_hosts_are_rejected() {
+        for input in ["", "   ", "localhost", "https://", "/", "just some text"] {
+            assert_eq!(normalize_domain(input), None, "{input}");
+        }
+    }
+
+    /// Excluding a site has to cover its subdomains, or the promise is false:
+    /// most of what a user wants hidden lives on `mail.` or `app.`.
+    #[test]
+    fn excluding_a_domain_covers_its_subdomains() {
+        assert!(host_matches_domain("example.com", "example.com"));
+        assert!(host_matches_domain("mail.example.com", "example.com"));
+        assert!(host_matches_domain("a.b.example.com", "example.com"));
+    }
+
+    /// And must not reach past the dot. `notexample.com` is somebody else's
+    /// site, and a suffix test written with `ends_with` alone would eat it.
+    #[test]
+    fn excluding_a_domain_stops_at_the_label_boundary() {
+        assert!(!host_matches_domain("notexample.com", "example.com"));
+        assert!(!host_matches_domain("example.com.evil.test", "example.com"));
+        assert!(!host_matches_domain("example.co", "example.com"));
+        // The narrower entry must not be widened by the broader one.
+        assert!(!host_matches_domain("example.com", "mail.example.com"));
+    }
+
+    #[test]
+    fn the_saved_list_is_deduplicated_and_ordered() {
+        let cleaned = normalize_domains(vec![
+            "https://example.com/inbox".into(),
+            "EXAMPLE.COM".into(),
+            "  ".into(),
+            "bank.test".into(),
+            "not a host".into(),
+        ]);
+        assert_eq!(cleaned, vec!["bank.test".to_owned(), "example.com".to_owned()]);
+    }
+
     /// A machine that should be summarising: plugged in, charged, untouched,
     /// quiet. Each test spoils exactly one of those.
     const IDEAL: MachineConditions = MachineConditions {
@@ -2462,6 +2836,11 @@ mod tests {
             title: None,
             bullets: None,
             category: None,
+            description: None,
+            threads: None,
+            entities: None,
+            decisions: None,
+            not_captured: None,
         }
     }
 

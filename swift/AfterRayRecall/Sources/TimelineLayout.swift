@@ -45,6 +45,34 @@ public struct AppUsageRun: Equatable, Identifiable, Sendable {
     }
 }
 
+/// A starred capture, already placed. Filtering the whole moment list for
+/// favourites on every frame was one of the scroll's per-frame O(n) costs;
+/// they change only when the captures do, so they are placed once here.
+public struct TimelineFavorite: Equatable, Identifiable, Sendable {
+    public let id: String
+    public let x: CGFloat
+}
+
+/// Everything a timeline derives from the captures alone: the bounds and the
+/// uncoloured runs. Zoom and viewport width only decide how wide each run is
+/// drawn, so keeping this separate lets a zoom drag re-place runs without
+/// re-scanning and re-sorting every moment.
+public struct TimelineSpine: Equatable, Sendable {
+    let startMs: Int64
+    let endMs: Int64
+    let raw: [TimelineLayout.RawRun]
+    let visualTotalMs: Int64
+
+    public init(moments: [RecallMoment]) {
+        let bounds = TimelineLayout.timeBounds(moments: moments)
+        startMs = bounds.startMs
+        endMs = bounds.endMs
+        let runs = TimelineLayout.makeRuns(moments: moments, endMs: bounds.endMs)
+        raw = runs
+        visualTotalMs = max(runs.reduce(Int64(0)) { $0 + $1.visualDurationMs }, 1)
+    }
+}
+
 /// Single mapping from wall-clock time to timeline x, and back.
 ///
 /// Short app-switch runs can be inflated to a minimum width, but that warp is
@@ -52,6 +80,7 @@ public struct AppUsageRun: Equatable, Identifiable, Sendable {
 public struct TimelineLayout: Equatable, Sendable {
     public let moments: [RecallMoment]
     public let runs: [AppUsageRun]
+    public let favorites: [TimelineFavorite]
     public let startMs: Int64
     public let endMs: Int64
     public let contentWidth: CGFloat
@@ -67,13 +96,29 @@ public struct TimelineLayout: Equatable, Sendable {
         density: Double,
         minimumSegmentWidth: CGFloat = TimelineLayout.minimumSegmentWidth
     ) {
-        self.moments = moments
-        let bounds = Self.timeBounds(moments: moments)
-        startMs = bounds.startMs
-        endMs = bounds.endMs
+        self.init(
+            spine: TimelineSpine(moments: moments),
+            moments: moments,
+            viewportWidth: viewportWidth,
+            density: density,
+            minimumSegmentWidth: minimumSegmentWidth
+        )
+    }
 
-        let rawRuns = Self.makeRuns(moments: moments, endMs: bounds.endMs)
-        let visualTotal = max(rawRuns.reduce(Int64(0)) { $0 + $1.visualDurationMs }, 1)
+    /// Re-places an already-computed spine at a new width. This is the path a
+    /// zoom drag takes: O(runs), with no moment scan.
+    public init(
+        spine: TimelineSpine,
+        moments: [RecallMoment],
+        viewportWidth: CGFloat,
+        density: Double,
+        minimumSegmentWidth: CGFloat = TimelineLayout.minimumSegmentWidth
+    ) {
+        self.moments = moments
+        startMs = spine.startMs
+        endMs = spine.endMs
+
+        let visualTotal = spine.visualTotalMs
         let seconds = CGFloat(visualTotal) / 1_000
         // Zoom multiplies `density`. Keep a high ceiling so a long archive can
         // still widen instead of sticking at the old 9_000 pt cap.
@@ -83,8 +128,8 @@ public struct TimelineLayout: Equatable, Sendable {
 
         var cursor: CGFloat = 0
         var placed: [AppUsageRun] = []
-        placed.reserveCapacity(rawRuns.count)
-        for raw in rawRuns {
+        placed.reserveCapacity(spine.raw.count)
+        for raw in spine.raw {
             let natural = baseWidth * CGFloat(raw.visualDurationMs) / CGFloat(visualTotal)
             let width = max(natural, minimumSegmentWidth)
             placed.append(
@@ -104,6 +149,37 @@ public struct TimelineLayout: Equatable, Sendable {
         }
         runs = placed
         contentWidth = max(cursor, 1)
+        favorites = Self.placeFavorites(
+            moments: moments,
+            runs: placed,
+            startMs: spine.startMs,
+            endMs: spine.endMs,
+            contentWidth: contentWidth
+        )
+    }
+
+    private static func placeFavorites(
+        moments: [RecallMoment],
+        runs: [AppUsageRun],
+        startMs: Int64,
+        endMs: Int64,
+        contentWidth: CGFloat
+    ) -> [TimelineFavorite] {
+        moments.reduce(into: [TimelineFavorite]()) { marks, moment in
+            guard moment.isFavorite else { return }
+            marks.append(
+                TimelineFavorite(
+                    id: moment.id,
+                    x: x(
+                        ms: moment.capturedAtMs,
+                        runs: runs,
+                        startMs: startMs,
+                        endMs: endMs,
+                        contentWidth: contentWidth
+                    )
+                )
+            )
+        }
     }
 
     public static func timeBounds(moments: [RecallMoment]) -> (startMs: Int64, endMs: Int64) {
@@ -118,9 +194,25 @@ public struct TimelineLayout: Equatable, Sendable {
     }
 
     public func x(ms: Int64) -> CGFloat {
+        Self.x(
+            ms: ms,
+            runs: runs,
+            startMs: startMs,
+            endMs: endMs,
+            contentWidth: contentWidth
+        )
+    }
+
+    private static func x(
+        ms: Int64,
+        runs: [AppUsageRun],
+        startMs: Int64,
+        endMs: Int64,
+        contentWidth: CGFloat
+    ) -> CGFloat {
         if ms <= startMs { return 0 }
         if ms >= endMs { return contentWidth }
-        guard let run = run(containingMs: ms) else { return contentWidth }
+        guard let run = run(containingMs: ms, in: runs) else { return contentWidth }
         let duration = CGFloat(max(run.endMs - run.startMs, 1))
         let t = CGFloat(ms - run.startMs) / duration
         return run.startX + t * run.width
@@ -141,25 +233,70 @@ public struct TimelineLayout: Equatable, Sendable {
     }
 
     public func run(containingMs ms: Int64) -> AppUsageRun? {
-        guard let last = runs.last else { return nil }
-        if let match = runs.dropLast().first(where: { $0.contains(ms: ms, isLast: false) }) {
-            return match
+        Self.run(containingMs: ms, in: runs)
+    }
+
+    public func run(atX x: CGFloat) -> AppUsageRun? {
+        Self.run(atX: x, in: runs)
+    }
+
+    /// Runs tile the whole span end to end, so the run holding `ms` is the
+    /// last one starting at or before it. Scrubbing asked this once per
+    /// frame per lookup; a linear scan made that O(runs).
+    static func run(containingMs ms: Int64, in runs: [AppUsageRun]) -> AppUsageRun? {
+        guard let first = runs.first, let last = runs.last else { return nil }
+        let index = searchIndex(in: runs) { $0.startMs <= ms }
+        if runs[index].contains(ms: ms, isLast: index == runs.count - 1) {
+            return runs[index]
         }
         if last.contains(ms: ms, isLast: true) || ms >= last.startMs {
             return last
         }
-        return runs.first
+        return first
     }
 
-    public func run(atX x: CGFloat) -> AppUsageRun? {
-        guard let last = runs.last else { return nil }
-        if let match = runs.dropLast().first(where: { $0.contains(x: x, isLast: false) }) {
-            return match
+    static func run(atX x: CGFloat, in runs: [AppUsageRun]) -> AppUsageRun? {
+        guard let first = runs.first, let last = runs.last else { return nil }
+        let index = searchIndex(in: runs) { $0.startX <= x }
+        if runs[index].contains(x: x, isLast: index == runs.count - 1) {
+            return runs[index]
         }
         if last.contains(x: x, isLast: true) || x >= last.startX {
             return last
         }
-        return runs.first
+        return first
+    }
+
+    /// Index of the last element satisfying a predicate that is true for a
+    /// prefix of the collection, or 0 when none is.
+    private static func searchIndex(
+        in runs: [AppUsageRun],
+        while isBefore: (AppUsageRun) -> Bool
+    ) -> Int {
+        var low = 0
+        var high = runs.count - 1
+        while low < high {
+            let mid = low + (high - low + 1) / 2
+            if isBefore(runs[mid]) {
+                low = mid
+            } else {
+                high = mid - 1
+            }
+        }
+        return low
+    }
+
+    /// The runs that intersect `range`, for a view that only draws what the
+    /// viewport can show. A day of captures is tens of thousands of points
+    /// wide; the visible slice is one screen of it.
+    public func runs(intersecting range: ClosedRange<CGFloat>) -> ArraySlice<AppUsageRun> {
+        guard !runs.isEmpty else { return runs[runs.startIndex..<runs.startIndex] }
+        let firstIndex = Self.searchIndex(in: runs) { $0.startX <= range.lowerBound }
+        var lastIndex = firstIndex
+        while lastIndex + 1 < runs.count, runs[lastIndex + 1].startX <= range.upperBound {
+            lastIndex += 1
+        }
+        return runs[firstIndex...lastIndex]
     }
 
     public func clamp(_ playheadMs: Int64) -> Int64 {
@@ -181,7 +318,7 @@ public struct TimelineLayout: Equatable, Sendable {
         return abs(playheadMs - previous) <= abs(next - playheadMs) ? previous : next
     }
 
-    private struct RawRun {
+    struct RawRun: Equatable, Sendable {
         let id: Int
         let identity: AppUsageIdentity
         let startMs: Int64
@@ -198,15 +335,17 @@ public struct TimelineLayout: Equatable, Sendable {
         }
     }
 
-    private static func makeRuns(moments: [RecallMoment], endMs: Int64) -> [RawRun] {
+    static func makeRuns(moments: [RecallMoment], endMs: Int64) -> [RawRun] {
         guard !moments.isEmpty else { return [] }
         var collected: [RawRun] = []
         var runStart = 0
+        // Hoisted: rebuilding the run's identity for every moment doubled the
+        // string traffic of the only full scan on this path.
+        var runIdentity = AppUsageIdentity.of(moments[0])
         for index in 1...moments.count {
             let atEnd = index == moments.count
             let nextGap = atEnd ? 0 : moments[index].capturedAtMs - moments[index - 1].capturedAtMs
-            let identityChanged = !atEnd
-                && AppUsageIdentity.of(moments[index]) != AppUsageIdentity.of(moments[runStart])
+            let identityChanged = !atEnd && AppUsageIdentity.of(moments[index]) != runIdentity
             let idleAhead = !atEnd && nextGap > idleGapThresholdMs
             guard atEnd || identityChanged || idleAhead else { continue }
 
@@ -244,8 +383,65 @@ public struct TimelineLayout: Equatable, Sendable {
                 )
             }
             runStart = index
+            if !atEnd { runIdentity = AppUsageIdentity.of(moments[index]) }
         }
         return collected
+    }
+}
+
+/// Keeps one `TimelineLayout` alive across renders, rebuilding only what its
+/// inputs invalidate. Main thread only — it is held by a view's `@State` and
+/// read from `body`.
+///
+/// Held by reference on purpose: the cache is derived data, so refreshing it
+/// during a render must not itself invalidate the view.
+public final class TimelineLayoutCache {
+    private var moments: [RecallMoment] = []
+    private var spine: TimelineSpine?
+    private var viewportWidth: CGFloat = -1
+    private var density: Double = -1
+    private var placed: TimelineLayout?
+
+    /// How much work the cache has actually avoided. Read by the tests: the
+    /// guarantee worth protecting is a count, not a duration.
+    public private(set) var scans = 0
+    public private(set) var placements = 0
+
+    public init() {}
+
+    public func layout(
+        moments: [RecallMoment],
+        viewportWidth: CGFloat,
+        density: Double
+    ) -> TimelineLayout {
+        let spine = spine(for: moments)
+        if let placed, viewportWidth == self.viewportWidth, density == self.density {
+            return placed
+        }
+        let built = TimelineLayout(
+            spine: spine,
+            moments: moments,
+            viewportWidth: viewportWidth,
+            density: density
+        )
+        self.viewportWidth = viewportWidth
+        self.density = density
+        placed = built
+        placements += 1
+        return built
+    }
+
+    /// `Array ==` short-circuits on shared storage, so the steady state — the
+    /// same captures frame after frame — costs a pointer comparison. The
+    /// store only republishes when something actually changed.
+    private func spine(for moments: [RecallMoment]) -> TimelineSpine {
+        if let spine, self.moments == moments { return spine }
+        let built = TimelineSpine(moments: moments)
+        self.moments = moments
+        spine = built
+        placed = nil
+        scans += 1
+        return built
     }
 }
 
@@ -265,18 +461,23 @@ public enum RecallPlayhead {
         return moment
     }
 
+    /// Captures are stored oldest first, so the frame under the playhead is
+    /// the last one at or before it. Scrubbing resolves this several times a
+    /// frame — walking the whole day to find it is what made it expensive.
     public static func resolveIndex(playheadMs: Int64, moments: [RecallMoment]) -> Int? {
         guard !moments.isEmpty else { return nil }
         if playheadMs < moments[0].capturedAtMs { return 0 }
-        var resolved = 0
-        for (index, moment) in moments.enumerated() {
-            if moment.capturedAtMs <= playheadMs {
-                resolved = index
+        var low = 0
+        var high = moments.count - 1
+        while low < high {
+            let mid = low + (high - low + 1) / 2
+            if moments[mid].capturedAtMs <= playheadMs {
+                low = mid
             } else {
-                break
+                high = mid - 1
             }
         }
-        return resolved
+        return low
     }
 
     public static func clamp(_ playheadMs: Int64, moments: [RecallMoment]) -> Int64 {

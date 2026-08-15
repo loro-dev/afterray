@@ -16,6 +16,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var isUpdatingLanguage: Bool { get }
     var recordAudio: Bool { get }
     var excludedBundleIds: [String] { get }
+    var excludedDomains: [String] { get }
     var isUpdatingExclusions: Bool { get }
     var isClearingHistory: Bool { get }
     var dataDirectoryPath: String { get }
@@ -41,6 +42,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func excludeBundle(_ bundleID: String) async
     func includeBundle(_ bundleID: String) async
     func excludeFrontmostApp() async
+    func excludeChosenApp() async
+    func excludeDomain(_ input: String) async
+    func includeDomain(_ domain: String) async
     func clearHistory(_ scope: HistoryScope) async
     func reveal(_ path: String)
     func download(packID: String?) async
@@ -269,6 +273,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @State private var page: AfterRaySettingsPage
     @State private var copied = false
     @State private var confirmingMlxRemoval = false
+    @State private var domainDraft = ""
 
     public init(
         model: Model,
@@ -506,7 +511,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     title: "Nothing excluded",
                     subtitle: "Every app you use is captured."
                 ) {
-                    excludeFrontmostButton
+                    excludeAppButtons
                 }
             } else {
                 ForEach(Array(model.excludedBundleIds.enumerated()), id: \.element) { index, bundleID in
@@ -521,7 +526,36 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     }
                 }
                 SettingsSeparator()
-                SettingsFooterBar { excludeFrontmostButton }
+                SettingsFooterBar { excludeAppButtons }
+            }
+        }
+
+        SettingsSection(
+            title: "Excluded websites",
+            footnote: "Nothing on these hosts is recorded, subdomains included. "
+                + "A page is identified by the address the browser reports, so this "
+                + "only covers browsers that publish one."
+        ) {
+            if model.excludedDomains.isEmpty {
+                SettingsRow(
+                    title: "Nothing excluded",
+                    subtitle: "Every site you visit is captured."
+                ) {
+                    addDomainField
+                }
+            } else {
+                ForEach(Array(model.excludedDomains.enumerated()), id: \.element) { index, domain in
+                    if index > 0 { SettingsSeparator() }
+                    SettingsRow(title: domain, subtitle: nil) {
+                        Button("Include") {
+                            Task { await model.includeDomain(domain) }
+                        }
+                        .buttonStyle(SettingsButtonStyle())
+                        .disabled(model.isUpdatingExclusions)
+                    }
+                }
+                SettingsSeparator()
+                SettingsFooterBar { addDomainField }
             }
         }
 
@@ -548,12 +582,51 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
     }
 
+    /// Two ways in, because they answer different questions. "Frontmost" is for
+    /// the app you are looking at right now; the picker is for the one you know
+    /// you want excluded but are not currently in — and during onboarding the
+    /// frontmost app is AfterRay itself, so the picker is the only one that works.
+    private var excludeAppButtons: some View {
+        HStack(spacing: 7) {
+            Button("Choose App…") {
+                Task { await model.excludeChosenApp() }
+            }
+            .buttonStyle(SettingsButtonStyle())
+            .disabled(model.isUpdatingExclusions)
+
+            excludeFrontmostButton
+        }
+    }
+
     private var excludeFrontmostButton: some View {
         Button("Exclude Frontmost App") {
             Task { await model.excludeFrontmostApp() }
         }
         .buttonStyle(SettingsButtonStyle())
         .disabled(model.isUpdatingExclusions)
+    }
+
+    private var addDomainField: some View {
+        HStack(spacing: 7) {
+            TextField("example.com", text: $domainDraft)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .rounded))
+                .frame(width: 170)
+                .onSubmit { submitDomain() }
+            Button("Exclude", action: submitDomain)
+                .buttonStyle(SettingsButtonStyle())
+                .disabled(
+                    model.isUpdatingExclusions
+                        || domainDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+        }
+    }
+
+    private func submitDomain() {
+        let typed = domainDraft
+        guard !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        domainDraft = ""
+        Task { await model.excludeDomain(typed) }
     }
 
     private var storageSection: some View {

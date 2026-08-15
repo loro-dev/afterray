@@ -10,7 +10,12 @@ final class RecallGeometryTests: XCTestCase {
     func testOverlaySettingsLeavesRoomForMomentActions() {
         XCTAssertEqual(RecallGeometry.overlaySettingsReservedWidth(), 50)
         XCTAssertEqual(RecallGeometry.detailsMenuTopPadding(chromeTopPadding: 44), 96)
-        XCTAssertEqual(RecallGeometry.daySummaryPanelWidth, 308)
+        XCTAssertEqual(RecallGeometry.daySummaryPanelWidth, 392)
+        XCTAssertGreaterThanOrEqual(
+            RecallGeometry.daySummaryMaxHeight,
+            RecallGeometry.daySummaryListMaxHeight,
+            "the list must fit inside the panel that frames it"
+        )
         XCTAssertEqual(RecallGeometry.daySummaryCornerRadius, 16)
     }
 

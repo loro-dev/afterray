@@ -48,6 +48,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod activity;
 mod gop;
+pub mod infoscore;
 mod jpeg;
 mod memory;
 mod slot;
@@ -71,12 +72,14 @@ pub type MomentAt = (String, i64);
 pub use slot::{
     AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
     SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
-    SlotSummaryState, StoredSlotOverlay, T2Card, T2_SYSTEM_PROMPT, TimelineEntry,
-    assemble_day_summary, build_slot_card, extract_json_object, local_day_bounds, local_day_for,
-    parse_t2_card, render_t2_prompt, shorten_place, slot_clock_label, slot_start_for,
+    SlotSummaryState, StoredSlotOverlay, T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport,
+    T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, TimelineEntry, assemble_day_summary,
+    attach_entity_candidates, build_slot_card, dedup_key_of, extract_json_object,
+    local_day_bounds, local_day_for, parse_t2_card, parse_t2_card_v2, render_t2_prompt,
+    shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
 };
 
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// `text_evidence.source` for the synthetic rows that put window titles in FTS.
 pub const WINDOW_EVIDENCE_SOURCE: &str = "window";
@@ -931,6 +934,132 @@ impl Vault {
         ))
     }
 
+    /// Folds up to `max_slots` closed-but-uncounted slots into the text DF
+    /// corpus, oldest first, and returns how many were processed. Called
+    /// repeatedly from a background task until it returns 0; each call is one
+    /// short transaction, so a cold-start backfill never blocks a reader.
+    ///
+    /// A slot enters the corpus once, decided by the watermark. Only closed
+    /// slots count — the half hour still being written must not see itself
+    /// in its own background.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be read or written.
+    pub fn advance_text_df(
+        &self,
+        now_ms: i64,
+        capture_interval_ms: i64,
+        max_slots: usize,
+    ) -> Result<usize, StoreError> {
+        const BACKFILL_REACH_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+        let current_slot = slot::slot_start_for(now_ms);
+        let floor = now_ms.saturating_sub(BACKFILL_REACH_MS);
+        let mut watermark = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement =
+                connection.prepare("SELECT watermark_ms FROM text_df_meta WHERE id = 1")?;
+            let mut rows = statement.query([])?;
+            match rows.next()? {
+                Some(row) => row.get::<_, i64>(0)?,
+                None => slot::slot_start_for(floor),
+            }
+        }
+        .max(slot::slot_start_for(floor));
+
+        let mut processed = 0_usize;
+        while processed < max_slots {
+            if watermark + slot::SLOT_DURATION_MS > current_slot.min(now_ms) {
+                break; // only slots that have fully closed
+            }
+            let slot_start = watermark;
+            watermark += slot::SLOT_DURATION_MS;
+            let rows = self.slot_moment_rows(slot_start, slot_start + slot::SLOT_DURATION_MS)?;
+            let (line_keys, tokens) = slot::df_contribution(&rows);
+            let connection = self.connection.lock().unwrap();
+            let tx = connection.unchecked_transaction()?;
+            {
+                let mut upsert = tx.prepare_cached(
+                    "INSERT INTO text_df (kind, key, df, last_seen_ms) VALUES (?1, ?2, 1, ?3)
+                     ON CONFLICT(kind, key) DO UPDATE SET
+                       df = df + 1, last_seen_ms = excluded.last_seen_ms",
+                )?;
+                for key in &line_keys {
+                    upsert.execute(params![0_i64, key, slot_start])?;
+                }
+                for token in &tokens {
+                    upsert.execute(params![1_i64, token, slot_start])?;
+                }
+            }
+            let occupied = i64::from(!line_keys.is_empty() || !tokens.is_empty());
+            tx.execute(
+                "INSERT INTO text_df_meta (id, watermark_ms, slot_count)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                   watermark_ms = excluded.watermark_ms,
+                   slot_count = text_df_meta.slot_count + ?2",
+                params![watermark, occupied],
+            )?;
+            tx.commit()?;
+            processed += 1;
+        }
+        let _ = capture_interval_ms; // rows query is interval-independent
+        Ok(processed)
+    }
+
+    /// Batch DF lookup for exactly the keys and tokens one card needs.
+    /// Loading the whole corpus would be megabytes; a card asks after a few
+    /// thousand strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn background_stats(
+        &self,
+        card: &slot::SlotCard,
+    ) -> Result<infoscore::BackgroundStats, StoreError> {
+        let (line_keys, tokens) = slot::card_df_queries(card);
+        let connection = self.connection.lock().unwrap();
+        let (slots, watermark_ms) = {
+            let mut statement = connection
+                .prepare("SELECT slot_count, watermark_ms FROM text_df_meta WHERE id = 1")?;
+            let mut rows = statement.query([])?;
+            match rows.next()? {
+                Some(row) => (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                None => (0, i64::MIN),
+            }
+        };
+        let mut stats = infoscore::BackgroundStats {
+            slots: u32::try_from(slots.max(0)).unwrap_or(u32::MAX),
+            corpus_includes_slot: card.slot_end_ms <= watermark_ms,
+            line_df: HashMap::new(),
+            token_df: HashMap::new(),
+        };
+        let mut lookup = connection
+            .prepare_cached("SELECT df FROM text_df WHERE kind = ?1 AND key = ?2")?;
+        for key in line_keys {
+            if let Some(df) = lookup
+                .query_row(params![0_i64, &key], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                stats
+                    .line_df
+                    .insert(key, u32::try_from(df.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        for token in tokens {
+            if let Some(df) = lookup
+                .query_row(params![1_i64, &token], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                stats
+                    .token_df
+                    .insert(token, u32::try_from(df.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        Ok(stats)
+    }
+
     /// Persists a successful T2 card. Re-running the same slot increments
     /// `generation` so a later model swap can tell the row is stale.
     ///
@@ -995,6 +1124,48 @@ impl Vault {
                 producer,
                 produced_at_ms,
                 latency_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persists a v2 card. Bullets are derived from threads so every v1
+    /// reader — the day panel, old CLI output — keeps working unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn put_t2_summary_v2(
+        &self,
+        card: &slot::SlotCard,
+        t2: &slot::T2CardV2,
+        producer: &str,
+        produced_at_ms: i64,
+        latency_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let compat = slot::T2Card {
+            artifacts: Vec::new(),
+            title: t2.title.clone(),
+            bullets: t2.derived_bullets(),
+            category: t2.category.clone(),
+            confidence: t2.confidence,
+        };
+        self.put_t2_summary(card, &compat, producer, produced_at_ms, latency_ms)?;
+        self.connection.lock().unwrap().execute(
+            "UPDATE slot_summaries SET
+                description = ?2,
+                threads_json = ?3,
+                entities_json = ?4,
+                decisions_json = ?5,
+                not_captured_json = ?6
+              WHERE slot_start_ms = ?1",
+            params![
+                card.slot_start_ms,
+                t2.description.trim(),
+                serde_json::to_string(&t2.threads).ok(),
+                serde_json::to_string(&t2.entities).ok(),
+                serde_json::to_string(&t2.decisions).ok(),
+                serde_json::to_string(&t2.not_captured).ok(),
             ],
         )?;
         Ok(())
@@ -1079,13 +1250,68 @@ impl Vault {
         ))
     }
 
+    /// A small, cursor-paginated slice of occupied local days for the history
+    /// summary panel. The query only keeps one page in memory; clients pass
+    /// `next_before_ms` back unchanged to continue toward older history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn summary_history(
+        &self,
+        before_ms: Option<i64>,
+        limit: usize,
+        capture_interval_ms: i64,
+    ) -> Result<slot::SummaryHistoryPage, StoreError> {
+        let mut cursor = before_ms.unwrap_or(i64::MAX);
+        let mut days = Vec::with_capacity(limit.clamp(1, 31));
+
+        for _ in 0..limit.clamp(1, 31) {
+            let Some(latest_ms) = self.latest_moment_before(cursor)? else {
+                break;
+            };
+            let summary = self.day_summary(latest_ms, capture_interval_ms)?;
+            // The cursor is the local midnight, rather than a fixed 24-hour
+            // subtraction, so it remains correct over DST changes too.
+            cursor = summary.day_start_ms;
+            if !summary.slots.is_empty() {
+                days.push(summary);
+            }
+        }
+
+        let has_more = self.latest_moment_before(cursor)?.is_some();
+        Ok(slot::SummaryHistoryPage {
+            days,
+            next_before_ms: has_more.then_some(cursor),
+            has_more,
+        })
+    }
+
+    fn latest_moment_before(&self, before_ms: i64) -> Result<Option<i64>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT captured_at_ms
+                   FROM moments
+                  WHERE captured_at_ms < ?1
+                  ORDER BY captured_at_ms DESC, id DESC
+                  LIMIT 1",
+                params![before_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     fn slot_overlays_for_day(
         &self,
         local_day: &str,
     ) -> Result<HashMap<i64, slot::StoredSlotOverlay>, StoreError> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
-            "SELECT slot_start_ms, state, title, bullets_json, category
+            "SELECT slot_start_ms, state, title, bullets_json, category,
+                    description, threads_json, entities_json, decisions_json,
+                    not_captured_json
                FROM slot_summaries
               WHERE local_day = ?1
               ORDER BY slot_start_ms",
@@ -1096,6 +1322,14 @@ impl Vault {
             let title: Option<String> = row.get(2)?;
             let bullets_json: Option<String> = row.get(3)?;
             let category: Option<String> = row.get(4)?;
+            let description: Option<String> = row.get(5)?;
+            let threads_json: Option<String> = row.get(6)?;
+            let entities_json: Option<String> = row.get(7)?;
+            let decisions_json: Option<String> = row.get(8)?;
+            let not_captured_json: Option<String> = row.get(9)?;
+            let parse_list = |json: Option<String>| {
+                json.and_then(|raw| serde_json::from_str(&raw).ok())
+            };
             let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
             Ok((
                 start,
@@ -1104,6 +1338,13 @@ impl Vault {
                     title,
                     bullets,
                     category,
+                    description: description.filter(|text| !text.is_empty()),
+                    threads: threads_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                    entities: entities_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                    decisions: parse_list(decisions_json),
+                    not_captured: parse_list(not_captured_json),
                 },
             ))
         })?;
@@ -1235,6 +1476,26 @@ impl Vault {
             Ok((row.get(0)?, row.get(1)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Oldest and newest capture held by the vault, or `None` when nothing has
+    /// been recorded. An agent needs this to tell a window that is genuinely
+    /// quiet from one that falls outside the recording altogether.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_time_bounds(&self) -> Result<Option<(i64, i64)>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement =
+            connection.prepare("SELECT MIN(captured_at_ms), MAX(captured_at_ms) FROM moments")?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let first: Option<i64> = row.get(0)?;
+        let last: Option<i64> = row.get(1)?;
+        Ok(first.zip(last))
     }
 
     /// Nearest moment to `at_ms`, in either direction.
@@ -2549,6 +2810,8 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_12(connection)?;
     migrate_schema_13(connection)?;
     migrate_schema_14(connection)?;
+    migrate_schema_15(connection)?;
+    migrate_schema_16(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -2944,6 +3207,55 @@ fn migrate_schema_14(connection: &Connection) -> Result<(), StoreError> {
            ON slot_summaries(slot_start_ms);
          CREATE INDEX IF NOT EXISTS slot_summaries_day
            ON slot_summaries(local_day, slot_start_ms);",
+    )?;
+    Ok(())
+}
+
+/// The v2 card columns: description, per-thread prose with frame citations,
+/// verbatim entities, decisions, and honest gaps. Additive so v1 rows keep
+/// reading; `bullets_json` stays derived for old readers.
+fn migrate_schema_16(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(slot_summaries)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for column in [
+        "description TEXT",
+        "threads_json TEXT",
+        "entities_json TEXT",
+        "decisions_json TEXT",
+        "not_captured_json TEXT",
+    ] {
+        let name = column.split(' ').next().unwrap_or_default();
+        if !existing.iter().any(|held| held == name) {
+            connection.execute(
+                &format!("ALTER TABLE slot_summaries ADD COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Document frequencies of screen-text lines and tokens over the user's own
+/// slot history — the background corpus for `infoscore`. `kind` 0 is a line
+/// dedup key, 1 is a token. `text_df_meta` remembers how far the corpus has
+/// been built so maintenance is incremental.
+fn migrate_schema_15(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS text_df (
+           kind          INTEGER NOT NULL,
+           key           TEXT NOT NULL,
+           df            INTEGER NOT NULL,
+           last_seen_ms  INTEGER NOT NULL,
+           PRIMARY KEY (kind, key)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS text_df_meta (
+           id            INTEGER PRIMARY KEY CHECK (id = 1),
+           watermark_ms  INTEGER NOT NULL,
+           slot_count    INTEGER NOT NULL
+         );",
     )?;
     Ok(())
 }
@@ -5335,6 +5647,48 @@ mod tests {
 
         let prev = vault.previous_slot_titles(second_slot + 1, 4).unwrap();
         assert_eq!(prev.last().map(|card| card.title.as_str()), Some("Second pass"));
+    }
+
+    #[test]
+    fn summary_history_pages_unique_days_with_an_exclusive_cursor() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (first_day_start, first_day_end) = local_day_bounds(1_786_698_000_000);
+        let (second_day_start, second_day_end) = local_day_bounds(first_day_end + 12 * 3_600_000);
+        assert!(second_day_start > first_day_start);
+
+        insert_named_moment(
+            &vault,
+            &session.id,
+            first_day_start + 10 * 3_600_000,
+            "Xcode",
+            "com.apple.dt.Xcode",
+            "first.rs",
+        );
+        insert_named_moment(
+            &vault,
+            &session.id,
+            second_day_start + 10 * 3_600_000,
+            "Safari",
+            "com.apple.Safari",
+            "second.dev",
+        );
+
+        let newest = vault
+            .summary_history(Some(second_day_end), 1, 10_000)
+            .unwrap();
+        assert_eq!(newest.days.len(), 1);
+        assert_eq!(newest.days[0].day_start_ms, second_day_start);
+        assert!(newest.has_more);
+        assert_eq!(newest.next_before_ms, Some(second_day_start));
+
+        let older = vault
+            .summary_history(newest.next_before_ms, 7, 10_000)
+            .unwrap();
+        assert_eq!(older.days.len(), 1);
+        assert_eq!(older.days[0].day_start_ms, first_day_start);
+        assert!(!older.has_more);
+        assert_eq!(older.next_before_ms, None);
     }
 
     #[test]

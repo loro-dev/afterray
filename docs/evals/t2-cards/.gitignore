@@ -1,0 +1,3 @@
+# Eval artifacts embed rendered prompts and tool results — the user's raw
+# screen text. Aggregate numbers go in REPORT.md; the raw runs stay local.
+*.json

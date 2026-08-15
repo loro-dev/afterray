@@ -2,8 +2,40 @@ import SwiftUI
 
 public enum AfterRayOnboardingStage: Equatable, Sendable {
     case hotKey
+    case privacy
     case cli
     case models
+}
+
+/// Exclusion hooks supplied by the app host. Onboarding is the one moment the
+/// user is thinking about what AfterRay will see, so it is where the question
+/// gets asked — not buried in Settings after a week of recording.
+public struct AfterRayOnboardingPrivacyActions: Sendable {
+    public var excludedApps: @MainActor @Sendable () -> [String]
+    public var excludedDomains: @MainActor @Sendable () -> [String]
+    public var addApp: @MainActor @Sendable () async -> Void
+    public var removeApp: @MainActor @Sendable (_ bundleID: String) async -> Void
+    public var addDomain: @MainActor @Sendable (_ typed: String) async -> Void
+    public var removeDomain: @MainActor @Sendable (_ domain: String) async -> Void
+    public var displayName: @MainActor @Sendable (_ bundleID: String) -> String
+
+    public init(
+        excludedApps: @escaping @MainActor @Sendable () -> [String],
+        excludedDomains: @escaping @MainActor @Sendable () -> [String],
+        addApp: @escaping @MainActor @Sendable () async -> Void,
+        removeApp: @escaping @MainActor @Sendable (_ bundleID: String) async -> Void,
+        addDomain: @escaping @MainActor @Sendable (_ typed: String) async -> Void,
+        removeDomain: @escaping @MainActor @Sendable (_ domain: String) async -> Void,
+        displayName: @escaping @MainActor @Sendable (_ bundleID: String) -> String = { $0 }
+    ) {
+        self.excludedApps = excludedApps
+        self.excludedDomains = excludedDomains
+        self.addApp = addApp
+        self.removeApp = removeApp
+        self.addDomain = addDomain
+        self.removeDomain = removeDomain
+        self.displayName = displayName
+    }
 }
 
 /// Optional PATH install hooks. The app host fills these; previews can omit them.
@@ -60,15 +92,18 @@ public final class AfterRayOnboardingModel: ObservableObject {
     @Published public var modelMessage: String?
 
     public let hotKeys: RecallHotKeyStore
+    public let privacyActions: AfterRayOnboardingPrivacyActions?
     public let cliActions: AfterRayOnboardingCliActions?
     public let modelActions: AfterRayOnboardingModelActions?
 
     public init(
         hotKeys: RecallHotKeyStore,
+        privacyActions: AfterRayOnboardingPrivacyActions? = nil,
         cliActions: AfterRayOnboardingCliActions? = nil,
         modelActions: AfterRayOnboardingModelActions? = nil
     ) {
         self.hotKeys = hotKeys
+        self.privacyActions = privacyActions
         self.cliActions = cliActions
         self.modelActions = modelActions
         refreshCli()
@@ -86,6 +121,21 @@ public final class AfterRayOnboardingModel: ObservableObject {
     public func advanceFromHotKey() {
         guard stage == .hotKey else { return }
         hotKeys.cancelRecording()
+        if privacyActions != nil {
+            stage = .privacy
+        } else {
+            enterStageAfterPrivacy()
+        }
+    }
+
+    public func advanceFromPrivacy() {
+        guard stage == .privacy else { return }
+        enterStageAfterPrivacy()
+    }
+
+    /// A host that supplies no CLI or model hooks leaves onboarding on the
+    /// privacy step rather than jumping to a stage it cannot render.
+    private func enterStageAfterPrivacy() {
         if cliActions != nil {
             stage = .cli
             refreshCli()
@@ -227,6 +277,7 @@ public struct AfterRayOnboardingView: View {
 
     @State private var hasAppeared = false
     @State private var isClosing = false
+    @State private var domainDraft = ""
 
     public init(
         model: AfterRayOnboardingModel,
@@ -296,6 +347,8 @@ public struct AfterRayOnboardingView: View {
         switch model.stage {
         case .hotKey:
             return "Press this to open AfterRay."
+        case .privacy:
+            return "Decide what AfterRay never sees."
         case .cli:
             return "Let other agents use your history."
         case .models:
@@ -306,6 +359,7 @@ public struct AfterRayOnboardingView: View {
     private var eyebrowTitle: String {
         switch model.stage {
         case .hotKey: "LOCAL ONLY / AFTERRAY"
+        case .privacy: "LOCAL ONLY / PRIVACY"
         case .cli: "LOCAL ONLY / CLI"
         case .models: "LOCAL ONLY / MODELS"
         }
@@ -316,6 +370,8 @@ public struct AfterRayOnboardingView: View {
         switch model.stage {
         case .hotKey:
             hotKeyStage
+        case .privacy:
+            privacyStage
         case .cli:
             cliStage
         case .models:
@@ -353,6 +409,81 @@ public struct AfterRayOnboardingView: View {
                     )
                     .animation(.easeOut(duration: 0.45), value: model.didPractice)
                 }
+        }
+    }
+
+    /// Apps and websites side by side. They are the same decision asked twice
+    /// — "do not look here" — and separating them into consecutive steps would
+    /// make the second read as an afterthought.
+    @ViewBuilder
+    private var privacyStage: some View {
+        if let privacy = model.privacyActions {
+            HStack(alignment: .top, spacing: 14) {
+                OnboardingExclusionColumn(
+                    title: "Exclude these apps",
+                    empty: "Nothing excluded yet.",
+                    entries: privacy.excludedApps().map {
+                        OnboardingExclusionEntry(id: $0, label: privacy.displayName($0))
+                    },
+                    onRemove: { id in Task { await privacy.removeApp(id) } },
+                    accessory: {
+                        Button {
+                            Task { await privacy.addApp() }
+                        } label: {
+                            Label("Add app", systemImage: "plus")
+                                .font(.system(size: 12, weight: .medium, design: .rounded))
+                        }
+                        .buttonStyle(OnboardingQuietButtonStyle())
+                    }
+                )
+
+                OnboardingExclusionColumn(
+                    title: "Exclude these websites",
+                    empty: "Nothing excluded yet.",
+                    entries: privacy.excludedDomains().map {
+                        OnboardingExclusionEntry(id: $0, label: $0)
+                    },
+                    onRemove: { domain in Task { await privacy.removeDomain(domain) } },
+                    accessory: {
+                        HStack(spacing: 7) {
+                            Image(systemName: "globe")
+                                .font(.system(size: 12))
+                                .foregroundStyle(RecallPalette.textSecondary)
+                            TextField("example.com", text: $domainDraft)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 12, design: .rounded))
+                                .onSubmit { submitDomain(privacy) }
+                            Button("Save") { submitDomain(privacy) }
+                                .buttonStyle(OnboardingQuietButtonStyle())
+                                .disabled(
+                                    domainDraft
+                                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                                        .isEmpty
+                                )
+                        }
+                    }
+                )
+            }
+            .frame(maxWidth: .infinity, minHeight: 196, maxHeight: 196)
+        }
+    }
+
+    private func submitDomain(_ privacy: AfterRayOnboardingPrivacyActions) {
+        let typed = domainDraft
+        guard !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        domainDraft = ""
+        Task { await privacy.addDomain(typed) }
+    }
+
+    private var privacyFooter: some View {
+        HStack(spacing: 10) {
+            Text("Private browsing is never recorded.")
+                .font(.system(size: 11, design: .rounded))
+                .foregroundStyle(RecallPalette.textSecondary)
+            Spacer(minLength: 8)
+            Button("Continue") { model.advanceFromPrivacy() }
+                .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
+                .keyboardShortcut(.defaultAction)
         }
     }
 
@@ -511,6 +642,8 @@ public struct AfterRayOnboardingView: View {
         switch model.stage {
         case .hotKey:
             hotKeyFooter
+        case .privacy:
+            privacyFooter
         case .cli:
             cliFooter
         case .models:
@@ -671,5 +804,82 @@ private struct OnboardingQuietButtonStyle: ButtonStyle {
             .frame(height: 30)
             .background(.white.opacity(configuration.isPressed ? 0.05 : 0.08), in: Capsule())
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+struct OnboardingExclusionEntry: Identifiable, Equatable {
+    let id: String
+    let label: String
+}
+
+/// One exclusion list: an action row on top, then what has been excluded.
+/// The action sits above the list because on first run the list is empty, and
+/// a lone control under dead space reads as disabled.
+struct OnboardingExclusionColumn<Accessory: View>: View {
+    let title: String
+    let empty: String
+    let entries: [OnboardingExclusionEntry]
+    let onRemove: (String) -> Void
+    @ViewBuilder let accessory: () -> Accessory
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(RecallPalette.textPrimary)
+
+            VStack(alignment: .leading, spacing: 0) {
+                accessory()
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+
+                Divider().overlay(Color.white.opacity(0.08))
+
+                if entries.isEmpty {
+                    Text(empty)
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundStyle(RecallPalette.textSecondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 9)
+                    Spacer(minLength: 0)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(entries) { entry in
+                                HStack(spacing: 8) {
+                                    Text(entry.label)
+                                        .font(.system(size: 12, design: .rounded))
+                                        .foregroundStyle(RecallPalette.textPrimary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer(minLength: 8)
+                                    Button {
+                                        onRemove(entry.id)
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .foregroundStyle(RecallPalette.textSecondary)
+                                            .frame(width: 18, height: 18)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Stop excluding \(entry.label)")
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(.white.opacity(0.035))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(.white.opacity(0.08), lineWidth: 1)
+                    }
+            }
+        }
     }
 }

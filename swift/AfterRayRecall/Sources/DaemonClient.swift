@@ -26,6 +26,7 @@ public protocol RecallDaemonServing: Sendable {
     func moments(sessionID: String) async throws -> [RecallMoment]
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment]
     func daySummary(dayMs: Int64) async throws -> DaySummary
+    func summaryHistory(beforeMs: Int64?, limit: Int) async throws -> SummaryHistoryPage
     func artifact(id: String) async throws -> ArtifactPayload
     func gopSegment(id: String) async throws -> ArtifactPayload
     func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload
@@ -48,6 +49,10 @@ public extension RecallDaemonServing {
 
     func daySummary(dayMs _: Int64) async throws -> DaySummary {
         .empty
+    }
+
+    func summaryHistory(beforeMs _: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
+        SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
     }
 
     func thumbnail(momentID _: String, maxEdge _: Int?) async throws -> ArtifactPayload {
@@ -103,6 +108,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     func updateSettings(
         recordAudio: Bool?,
         excludedBundleIds: [String]?,
+        excludedDomains: [String]?,
         llmProvider: LlmProvider?,
         llmBaseUrl: String?,
         llmModel: String?,
@@ -127,6 +133,7 @@ public extension AfterRayDaemonServing {
         try await updateSettings(
             recordAudio: recordAudio,
             excludedBundleIds: nil,
+            excludedDomains: nil,
             llmProvider: nil,
             llmBaseUrl: nil,
             llmModel: nil,
@@ -190,6 +197,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     public func updateSettings(
         recordAudio: Bool?,
         excludedBundleIds: [String]?,
+        excludedDomains: [String]?,
         llmProvider: LlmProvider? = nil,
         llmBaseUrl: String? = nil,
         llmModel: String? = nil,
@@ -203,6 +211,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 type: "update_settings",
                 recordAudio: recordAudio,
                 excludedBundleIds: excludedBundleIds,
+                excludedDomains: excludedDomains,
                 llmProvider: llmProvider?.rawValue,
                 llmBaseUrl: llmBaseUrl,
                 llmModel: llmModel,
@@ -336,6 +345,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         try await request(WireRequest(type: "day_summary", dayMs: dayMs), as: DaySummary.self)
     }
 
+    public func summaryHistory(beforeMs: Int64?, limit: Int = 7) async throws -> SummaryHistoryPage {
+        try await request(
+            WireRequest(type: "summary_history", limit: limit, beforeMs: beforeMs),
+            as: SummaryHistoryPage.self
+        )
+    }
+
     public func recallWindow(sessionID: String, centerMs: Int64, limit: Int = 120) async throws -> [RecallMoment] {
         try await request(
             WireRequest(type: "recall_window", sessionID: sessionID, centerMs: centerMs, limit: limit),
@@ -437,6 +453,7 @@ struct WireRequest: Encodable, Equatable {
     var toMs: Int64?
     var sinceMs: Int64?
     var dayMs: Int64?
+    var beforeMs: Int64?
     var recordAudio: Bool?
     var reason: String?
     var packID: String?
@@ -445,6 +462,7 @@ struct WireRequest: Encodable, Equatable {
     var gopMode: String?
     var maxEdge: Int?
     var excludedBundleIds: [String]?
+    var excludedDomains: [String]?
     var historyScope: String?
     var llmProvider: String?
     var llmBaseUrl: String?
@@ -472,6 +490,7 @@ struct WireRequest: Encodable, Equatable {
         case toMs = "to_ms"
         case sinceMs = "since_ms"
         case dayMs = "day_ms"
+        case beforeMs = "before_ms"
         case recordAudio = "record_audio"
         case reason
         case packID = "pack_id"
@@ -480,6 +499,7 @@ struct WireRequest: Encodable, Equatable {
         case gopMode = "mode"
         case maxEdge = "max_edge"
         case excludedBundleIds = "excluded_bundle_ids"
+        case excludedDomains = "excluded_domains"
         case historyScope = "scope"
         case llmProvider = "llm_provider"
         case llmBaseUrl = "llm_base_url"
@@ -509,6 +529,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(toMs, forKey: .toMs)
         try container.encodeIfPresent(sinceMs, forKey: .sinceMs)
         try container.encodeIfPresent(dayMs, forKey: .dayMs)
+        try container.encodeIfPresent(beforeMs, forKey: .beforeMs)
         try container.encodeIfPresent(recordAudio, forKey: .recordAudio)
         try container.encodeIfPresent(reason, forKey: .reason)
         try container.encodeIfPresent(packID, forKey: .packID)
@@ -517,6 +538,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(gopMode, forKey: .gopMode)
         try container.encodeIfPresent(maxEdge, forKey: .maxEdge)
         try container.encodeIfPresent(excludedBundleIds, forKey: .excludedBundleIds)
+        try container.encodeIfPresent(excludedDomains, forKey: .excludedDomains)
         try container.encodeIfPresent(historyScope, forKey: .historyScope)
         try container.encodeIfPresent(llmProvider, forKey: .llmProvider)
         try container.encodeIfPresent(llmBaseUrl, forKey: .llmBaseUrl)
@@ -557,10 +579,22 @@ final class StreamSocket: @unchecked Sendable {
 }
 
 enum UnixLineTransport {
-    static func exchange(path: String, payload: Data) throws -> Data {
+    /// Unary requests get a receive deadline. Without one, a daemon that is
+    /// alive but wedged (model queue jammed, vault lock held) parks every
+    /// caller in a blocking `read` forever — awaits that never resume are how
+    /// the overlay froze on 2026-08-15. Streaming reads (`readLines`) stay
+    /// deadline-free: a chat stream legitimately goes quiet during prefill.
+    static let unaryReceiveTimeout: TimeInterval = 30
+
+    static func exchange(
+        path: String,
+        payload: Data,
+        receiveTimeout: TimeInterval = UnixLineTransport.unaryReceiveTimeout
+    ) throws -> Data {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw posixError("open socket") }
         defer { Darwin.close(descriptor) }
+        try applyReceiveTimeout(descriptor: descriptor, seconds: receiveTimeout)
         try connect(descriptor: descriptor, path: path)
         try writeAll(descriptor: descriptor, payload: payload)
         return try readLine(descriptor: descriptor)
@@ -570,6 +604,7 @@ enum UnixLineTransport {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw posixError("open socket") }
         defer { Darwin.close(descriptor) }
+        try applyReceiveTimeout(descriptor: descriptor, seconds: unaryReceiveTimeout)
         try connect(descriptor: descriptor, path: path)
         try writeAll(descriptor: descriptor, payload: payload)
 
@@ -644,6 +679,22 @@ enum UnixLineTransport {
         }
     }
 
+    private static func applyReceiveTimeout(descriptor: Int32, seconds: TimeInterval) throws {
+        guard seconds > 0 else { return }
+        var timeout = timeval(
+            tv_sec: Int(seconds),
+            tv_usec: Int32((seconds.truncatingRemainder(dividingBy: 1)) * 1_000_000)
+        )
+        let applied = setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
+        guard applied == 0 else { throw posixError("set receive timeout") }
+    }
+
     private static func connect(descriptor: Int32, path: String) throws {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -689,6 +740,11 @@ enum UnixLineTransport {
         var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
         while response.count < maximumResponseBytes {
             let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                throw DaemonClientError.connection(
+                    "daemon did not respond within \(Int(unaryReceiveTimeout))s"
+                )
+            }
             guard count > 0 else { break }
             let bytes = buffer[..<count]
             if let newline = bytes.firstIndex(of: 0x0A) {

@@ -40,6 +40,30 @@ pub struct ToolCallRecord {
 pub struct AgentTurn {
     pub answer: String,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Tool outputs, parallel to `tool_calls`. Verification needs them: a
+    /// claim is grounded if it appears in the prompt *or* in something a
+    /// tool returned during the turn.
+    pub tool_results: Vec<String>,
+}
+
+/// Anything that can answer an agent loop's TOOL calls.
+pub trait ToolSurface {
+    fn invoke(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send;
+}
+
+/// Loop shape knobs. Chat keeps the historical clipping; the T2 pass runs
+/// append-only so a prefix-caching runtime (Ollama, the MLX worker) only
+/// prefills each round's delta — clipping the middle would invalidate the
+/// whole cached prefix every round.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentLoopConfig {
+    pub max_rounds: usize,
+    /// `None` = never clip the transcript.
+    pub clip_chars: Option<usize>,
 }
 
 /// Wraps vault or user text so the model can tell data from instructions.
@@ -68,25 +92,48 @@ pub async fn run_readonly_agent_traced(
     system: &str,
     user: &str,
 ) -> Result<AgentTurn, AgentError> {
-    let mut transcript = format!("User task:\n{user}\n");
     let system = format!("{system}\n\n{}", tool_catalog_text());
-    let mut tool_calls = Vec::new();
+    run_agent_loop(
+        models,
+        tools,
+        &system,
+        user,
+        AgentLoopConfig {
+            max_rounds: MAX_ROUNDS,
+            clip_chars: Some(MAX_HISTORY_CHARS),
+        },
+    )
+    .await
+}
 
-    for round in 0..MAX_ROUNDS {
-        let prompt = if transcript.chars().count() > MAX_HISTORY_CHARS {
-            let kept: String = transcript
-                .chars()
-                .skip(transcript.chars().count() - MAX_HISTORY_CHARS)
-                .collect();
-            format!("…(earlier tool transcript truncated)…\n{kept}")
-        } else {
-            transcript.clone()
+/// The TOOL/ARGS ↔ FINAL loop itself, shared by chat (history tools, clipped
+/// transcript) and the T2 summariser (slot tools, append-only transcript).
+/// The caller composes the full system prompt, tool catalog included.
+pub async fn run_agent_loop<T: ToolSurface>(
+    models: &ModelQueue,
+    tools: &T,
+    system: &str,
+    user: &str,
+    config: AgentLoopConfig,
+) -> Result<AgentTurn, AgentError> {
+    let mut transcript = format!("User task:\n{user}\n");
+    let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for round in 0..config.max_rounds {
+        let prompt = match config.clip_chars {
+            Some(limit) => clip_transcript(&transcript, limit),
+            None => transcript.clone(),
         };
 
-        let text = generate(models, &prompt, &system).await?;
+        let text = generate(models, &prompt, system).await?;
 
         if let Some(answer) = parse_final(&text) {
-            return Ok(AgentTurn { answer, tool_calls });
+            return Ok(AgentTurn {
+                answer,
+                tool_calls,
+                tool_results,
+            });
         }
         if let Some((name, args)) = parse_tool_call(&text) {
             let result = match tools.invoke(&name, &args).await {
@@ -98,12 +145,14 @@ pub async fn run_readonly_agent_traced(
                 name: name.clone(),
                 args,
             });
-            if round + 1 == MAX_ROUNDS {
+            tool_results.push(result.clone());
+            if round + 1 == config.max_rounds {
                 return Ok(AgentTurn {
                     answer: format!(
                         "I reached the tool limit before finishing. Last tool `{name}` returned:\n{result}"
                     ),
                     tool_calls,
+                    tool_results,
                 });
             }
             continue;
@@ -113,11 +162,32 @@ pub async fn run_readonly_agent_traced(
             return Ok(AgentTurn {
                 answer: text.trim().to_owned(),
                 tool_calls,
+                tool_results,
             });
         }
         return Err(AgentError::Failed("model returned empty output".into()));
     }
     Err(AgentError::Failed("agent loop exhausted".into()))
+}
+
+/// Drops the middle, not the head: the opening holds the task and the clock
+/// anchors the tools need.
+fn clip_transcript(transcript: &str, limit: usize) -> String {
+    let total = transcript.chars().count();
+    if total <= limit {
+        return transcript.to_owned();
+    }
+    let head_chars = limit / 3;
+    let tail_chars = limit - head_chars;
+    let head: String = transcript.chars().take(head_chars).collect();
+    let tail: String = transcript.chars().skip(total - tail_chars).collect();
+    format!("{head}\n…(middle of the tool transcript omitted)…\n{tail}")
+}
+
+impl ToolSurface for ToolHost<'_> {
+    async fn invoke(&self, name: &str, args: &Value) -> Result<String, String> {
+        Self::invoke(self, name, args).await
+    }
 }
 
 async fn generate(models: &ModelQueue, prompt: &str, system: &str) -> Result<String, AgentError> {
