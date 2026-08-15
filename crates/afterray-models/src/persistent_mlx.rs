@@ -129,7 +129,9 @@ impl PersistentMlxAdapter {
             self.set_health(ModelPackState::Incompatible, None, None, Some(error.into()));
             return Err(AdapterError::Process(error.into()));
         }
-        let ModelInput::Llm { prompt, system } = input else {
+        // `messages` is ignored here on purpose: the worker protocol takes one
+        // prompt, and `prompt` is the flattening of exactly those messages.
+        let ModelInput::Llm { prompt, system, .. } = input else {
             return Err(AdapterError::InvalidOutput(
                 "MLX adapter received a non-LLM input".into(),
             ));
@@ -609,6 +611,7 @@ done
 
     fn prompt(value: &str) -> ModelInput {
         ModelInput::Llm {
+            messages: Vec::new(),
             prompt: value.into(),
             system: Some("system".into()),
         }

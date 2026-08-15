@@ -791,6 +791,7 @@ mod tests {
 
     fn llm_job(label: &str) -> ModelInput {
         ModelInput::Llm {
+            messages: Vec::new(),
             prompt: label.to_owned(),
             system: None,
         }
@@ -1029,6 +1030,7 @@ mod tests {
         let id = queue
             .submit_prepared(
                 ModelInput::Llm {
+                    messages: Vec::new(),
                     prompt: "hi".into(),
                     system: None,
                 },

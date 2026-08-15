@@ -279,6 +279,7 @@ print(json.dumps({
             .execute(
                 "job-1",
                 &ModelInput::Llm {
+                    messages: Vec::new(),
                     prompt: "hello".to_owned(),
                     system: None,
                 },

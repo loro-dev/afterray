@@ -240,7 +240,12 @@ impl ModelAdapter for LlmRouterAdapter {
                     .await
             }
             LlmProvider::Ollama | LlmProvider::OpenaiCompatible => {
-                let ModelInput::Llm { prompt, system } = input else {
+                let ModelInput::Llm {
+                    prompt,
+                    system,
+                    messages,
+                } = input
+                else {
                     return Err(AdapterError::InvalidOutput(
                         "LLM router received a non-LLM input".into(),
                     ));
@@ -253,6 +258,7 @@ impl ModelAdapter for LlmRouterAdapter {
                     &self.client,
                     &config,
                     prompt,
+                    messages,
                     system.as_deref(),
                     token_tx,
                     cancellation,
@@ -389,13 +395,22 @@ async fn generate_remote(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     prompt: &str,
+    messages: &[crate::ChatMessage],
     system: Option<&str>,
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
     if let Some(token_tx) = token_tx {
-        return stream::generate_streaming(client, config, prompt, system, token_tx, cancellation)
-            .await;
+        return stream::generate_streaming(
+            client,
+            config,
+            prompt,
+            messages,
+            system,
+            token_tx,
+            cancellation,
+        )
+        .await;
     }
     let model = config.chat_model();
     if model.is_empty() {
@@ -936,6 +951,7 @@ mod tests {
                 &ModelInput::Llm {
                     prompt: "hi".into(),
                     system: None,
+                    messages: Vec::new(),
                 },
                 Cancellation::default(),
             )

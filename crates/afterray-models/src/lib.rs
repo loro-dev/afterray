@@ -97,7 +97,32 @@ pub enum ModelInput {
         prompt: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         system: Option<String>,
+        /// The same conversation as `prompt`, message by message.
+        ///
+        /// Both, not either: `/api/chat` and the OpenAI-compatible endpoints
+        /// take an array and cache on its longest stable prefix, while the
+        /// managed MLX worker speaks the worker protocol and takes one string.
+        /// `prompt` is the flattening of exactly these messages, so the two can
+        /// never describe different conversations.
+        ///
+        /// Empty for callers that have no conversation — the T2 summariser asks
+        /// one question and reads one answer.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        messages: Vec<ChatMessage>,
     },
+}
+
+/// One message of a conversation, as the model layer carries it.
+///
+/// Its own type rather than the harness's: the dependency runs harness →
+/// `afterray-agent` → models, and this crate must not reach back up. The seam
+/// converts, as it already does for token deltas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// `system`, `user` or `assistant` — the three roles every provider agrees
+    /// on. Kept as a string because it goes straight onto the wire.
+    pub role: String,
+    pub content: String,
 }
 
 impl ModelInput {

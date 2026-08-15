@@ -7,10 +7,10 @@
 //!
 //! Tools stay in the daemon, where the vault is.
 
-use afterray_harness::{GenerateRequest, ModelError, ModelSurface, StreamDelta};
+use afterray_harness::{GenerateRequest, Message, ModelError, ModelSurface, StreamDelta};
 use afterray_models::{
-    JobPriority, JobState, LlmDelta, LlmDeltaKind, LlmTokenSink, ModelInput, ModelOutput,
-    ModelQueue, QueueError,
+    ChatMessage, JobPriority, JobState, LlmDelta, LlmDeltaKind, LlmTokenSink, ModelInput,
+    ModelOutput, ModelQueue, QueueError,
 };
 use tokio::sync::mpsc;
 
@@ -46,6 +46,18 @@ impl ModelSurface for QueueModel<'_> {
     }
 }
 
+/// The harness's message type into the model layer's.
+///
+/// Two types on purpose: the harness must not depend on the model layer, and
+/// the model layer must not depend on the harness. This crate is the only place
+/// that knows both, exactly as it already is for token deltas.
+fn to_model_message(message: &Message) -> ChatMessage {
+    ChatMessage {
+        role: message.role.wire_name().to_owned(),
+        content: message.content.clone(),
+    }
+}
+
 fn convert(delta: LlmDelta) -> StreamDelta {
     match delta.kind {
         LlmDeltaKind::Content => StreamDelta::content(delta.text),
@@ -75,6 +87,7 @@ impl QueueModel<'_> {
                 ModelInput::Llm {
                     prompt: request.prompt.to_owned(),
                     system: Some(request.system.to_owned()),
+                    messages: request.messages.iter().map(to_model_message).collect(),
                 },
                 self.priority,
                 |job_id| {

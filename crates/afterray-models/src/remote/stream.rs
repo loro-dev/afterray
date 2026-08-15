@@ -6,7 +6,7 @@
 //! generation.
 
 use super::{LlmRuntimeConfig, chat_completions_url, normalize_origin, remote_http_error};
-use crate::{AdapterError, Cancellation, LlmDelta};
+use crate::{AdapterError, Cancellation, ChatMessage, LlmDelta};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -28,16 +28,18 @@ pub(super) async fn generate_streaming(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     prompt: &str,
+    messages: &[ChatMessage],
     system: Option<&str>,
     token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
+    let body = chat_messages(prompt, messages, system);
     match config.provider {
         afterray_protocol::LlmProvider::Ollama => {
-            generate_ollama_stream(client, config, prompt, system, token_tx, cancellation).await
+            generate_ollama_stream(client, config, body, token_tx, cancellation).await
         }
         afterray_protocol::LlmProvider::OpenaiCompatible => {
-            generate_openai_stream(client, config, prompt, system, token_tx, cancellation).await
+            generate_openai_stream(client, config, body, token_tx, cancellation).await
         }
         afterray_protocol::LlmProvider::MlxLocal => Err(AdapterError::InvalidOutput(
             "MLX local generation uses the persistent worker protocol".into(),
@@ -48,8 +50,7 @@ pub(super) async fn generate_streaming(
 async fn generate_ollama_stream(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
-    prompt: &str,
-    system: Option<&str>,
+    messages: Vec<Value>,
     token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
@@ -58,7 +59,7 @@ async fn generate_ollama_stream(
     let url = ollama_chat_url(&origin);
     let mut body = json!({
         "model": model,
-        "messages": chat_messages(prompt, system),
+        "messages": messages,
         "stream": true,
     });
     // Declaring the window makes the server's own default stop mattering: left
@@ -81,8 +82,7 @@ async fn generate_ollama_stream(
 async fn generate_openai_stream(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
-    prompt: &str,
-    system: Option<&str>,
+    messages: Vec<Value>,
     token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
@@ -91,7 +91,7 @@ async fn generate_openai_stream(
     let url = chat_completions_url(&origin);
     let body = json!({
         "model": model,
-        "messages": chat_messages(prompt, system),
+        "messages": messages,
         "stream": true,
     });
     let api_key = config
@@ -128,13 +128,27 @@ fn require_origin(config: &LlmRuntimeConfig) -> Result<String, AdapterError> {
     Ok(origin)
 }
 
-fn chat_messages(prompt: &str, system: Option<&str>) -> Vec<Value> {
-    let mut messages = Vec::new();
+/// The outgoing `messages` array.
+///
+/// A conversation when the caller has one, and a single user turn when it does
+/// not. The two-message shape was the only shape for a long time, which is what
+/// made the prefix unstable: an entire conversation folded into one string,
+/// re-sliced every turn, so nothing a provider had cached ever matched.
+fn chat_messages(prompt: &str, messages: &[ChatMessage], system: Option<&str>) -> Vec<Value> {
+    let mut out = Vec::new();
     if let Some(system) = system.filter(|value| !value.is_empty()) {
-        messages.push(json!({"role": "system", "content": system}));
+        out.push(json!({"role": "system", "content": system}));
     }
-    messages.push(json!({"role": "user", "content": prompt}));
-    messages
+    if messages.is_empty() {
+        out.push(json!({"role": "user", "content": prompt}));
+        return out;
+    }
+    out.extend(
+        messages
+            .iter()
+            .map(|message| json!({"role": message.role, "content": message.content})),
+    );
+    out
 }
 
 async fn send_chat(
@@ -668,6 +682,7 @@ mod tests {
             &client,
             &config,
             "Reply with exactly the two characters: OK",
+            &[],
             Some("You reply with the requested characters and nothing else."),
             tx,
             Cancellation::default(),
@@ -706,7 +721,7 @@ mod tests {
             .build()
             .unwrap();
         let (tx, mut rx) = mpsc::channel(16);
-        let text = generate_streaming(&client, &config, "hi", None, tx, cancellation).await?;
+        let text = generate_streaming(&client, &config, "hi", &[], None, tx, cancellation).await?;
         let mut tokens = Vec::new();
         while let Ok(token) = rx.try_recv() {
             tokens.push(token);
@@ -742,6 +757,7 @@ mod tests {
             &client,
             &config,
             "prompt",
+            &[],
             None,
             tx,
             Cancellation::default(),
