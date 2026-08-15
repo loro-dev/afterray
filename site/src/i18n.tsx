@@ -18,7 +18,7 @@ export const LANGS: { code: Lang; label: string }[] = [
 
 const en = {
   meta: {
-    title: 'AfterRay — A searchable recording of everything you see and hear.',
+    title: 'AfterRay — Remember everything you see and hear on your Mac.',
     htmlLang: 'en',
   },
   nav: {
@@ -30,12 +30,12 @@ const en = {
   },
   hero: {
     eyebrow: 'Local-first computer history',
-    titleA: ['A searchable recording'] as Part[],
-    titleB: ['of everything you ', { em: 'see and hear.' }] as Part[],
-    sub: 'AfterRay captures your screen and the audio around it all day and keeps it on this Mac. Replay any moment, search it by half a phrase, or let Claude Code and Codex look it up for you.',
+    titleA: ['Remember'] as Part[],
+    titleB: [{ em: 'everything.' }] as Part[],
+    sub: 'AfterRay records your screen and the audio around it all day. Replay any moment, search it, or let Claude Code and Codex look it up — and exclude any app you would rather it did not see. All on this Mac.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
-    facts: ['macOS 15+ · Apple Silicon', 'No account, no telemetry', 'Nothing leaves this Mac'],
+    facts: ['macOS 15+ · Apple Silicon', 'Pause or delete anytime', 'Nothing leaves this Mac'],
   },
   jtbd: [
     {
@@ -296,7 +296,7 @@ export type Copy = typeof en
 
 const zh: Copy = {
   meta: {
-    title: 'AfterRay — 一份可搜索的记录，装下你看到和听到的一切',
+    title: 'AfterRay — 记住一切，你在 Mac 上看到和听到的',
     htmlLang: 'zh-CN',
   },
   nav: {
@@ -308,12 +308,12 @@ const zh: Copy = {
   },
   hero: {
     eyebrow: '纯本地的 computer history',
-    titleA: ['一份可搜索的记录，'],
-    titleB: ['装下你', { em: '看到和听到的一切。' }],
-    sub: 'AfterRay 整天捕获你的屏幕和周围的声音，全部留在这台 Mac 上。回放任意一刻，用记得的只言片语搜出来，也可以让 Claude Code、Codex 替你去查。',
+    titleA: ['记住'],
+    titleB: [{ em: '一切。' }],
+    sub: 'AfterRay 整天记录你的屏幕和周围的声音。回放任意一刻、搜索它，或者让 Claude Code、Codex 替你去查——不想被记录的 App，随时排除。全程在这台 Mac 上。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
-    facts: ['macOS 15+ · Apple Silicon', '无账号，无遥测', '数据不出这台 Mac'],
+    facts: ['macOS 15+ · Apple Silicon', '随时暂停或删除', '数据不出这台 Mac'],
   },
   jtbd: [
     {
