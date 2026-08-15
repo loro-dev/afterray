@@ -57,6 +57,7 @@ cli_bin="$repo_root/target/release/afterray"
 model_worker="$repo_root/target/release/afterray-model-worker"
 app_bin="$repo_root/.build/debug/afterray-app"
 native_model_worker="$repo_root/.build/release/afterray-native-model-worker"
+mlx_model_worker="$repo_root/.build/release/afterray-mlx-vlm-worker"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
 swift_cache="$repo_root/.afterray-dev/swift-cache"
 
@@ -134,6 +135,10 @@ swift build \
   --package-path "$repo_root" \
   --configuration release \
   --product afterray-native-model-worker
+swift build \
+  --package-path "$repo_root" \
+  --configuration release \
+  --product afterray-mlx-vlm-worker
 
 printf '%s\n' '==> Assembling AfterRay.app'
 stop_development_processes
@@ -148,11 +153,14 @@ mkdir -p \
 cp "$repo_root/apps/AfterRay/Resources/Info.plist" "$app_bundle/Contents/Info.plist"
 cp "$repo_root/apps/AfterRay/Resources/AppIcon.icns" \
   "$app_bundle/Contents/Resources/AppIcon.icns"
+cp "$repo_root/LICENSES/Qwen3.5-4B-MLX-4bit-NOTICE.txt" \
+  "$app_bundle/Contents/Resources/Qwen3.5-4B-MLX-4bit-NOTICE.txt"
 cp "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"
 cp "$daemon_bin" "$app_bundle/Contents/Helpers/afterrayd"
 cp "$cli_bin" "$app_bundle/Contents/Helpers/afterray"
 cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
+cp "$mlx_model_worker" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
 cp "$model_worker" "$app_bundle/Contents/Helpers/afterray-model-worker"
 chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
 codesign_identity="$(resolve_codesign_identity)"
@@ -162,10 +170,19 @@ if [[ "$codesign_identity" == '-' ]]; then
     'Screen Recording permission may be lost after every ad-hoc rebuild.' >&2
 fi
 printf '==> Signing with: %s\n' "$codesign_identity"
+xcrun swift-stdlib-tool \
+  --copy \
+  --scan-executable "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" \
+  --platform macosx \
+  --destination "$app_bundle/Contents/Helpers" \
+  --sign "$codesign_identity"
+rm -f "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib.original"
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-model-worker" >/dev/null
 if [[ "$codesign_identity" == '-' ]]; then
   codesign \
@@ -252,6 +269,7 @@ if [[ "$mode" == 'app' ]]; then
   export AFTERRAY_DAEMON="$app_bundle/Contents/Helpers/afterrayd"
   export AFTERRAY_CAPTURE_SHIM="$app_bundle/Contents/Helpers/AfterRayCaptureShim"
   export AFTERRAY_NATIVE_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-native-model-worker"
+  export AFTERRAY_MLX_WORKER="$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
   export AFTERRAY_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-model-worker"
   printf '%s\n' \
     '==> Opening AfterRay.app through LaunchServices' \
@@ -268,6 +286,7 @@ if [[ "$mode" == 'app' ]]; then
     AFTERRAY_DAEMON
     AFTERRAY_CAPTURE_SHIM
     AFTERRAY_NATIVE_MODEL_WORKER
+    AFTERRAY_MLX_WORKER
     AFTERRAY_MODEL_WORKER
     AFTERRAY_ASR_MODEL
     AFTERRAY_EMBEDDING_MODEL

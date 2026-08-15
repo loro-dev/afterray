@@ -72,6 +72,32 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             directory: modelDirectoryPath,
             packs: [
                 ModelPack(
+                    id: "llm_qwen35_4b_mlx4",
+                    name: "Qwen3.5-4B MLX 4-bit",
+                    capability: "llm_vlm",
+                    path: "\(modelDirectoryPath)/Qwen3.5-4B-MLX-4bit",
+                    present: false,
+                    bytes: 0,
+                    required: false,
+                    note: "Recommended local model · mlx-community · Apache 2.0",
+                    expectedBytes: 3_061_129_077,
+                    state: .notDownloaded,
+                    revision: "32f3e8ecf65426fc3306969496342d504bfa13f3"
+                ),
+                ModelPack(
+                    id: "llm_qwen35_9b_mlx4",
+                    name: "Qwen3.5-9B MLX 4-bit",
+                    capability: "llm_vlm",
+                    path: "\(modelDirectoryPath)/Qwen3.5-9B-MLX-4bit",
+                    present: false,
+                    bytes: 0,
+                    required: false,
+                    note: "Higher-quality local assistant · approximately 5.97 GB",
+                    expectedBytes: 5_977_071_067,
+                    state: .notDownloaded,
+                    revision: "938d8919941c6e7efd3c7150eff7fe9d12afa631"
+                ),
+                ModelPack(
                     id: "asr",
                     name: "Qwen3 ASR",
                     capability: "asr",
@@ -197,6 +223,30 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         downloadProgress = nil
         downloadStatus = nil
         message = "Preview marked \(packID ?? "models") as installed."
+    }
+
+    public func remove(packID: String) async {
+        guard let current = library else { return }
+        library = ModelLibrary(
+            directory: current.directory,
+            packs: current.packs.map { pack in
+                guard pack.id == packID else { return pack }
+                return ModelPack(
+                    id: pack.id,
+                    name: pack.name,
+                    capability: pack.capability,
+                    path: pack.path,
+                    present: false,
+                    bytes: 0,
+                    required: pack.required,
+                    note: pack.note,
+                    expectedBytes: pack.expectedBytes,
+                    state: .notDownloaded,
+                    revision: pack.revision
+                )
+            }
+        )
+        message = "Preview removed \(packID)."
     }
 
     public func revealLogs() {

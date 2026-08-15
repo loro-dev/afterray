@@ -302,23 +302,29 @@ public struct ModelJob: Codable, Equatable, Identifiable, Sendable {
 
 public struct ModelDownloadProgress: Codable, Equatable, Sendable {
     public let packId: String
+    public let state: ModelPackState
     public let bytes: UInt64
     public let expectedBytes: UInt64?
     public let completedFiles: UInt64
     public let totalFiles: UInt64
+    public let error: String?
 
     public init(
         packId: String,
+        state: ModelPackState = .downloading,
         bytes: UInt64,
         expectedBytes: UInt64? = nil,
         completedFiles: UInt64 = 0,
-        totalFiles: UInt64 = 0
+        totalFiles: UInt64 = 0,
+        error: String? = nil
     ) {
         self.packId = packId
+        self.state = state
         self.bytes = bytes
         self.expectedBytes = expectedBytes
         self.completedFiles = completedFiles
         self.totalFiles = totalFiles
+        self.error = error
     }
 
     public var fraction: Double? {
@@ -332,11 +338,34 @@ public struct ModelDownloadProgress: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case packId = "pack_id"
+        case state
         case bytes
         case expectedBytes = "expected_bytes"
         case completedFiles = "completed_files"
         case totalFiles = "total_files"
+        case error
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        packId = try container.decode(String.self, forKey: .packId)
+        state = try container.decodeIfPresent(ModelPackState.self, forKey: .state) ?? .downloading
+        bytes = try container.decode(UInt64.self, forKey: .bytes)
+        expectedBytes = try container.decodeIfPresent(UInt64.self, forKey: .expectedBytes)
+        completedFiles = try container.decodeIfPresent(UInt64.self, forKey: .completedFiles) ?? 0
+        totalFiles = try container.decodeIfPresent(UInt64.self, forKey: .totalFiles) ?? 0
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+public enum ModelPackState: String, Codable, Equatable, Sendable {
+    case notDownloaded = "not_downloaded"
+    case downloading
+    case verifying
+    case ready
+    case inUse = "in_use"
+    case failed
+    case incompatible
 }
 
 public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
@@ -349,6 +378,9 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
     public let required: Bool
     public let note: String?
     public let expectedBytes: UInt64?
+    public let state: ModelPackState
+    public let revision: String?
+    public let error: String?
 
     public init(
         id: String,
@@ -359,7 +391,10 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
         bytes: UInt64,
         required: Bool,
         note: String? = nil,
-        expectedBytes: UInt64? = nil
+        expectedBytes: UInt64? = nil,
+        state: ModelPackState? = nil,
+        revision: String? = nil,
+        error: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -370,6 +405,9 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
         self.required = required
         self.note = note
         self.expectedBytes = expectedBytes
+        self.state = state ?? (present ? .ready : .notDownloaded)
+        self.revision = revision
+        self.error = error
     }
 
     enum CodingKeys: String, CodingKey {
@@ -382,11 +420,32 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
         case required
         case note
         case expectedBytes = "expected_bytes"
+        case state
+        case revision
+        case error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        capability = try container.decode(String.self, forKey: .capability)
+        path = try container.decode(String.self, forKey: .path)
+        present = try container.decode(Bool.self, forKey: .present)
+        bytes = try container.decode(UInt64.self, forKey: .bytes)
+        required = try container.decode(Bool.self, forKey: .required)
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+        expectedBytes = try container.decodeIfPresent(UInt64.self, forKey: .expectedBytes)
+        state = try container.decodeIfPresent(ModelPackState.self, forKey: .state)
+            ?? (present ? .ready : .notDownloaded)
+        revision = try container.decodeIfPresent(String.self, forKey: .revision)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
     }
 }
 
 public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
     case builtin
+    case mlxLocal = "mlx_local"
     case ollama
     case openaiCompatible = "openai_compatible"
 
@@ -395,6 +454,7 @@ public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
     public var title: String {
         switch self {
         case .builtin: "Built-in"
+        case .mlxLocal: "AfterRay Local (MLX)"
         case .ollama: "Ollama"
         case .openaiCompatible: "OpenAI compatible"
         }

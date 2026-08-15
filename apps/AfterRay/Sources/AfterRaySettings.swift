@@ -321,6 +321,23 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         await refresh()
     }
 
+    func remove(packID: String) async {
+        guard downloadingID == nil else { return }
+        do {
+            library = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).removeModel(packID: packID)
+            message = "Removed \(displayName(for: packID))."
+            storage = AfterRayStorageSnapshot.measure(
+                dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
+                modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
+                runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
+            )
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
     func revealLogs() {
         reveal(AfterRayLog.directory.path)
     }
@@ -442,6 +459,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         switch provider {
         case .builtin:
             "Ask will use the on-device pack when it is installed."
+        case .mlxLocal:
+            "Ask will use the selected Qwen3.5 MLX model through AfterRay's signed worker."
         case .ollama:
             "Ask will use a local Ollama model."
         case .openaiCompatible:
@@ -459,7 +478,11 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             downloadProgress = min(fraction, 0.99)
         }
         let name = displayName(for: download.packId.isEmpty ? fallbackPackID : download.packId)
-        if let percent = download.percent {
+        if download.state == .verifying {
+            downloadStatus = "Verifying \(name)…"
+        } else if let error = download.error, !error.isEmpty {
+            downloadStatus = error
+        } else if let percent = download.percent {
             downloadStatus = "Downloading \(name) · \(percent)%"
         } else if download.totalFiles > 0 {
             downloadStatus = "Downloading \(name) · \(download.completedFiles)/\(download.totalFiles) files"

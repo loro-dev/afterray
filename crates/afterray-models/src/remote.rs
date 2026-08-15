@@ -2,12 +2,12 @@ mod stream;
 
 use crate::{
     AdapterError, Cancellation, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
-    ProcessAdapter,
+    PersistentMlxAdapter, ProcessAdapter, QWEN35_4B_MLX_PACK_ID, QWEN35_9B_MLX_PACK_ID,
 };
 use afterray_protocol::{LlmEndpointStatus, LlmProvider, LlmRemoteModel};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
 pub use stream::{ollama_chat_delta, ollama_chat_url, openai_sse_delta};
@@ -44,13 +44,33 @@ impl LlmRuntimeConfig {
     pub fn is_ready(&self, builtin_present: bool) -> bool {
         match self.provider {
             LlmProvider::Builtin => builtin_present,
+            LlmProvider::MlxLocal => false,
             LlmProvider::Ollama | LlmProvider::OpenaiCompatible => !self.chat_model().is_empty(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_ready_with_mlx(&self, builtin_present: bool, mlx_present: bool) -> bool {
+        match self.provider {
+            LlmProvider::MlxLocal => mlx_present,
+            _ => self.is_ready(builtin_present),
         }
     }
 
     #[must_use]
     pub fn chat_model(&self) -> &str {
         self.model.trim()
+    }
+
+    /// MLX choices are managed pack IDs, never a free-form model path or
+    /// remote repository. Empty settings retain the recommended 4B default.
+    #[must_use]
+    pub fn mlx_pack_id(&self) -> Option<&'static str> {
+        match self.chat_model() {
+            "" | QWEN35_4B_MLX_PACK_ID => Some(QWEN35_4B_MLX_PACK_ID),
+            QWEN35_9B_MLX_PACK_ID => Some(QWEN35_9B_MLX_PACK_ID),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -61,7 +81,9 @@ impl LlmRuntimeConfig {
         }
         match self.provider {
             LlmProvider::Ollama => DEFAULT_OLLAMA_BASE_URL.to_owned(),
-            LlmProvider::Builtin | LlmProvider::OpenaiCompatible => String::new(),
+            LlmProvider::Builtin | LlmProvider::MlxLocal | LlmProvider::OpenaiCompatible => {
+                String::new()
+            }
         }
     }
 }
@@ -113,6 +135,7 @@ impl Drop for LlmTokenSinkGuard {
 /// endpoint (Ollama included).
 pub struct LlmRouterAdapter {
     builtin: ProcessAdapter,
+    mlx: BTreeMap<String, Arc<PersistentMlxAdapter>>,
     config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     client: reqwest::Client,
     token_sink: LlmTokenSink,
@@ -123,6 +146,7 @@ impl LlmRouterAdapter {
     pub fn new(builtin: ProcessAdapter, config: Arc<std::sync::Mutex<LlmRuntimeConfig>>) -> Self {
         Self {
             builtin,
+            mlx: BTreeMap::new(),
             config,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(2))
@@ -131,6 +155,12 @@ impl LlmRouterAdapter {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             token_sink: LlmTokenSink::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_mlx(mut self, pack_id: impl Into<String>, mlx: Arc<PersistentMlxAdapter>) -> Self {
+        self.mlx.insert(pack_id.into(), mlx);
+        self
     }
 
     #[must_use]
@@ -155,6 +185,7 @@ impl ModelAdapter for LlmRouterAdapter {
     fn name(&self) -> &str {
         match self.snapshot().provider {
             LlmProvider::Builtin => "llama-llm",
+            LlmProvider::MlxLocal => "mlx-local-llm",
             LlmProvider::Ollama => "ollama-llm",
             LlmProvider::OpenaiCompatible => "openai-llm",
         }
@@ -178,6 +209,20 @@ impl ModelAdapter for LlmRouterAdapter {
         let token_tx = self.token_sink.take();
         match config.provider {
             LlmProvider::Builtin => self.builtin.execute(job_id, input, cancellation).await,
+            LlmProvider::MlxLocal => {
+                let pack_id = config.mlx_pack_id().ok_or_else(|| {
+                    AdapterError::MissingModel(
+                        "AfterRay MLX selection is invalid; choose the managed 4B or 9B pack".into(),
+                    )
+                })?;
+                let mlx = self.mlx.get(pack_id).ok_or_else(|| {
+                    AdapterError::MissingModel(
+                        format!("AfterRay MLX worker for `{pack_id}` is unavailable in this installation"),
+                    )
+                })?;
+                mlx.execute_streaming(job_id, input, token_tx, cancellation)
+                    .await
+            }
             LlmProvider::Ollama | LlmProvider::OpenaiCompatible => {
                 let ModelInput::Llm { prompt, system } = input else {
                     return Err(AdapterError::InvalidOutput(
@@ -207,13 +252,14 @@ pub async fn probe_llm(
 ) -> LlmEndpointStatus {
     let default_base_url = match provider {
         LlmProvider::Ollama => DEFAULT_OLLAMA_BASE_URL.to_owned(),
+        LlmProvider::MlxLocal => String::new(),
         LlmProvider::OpenaiCompatible => base_url
             .map(normalize_origin)
             .filter(|value| !value.is_empty())
             .unwrap_or_default(),
         LlmProvider::Builtin => String::new(),
     };
-    if provider == LlmProvider::Builtin {
+    if matches!(provider, LlmProvider::Builtin | LlmProvider::MlxLocal) {
         return LlmEndpointStatus {
             reachable: false,
             models: Vec::new(),
@@ -256,6 +302,7 @@ pub async fn probe_llm(
     let result = match provider {
         LlmProvider::Ollama => probe_ollama(&client, &origin).await,
         LlmProvider::OpenaiCompatible => probe_openai(&client, &origin, api_key).await,
+        LlmProvider::MlxLocal => unreachable!("local probe returns earlier"),
         LlmProvider::Builtin => unreachable!("builtin probe returns earlier"),
     };
     match result {
@@ -582,6 +629,18 @@ mod tests {
         let config = LlmRuntimeConfig::default();
         assert!(!config.is_ready(false));
         assert!(config.is_ready(true));
+    }
+
+    #[test]
+    fn mlx_is_ready_only_when_the_verified_mlx_pack_is_present() {
+        let config = LlmRuntimeConfig {
+            provider: LlmProvider::MlxLocal,
+            ..LlmRuntimeConfig::default()
+        };
+        assert!(!config.is_ready(false));
+        assert!(!config.is_ready_with_mlx(true, false));
+        assert!(config.is_ready_with_mlx(false, true));
+        assert!(config.resolved_base_url().is_empty());
     }
 
     #[test]

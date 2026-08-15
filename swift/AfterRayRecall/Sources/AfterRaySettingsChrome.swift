@@ -44,6 +44,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func clearHistory(_ scope: HistoryScope) async
     func reveal(_ path: String)
     func download(packID: String?) async
+    func remove(packID: String) async
     func revealLogs()
     func copyDiagnostics()
     func setLlmProvider(_ provider: LlmProvider) async
@@ -267,6 +268,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     let onClose: () -> Void
     @State private var page: AfterRaySettingsPage
     @State private var copied = false
+    @State private var confirmingMlxRemoval = false
 
     public init(
         model: Model,
@@ -731,7 +733,9 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 SettingsPill("Built in", tone: .neutral)
             }
             if let library = model.library {
-                ForEach(library.packs) { pack in
+                ForEach(library.packs.filter {
+                    $0.id != qwen35MlxPackID && $0.id != qwen35Mlx9BPackID
+                }) { pack in
                     SettingsSeparator()
                     modelPackRow(pack)
                 }
@@ -812,6 +816,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         switch model.settings?.llmProvider ?? .builtin {
         case .builtin:
             "Downloads Qwen3.6-27B Q4 (~17 GB) and runs it on this Mac. Capture keeps working without it."
+        case .mlxLocal:
+            "Choose Qwen3.5 4B or the optional higher-quality 9B pack. Both run inside AfterRay through MLX."
         case .ollama:
             "AfterRay talks to Ollama over HTTP on this Mac. Nothing leaves the machine."
         case .openaiCompatible:
@@ -833,10 +839,160 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         switch model.settings?.llmProvider ?? .builtin {
         case .builtin:
             EmptyView()
+        case .mlxLocal:
+            mlxLocalPanel
         case .ollama:
             ollamaPanel
         case .openaiCompatible:
             openaiPanel
+        }
+    }
+
+    private let qwen35MlxPackID = "llm_qwen35_4b_mlx4"
+    private let qwen35Mlx9BPackID = "llm_qwen35_9b_mlx4"
+
+    @ViewBuilder
+    private var mlxLocalPanel: some View {
+        let selectedPackID = selectedMlxPackID
+        if let pack = model.library?.packs.first(where: { $0.id == selectedPackID }) {
+            VStack(alignment: .leading, spacing: 12) {
+                SettingsField(label: "Model") {
+                    Picker("AfterRay MLX model", selection: mlxModelBinding) {
+                        Text("Recommended · Qwen3.5 4B").tag(qwen35MlxPackID)
+                        Text("Higher quality · Qwen3.5 9B").tag(qwen35Mlx9BPackID)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .disabled(model.isUpdatingLlm)
+                }
+                HStack(spacing: 8) {
+                    SettingsPill(mlxStateLabel(pack.state), tone: mlxStateTone(pack.state))
+                    Text("mlx-community · Apache 2.0")
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                    Spacer(minLength: 8)
+                    if pack.state == .downloading || pack.state == .verifying {
+                        ProgressView().controlSize(.mini)
+                    }
+                }
+
+                Text(mlxDescription(for: pack.id))
+                    .font(.settingsCaption)
+                    .foregroundStyle(SettingsPalette.secondaryLabel)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let error = pack.error, !error.isEmpty {
+                    Text(error)
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.danger)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let download = model.library?.download,
+                   download.packId == pack.id,
+                   download.state == .downloading || download.state == .verifying
+                {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(download.state == .verifying ? "Verifying files…" : "Downloading model…")
+                                .font(.settingsCaption)
+                                .foregroundStyle(SettingsPalette.secondaryLabel)
+                            Spacer()
+                            if let percent = download.percent {
+                                Text("\(percent)%")
+                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                    .monospacedDigit()
+                            }
+                        }
+                        ProgressView(value: download.fraction ?? 0)
+                            .progressViewStyle(.linear)
+                            .tint(SettingsPalette.accent)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    switch pack.state {
+                    case .notDownloaded, .failed:
+                        Button(pack.state == .failed ? "Retry Download" : "Download \(mlxDownloadLabel(for: pack.id))") {
+                            Task { await model.download(packID: pack.id) }
+                        }
+                        .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                        .disabled(model.downloadingID != nil)
+                    case .ready, .inUse:
+                        Button("Show Files") { model.reveal(pack.path) }
+                            .buttonStyle(SettingsButtonStyle())
+                        Button("Remove…") { confirmingMlxRemoval = true }
+                            .buttonStyle(SettingsButtonStyle())
+                            .disabled(pack.state == .inUse || model.downloadingID != nil)
+                    case .downloading, .verifying, .incompatible:
+                        EmptyView()
+                    }
+                    Spacer()
+                }
+            }
+            .confirmationDialog(
+                "Remove \(pack.name) from this Mac?",
+                isPresented: $confirmingMlxRemoval,
+                titleVisibility: .visible
+            ) {
+                Button("Remove Download", role: .destructive) {
+                    Task { await model.remove(packID: pack.id) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("AfterRay can download the verified snapshot again later.")
+            }
+        } else {
+            Text("The managed MLX model is unavailable in this daemon build.")
+                .font(.settingsCaption)
+                .foregroundStyle(SettingsPalette.secondaryLabel)
+        }
+    }
+
+    private var selectedMlxPackID: String {
+        let candidate = model.settings?.llmModel.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return [qwen35MlxPackID, qwen35Mlx9BPackID].contains(candidate) ? candidate : qwen35MlxPackID
+    }
+
+    private var mlxModelBinding: Binding<String> {
+        Binding(
+            get: { selectedMlxPackID },
+            set: { next in
+                model.draftLlmModel = next
+                Task { await model.saveLlmConnection() }
+            }
+        )
+    }
+
+    private func mlxDownloadLabel(for packID: String) -> String {
+        packID == qwen35Mlx9BPackID ? "~5.97 GB" : "~3.06 GB"
+    }
+
+    private func mlxDescription(for packID: String) -> String {
+        if packID == qwen35Mlx9BPackID {
+            return "Pinned Qwen3.5-9B 4-bit VLM. It is the higher-quality option and downloads approximately 5.97 GB. Requires Apple Silicon and macOS 14 or later; check unified-memory headroom before downloading."
+        }
+        return "Pinned Qwen3.5-4B 4-bit VLM. Requires Apple Silicon and macOS 14 or later; download size is approximately 3.06 GB. On M2, 8 GB is experimental; 16 GB and 24 GB remain subject to real-device validation."
+    }
+
+    private func mlxStateLabel(_ state: ModelPackState) -> String {
+        switch state {
+        case .notDownloaded: "Not downloaded"
+        case .downloading: "Downloading"
+        case .verifying: "Verifying"
+        case .ready: "Ready"
+        case .inUse: "Loaded"
+        case .failed: "Failed"
+        case .incompatible: "Incompatible"
+        }
+    }
+
+    private func mlxStateTone(_ state: ModelPackState) -> SettingsTone {
+        switch state {
+        case .ready, .inUse: .positive
+        case .downloading, .verifying: .neutral
+        case .notDownloaded: .warning
+        case .failed, .incompatible: .danger
         }
     }
 
@@ -1022,12 +1178,17 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private func packStatus(_ pack: ModelPack) -> String {
+        if pack.state == .failed { return "Failed" }
+        if pack.state == .incompatible { return "Incompatible" }
+        if pack.state == .verifying { return "Verifying" }
+        if pack.state == .inUse { return "Loaded" }
         if pack.present { return "Ready" }
         if pack.bytes > 0 { return "Incomplete" }
         return pack.required ? "Needed" : "Optional"
     }
 
     private func packTone(_ pack: ModelPack) -> SettingsTone {
+        if pack.state == .failed || pack.state == .incompatible { return .danger }
         if pack.present { return .positive }
         if pack.bytes > 0 { return .warning }
         return pack.required ? .warning : .neutral

@@ -9,9 +9,11 @@ rust-version.workspace = true
 afterray-protocol = { path = "../afterray-protocol" }
 async-trait.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true

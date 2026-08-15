@@ -202,7 +202,7 @@ cargo build \
   -p afterray-cli \
   -p afterray-infer
 
-step 'Building Swift app and native model worker (release)'
+step 'Building Swift app and native model workers (release)'
 swift build \
   --package-path "$repo_root" \
   --configuration release \
@@ -211,6 +211,10 @@ swift build \
   --package-path "$repo_root" \
   --configuration release \
   --product afterray-native-model-worker
+swift build \
+  --package-path "$repo_root" \
+  --configuration release \
+  --product afterray-mlx-vlm-worker
 
 capture_bin="$repo_root/apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim"
 daemon_bin="$repo_root/target/release/afterrayd"
@@ -218,6 +222,7 @@ cli_bin="$repo_root/target/release/afterray"
 model_worker_bin="$repo_root/target/release/afterray-model-worker"
 app_bin="$repo_root/.build/release/afterray-app"
 native_model_worker_bin="$repo_root/.build/release/afterray-native-model-worker"
+mlx_worker_bin="$repo_root/.build/release/afterray-mlx-vlm-worker"
 source_binaries=(
   "$app_bin"
   "$daemon_bin"
@@ -225,6 +230,7 @@ source_binaries=(
   "$model_worker_bin"
   "$capture_bin"
   "$native_model_worker_bin"
+  "$mlx_worker_bin"
 )
 for binary in "${source_binaries[@]}"; do
   [[ -x "$binary" ]] || die "expected release executable is missing: $binary"
@@ -238,6 +244,8 @@ mkdir -p \
 install -m 0644 "$source_plist" "$app_bundle/Contents/Info.plist"
 install -m 0644 "$repo_root/apps/AfterRay/Resources/AppIcon.icns" \
   "$app_bundle/Contents/Resources/AppIcon.icns"
+install -m 0644 "$repo_root/LICENSES/Qwen3.5-4B-MLX-4bit-NOTICE.txt" \
+  "$app_bundle/Contents/Resources/Qwen3.5-4B-MLX-4bit-NOTICE.txt"
 install -m 0755 "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"
 install -m 0755 "$daemon_bin" "$app_bundle/Contents/Helpers/afterrayd"
 install -m 0755 "$cli_bin" "$app_bundle/Contents/Helpers/afterray"
@@ -245,6 +253,15 @@ install -m 0755 "$model_worker_bin" "$app_bundle/Contents/Helpers/afterray-model
 install -m 0755 "$capture_bin" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 install -m 0755 "$native_model_worker_bin" \
   "$app_bundle/Contents/Helpers/afterray-native-model-worker"
+install -m 0755 "$mlx_worker_bin" \
+  "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
+xcrun swift-stdlib-tool \
+  --copy \
+  --scan-executable "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" \
+  --platform macosx \
+  --destination "$app_bundle/Contents/Helpers" \
+  --sign "$codesign_identity"
+rm -f "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib.original"
 plutil -lint "$app_bundle/Contents/Info.plist" >/dev/null
 
 bundle_binaries=(
@@ -254,7 +271,14 @@ bundle_binaries=(
   "$app_bundle/Contents/Helpers/afterray-model-worker"
   "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
   "$app_bundle/Contents/Helpers/afterray-native-model-worker"
+  "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
 )
+runtime_libraries=(
+  "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib"
+)
+for library in "${runtime_libraries[@]}"; do
+  [[ -f "$library" ]] || die "expected Swift runtime library is missing: $library"
+done
 for binary in "${bundle_binaries[@]}"; do
   architectures="$(lipo -archs "$binary")"
   [[ "$architectures" == 'arm64' ]] || die "expected arm64-only executable, got '$architectures': $binary"
@@ -266,6 +290,10 @@ for binary in "${bundle_binaries[@]}"; do
     [[ -n "$dependency" ]] || continue
     case "$dependency" in
       /System/Library/* | /usr/lib/*) ;;
+      @rpath/*)
+        [[ -f "$(dirname "$binary")/${dependency##*/}" ]] \
+          || die "missing bundled dynamic dependency '$dependency': $binary"
+        ;;
       *) die "executable has a non-system dynamic dependency '$dependency': $binary" ;;
     esac
   done <<<"$dependencies"
@@ -286,6 +314,9 @@ sign_executable() {
 }
 
 step "Signing nested executables (${codesign_identity})"
+for library in "${runtime_libraries[@]}"; do
+  sign_executable "$library"
+done
 for binary in "${bundle_binaries[@]:1}"; do
   sign_executable "$binary"
 done
@@ -296,6 +327,11 @@ for binary in "${bundle_binaries[@]}"; do
   codesign --verify --strict --verbose=2 "$binary"
   signature_details="$(codesign -d --verbose=4 "$binary" 2>&1)"
   [[ "$signature_details" == *'runtime'* ]] || die "Hardened Runtime flag is missing: $binary"
+done
+for library in "${runtime_libraries[@]}"; do
+  codesign --verify --strict --verbose=2 "$library"
+  signature_details="$(codesign -d --verbose=4 "$library" 2>&1)"
+  [[ "$signature_details" == *'runtime'* ]] || die "Hardened Runtime flag is missing: $library"
 done
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
 

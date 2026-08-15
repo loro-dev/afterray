@@ -113,11 +113,16 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     ) async throws -> AppSettings
     func probeLlm(provider: LlmProvider?, baseUrl: String?) async throws -> LlmEndpointStatus
     func downloadModels(packID: String?) async throws -> ModelLibrary
+    func removeModel(packID: String) async throws -> ModelLibrary
     func jobs() async throws -> [ModelJob]
     func clearHistory(scope: HistoryScope) async throws -> HistoryClearResult
 }
 
 public extension AfterRayDaemonServing {
+    func removeModel(packID _: String) async throws -> ModelLibrary {
+        throw DaemonClientError.rejected("model removal is not available")
+    }
+
     func updateSettings(recordAudio: Bool) async throws -> AppSettings {
         try await updateSettings(
             recordAudio: recordAudio,
@@ -134,7 +139,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 6
+    public static let protocolVersion = 7
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -227,6 +232,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     public func downloadModels(packID: String?) async throws -> ModelLibrary {
         try await request(
             WireRequest(type: "download_models", packID: packID),
+            as: ModelLibrary.self
+        )
+    }
+
+    public func removeModel(packID: String) async throws -> ModelLibrary {
+        try await request(
+            WireRequest(type: "remove_model", packID: packID),
             as: ModelLibrary.self
         )
     }

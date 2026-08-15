@@ -43,6 +43,9 @@ pub(super) async fn generate_streaming(
             "builtin GGUF worker has no token stream; the chat path falls back to a one-shot answer"
                 .into(),
         )),
+        afterray_protocol::LlmProvider::MlxLocal => Err(AdapterError::InvalidOutput(
+            "MLX local generation uses the persistent worker protocol".into(),
+        )),
     }
 }
 

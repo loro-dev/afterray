@@ -43,6 +43,7 @@ if [[ "$mode" == 'app' ]]; then
     "$repo_root/apps/AfterRay"
     "$repo_root/apps/AfterRayCaptureShim"
     "$repo_root/apps/AfterRayNativeModelWorker"
+    "$repo_root/apps/AfterRayMlxVlmWorker"
     "$repo_root/crates"
     "$repo_root/scripts/run-v0.sh"
   )

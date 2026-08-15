@@ -2,7 +2,7 @@
 
 use afterray_models::{JobState, ModelInput, ModelOutput, ModelQueue, QueueError};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::fmt::Write as _;
 
 use crate::tools::{ToolHost, tool_catalog_text};
@@ -198,10 +198,13 @@ fn parse_tool_call(text: &str) -> Option<(String, Value)> {
         }
     }
     let name = name?;
-    let args_raw = args_raw.unwrap_or_else(|| "{}".to_owned());
+    let args_raw = args_raw?;
     // Take first JSON object if model appended prose
     let json_slice = extract_json_object(&args_raw).unwrap_or(args_raw.as_str());
-    let args = serde_json::from_str(json_slice).unwrap_or_else(|_| Value::Object(Map::default()));
+    let args: Value = serde_json::from_str(json_slice).ok()?;
+    if !args.is_object() {
+        return None;
+    }
     Some((name, args))
 }
 
@@ -262,6 +265,13 @@ mod tests {
     fn extracts_json_with_trailing_prose() {
         let raw = r#"{"moment_id":"abc"} then more text"#;
         assert_eq!(extract_json_object(raw), Some(r#"{"moment_id":"abc"}"#));
+    }
+
+    #[test]
+    fn rejects_invalid_or_non_object_tool_args() {
+        assert!(parse_tool_call("TOOL get_ocr\nARGS {not json}").is_none());
+        assert!(parse_tool_call("TOOL get_ocr\nARGS [\"moment_id\"]").is_none());
+        assert!(parse_tool_call("TOOL get_ocr").is_none());
     }
 
     #[test]

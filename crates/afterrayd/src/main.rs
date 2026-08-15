@@ -9,8 +9,11 @@ mod tools;
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
     JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, ModelAdapter, ModelCapability,
-    ModelInput, ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig,
-    download_packs, library, model_directory, probe_llm, specs_for_download,
+    ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter, PersistentMlxConfig, ProcessAdapter,
+    ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REVISION,
+    QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig, download_packs, library,
+    model_directory, probe_llm, qwen35_9b_mlx_manifest, qwen35_mlx_manifest, remove_pack,
+    spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
@@ -107,8 +110,17 @@ async fn main() -> anyhow::Result<()> {
         || PathBuf::from(".build/release/afterray-native-model-worker"),
         PathBuf::from,
     );
-    let (adapters, llm_token_sink) =
-        local_model_adapters(native_worker_path, worker_path, Arc::clone(&llm_config));
+    let mlx_worker_path = resolve_helper_path(
+        "AFTERRAY_MLX_WORKER",
+        "afterray-mlx-vlm-worker",
+        ".build/release/afterray-mlx-vlm-worker",
+    );
+    let (adapters, llm_token_sink, mlx_adapters) = local_model_adapters(
+        native_worker_path,
+        worker_path,
+        mlx_worker_path,
+        Arc::clone(&llm_config),
+    );
     let models = ModelQueue::new(adapters, QueueConfig::default())?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -145,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         llm_config,
         llm_token_sink,
+        mlx_adapters,
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -217,8 +230,25 @@ async fn shutdown_signal() {
 fn local_model_adapters(
     native_worker: PathBuf,
     general_worker: PathBuf,
+    mlx_worker: PathBuf,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
-) -> (Vec<Arc<dyn ModelAdapter>>, LlmTokenSink) {
+) -> (
+    Vec<Arc<dyn ModelAdapter>>,
+    LlmTokenSink,
+    Vec<(String, Arc<PersistentMlxAdapter>)>,
+) {
+    let mlx_4b = new_mlx_adapter(
+        &mlx_worker,
+        QWEN35_4B_MLX_PACK_ID,
+        QWEN35_4B_MLX_REVISION,
+        qwen35_mlx_manifest(),
+    );
+    let mlx_9b = new_mlx_adapter(
+        &mlx_worker,
+        QWEN35_9B_MLX_PACK_ID,
+        QWEN35_9B_MLX_REVISION,
+        qwen35_9b_mlx_manifest(),
+    );
     let llm = LlmRouterAdapter::new(
         ProcessAdapter::new(ProcessAdapterConfig::new(
             "llama-llm",
@@ -226,7 +256,9 @@ fn local_model_adapters(
             general_worker.clone(),
         )),
         llm_config,
-    );
+    )
+    .with_mlx(QWEN35_4B_MLX_PACK_ID, Arc::clone(&mlx_4b))
+    .with_mlx(QWEN35_9B_MLX_PACK_ID, Arc::clone(&mlx_9b));
     let token_sink = llm.token_sink();
     (
         vec![
@@ -248,7 +280,46 @@ fn local_model_adapters(
             Arc::new(llm),
         ],
         token_sink,
+        vec![
+            (QWEN35_4B_MLX_PACK_ID.into(), mlx_4b),
+            (QWEN35_9B_MLX_PACK_ID.into(), mlx_9b),
+        ],
     )
+}
+
+fn new_mlx_adapter(
+    worker: &Path,
+    pack_id: &str,
+    revision: &str,
+    manifest: Vec<afterray_models::ManifestFile>,
+) -> Arc<PersistentMlxAdapter> {
+    let model_dir = spec_by_id(pack_id)
+        .map(|spec| spec.path)
+        .unwrap_or_else(|| model_directory().join(pack_id));
+    let mut mlx_config = PersistentMlxConfig::new(worker, model_dir);
+    mlx_config.revision = revision.into();
+    mlx_config.manifest = manifest;
+    // Cache reuse is the normal path. `=0` remains a narrow recovery switch
+    // for a measured upstream regression; failed cache-prefill attempts retry
+    // once with a fresh session in this same model container.
+    mlx_config.enable_kv_cache = std::env::var("AFTERRAY_MLX_ENABLE_KV_CACHE")
+        .map_or(true, |value| value.trim() != "0");
+    Arc::new(PersistentMlxAdapter::new(mlx_config))
+}
+
+fn resolve_helper_path(env_key: &str, helper_name: &str, development_path: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(env_key).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let bundled = directory.join(helper_name);
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    PathBuf::from(development_path)
 }
 
 struct AppState {
@@ -271,6 +342,7 @@ struct AppState {
     languages: std::sync::Mutex<(String, String)>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     llm_token_sink: LlmTokenSink,
+    mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -483,9 +555,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         | Request::ReadThumbnail { .. } => Response::failure(
             "artifact reads are framed as a JSON header plus raw bytes and are handled separately",
         ),
-        Request::ChatStream { .. } => Response::failure(
-            "chat streams are framed as NDJSON events and are handled separately",
-        ),
+        Request::ChatStream { .. } => {
+            Response::failure("chat streams are framed as NDJSON events and are handled separately")
+        }
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
@@ -494,18 +566,16 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             limit,
             from_ms,
             to_ms,
-        } => {
-            match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
-                Ok(mut hits) => {
-                    if let (Some(from), Some(to)) = (from_ms, to_ms) {
-                        let (from, to) = if from <= to { (from, to) } else { (to, from) };
-                        hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
-                    }
-                    Response::success(hits)
+        } => match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
+            Ok(mut hits) => {
+                if let (Some(from), Some(to)) = (from_ms, to_ms) {
+                    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+                    hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
                 }
-                Err(error) => Response::failure(error.to_string()),
+                Response::success(hits)
             }
-        }
+            Err(error) => Response::failure(error.to_string()),
+        },
         Request::MomentGet { moment_id } => match tools::moment_detail(&state.store, &moment_id) {
             Ok(moment) => Response::success(moment),
             Err(error) => Response::failure(error),
@@ -623,10 +693,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             )
             .await
         }
-        Request::LlmProbe {
-            provider,
-            base_url,
-        } => {
+        Request::LlmProbe { provider, base_url } => {
             let config = current_llm_config(state);
             let provider = provider.unwrap_or(config.provider);
             let base_url = base_url
@@ -640,12 +707,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     }
                 });
             Response::success(
-                probe_llm(
-                    provider,
-                    base_url.as_deref(),
-                    config.api_key.as_deref(),
-                )
-                .await,
+                probe_llm(provider, base_url.as_deref(), config.api_key.as_deref()).await,
             )
         }
         Request::ClearHistory { scope } => clear_history(state, scope).await,
@@ -655,6 +717,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             limit,
         } => into_response(state.store.memories(from_ms, to_ms, limit.clamp(1, 200))),
         Request::DownloadModels { pack_id } => download_models(state, pack_id.as_deref()).await,
+        Request::RemoveModel { pack_id } => remove_model(state, &pack_id).await,
         Request::Shutdown => {
             let _ = state.shutdown.send(true);
             Response::success(serde_json::json!({
@@ -1007,6 +1070,10 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         || llm_model.is_some()
         || llm_api_key.is_some()
     {
+        let previous_llm = current_llm_config(state);
+        let previous_mlx_pack = (previous_llm.provider == LlmProvider::MlxLocal)
+            .then(|| previous_llm.mlx_pack_id().map(ToOwned::to_owned))
+            .flatten();
         {
             let mut llm = state
                 .llm_config
@@ -1033,6 +1100,19 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         if let Err(error) = persist_current_settings(state) {
             return Response::failure(format!("could not save assistant settings: {error}"));
         }
+        let selected_llm = current_llm_config(state);
+        let selected_mlx_pack = (selected_llm.provider == LlmProvider::MlxLocal)
+            .then(|| selected_llm.mlx_pack_id().map(ToOwned::to_owned))
+            .flatten();
+        if previous_mlx_pack != selected_mlx_pack
+            && let Some(previous_mlx_pack) = previous_mlx_pack
+            && let Some((_, adapter)) = state
+                .mlx_adapters
+                .iter()
+                .find(|(pack_id, _)| pack_id == &previous_mlx_pack)
+        {
+            adapter.shutdown().await;
+        }
     }
     Response::success(current_settings(state))
 }
@@ -1046,7 +1126,8 @@ fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
             .unwrap_or(persisted.llm_provider),
         base_url: env_nonempty("AFTERRAY_LLM_BASE_URL")
             .unwrap_or_else(|| persisted.llm_base_url.clone()),
-        model: env_nonempty("AFTERRAY_LLM_CHAT_MODEL").unwrap_or_else(|| persisted.llm_model.clone()),
+        model: env_nonempty("AFTERRAY_LLM_CHAT_MODEL")
+            .unwrap_or_else(|| persisted.llm_model.clone()),
         api_key: env_nonempty("AFTERRAY_LLM_API_KEY").or_else(|| {
             let key = persisted.llm_api_key.trim();
             if key.is_empty() {
@@ -1568,7 +1649,9 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let parsed = afterray_store::parse_t2_card(&raw);
-    let card_value = parsed.as_ref().and_then(|card| serde_json::to_value(card).ok());
+    let card_value = parsed
+        .as_ref()
+        .and_then(|card| serde_json::to_value(card).ok());
     eprintln!(
         "slot.t2 slot={slot_start_ms} model={} prompt_chars={} out_chars={} latency_ms={latency_ms} \
          parsed={}",
@@ -1592,7 +1675,9 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
                 }
             }
             Err(error) => {
-                eprintln!("slot.t2 persist skipped, card rebuild failed slot={slot_start_ms}: {error}");
+                eprintln!(
+                    "slot.t2 persist skipped, card rebuild failed slot={slot_start_ms}: {error}"
+                );
             }
         }
     }
@@ -1689,9 +1774,9 @@ fn t2_may_run(conditions: MachineConditions) -> Result<(), String> {
         ));
     }
     match conditions.load_per_core {
-        Some(load) if load > T2_MAX_LOAD_PER_CORE => {
-            Err(format!("load {load:.2}/core is above {T2_MAX_LOAD_PER_CORE:.2}"))
-        }
+        Some(load) if load > T2_MAX_LOAD_PER_CORE => Err(format!(
+            "load {load:.2}/core is above {T2_MAX_LOAD_PER_CORE:.2}"
+        )),
         // An unreadable load average is not permission to add to it.
         None => Err("load average unavailable".to_owned()),
         Some(_) => Ok(()),
@@ -1883,13 +1968,18 @@ fn slot_card_for(
 ) -> Result<afterray_store::SlotCard, afterray_store::StoreError> {
     let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
     let card = state.store.slot_card(at_ms, interval_ms)?;
-    let (run_count, gap_count, dedup_chars) = card.timeline.iter().fold(
-        (0_usize, 0_usize, 0_usize),
-        |(runs, gaps, chars), entry| match entry {
-            afterray_store::TimelineEntry::Run(run) => (runs + 1, gaps, chars + run.total_chars),
-            afterray_store::TimelineEntry::Gap(_) => (runs, gaps + 1, chars),
-        },
-    );
+    let (run_count, gap_count, dedup_chars) =
+        card.timeline
+            .iter()
+            .fold(
+                (0_usize, 0_usize, 0_usize),
+                |(runs, gaps, chars), entry| match entry {
+                    afterray_store::TimelineEntry::Run(run) => {
+                        (runs + 1, gaps, chars + run.total_chars)
+                    }
+                    afterray_store::TimelineEntry::Gap(_) => (runs, gaps + 1, chars),
+                },
+            );
     eprintln!(
         "slot.t1 slot={} day={} state={:?} moments={} ocr={} ax={} switches={} idle={:.2} \
          runs={run_count} gaps={gap_count} revisits={} dedup_chars={dedup_chars} theme={:?}",
@@ -1942,12 +2032,51 @@ fn slot_prompt_for(
 
 fn model_library(state: &AppState) -> afterray_protocol::ModelLibrary {
     let mut library = library();
-    library.download = state
+    let download = state
         .download
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    if let Some(progress) = &download
+        && let Some(pack) = library
+            .packs
+            .iter_mut()
+            .find(|pack| pack.id == progress.pack_id)
+    {
+        pack.state = progress.state;
+        pack.error.clone_from(&progress.error);
+    }
+    for (pack_id, adapter) in &state.mlx_adapters {
+        if let Some(pack) = library.packs.iter_mut().find(|pack| pack.id == *pack_id) {
+            if let Some(error) = mlx_platform_incompatibility() {
+                pack.state = afterray_protocol::ModelPackState::Incompatible;
+                pack.error = Some(error.into());
+                continue;
+            }
+            let mlx_health = adapter.health();
+            if matches!(
+                mlx_health.state,
+                afterray_protocol::ModelPackState::Verifying
+                    | afterray_protocol::ModelPackState::InUse
+                    | afterray_protocol::ModelPackState::Failed
+            ) {
+                pack.state = mlx_health.state;
+                pack.error = mlx_health.error;
+            }
+        }
+    }
+    library.download = download;
     library
+}
+
+fn mlx_platform_incompatibility() -> Option<&'static str> {
+    if !cfg!(target_os = "macos") {
+        return Some("AfterRay Local (MLX) requires macOS 14 or later on Apple Silicon");
+    }
+    if !cfg!(target_arch = "aarch64") {
+        return Some("AfterRay Local (MLX) requires Apple Silicon");
+    }
+    None
 }
 
 async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Response {
@@ -1961,10 +2090,12 @@ async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Respon
     let result = download_packs(&packs, |spec, progress| {
         let snapshot = ModelDownloadProgress {
             pack_id: spec.id.clone(),
+            state: progress.state,
             bytes: progress.bytes,
             expected_bytes: progress.expected_bytes,
             completed_files: u64::try_from(progress.completed_files).unwrap_or(0),
             total_files: u64::try_from(progress.total_files).unwrap_or(0),
+            error: None,
         };
         if let Some(percent) = progress.percent() {
             eprintln!("Downloading {} · {percent}%", spec.name);
@@ -1980,12 +2111,54 @@ async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Respon
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     })
     .await;
-    *state
-        .download
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     match result {
-        Ok(()) => Response::success(model_library(state)),
+        Ok(()) => {
+            *state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            Response::success(model_library(state))
+        }
+        Err(error) => {
+            let mut download = state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(progress) = download.as_mut() {
+                progress.state = afterray_protocol::ModelPackState::Failed;
+                progress.error = Some(error.to_string());
+            }
+            Response::failure(error.to_string())
+        }
+    }
+}
+
+async fn remove_model(state: &Arc<AppState>, pack_id: &str) -> Response {
+    let Some(pack) = spec_by_id(pack_id) else {
+        return Response::failure(format!("unknown model pack `{pack_id}`"));
+    };
+    if let Some((_, adapter)) = state
+        .mlx_adapters
+        .iter()
+        .find(|(id, _)| id == pack_id)
+    {
+        adapter.shutdown().await;
+    }
+    match remove_pack(&pack) {
+        Ok(()) => {
+            let mut download = state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if download
+                .as_ref()
+                .is_some_and(|progress| progress.pack_id == pack_id)
+            {
+                *download = None;
+            }
+            drop(download);
+            Response::success(model_library(state))
+        }
         Err(error) => Response::failure(error.to_string()),
     }
 }
@@ -2152,10 +2325,34 @@ mod tests {
     #[test]
     fn each_condition_alone_blocks_t2() {
         let cases = [
-            ("battery", MachineConditions { on_ac: false, ..IDEAL }),
-            ("low charge", MachineConditions { battery: Some(0.1), ..IDEAL }),
-            ("in use", MachineConditions { idle_seconds: 5.0, ..IDEAL }),
-            ("busy", MachineConditions { load_per_core: Some(3.0), ..IDEAL }),
+            (
+                "battery",
+                MachineConditions {
+                    on_ac: false,
+                    ..IDEAL
+                },
+            ),
+            (
+                "low charge",
+                MachineConditions {
+                    battery: Some(0.1),
+                    ..IDEAL
+                },
+            ),
+            (
+                "in use",
+                MachineConditions {
+                    idle_seconds: 5.0,
+                    ..IDEAL
+                },
+            ),
+            (
+                "busy",
+                MachineConditions {
+                    load_per_core: Some(3.0),
+                    ..IDEAL
+                },
+            ),
         ];
         for (label, conditions) in cases {
             assert!(
@@ -2169,7 +2366,13 @@ mod tests {
     /// reason to never summarise on one.
     #[test]
     fn a_machine_without_a_battery_is_not_blocked_by_charge() {
-        assert!(t2_may_run(MachineConditions { battery: None, ..IDEAL }).is_ok());
+        assert!(
+            t2_may_run(MachineConditions {
+                battery: None,
+                ..IDEAL
+            })
+            .is_ok()
+        );
     }
 
     /// An unreadable load average is not permission to add to it. Every other
@@ -2177,14 +2380,26 @@ mod tests {
     /// report load would run T2 while pinned.
     #[test]
     fn an_unreadable_load_average_blocks_t2() {
-        assert!(t2_may_run(MachineConditions { load_per_core: None, ..IDEAL }).is_err());
+        assert!(
+            t2_may_run(MachineConditions {
+                load_per_core: None,
+                ..IDEAL
+            })
+            .is_err()
+        );
     }
 
     /// The thresholds are boundaries, not approximations: exactly at the limit
     /// counts as acceptable, one step past does not.
     #[test]
     fn thresholds_are_exact() {
-        assert!(t2_may_run(MachineConditions { battery: Some(T2_MIN_BATTERY), ..IDEAL }).is_ok());
+        assert!(
+            t2_may_run(MachineConditions {
+                battery: Some(T2_MIN_BATTERY),
+                ..IDEAL
+            })
+            .is_ok()
+        );
         assert!(
             t2_may_run(MachineConditions {
                 idle_seconds: T2_MIN_IDLE_SECONDS,
@@ -2211,9 +2426,17 @@ mod tests {
     /// The reason reaches the log, so it has to name the thing that is wrong.
     #[test]
     fn the_block_reason_names_the_condition() {
-        let reason = t2_may_run(MachineConditions { on_ac: false, ..IDEAL }).unwrap_err();
+        let reason = t2_may_run(MachineConditions {
+            on_ac: false,
+            ..IDEAL
+        })
+        .unwrap_err();
         assert!(reason.contains("battery"), "{reason}");
-        let reason = t2_may_run(MachineConditions { idle_seconds: 3.0, ..IDEAL }).unwrap_err();
+        let reason = t2_may_run(MachineConditions {
+            idle_seconds: 3.0,
+            ..IDEAL
+        })
+        .unwrap_err();
         assert!(reason.contains("in use"), "{reason}");
     }
 
@@ -2267,7 +2490,10 @@ mod tests {
         let end = start + afterray_store::SLOT_DURATION_MS;
         let slots = [day_slot(start, SlotSummaryState::Degraded)];
 
-        assert!(due_slot_starts(&slots, end).is_empty(), "closed but not settled");
+        assert!(
+            due_slot_starts(&slots, end).is_empty(),
+            "closed but not settled"
+        );
         assert!(
             due_slot_starts(&slots, end + T2_SETTLE_MS - 1).is_empty(),
             "one millisecond short still counts as unsettled"
@@ -2626,8 +2852,8 @@ print(json.dumps({
                     captured,
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
             ids.push(moment.id);
         }
@@ -2973,8 +3199,8 @@ print(json.dumps({
                     moment.captured_at_ms,
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
         }
         eprintln!("imported {want} JPEG bytes into an isolated vault");
