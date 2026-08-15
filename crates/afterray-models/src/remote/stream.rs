@@ -265,6 +265,7 @@ fn json_text(value: Option<&Value>) -> Option<String> {
 mod tests {
     use super::*;
     use afterray_protocol::LlmProvider;
+    use crate::DEFAULT_OLLAMA_BASE_URL;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
@@ -380,28 +381,176 @@ mod tests {
         assert!(matches!(error, AdapterError::Cancelled));
     }
 
+    /// Tag to use when this machine has it. A preference, never a requirement:
+    /// see [`live_ollama_chat_model`] for why hardcoding one was the bug.
+    const PREFERRED_OLLAMA_TEST_MODEL: &str = "qwen3.6:35b-mlx";
+
+    /// A live Ollama chat model to run the streaming test against, or `None`
+    /// when this machine cannot run it.
+    ///
+    /// The old guard checked only that the server answered, then used a
+    /// hardcoded tag. That made the two skip-worthy states asymmetric:
+    /// "Ollama is not running" returned quietly, while "Ollama is running but
+    /// does not have this exact tag" was a hard failure — and the second is by
+    /// far the more common, because nothing makes any machine pull whichever
+    /// tag happened to be written here. Substituting a different hardcoded tag
+    /// would only move that failure.
+    ///
+    /// Selection, in order:
+    /// 1. `AFTERRAY_OLLAMA_TEST_MODEL`, so CI or another machine can pin one.
+    /// 2. [`PREFERRED_OLLAMA_TEST_MODEL`], if installed.
+    /// 3. Any installed model that serves `/api/chat`.
+    async fn live_ollama_chat_model(client: &reqwest::Client) -> Option<String> {
+        if let Ok(pinned) = std::env::var("AFTERRAY_OLLAMA_TEST_MODEL") {
+            let pinned = pinned.trim();
+            if !pinned.is_empty() {
+                return Some(pinned.to_owned());
+            }
+        }
+        let response = client
+            .get(format!("{DEFAULT_OLLAMA_BASE_URL}/api/tags"))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: Value = response.json().await.ok()?;
+        pick_ollama_chat_model(body.get("models")?.as_array()?)
+    }
+
+    /// The selection itself, over an `/api/tags` `models` array.
+    ///
+    /// Split out from the HTTP call so it stays covered on a machine with no
+    /// Ollama — which is most of them, and is exactly the machine where a
+    /// mistake here turns back into a hard failure.
+    fn pick_ollama_chat_model(models: &[Value]) -> Option<String> {
+        let installed: Vec<&str> = models
+            .iter()
+            .filter(|model| ollama_model_serves_chat(model))
+            .filter_map(|model| model.get("name").and_then(Value::as_str))
+            .collect();
+        installed
+            .iter()
+            .find(|name| **name == PREFERRED_OLLAMA_TEST_MODEL)
+            .or_else(|| installed.first())
+            .map(|name| (*name).to_owned())
+    }
+
+    /// Whether one `/api/tags` entry can answer `/api/chat`.
+    ///
+    /// Embedding models are excluded: they have no `/api/chat`, so picking one
+    /// would reproduce the same hard failure under a different name.
+    fn ollama_model_serves_chat(model: &Value) -> bool {
+        match model.get("capabilities").and_then(Value::as_array) {
+            Some(capabilities) => capabilities
+                .iter()
+                .any(|capability| capability.as_str() == Some("completion")),
+            // Older servers omit `capabilities`. Fall back to the name, which
+            // is what actually marks an embedding model in practice.
+            None => !model
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("embed"),
+        }
+    }
+
+    /// The real `/api/tags` payload from the machine this was fixed on, cut to
+    /// the fields that matter. `qwen3.6:latest` — the tag that used to be
+    /// hardcoded — is deliberately absent, because that is the whole point.
+    fn tags_fixture() -> Vec<Value> {
+        serde_json::from_str(
+            r#"[
+              {"name":"qwen3.5:4b","capabilities":["vision","completion","tools","thinking"]},
+              {"name":"nomic-embed-text:latest","capabilities":["embedding"]},
+              {"name":"qwen3.6:35b-mlx","capabilities":["completion","vision","thinking","tools"]},
+              {"name":"gemma4:latest","capabilities":["completion","tools","thinking"]}
+            ]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn model_choice_prefers_the_known_good_tag() {
+        assert_eq!(
+            pick_ollama_chat_model(&tags_fixture()).as_deref(),
+            Some(PREFERRED_OLLAMA_TEST_MODEL)
+        );
+    }
+
+    /// Without the preferred tag, any chat model will do. Hardcoding a second
+    /// tag here would only move the original failure.
+    #[test]
+    fn model_choice_falls_back_to_any_chat_model() {
+        let models: Vec<Value> = tags_fixture()
+            .into_iter()
+            .filter(|model| model["name"] != PREFERRED_OLLAMA_TEST_MODEL)
+            .collect();
+        assert_eq!(
+            pick_ollama_chat_model(&models).as_deref(),
+            Some("qwen3.5:4b")
+        );
+    }
+
+    /// An embedding model has no `/api/chat`. Choosing one would reproduce the
+    /// hard failure this guard exists to remove.
+    #[test]
+    fn model_choice_never_returns_an_embedding_model() {
+        let embedding_only: Vec<Value> = serde_json::from_str(
+            r#"[{"name":"nomic-embed-text:latest","capabilities":["embedding"]}]"#,
+        )
+        .unwrap();
+        assert_eq!(pick_ollama_chat_model(&embedding_only), None);
+        assert!(pick_ollama_chat_model(&[]).is_none());
+    }
+
+    /// Older servers omit `capabilities` entirely; the name is then the only
+    /// signal, and it must still keep embedding models out.
+    #[test]
+    fn model_choice_copes_with_a_server_that_reports_no_capabilities() {
+        let legacy: Vec<Value> =
+            serde_json::from_str(r#"[{"name":"nomic-embed-text:latest"},{"name":"llama3:8b"}]"#)
+                .unwrap();
+        assert_eq!(pick_ollama_chat_model(&legacy).as_deref(), Some("llama3:8b"));
+    }
+
     #[tokio::test]
     async fn live_ollama_streams_tokens_when_running() {
-        let client = reqwest::Client::builder()
+        let probe = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
             .build()
             .unwrap();
-        let ok = client
-            .get("http://127.0.0.1:11434/api/tags")
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false);
-        if !ok {
+        let Some(model) = live_ollama_chat_model(&probe).await else {
+            // Said out loud. This is the only check that the live Ollama
+            // `/api/chat` NDJSON parse works against a real server, and a test
+            // that skips silently forever is the same as no test at all.
+            eprintln!(
+                "skip: no live Ollama chat model on {DEFAULT_OLLAMA_BASE_URL} \
+                 (set AFTERRAY_OLLAMA_TEST_MODEL to pin one)"
+            );
             return;
-        }
+        };
+        eprintln!("live ollama /api/chat stream test using model `{model}`");
         let config = LlmRuntimeConfig {
             provider: LlmProvider::Ollama,
             base_url: String::new(),
-            model: "qwen3.6:latest".into(),
+            model,
             api_key: None,
         };
         let (tx, mut rx) = mpsc::channel(32);
+        // Drained concurrently, not afterwards. `push_delta` awaits on this
+        // bounded channel, so a model that emits more than 32 deltas would
+        // block forever against a receiver that only starts reading once the
+        // call returns — and no timeout covers a channel send. The daemon's own
+        // chat path already drains as it goes; only this test did not.
+        let collector = tokio::spawn(async move {
+            let mut tokens = Vec::new();
+            while let Some(token) = rx.recv().await {
+                tokens.push(token);
+            }
+            tokens
+        });
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(90))
@@ -417,10 +566,14 @@ mod tests {
         )
         .await
         .expect("ollama /api/chat stream");
-        let mut tokens = Vec::new();
-        while let Ok(token) = rx.try_recv() {
-            tokens.push(token);
-        }
+        // `generate_streaming` owns the sender, so returning closes the channel
+        // and the collector finishes on its own.
+        let tokens = collector.await.expect("token collector panicked");
+        eprintln!(
+            "live ollama stream: {} token delta(s), assembled {:?}",
+            tokens.len(),
+            text.trim()
+        );
         assert!(
             !tokens.is_empty(),
             "live Ollama should emit at least one token delta; assembled={text:?}"
