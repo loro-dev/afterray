@@ -59,17 +59,16 @@ const en = {
       date: 'Friday, Aug 14',
       hint: 'Drag to zoom · Swipe to travel · Esc to close',
       heardLabel: 'Heard',
-      // one continuous audio track for the day — the panel shows the lines
-      // nearest the playhead, whichever app happened to be in front
+      // speech only exists where there was a call, so every line sits inside
+      // one of the Zoom spans above — the panel appears and vanishes with them
       transcript: [
-        { pos: 0.05, time: '9:26 AM', who: 'Podcast', text: '…and that is why closed GOP matters for random access.' },
-        { pos: 0.16, time: '10:24 AM', who: 'You', text: 'So HEIF decode is the slow path. Note that down.' },
-        { pos: 0.33, time: '12:10 PM', who: 'Alex', text: 'The timeline zoom has to feel like a camera, not a scrollbar.' },
-        { pos: 0.41, time: '12:38 PM', who: 'Jo', text: 'Can we keep the playhead fixed and move the track underneath?' },
-        { pos: 0.56, time: '2:12 PM', who: 'You', text: 'Right — favorites are exempt, everything else is bounded.' },
-        { pos: 0.7, time: '3:20 PM', who: 'Alex', text: 'Favorites never expire. Everything else stays bounded.' },
-        { pos: 0.79, time: '3:58 PM', who: 'Chen', text: 'The spike is a duplicate copy in cold-still packing.' },
-        { pos: 0.93, time: '5:59 PM', who: 'You', text: 'Bench says HEIF forty-one milliseconds, JPEG sixty-three.' },
+        { pos: 0.35, time: '12:09 PM', who: 'Alex', text: 'The timeline zoom has to feel like a camera, not a scrollbar.' },
+        { pos: 0.39, time: '12:30 PM', who: 'Jo', text: 'Can we keep the playhead fixed and move the track underneath?' },
+        { pos: 0.42, time: '12:46 PM', who: 'You', text: 'Yes — that is the part that makes it feel like a camera.' },
+        { pos: 0.46, time: '1:08 PM', who: 'Alex', text: 'Then scrubbing only needs the poster frame. Settle can come after.' },
+        { pos: 0.755, time: '3:47 PM', who: 'Chen', text: 'The spike is a duplicate copy in cold-still packing.' },
+        { pos: 0.775, time: '3:58 PM', who: 'Alex', text: 'Favorites never expire. Everything else stays bounded.' },
+        { pos: 0.79, time: '4:06 PM', who: 'You', text: 'Bench says HEIF forty-one milliseconds, JPEG sixty-three.' },
       ],
       segments: [
         { app: 'Xcode', from: 0, to: 0.08, dur: '43m', c: '#ff5f4a' },
@@ -337,14 +336,13 @@ const zh: Copy = {
       hint: '拖动缩放 · 滑动穿梭 · Esc 关闭',
       heardLabel: '听到的',
       transcript: [
-        { pos: 0.05, time: '9:26', who: '播客', text: '……所以 closed GOP 对随机访问才这么关键。' },
-        { pos: 0.16, time: '10:24', who: '你', text: 'HEIF 解码是慢路径，记一下。' },
-        { pos: 0.33, time: '12:10', who: 'Alex', text: '时间线缩放要做得像相机运镜，而不是滚动条。' },
-        { pos: 0.41, time: '12:38', who: 'Jo', text: '能不能把播放头固定住，让轨道在下面滑？' },
-        { pos: 0.56, time: '14:12', who: '你', text: '对，收藏的豁免，其余的按上限来。' },
-        { pos: 0.7, time: '15:20', who: 'Alex', text: '收藏的永不过期，其余的自动限额。' },
-        { pos: 0.79, time: '15:58', who: 'Chen', text: '峰值是 cold-still 打包里的重复拷贝。' },
-        { pos: 0.93, time: '17:59', who: '你', text: 'bench 结果是 HEIF 41 毫秒，JPEG 63 毫秒。' },
+        { pos: 0.35, time: '12:09', who: 'Alex', text: '时间线缩放要做得像相机运镜，而不是滚动条。' },
+        { pos: 0.39, time: '12:30', who: 'Jo', text: '能不能把播放头固定住，让轨道在下面滑？' },
+        { pos: 0.42, time: '12:46', who: '你', text: '对，就是这一点让它像运镜。' },
+        { pos: 0.46, time: '13:08', who: 'Alex', text: '那拖动时只要出关键帧就行，落点之后再补。' },
+        { pos: 0.755, time: '15:47', who: 'Chen', text: '峰值是 cold-still 打包里的重复拷贝。' },
+        { pos: 0.775, time: '15:58', who: 'Alex', text: '收藏的永不过期，其余的自动限额。' },
+        { pos: 0.79, time: '16:06', who: '你', text: 'bench 结果是 HEIF 41 毫秒，JPEG 63 毫秒。' },
       ],
       segments: [
         { app: 'Xcode', from: 0, to: 0.08, dur: '43m', c: '#ff5f4a' },

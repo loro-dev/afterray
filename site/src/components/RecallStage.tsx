@@ -122,14 +122,20 @@ export default function RecallStage() {
     return best
   }, [pos, t.mock.records])
 
-  // the three transcript lines closest to the playhead, kept in clock order
+  // there is only speech to show while a call was running, so the panel is
+  // scoped to the meeting span under the playhead — never borrowed from another
   const heard = useMemo(() => {
-    const near = [...t.mock.transcript]
+    const call = t.mock.segments.find(
+      (s) => s.app === 'Zoom' && pos >= s.from && pos <= s.to,
+    )
+    if (!call) return []
+    const spoken = t.mock.transcript.filter((l) => l.pos >= call.from && l.pos <= call.to)
+    const near = [...spoken]
       .sort((a, b) => Math.abs(a.pos - pos) - Math.abs(b.pos - pos))
       .slice(0, 3)
     const current = near[0]
     return near.sort((a, b) => a.pos - b.pos).map((l) => ({ ...l, now: l === current }))
-  }, [pos, t.mock.transcript])
+  }, [pos, t.mock.segments, t.mock.transcript])
 
   // the track moves; the playhead stays dead center
   const trackW = stripW * ZOOM
@@ -154,32 +160,34 @@ export default function RecallStage() {
             {t.mock.searchHint}
           </div>
 
-          {/* what was on screen, beside what was being said at the same second */}
-          <div className="rc-body">
+          {/* what was on screen, and — during a call — what was being said */}
+          <div className={`rc-body${heard.length ? ' rc-body-split' : ''}`}>
             <div className="rc-window" key={rec.time}>
               <AppWindow rec={rec} />
             </div>
-            <aside className="rc-heard" aria-live="polite">
-              <div className="rc-heard-head mono">
-                <span className="rc-wave" aria-hidden="true">
-                  <i />
-                  <i />
-                  <i />
-                  <i />
-                </span>
-                {t.mock.heardLabel}
-              </div>
-              <ol className="rc-heard-lines">
-                {heard.map((l) => (
-                  <li key={l.time} className={l.now ? 'rc-heard-now' : ''}>
-                    <span className="rc-heard-meta mono">
-                      {l.time} · {l.who}
-                    </span>
-                    <p>{l.text}</p>
-                  </li>
-                ))}
-              </ol>
-            </aside>
+            {heard.length > 0 && (
+              <aside className="rc-heard" aria-live="polite">
+                <div className="rc-heard-head mono">
+                  <span className="rc-wave" aria-hidden="true">
+                    <i />
+                    <i />
+                    <i />
+                    <i />
+                  </span>
+                  {t.mock.heardLabel}
+                </div>
+                <ol className="rc-heard-lines">
+                  {heard.map((l) => (
+                    <li key={l.time} className={l.now ? 'rc-heard-now' : ''}>
+                      <span className="rc-heard-meta mono">
+                        {l.time} · {l.who}
+                      </span>
+                      <p>{l.text}</p>
+                    </li>
+                  ))}
+                </ol>
+              </aside>
+            )}
           </div>
 
           <div className="rc-cluster">

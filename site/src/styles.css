@@ -540,12 +540,20 @@ button:focus-visible {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 1.1rem;
   align-items: start;
 }
+/* the second column only exists while there was a call to transcribe */
+.rc-body-split {
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+}
 .rc-window {
   min-width: 0;
+}
+.rc-body:not(.rc-body-split) .rc-window {
+  max-width: 30rem;
+  margin-inline: auto;
 }
 /* a tall capture must not stretch the stage past its chrome */
 .rc-window .appwin-body {
@@ -1267,7 +1275,7 @@ button.sa-chip.sa-chip-active {
   .section {
     padding: 5rem 1.4rem;
   }
-  .rc-body {
+  .rc-body-split {
     grid-template-columns: 1fr;
     gap: 0.85rem;
   }
