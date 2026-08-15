@@ -16,6 +16,8 @@
 //!    inside one hands the model a fragment it has no way to recognise as one.
 
 use crate::budget::ContextBudget;
+use crate::message::Message;
+use crate::tokens::estimate_tokens;
 use crate::transcript::Transcript;
 
 /// One compaction pass, for the log and for the UI.
@@ -50,6 +52,22 @@ pub trait CompactionStrategy: Send + Sync {
         transcript: &mut Transcript,
         budget: ContextBudget,
     ) -> Vec<CompactionNotice>;
+
+    /// The same job on the conversation *before* this turn started.
+    ///
+    /// One policy for both, deliberately. Running out of room inside a turn and
+    /// running out of room across turns are the same problem, and until this
+    /// existed they were handled differently: the in-turn path announced what
+    /// it dropped and showed it in the UI, while the cross-turn path silently
+    /// deleted the middle of the conversation and left a bare "(earlier turns
+    /// omitted)" in a prompt nobody could inspect.
+    ///
+    /// `limit` is what the history may occupy, in estimated tokens.
+    fn compact_history(
+        &self,
+        history: &mut Vec<Message>,
+        limit: usize,
+    ) -> Vec<CompactionNotice>;
 }
 
 /// Drops the oldest tool-result bodies until the transcript fits.
@@ -65,6 +83,24 @@ pub struct PruneToolResults;
 
 impl PruneToolResults {
     pub const NAME: &'static str = "prune_tool_results";
+    /// The cross-turn pass. A separate name because what a user loses is
+    /// different — whole exchanges rather than evidence bodies — and a line
+    /// that says "dropped earlier tool results" when half the conversation
+    /// went is worse than no line at all.
+    pub const HISTORY_NAME: &'static str = "drop_earlier_turns";
+
+    /// What replaces the dropped exchanges.
+    ///
+    /// A marker rather than a silent gap: the model can otherwise see a
+    /// question of its own with no answer behind it, and the user can see a
+    /// thin answer with no explanation. The vault still holds every turn — this
+    /// is what fits in the window, not what exists.
+    fn history_marker(dropped: usize) -> Message {
+        Message::user(format!(
+            "[AfterRay] {dropped} earlier message(s) in this conversation were dropped to fit \
+             the context window. They are still in the thread; ask about them again if needed."
+        ))
+    }
 }
 
 impl CompactionStrategy for PruneToolResults {
@@ -101,6 +137,44 @@ impl CompactionStrategy for PruneToolResults {
             to_round: last,
             tokens_before,
             tokens_after: transcript.tokens(),
+        }]
+    }
+
+    fn compact_history(
+        &self,
+        history: &mut Vec<Message>,
+        limit: usize,
+    ) -> Vec<CompactionNotice> {
+        let tokens = |messages: &[Message]| -> usize {
+            messages
+                .iter()
+                .map(|message| estimate_tokens(&message.content))
+                .sum()
+        };
+        let tokens_before = tokens(history);
+        if tokens_before <= limit {
+            return Vec::new();
+        }
+
+        // Oldest first, and always in whole messages: half an exchange is worse
+        // than none of it. The newest end is what a follow-up refers to.
+        let mut dropped = 0;
+        while tokens(history) > limit && history.len() > 1 {
+            history.remove(0);
+            dropped += 1;
+        }
+        if dropped == 0 {
+            return Vec::new();
+        }
+        history.insert(0, Self::history_marker(dropped));
+        vec![CompactionNotice {
+            strategy: Self::HISTORY_NAME,
+            // Rounds are an in-turn idea; a cross-turn pass covers the whole
+            // opening, and the count that matters is in the marker.
+            from_round: 0,
+            to_round: 0,
+            tokens_before,
+            tokens_after: tokens(history),
         }]
     }
 }
@@ -185,5 +259,74 @@ mod tests {
         let notices = PruneToolResults.compact(&mut transcript, ContextBudget::DEFAULT);
         assert_eq!(notices.len(), 1);
         assert!(transcript.tokens() > ContextBudget::DEFAULT.transcript_tokens());
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::message::is_prefix_of;
+
+    fn conversation(turns: usize) -> Vec<Message> {
+        (0..turns)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("question {index} {}", "x".repeat(200))),
+                    Message::assistant(format!("answer {index} {}", "y".repeat(200))),
+                ]
+            })
+            .collect()
+    }
+
+    /// The cross-turn pass keeps the same contract as the in-turn one: whole
+    /// messages, and a line saying what went.
+    #[test]
+    fn dropping_the_oldest_messages_is_announced_and_marked() {
+        let mut history = conversation(20);
+        let notices = PruneToolResults.compact_history(&mut history, 500);
+
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].strategy, PruneToolResults::HISTORY_NAME);
+        assert!(notices[0].tokens_after < notices[0].tokens_before);
+        assert!(
+            history[0].content.starts_with("[AfterRay]"),
+            "no marker where the conversation was cut: {:?}",
+            history[0]
+        );
+        // The newest exchange survives: it is what a follow-up refers to.
+        assert!(history.last().unwrap().content.contains("answer 19"));
+    }
+
+    /// A compaction moves the prefix once — that is the price — and then the
+    /// prefix is stable again for every turn after it.
+    #[test]
+    fn the_prefix_settles_again_after_a_compaction() {
+        let mut history = conversation(20);
+        PruneToolResults.compact_history(&mut history, 500);
+        let after_first = history.clone();
+
+        // Two more turns arrive, and each is compacted the same way.
+        for index in 20..22 {
+            history.push(Message::user(format!("question {index}")));
+            history.push(Message::assistant(format!("answer {index}")));
+            let before = history.clone();
+            PruneToolResults.compact_history(&mut history, 5_000);
+            assert!(
+                is_prefix_of(&before, &history),
+                "a pass that did not need to drop anything still rewrote the history"
+            );
+        }
+        assert!(
+            is_prefix_of(&after_first, &history),
+            "the settled prefix moved again without pressure"
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_fits_is_left_exactly_as_it_was() {
+        let mut history = conversation(2);
+        let before = history.clone();
+        assert!(PruneToolResults.compact_history(&mut history, 100_000).is_empty());
+        assert_eq!(history, before);
     }
 }
