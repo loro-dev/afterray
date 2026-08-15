@@ -6,7 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+afterray-agent = { path = "../afterray-agent" }
 afterray-codec = { path = "../afterray-codec" }
+afterray-harness = { path = "../afterray-harness" }
 afterray-models = { path = "../afterray-models" }
 afterray-platform-macos = { path = "../afterray-platform-macos" }
 afterray-protocol = { path = "../afterray-protocol" }

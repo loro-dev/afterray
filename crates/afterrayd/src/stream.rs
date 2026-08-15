@@ -1,19 +1,21 @@
 //! NDJSON chat stream. Kept out of `main` so task A can keep editing dispatch
 //! without merging a large streaming loop.
 
-use afterray_models::{JobState, LlmTokenSink, ModelInput, ModelOutput, ModelQueue, QueueError};
+use afterray_agent::QueueModel;
+use afterray_harness::{
+    ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError, ModelError, PruneToolResults,
+    run_turn,
+};
+use afterray_models::{JobPriority, LlmTokenSink, ModelQueue};
 use afterray_protocol::{ChatStreamEvent, ConversationMessage, local_calendar_day_bounds_ms};
 use afterray_store::Vault;
 use chrono::Local;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::mpsc;
 
-use crate::agent::{AgentError, fence_untrusted};
-use crate::budget::ContextBudget;
+use crate::agent::AgentError;
 use crate::tools::{ToolHost, tool_catalog_text};
-use crate::transcript::Transcript;
 
 const FOLD_CHAR_CAP: usize = 8_000;
 const RECENT_TURNS: usize = 6;
@@ -60,7 +62,7 @@ pub(crate) async fn run_chat_stream<W>(
     message: &str,
 ) -> anyhow::Result<()>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send,
 {
     if message.trim().is_empty() {
         return write_event(
@@ -168,13 +170,70 @@ struct ToolLogEntry {
     chars: usize,
 }
 
-async fn run_agent<W: AsyncWrite + Unpin>(
+/// Turns harness events into NDJSON lines on the client's socket, and keeps
+/// the tool log the assistant message is stored with.
+struct StreamSink<'w, W> {
+    write: &'w mut W,
+    tool_log: Vec<ToolLogEntry>,
+}
+
+impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, W> {
+    async fn emit(&mut self, event: HarnessEvent) -> Result<(), String> {
+        let wire = match event {
+            HarnessEvent::ToolCall { name, args } => {
+                self.tool_log.push(ToolLogEntry {
+                    name: name.clone(),
+                    args: args.clone(),
+                    chars: 0,
+                });
+                ChatStreamEvent::ToolCall { name, args }
+            }
+            HarnessEvent::ToolResult { name, chars, .. } => {
+                if let Some(entry) = self
+                    .tool_log
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.name == name && entry.chars == 0)
+                {
+                    entry.chars = chars;
+                }
+                ChatStreamEvent::ToolResult { name, chars }
+            }
+            HarnessEvent::Token { text } => ChatStreamEvent::Token { text },
+            // Not on the wire yet; the log is where context pressure is
+            // visible until the app learns to render it.
+            HarnessEvent::Usage {
+                prompt_tokens,
+                window_tokens,
+                round,
+            } => {
+                eprintln!("chat.usage round={round} prompt_tokens={prompt_tokens} window_tokens={window_tokens}");
+                return Ok(());
+            }
+            HarnessEvent::Compaction(notice) => {
+                eprintln!(
+                    "chat.compaction strategy={} rounds={}..={} tokens={}->{}",
+                    notice.strategy,
+                    notice.from_round,
+                    notice.to_round,
+                    notice.tokens_before,
+                    notice.tokens_after
+                );
+                return Ok(());
+            }
+        };
+        write_event(self.write, &wire)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn run_agent<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     ctx: &ChatStreamCtx<'_>,
     user: &str,
 ) -> Result<(String, Vec<ToolLogEntry>), String> {
     let budget = ContextBudget::DEFAULT;
-    let mut transcript = Transcript::new(format!("{user}\n"), fence_untrusted);
     let system = format!("{SYSTEM_PROMPT}\n\n{}", tool_catalog_text());
     let host = ToolHost {
         store: ctx.store,
@@ -182,184 +241,33 @@ async fn run_agent<W: AsyncWrite + Unpin>(
         now_ms: ctx.now_ms,
         budget,
     };
-    let mut tool_log = Vec::new();
-
-    for round in 0..budget.max_rounds {
-        for entry in transcript.fit(budget) {
-            eprintln!(
-                "chat.compaction round={} tool={} tokens_freed={}",
-                entry.round, entry.tool, entry.tokens_freed
-            );
-        }
-        let prompt = transcript.render();
-        // Context pressure used to be invisible from every angle. At minimum
-        // it belongs in the log; the `usage` stream event carries it to the app.
-        eprintln!(
-            "chat.usage round={} prompt_tokens={} window_tokens={} results_held={}",
-            round + 1,
-            transcript.tokens(),
-            budget.window_tokens,
-            transcript.rounds().iter().filter(|entry| !entry.pruned).count(),
-        );
-        let (text, mut gate) =
-            generate_round(write, ctx.models, ctx.token_sink, &prompt, &system).await?;
-
-        if let Some(answer) = parse_final(&text) {
-            emit_leftover(write, &mut gate, &answer).await?;
-            return Ok((answer, tool_log));
-        }
-        if let Some((name, args)) = parse_tool_call(&text) {
-            write_event(
-                write,
-                &ChatStreamEvent::ToolCall {
-                    name: name.clone(),
-                    args: args.clone(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            let result = match host.invoke(&name, &args).await {
-                Ok(result) => result,
-                Err(error) => crate::truncate::Budgeted::verbatim(format!("ERROR: {error}")),
-            };
-            let chars = result.text.chars().count();
-            write_event(
-                write,
-                &ChatStreamEvent::ToolResult {
-                    name: name.clone(),
-                    chars,
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            tool_log.push(ToolLogEntry {
-                name: name.clone(),
-                args: args.clone(),
-                chars,
-            });
-            let last_round = round + 1 == budget.max_rounds;
-            let body = result.text.clone();
-            transcript.push(name.clone(), args, result);
-            if last_round {
-                let answer = format!(
-                    "I reached the tool limit before finishing. Last tool `{name}` returned:\n{body}"
-                );
-                write_event(
-                    write,
-                    &ChatStreamEvent::Token {
-                        text: answer.clone(),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                return Ok((answer, tool_log));
-            }
-            continue;
-        }
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Err("model returned empty output".into());
-        }
-        emit_leftover(write, &mut gate, trimmed).await?;
-        return Ok((trimmed.to_owned(), tool_log));
-    }
-    Err("agent loop exhausted".into())
-}
-
-async fn emit_leftover<W: AsyncWrite + Unpin>(
-    write: &mut W,
-    gate: &mut AnswerGate,
-    answer: &str,
-) -> Result<(), String> {
-    if let Some(text) = gate.leftover_answer(answer) {
-        write_event(write, &ChatStreamEvent::Token { text })
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-async fn generate_round<W: AsyncWrite + Unpin>(
-    write: &mut W,
-    models: &ModelQueue,
-    sink: &LlmTokenSink,
-    prompt: &str,
-    system: &str,
-) -> Result<(String, AnswerGate), String> {
-    let (tx, mut rx) = mpsc::channel(64);
-    let guard = sink.install(tx);
-    let job_id = match models
-        .submit(ModelInput::Llm {
-            prompt: prompt.to_owned(),
-            system: Some(system.to_owned()),
-        })
-        .await
-    {
-        Ok(id) => id,
-        Err(QueueError::MissingAdapter(_)) => {
-            return Err(AgentError::MissingModel.to_string());
-        }
-        Err(error) => return Err(error.to_string()),
+    let model = QueueModel {
+        models: ctx.models,
+        priority: JobPriority::Interactive,
+        token_sink: Some(ctx.token_sink),
     };
-
-    let mut gate = AnswerGate::default();
-    let wait = models.wait(&job_id);
-    tokio::pin!(wait);
-    let mut tokens_open = true;
-    let snapshot = loop {
-        tokio::select! {
-            result = &mut wait => break result.map_err(|error| error.to_string())?,
-            token = rx.recv(), if tokens_open => {
-                match token {
-                    Some(delta) => {
-                        emit_gate_tokens(write, models, &job_id, &mut gate, &delta).await?;
-                    }
-                    None => tokens_open = false,
-                }
-            }
-        }
+    let strategy = PruneToolResults;
+    let mut sink = StreamSink {
+        write,
+        tool_log: Vec::new(),
     };
-    drop(guard);
-    while let Ok(delta) = rx.try_recv() {
-        emit_gate_tokens(write, models, &job_id, &mut gate, &delta).await?;
-    }
-
-    if snapshot.state != JobState::Done {
-        let error = snapshot
-            .last_error
-            .unwrap_or_else(|| format!("llm job ended as {:?}", snapshot.state));
-        return Err(classify_model_error(&error));
-    }
-    match snapshot.output {
-        Some(ModelOutput::Llm { text }) if !text.trim().is_empty() => Ok((text, gate)),
-        Some(ModelOutput::Llm { .. }) => Err("empty llm text".into()),
-        _ => Err("wrong llm output type".into()),
-    }
-}
-
-async fn emit_gate_tokens<W: AsyncWrite + Unpin>(
-    write: &mut W,
-    models: &ModelQueue,
-    job_id: &str,
-    gate: &mut AnswerGate,
-    delta: &str,
-) -> Result<(), String> {
-    for text in gate.push(delta) {
-        if let Err(error) = write_event(write, &ChatStreamEvent::Token { text }).await {
-            let _ = models.cancel(job_id).await;
-            return Err(error.to_string());
-        }
-    }
-    Ok(())
-}
-
-fn classify_model_error(error: &str) -> String {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("missing") || lower.contains("not configured") {
-        AgentError::MissingModel.to_string()
-    } else {
-        error.to_owned()
-    }
+    let turn = run_turn(
+        &model,
+        &host,
+        &mut sink,
+        &LoopConfig {
+            budget,
+            compaction: Some(&strategy),
+        },
+        &system,
+        format!("{user}\n"),
+    )
+    .await
+    .map_err(|error| match error {
+        LoopError::Model(ModelError::Missing) => AgentError::MissingModel.to_string(),
+        other => other.to_string(),
+    })?;
+    Ok((turn.answer, sink.tool_log))
 }
 
 async fn write_event<W: AsyncWrite + Unpin>(
@@ -507,160 +415,6 @@ fn build_user_prompt(seed: &str, history: &str, message: &str) -> String {
     body
 }
 
-/// Holds token deltas until we know they are the user-visible answer.
-/// TOOL/ARGS drafts must not leak into the client event stream.
-#[derive(Debug, Default)]
-struct AnswerGate {
-    buf: String,
-    state: GateState,
-    emitted: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum GateState {
-    #[default]
-    Unknown,
-    Answer,
-    Hidden,
-}
-
-impl AnswerGate {
-    fn push(&mut self, delta: &str) -> Vec<String> {
-        match self.state {
-            GateState::Hidden => Vec::new(),
-            GateState::Answer => {
-                if delta.is_empty() {
-                    Vec::new()
-                } else {
-                    self.emitted = true;
-                    vec![delta.to_owned()]
-                }
-            }
-            GateState::Unknown => {
-                self.buf.push_str(delta);
-                self.classify()
-            }
-        }
-    }
-
-    fn leftover_answer(&mut self, parsed: &str) -> Option<String> {
-        if self.emitted || self.state == GateState::Hidden || parsed.is_empty() {
-            None
-        } else {
-            Some(parsed.to_owned())
-        }
-    }
-
-    fn classify(&mut self) -> Vec<String> {
-        let trimmed = self.buf.trim_start();
-        let upper = trimmed.to_ascii_uppercase();
-        if is_open_prefix("FINAL", &upper) || is_open_prefix("TOOL", &upper) {
-            return Vec::new();
-        }
-        if let Some(body) = strip_final_prefix(trimmed) {
-            self.state = GateState::Answer;
-            self.buf.clear();
-            if body.is_empty() {
-                return Vec::new();
-            }
-            self.emitted = true;
-            return vec![body];
-        }
-        if first_line_is_tool(trimmed) {
-            self.state = GateState::Hidden;
-            self.buf.clear();
-            return Vec::new();
-        }
-        self.state = GateState::Answer;
-        let body = std::mem::take(&mut self.buf);
-        if body.is_empty() {
-            return Vec::new();
-        }
-        self.emitted = true;
-        vec![body]
-    }
-}
-
-fn is_open_prefix(word: &str, upper: &str) -> bool {
-    upper.is_empty() || (word.starts_with(upper) && upper.len() < word.len())
-}
-
-fn strip_final_prefix(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    let rest = upper.strip_prefix("FINAL")?;
-    let original_rest = &trimmed[trimmed.len() - rest.len()..];
-    Some(
-        original_rest
-            .trim_start_matches([':', ' ', '\n', '\r', '\t'])
-            .to_owned(),
-    )
-}
-
-fn first_line_is_tool(text: &str) -> bool {
-    text.trim_start()
-        .lines()
-        .next()
-        .is_some_and(|line| line.trim().to_ascii_uppercase().starts_with("TOOL"))
-}
-
-fn parse_final(text: &str) -> Option<String> {
-    let body = strip_final_prefix(text)?;
-    if body.is_empty() { None } else { Some(body) }
-}
-
-fn parse_tool_call(text: &str) -> Option<(String, Value)> {
-    let trimmed = text.trim();
-    let mut name: Option<String> = None;
-    let mut args_raw: Option<String> = None;
-    for line in trimmed.lines() {
-        let line = line.trim();
-        let upper = line.to_ascii_uppercase();
-        if let Some(rest) = upper.strip_prefix("TOOL") {
-            let original = line[line.len() - rest.len()..].trim_start_matches([':', ' ', '\t']);
-            if !original.is_empty() {
-                name = Some(original.to_owned());
-            }
-        } else if let Some(rest) = upper.strip_prefix("ARGS") {
-            let original = line[line.len() - rest.len()..].trim_start_matches([':', ' ', '\t']);
-            args_raw = Some(original.to_owned());
-        }
-    }
-    if args_raw.is_none() {
-        if let Some(pos) = trimmed.to_ascii_uppercase().find("ARGS") {
-            let after = &trimmed[pos + 4..];
-            let after = after.trim_start_matches([':', ' ', '\n', '\r', '\t']);
-            if after.starts_with('{') {
-                args_raw = Some(after.to_owned());
-            }
-        }
-    }
-    let name = name?;
-    let args_raw = args_raw.unwrap_or_else(|| "{}".to_owned());
-    let json_slice = extract_json_object(&args_raw).unwrap_or(args_raw.as_str());
-    let args = serde_json::from_str(json_slice)
-        .unwrap_or_else(|_| Value::Object(serde_json::Map::default()));
-    Some((name, args))
-}
-
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0i32;
-    for (idx, ch) in text[start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=start + idx]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,7 +422,6 @@ mod tests {
         ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig, QueueConfig,
     };
     use afterray_store::VaultConfig;
-    use serde_json::json;
     use std::sync::Arc;
 
     fn test_vault() -> (tempfile::TempDir, Vault) {
@@ -732,27 +485,7 @@ mod tests {
         assert!(!folded.contains("msg2"), "{folded}");
     }
 
-    #[test]
-    fn gate_hides_tool_drafts_and_streams_final() {
-        let mut gate = AnswerGate::default();
-        assert!(gate.push("TO").is_empty());
-        assert!(gate.push("OL list_activity\nARGS {}").is_empty());
-        assert_eq!(gate.state, GateState::Hidden);
-        assert!(gate.leftover_answer("ignored").is_none());
 
-        let mut answer = AnswerGate::default();
-        assert!(answer.push("FI").is_empty());
-        assert_eq!(answer.push("NAL\n你今天"), ["你今天"]);
-        assert_eq!(answer.push("下午"), ["下午"]);
-        assert!(answer.leftover_answer("你今天下午").is_none());
-    }
-
-    #[test]
-    fn gate_treats_bare_prose_as_the_answer() {
-        let mut gate = AnswerGate::default();
-        assert_eq!(gate.push("You used Safari."), ["You used Safari."]);
-        assert!(gate.leftover_answer("You used Safari.").is_none());
-    }
 
     #[tokio::test]
     async fn empty_message_is_an_error_event() {
@@ -945,14 +678,4 @@ print(json.dumps({
         ));
     }
 
-    #[test]
-    fn parse_helpers_match_agent_schema() {
-        assert_eq!(
-            parse_final("FINAL\nYou used Safari.").as_deref(),
-            Some("You used Safari.")
-        );
-        let (name, args) = parse_tool_call("TOOL get_ocr\nARGS {\"moment_id\":\"m1\"}\n").unwrap();
-        assert_eq!(name, "get_ocr");
-        assert_eq!(args, json!({"moment_id":"m1"}));
-    }
 }

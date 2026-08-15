@@ -1,14 +1,10 @@
 mod agent;
 mod ask;
-mod budget;
 mod chat;
 mod gop_packer;
 mod memory;
 mod stream;
-mod tokens;
 mod tools;
-mod transcript;
-mod truncate;
 
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
@@ -1965,21 +1961,30 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         store: &state.store,
         card: &inputs.card,
     };
-    let turn = agent::run_agent_loop(
-        &state.models,
-        &tools,
-        inputs.system,
-        &inputs.user,
-        agent::AgentLoopConfig {
-            budget: budget::ContextBudget {
-                max_rounds: T2_MAX_ROUNDS,
-                ..budget::ContextBudget::DEFAULT
-            },
-            prune: false,
-            priority: afterray_models::JobPriority::Background {
-                lease: Some(lease_hold.id()),
-            },
+    let model = afterray_agent::QueueModel {
+        models: &state.models,
+        priority: afterray_models::JobPriority::Background {
+            lease: Some(lease_hold.id()),
         },
+        token_sink: None,
+    };
+    let turn = afterray_harness::run_turn(
+        &model,
+        &tools,
+        &mut afterray_harness::Discard,
+        &afterray_harness::LoopConfig {
+            budget: afterray_harness::ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..afterray_harness::ContextBudget::DEFAULT
+            },
+            // Append-only. A prefix-caching runtime re-prefills only each
+            // round's delta, and rewriting an earlier round would invalidate
+            // the whole cached prefix. The prompt is built from one slot's
+            // card, so it is bounded by construction.
+            compaction: None,
+        },
+        inputs.system,
+        format!("User task:\n{}\n", inputs.user),
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -2568,12 +2573,12 @@ impl SlotT2Tools<'_> {
     }
 }
 
-impl agent::ToolSurface for SlotT2Tools<'_> {
+impl afterray_harness::ToolSurface for SlotT2Tools<'_> {
     async fn invoke(
         &self,
         name: &str,
         args: &serde_json::Value,
-    ) -> Result<truncate::Budgeted, String> {
+    ) -> Result<afterray_harness::Budgeted, String> {
         let text = match name {
             "get_run_text" => self.get_run_text(args),
             "get_transcript" => self.get_transcript(),
@@ -2585,7 +2590,7 @@ impl agent::ToolSurface for SlotT2Tools<'_> {
         }?;
         // These tools already page themselves against `T2_TOOL_PAGE_CHARS`, so
         // there is nothing left for a second budget to cut.
-        Ok(truncate::Budgeted::verbatim(text))
+        Ok(afterray_harness::Budgeted::verbatim(text))
     }
 }
 

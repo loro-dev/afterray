@@ -1,0 +1,23 @@
+[package]
+name = "afterray-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Deliberately depends on no afterray crate. The harness knows about tokens,
+# transcripts and a tool-calling wire format; it must not learn about vaults,
+# moments or model queues. If this list ever grows an `afterray-*` line, the
+# separation has been lost.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Only the pieces the loop needs: a channel for token deltas and `select!` to
+# drain it while a round is still generating. No runtime, no I/O.
+tokio = { version = "1.49", default-features = false, features = ["macros", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

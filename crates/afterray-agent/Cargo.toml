@@ -1,0 +1,17 @@
+[package]
+name = "afterray-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+afterray-harness = { path = "../afterray-harness" }
+afterray-models = { path = "../afterray-models" }
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

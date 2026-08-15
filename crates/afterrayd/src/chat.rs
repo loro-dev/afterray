@@ -10,8 +10,10 @@ use chrono::Local;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::agent::{self, ToolCallRecord, fence_untrusted};
-use crate::budget::ContextBudget;
+use afterray_harness::ToolCallRecord;
+
+use crate::agent::{self, fence_untrusted};
+use afterray_harness::ContextBudget;
 use crate::tools::ToolHost;
 
 const TITLE_MAX_CHARS: usize = 24;
@@ -90,11 +92,11 @@ pub(crate) async fn handle_send(
     match agent::run_readonly_agent_traced(models, &host, CHAT_SYSTEM_PROMPT, &user).await {
         Ok(turn) => {
             eprintln!(
-                "chat.usage rounds={} prompt_tokens={} window_tokens={} pruned={}",
+                "chat.usage rounds={} prompt_tokens={} window_tokens={} compactions={}",
                 turn.usage.rounds,
                 turn.usage.prompt_tokens,
                 turn.usage.window_tokens,
-                turn.pruned.len(),
+                turn.compactions.len(),
             );
             let tool_log = serialize_tool_log(&turn.tool_calls);
             persist_reply(

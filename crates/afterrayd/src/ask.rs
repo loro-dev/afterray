@@ -8,7 +8,7 @@ use chrono::Local;
 use std::fmt::Write as _;
 
 use crate::agent;
-use crate::budget::ContextBudget;
+use afterray_harness::ContextBudget;
 use crate::search_hits;
 use crate::tools::ToolHost;
 

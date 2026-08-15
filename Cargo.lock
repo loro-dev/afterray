@@ -13,6 +13,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "afterray-agent"
+version = "0.0.1"
+dependencies = [
+ "afterray-harness",
+ "afterray-models",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "afterray-cli"
 version = "0.0.1"
 dependencies = [
@@ -44,6 +54,15 @@ dependencies = [
  "async-trait",
  "serde",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "afterray-harness"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -135,7 +154,9 @@ dependencies = [
 name = "afterrayd"
 version = "0.0.1"
 dependencies = [
+ "afterray-agent",
  "afterray-codec",
+ "afterray-harness",
  "afterray-models",
  "afterray-platform-macos",
  "afterray-protocol",

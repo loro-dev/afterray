@@ -13,7 +13,6 @@
 use serde_json::Value;
 use std::fmt::Write as _;
 
-use crate::budget::ContextBudget;
 use crate::tokens::estimate_tokens;
 use crate::truncate::Budgeted;
 
@@ -104,43 +103,39 @@ impl Transcript {
         estimate_tokens(&self.render())
     }
 
-    /// Drops the oldest un-pruned bodies until the render fits `budget`.
+    /// The oldest round whose body is still present, if any.
+    #[must_use]
+    pub fn oldest_intact(&self) -> Option<usize> {
+        self.rounds.iter().position(|round| !round.pruned)
+    }
+
+    /// Drops one round's body, returning what that freed.
     ///
-    /// Oldest first because the most recent result is the one the model is
-    /// reasoning about right now. The opening is never touched.
-    ///
-    /// Returns what went, so the caller can report it. An empty result means
-    /// the transcript already fitted — or that nothing is left to drop, which
-    /// is possible and is not an error: the loop's round cap bounds how bad
-    /// that can get, and the answer is still better than a mid-JSON cut.
-    pub fn fit(&mut self, budget: ContextBudget) -> Vec<Pruned> {
-        let limit = budget.transcript_tokens();
-        let mut pruned = Vec::new();
-        while estimate_tokens(&self.render()) > limit {
-            let Some(index) = self.rounds.iter().position(|round| !round.pruned) else {
-                break;
-            };
-            let freed = estimate_tokens(&self.rounds[index].result.text);
-            self.rounds[index].pruned = true;
-            pruned.push(Pruned {
-                round: index,
-                tool: self.rounds[index].name.clone(),
-                tokens_freed: freed,
-            });
+    /// `None` if the index is out of range or the body has already gone. The
+    /// call and its arguments are untouched by design — see the module note.
+    pub fn prune_round(&mut self, index: usize) -> Option<Pruned> {
+        let round = self.rounds.get_mut(index)?;
+        if round.pruned {
+            return None;
         }
-        pruned
+        round.pruned = true;
+        Some(Pruned {
+            round: index,
+            tool: round.name.clone(),
+            tokens_freed: estimate_tokens(&round.result.text),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::fence_untrusted;
+    use crate::fence::untrusted;
     use crate::truncate::truncate_head;
     use serde_json::json;
 
     fn transcript() -> Transcript {
-        Transcript::new("User task:\nwhat did I do\n".to_owned(), fence_untrusted)
+        Transcript::new("User task:\nwhat did I do\n".to_owned(), untrusted)
     }
 
     fn result(text: &str) -> Budgeted {
@@ -163,75 +158,61 @@ mod tests {
         assert!(rendered.contains("\"app\":\"Zed\""));
     }
 
-    /// The bug: a character cut used to land inside a result. Now the unit is
-    /// the whole body, and a JSON object is either wholly present or wholly
-    /// gone.
+    /// The unit of removal is the whole body. A JSON object is either wholly
+    /// present or wholly gone — never the half a character cut used to leave.
     #[test]
-    fn pruning_drops_whole_bodies_never_half_of_one() {
+    fn pruning_drops_a_whole_body_and_keeps_the_call() {
         let mut transcript = transcript();
-        for index in 0..6 {
-            transcript.push(
-                "get_slot_card".to_owned(),
-                json!({ "at_ms": index }),
-                result(&format!("{{\"slot\": {index}, \"text\": \"{}\"}}", "x".repeat(20_000))),
-            );
-        }
-        let budget = ContextBudget::DEFAULT;
-        let pruned = transcript.fit(budget);
+        transcript.push(
+            "get_slot_card".to_owned(),
+            json!({"at_ms": 7}),
+            result("{\"slot\": 7, \"text\": \"long\"}"),
+        );
+        assert_eq!(transcript.oldest_intact(), Some(0));
 
-        assert!(!pruned.is_empty());
-        assert!(transcript.tokens() <= budget.transcript_tokens());
+        let pruned = transcript.prune_round(0).expect("a body to drop");
+        assert_eq!(pruned.round, 0);
+        assert_eq!(pruned.tool, "get_slot_card");
+        assert!(pruned.tokens_freed > 0);
+        assert_eq!(transcript.oldest_intact(), None);
+
         let rendered = transcript.render();
-        // Every surviving body is complete JSON: it closes.
-        for round in transcript.rounds().iter().filter(|round| !round.pruned) {
-            assert!(round.result.text.ends_with("\"}"), "{}", round.result.text);
-        }
+        assert!(rendered.contains(r#"ARGS {"at_ms":7}"#), "the call must survive");
         assert!(rendered.contains("dropped to make room"));
-    }
-
-    /// Oldest first, and the call itself survives so the model does not repeat
-    /// the lookup it has already paid for.
-    #[test]
-    fn pruning_takes_the_oldest_and_keeps_the_call_visible() {
-        let mut transcript = transcript();
-        for index in 0..4 {
-            transcript.push(
-                "search_evidence".to_owned(),
-                json!({ "query": format!("q{index}") }),
-                result(&"y".repeat(20_000)),
-            );
-        }
-        let pruned = transcript.fit(ContextBudget::DEFAULT);
-        assert_eq!(pruned.first().map(|entry| entry.round), Some(0));
-        assert!(pruned.iter().all(|entry| entry.tokens_freed > 0));
-
-        let rendered = transcript.render();
-        assert!(rendered.contains(r#""query":"q0""#), "the call must survive");
-        assert!(transcript.rounds()[0].pruned);
+        assert!(!rendered.contains("\"slot\": 7"));
     }
 
     #[test]
-    fn a_transcript_that_fits_is_left_alone() {
+    fn pruning_the_same_round_twice_is_a_no_op() {
         let mut transcript = transcript();
-        transcript.push("get_now".to_owned(), json!({}), result("{\"now_ms\":1}"));
-        let before = transcript.render();
-        assert!(transcript.fit(ContextBudget::DEFAULT).is_empty());
-        assert_eq!(transcript.render(), before);
+        transcript.push("get_now".to_owned(), json!({}), result("{}"));
+        assert!(transcript.prune_round(0).is_some());
+        assert!(transcript.prune_round(0).is_none());
+        assert!(transcript.prune_round(99).is_none());
     }
 
-    /// The opening carries the clock anchors and the question. Even when every
-    /// body has gone, it stays.
+    /// The opening carries the clock anchors and the question. Even with every
+    /// body gone, it stays.
     #[test]
     fn the_opening_survives_total_pruning() {
-        let mut transcript = Transcript::new("User task:\nnow_ms=17867\n".to_owned(), fence_untrusted);
+        let mut transcript = Transcript::new("User task:\nnow_ms=17867\n".to_owned(), untrusted);
         for index in 0..3 {
             transcript.push(
                 "get_ocr".to_owned(),
                 json!({ "moment_id": index }),
-                result(&"z".repeat(200_000)),
+                result("body"),
             );
+            transcript.prune_round(index);
         }
-        transcript.fit(ContextBudget::DEFAULT);
         assert!(transcript.render().contains("now_ms=17867"));
+        assert_eq!(transcript.oldest_intact(), None);
+    }
+
+    #[test]
+    fn tokens_grow_with_the_transcript() {
+        let mut transcript = transcript();
+        let empty = transcript.tokens();
+        transcript.push("get_now".to_owned(), json!({}), result(&"x".repeat(4_000)));
+        assert!(transcript.tokens() > empty + 500);
     }
 }

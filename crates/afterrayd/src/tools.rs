@@ -6,9 +6,9 @@ use afterray_store::{Vault, parse_accessibility_digest};
 use chrono::Local;
 use serde_json::{Value, json};
 
-use crate::budget::ContextBudget;
+use afterray_harness::ContextBudget;
 use crate::search_hits;
-use crate::truncate::{Budgeted, truncate_head};
+use afterray_harness::{Budgeted, truncate_head};
 
 
 const DEFAULT_SEARCH_LIMIT: usize = 8;
