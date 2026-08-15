@@ -575,6 +575,133 @@ FINAL
 }
 
 #[cfg(test)]
+mod catalog_drift {
+    //! The tool catalog, the dispatch table and three system prompts are four
+    //! hand-written texts describing one thing. They have already drifted once:
+    //! `get_day_summary` was dispatchable and documented while `chat.rs` still
+    //! told the model to "start wide with `get_slot_card`".
+    //!
+    //! These tests read the dispatch arms out of this file's own source, so the
+    //! `match` stays the single authority and the prose has to follow it.
+
+    use super::tool_catalog_text;
+
+    /// Every name in `ToolHost::invoke`'s `match`, read from the source.
+    ///
+    /// The markers are split across two literals and rejoined by `concat!`, so
+    /// the joined text appears in this file exactly once — in the real code —
+    /// and this scan cannot accidentally find itself.
+    fn dispatched_names() -> Vec<String> {
+        const START: &str = concat!("let result = ", "match name {");
+        const END: &str = concat!("other =>", " format!");
+        let source = include_str!("tools.rs");
+        let (_, rest) = source
+            .split_once(START)
+            .expect("the dispatch match moved; update START");
+        let (arms, _) = rest
+            .split_once(END)
+            .unwrap_or_else(|| rest.split_once("other =>").expect("no fallback arm"));
+        arms.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix('"')?;
+                let (name, _) = rest.split_once("\" =>")?;
+                Some(name.to_owned())
+            })
+            .collect()
+    }
+
+    /// Tool-shaped identifiers a prompt mentions.
+    fn tools_named_in(source: &str) -> Vec<String> {
+        let prefixes = ["get_", "list_", "search_"];
+        let mut found: Vec<String> = Vec::new();
+        for token in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+            if prefixes.iter().any(|prefix| token.starts_with(prefix))
+                && !found.iter().any(|seen| seen == token)
+            {
+                found.push(token.to_owned());
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_scan_finds_the_real_dispatch_table() {
+        let names = dispatched_names();
+        assert!(names.len() >= 10, "scan found only {names:?}");
+        assert!(names.iter().any(|name| name == "get_day_summary"), "{names:?}");
+        assert!(names.iter().any(|name| name == "get_now"), "{names:?}");
+    }
+
+    /// The test the plan asks for: nothing callable may be undocumented.
+    #[test]
+    fn every_dispatched_tool_appears_in_the_catalog() {
+        let catalog = tool_catalog_text();
+        for name in dispatched_names() {
+            assert!(
+                catalog.contains(&format!("- {name}:")),
+                "`{name}` is callable but the catalog never lists it"
+            );
+        }
+    }
+
+    /// And the other direction: nothing documented may be uncallable, or the
+    /// model spends a round discovering `unknown tool`.
+    #[test]
+    fn every_catalogued_tool_is_dispatched() {
+        let dispatched = dispatched_names();
+        for line in tool_catalog_text().lines() {
+            let Some(rest) = line.trim().strip_prefix("- ") else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once(':') else {
+                continue;
+            };
+            assert!(
+                dispatched.iter().any(|known| known == name),
+                "the catalog documents `{name}`, which nothing dispatches"
+            );
+        }
+    }
+
+    /// The drift that actually shipped was subtler than a wrong name: chat's
+    /// prompt said "start wide with `get_slot_card`" and simply never learned
+    /// about `get_day_summary`. No test can require a prompt to *mention* a
+    /// tool, so the rule is the other way round — a system prompt may not name
+    /// tools at all. Ordering advice lives in the catalog, next to the tools it
+    /// orders, where adding one puts the advice in front of whoever adds it.
+    #[test]
+    fn system_prompts_leave_tool_advice_to_the_catalog() {
+        let dispatched = dispatched_names();
+        let prompts = [
+            ("chat.rs", include_str!("chat.rs")),
+            ("stream.rs", include_str!("stream.rs")),
+            ("ask.rs", include_str!("ask.rs")),
+        ];
+        for (file, source) in prompts {
+            // Only the prompt constants, not the whole file: the handlers
+            // legitimately call `store.get_*` helpers of their own.
+            for constant in source.split("_PROMPT: &str = ").skip(1) {
+                let body = constant.split(";\n").next().unwrap_or_default();
+                let named = tools_named_in(body);
+                let (tools, strangers): (Vec<_>, Vec<_>) = named
+                    .into_iter()
+                    .partition(|name| dispatched.iter().any(|tool| tool == name));
+                assert!(
+                    tools.is_empty(),
+                    "{file}'s system prompt names {tools:?}. Move the advice into \
+                     tool_catalog_text() so it cannot fall behind the tool list."
+                );
+                assert!(
+                    strangers.is_empty(),
+                    "{file}'s system prompt names {strangers:?}, which are not tools at all"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use afterray_models::QueueConfig;
