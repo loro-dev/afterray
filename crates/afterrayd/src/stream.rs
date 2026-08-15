@@ -1215,14 +1215,7 @@ print(json.dumps({
                 api_key: None,
             },
         ));
-        let router = afterray_models::LlmRouterAdapter::new(
-            afterray_models::ProcessAdapter::new(afterray_models::ProcessAdapterConfig::new(
-                "unused-builtin",
-                afterray_models::ModelCapability::Llm,
-                "/bin/false",
-            )),
-            config,
-        );
+        let router = afterray_models::LlmRouterAdapter::new(config);
         let sink = router.token_sink();
         let models = ModelQueue::new(
             vec![std::sync::Arc::new(router) as std::sync::Arc<dyn afterray_models::ModelAdapter>],
@@ -1426,14 +1419,7 @@ print(json.dumps({
                 api_key: None,
             },
         ));
-        let router = afterray_models::LlmRouterAdapter::new(
-            afterray_models::ProcessAdapter::new(afterray_models::ProcessAdapterConfig::new(
-                "unused-builtin",
-                afterray_models::ModelCapability::Llm,
-                "/bin/false",
-            )),
-            config,
-        );
+        let router = afterray_models::LlmRouterAdapter::new(config);
         let sink = router.token_sink();
         let models = ModelQueue::new(
             vec![std::sync::Arc::new(router) as std::sync::Arc<dyn afterray_models::ModelAdapter>],

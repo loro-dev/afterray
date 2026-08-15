@@ -691,14 +691,9 @@ mod tests {
     /// says `search_evidence` is not an exfiltration path.
     #[tokio::test]
     async fn the_remote_router_refuses_everything_that_is_not_an_llm_call() {
-        let adapter = LlmRouterAdapter::new(
-            crate::ProcessAdapter::new(crate::ProcessAdapterConfig::new(
-                "builtin",
-                ModelCapability::Llm,
-                "/bin/false",
-            )),
-            Arc::new(std::sync::Mutex::new(LlmRuntimeConfig::default())),
-        );
+        let adapter = LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(
+            LlmRuntimeConfig::default(),
+        )));
         assert_eq!(adapter.capability(), ModelCapability::Llm);
 
         let refused = adapter

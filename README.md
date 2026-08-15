@@ -149,6 +149,34 @@ can search and read moments, activity, memories, OCR, and Accessibility
 evidence, and has no tool for running shell commands, editing files, changing
 settings, controlling capture, deleting history, or writing to the vault.
 
+That is enforced rather than promised, and each part is something you can check:
+
+- **The loop has no way to reach the network.** `afterray-harness`, the crate the
+  agent loop lives in, has three dependencies: `serde`, `serde_json`, and
+  `tokio` with default features off and only `macros`, `sync`, and `time`
+  turned on. No HTTP client, no sockets, no runtime. Reaching the network would
+  mean adding a dependency, and that shows up in a diff.
+- **The tools cannot write to the vault.** They hold a read-only handle whose
+  type has no `append`, `insert`, `delete`, or `clear` on it, so a write is a
+  compile error rather than an oversight. Widening that handle is a visible
+  change, with a test against it.
+- **The tools take no paths, URLs, or commands** — only timestamps, moment ids,
+  a query string, and a limit. There is nothing to traverse.
+- **Nothing in a tool may touch the filesystem, spawn a process, or open a
+  socket.** Rust cannot express that as a type — `std::fs` is in scope in every
+  crate — so it is a check that fails the build if a tool surface so much as
+  mentions `std::fs`, `std::process`, or an HTTP client. Bypassing it means
+  editing the list, in the open.
+- **Screen text is fenced before the model sees it**, and the system prompt says
+  the fence holds observed data, not instructions. Injection is the reason the
+  read-only surface matters: it bounds what a successful one could do.
+
+The one boundary none of that moves is **which model you point it at**. A local
+model keeps the prompt and the retrieved evidence on this Mac. A remote endpoint
+receives them, because sending them is what running a remote model is. See
+[docs/harness-threat-model.md](docs/harness-threat-model.md) for the full
+picture, including the risks we accept.
+
 Anything returned through the CLI becomes visible to that agent. The V0 CLI is
 the full developer CLI, so treat it as trusted local access rather than a
 security boundary.
