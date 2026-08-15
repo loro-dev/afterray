@@ -28,6 +28,8 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>AfterRay checks whether the active browser window is private so it can skip recording it. This permission does not read the page URL.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>AfterRay transcribes your voice locally while recording your computer activity.</string>
     <key>NSHumanReadableCopyright</key>

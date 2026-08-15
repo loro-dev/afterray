@@ -169,9 +169,14 @@ that was on screen. In V0:
   vault — but they were written before that was known.
 - System audio is one mix of the whole machine. Excluding an app does not take
   its sound out of a recording.
-- Private browsing is not detected. macOS offers no reliable signal for it, so
-  a private window is recorded like any other window. Exclude the sites you
-  care about by name.
+- AfterRay checks private-window state before asking ScreenCaptureKit for an
+  image. Chromium browsers use their read-only AppleScript window mode,
+  Firefox uses its localized private-window title suffix, and browser-owned
+  Accessibility chrome is a positive fallback. A detected private window is
+  discarded before screenshots, Accessibility artifacts, OCR, activity spans,
+  or memory summaries can be created. macOS has no cross-browser private-mode
+  flag, so Safari and unsupported browser versions remain best-effort; system
+  audio still follows the normal whole-machine capture path.
 
 Moving exclusion into the capture filter, before a frame exists, is planned
 before the public release.

@@ -5469,6 +5469,44 @@ mod tests {
     }
 
     #[test]
+    fn private_browsing_snapshot_cannot_attach_a_url_to_the_moment() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        vault
+            .insert_moment(&session.id, 20, "image/jpeg", b"screen")
+            .unwrap();
+        let snapshot = br#"{
+            "application_name": "Google Chrome",
+            "bundle_identifier": "com.google.Chrome",
+            "private_browsing": true,
+            "window_title": "Private account",
+            "url": "https://private.example/account",
+            "root": {
+                "role": "AXWindow",
+                "children": [{
+                    "role": "AXWebArea",
+                    "url": "https://private.example/account"
+                }]
+            }
+        }"#;
+
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                20,
+                "application/vnd.afterray.ax+json",
+                snapshot,
+                Some("Google Chrome"),
+                Some("com.google.Chrome"),
+            )
+            .unwrap();
+
+        let moment = &vault.moments_sync(&session.id).unwrap()[0];
+        assert_eq!(moment.window_title.as_deref(), Some("Private account"));
+        assert!(moment.url.is_none());
+    }
+
+    #[test]
     fn activity_spans_merge_consecutive_moments_with_duration() {
         let (_directory, vault) = test_vault(20);
         let session = vault.create_session_sync(1).unwrap();

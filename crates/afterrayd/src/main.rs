@@ -1788,8 +1788,8 @@ struct AccessibilityMetadata {
     application_name: Option<String>,
     bundle_identifier: Option<String>,
     /// Present when the foreground app exposes one — browsers do, via the web
-    /// area's `AXURL`. This is the only place a page's address is visible;
-    /// the screenshot itself carries no such thing.
+    /// area's `AXURL`. This is the structured address used for activity spans
+    /// and website exclusions.
     url: Option<String>,
 }
 
