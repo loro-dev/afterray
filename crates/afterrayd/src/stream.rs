@@ -64,29 +64,19 @@ pub(crate) async fn handle_chat_stream(
         budget: ContextBudget::DEFAULT,
         cancel: cancel.clone(),
     };
-    // Registered under the conversation, because that is the only name the app
-    // has for a turn when it presses stop on a different connection. An id that
-    // was not known when the stream opened — a brand new conversation — is
-    // registered as soon as `run_chat_stream_registered` resolves it.
-    //
-    // A guard rather than an explicit remove after the await: a panic in the
-    // turn, or this future being dropped, would otherwise strand the token.
-    let _registration = conversation_id
-        .clone()
-        .map(|id| Registration::insert(state, id, cancel.clone()));
     run_chat_stream_registered(
         write,
         ctx,
         conversation_id.as_deref(),
         &message,
-        Some((state, &cancel)),
+        Some((state.running_turns.as_ref(), &cancel)),
     )
     .await
 }
 
 /// Registers the turn under whichever conversation it resolved to, so a stop
 /// arriving on another connection can find it, and unregisters on the way out.
-type Registry<'a> = Option<(&'a crate::AppState, &'a CancelToken)>;
+type Registry<'a> = Option<(&'a RunningTurns, &'a CancelToken)>;
 
 /// One chat turn, with no abort registry behind it.
 ///
@@ -142,16 +132,25 @@ where
             }
         };
 
-    // A new conversation had no id when the stream opened, so register it now.
-    let _late_registration = registry.and_then(|(state, cancel)| {
-        let already_registered = state
-            .running_turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&conversation_id);
-        (!already_registered)
-            .then(|| Registration::insert(state, conversation_id.clone(), cancel.clone()))
-    });
+    // Claimed once, here, where the conversation finally has an id. One turn per
+    // conversation: the second is refused rather than interleaved.
+    let _claim = match registry {
+        Some((running, cancel)) => {
+            match Registration::claim(running, conversation_id.clone(), cancel) {
+                Some(claim) => Some(claim),
+                None => {
+                    return write_event(
+                        write,
+                        &ChatStreamEvent::Error {
+                            message: "a turn is already running on this conversation".into(),
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        None => None,
+    };
 
     let prior = ctx
         .store
@@ -296,29 +295,55 @@ where
 /// Both registration points use this. An explicit `remove` after the await
 /// looks equivalent and is not: a panic inside the turn, or this future being
 /// dropped, would leave the token behind.
+/// The map a [`Registration`] claims a slot in.
+pub(crate) type RunningTurns = std::sync::Mutex<std::collections::HashMap<String, CancelToken>>;
+
 struct Registration<'a> {
-    state: &'a crate::AppState,
+    running: &'a RunningTurns,
     id: String,
+    /// Removed only if this is still the token in the map. A turn that ends
+    /// after a successor claimed the conversation must not evict it.
+    cancel: CancelToken,
 }
 
 impl<'a> Registration<'a> {
-    fn insert(state: &'a crate::AppState, id: String, cancel: CancelToken) -> Self {
-        state
-            .running_turns
+    /// Claims the conversation, or `None` if a turn is already running on it.
+    ///
+    /// Admission control, not bookkeeping. One conversation runs one turn at a
+    /// time: two concurrent turns share a single LLM lane, interleave their
+    /// writes into the same thread, and — before the outlet was keyed by job —
+    /// could stream each other's tokens. The UI's own "is sending" flag is not
+    /// this: it is per-window state, and a relaunch or a second client walks
+    /// straight past it.
+    fn claim(running: &'a RunningTurns, id: String, cancel: &CancelToken) -> Option<Self> {
+        let mut held = running
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.clone(), cancel);
-        Self { state, id }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.contains_key(&id) {
+            return None;
+        }
+        held.insert(id.clone(), cancel.clone());
+        drop(held);
+        Some(Self {
+            running,
+            id,
+            cancel: cancel.clone(),
+        })
     }
 }
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        self.state
-            .running_turns
+        let mut held = self
+            .running
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held
+            .get(&self.id)
+            .is_some_and(|token| token.is_same(&self.cancel))
+        {
+            held.remove(&self.id);
+        }
     }
 }
 
@@ -1030,14 +1055,22 @@ print(json.dumps({
             .unwrap();
         let events = parse_events(&buf);
 
-        let compaction = events
+        // The opening may also be trimmed on a window this narrow; the pass
+        // under test is the one that drops earlier tool results.
+        let pruned = events
             .iter()
-            .find(|event| matches!(event, ChatStreamEvent::Compaction { .. }))
-            .unwrap_or_else(|| panic!("no compaction announced: {events:?}"));
+            .find(|event| {
+                matches!(
+                    event,
+                    ChatStreamEvent::Compaction { strategy, .. }
+                        if strategy == "prune_tool_results"
+                )
+            })
+            .unwrap_or_else(|| panic!("no tool-result compaction announced: {events:?}"));
         assert!(matches!(
-            compaction,
-            ChatStreamEvent::Compaction { strategy, tokens_before, tokens_after, .. }
-                if strategy == "prune_tool_results" && tokens_after < tokens_before
+            pruned,
+            ChatStreamEvent::Compaction { tokens_before, tokens_after, .. }
+                if tokens_after < tokens_before
         ));
         // A result too big for the per-call cap is cut, and the client hears so.
         assert!(
@@ -1056,14 +1089,15 @@ print(json.dumps({
         assert_eq!(roles.last(), Some(&"assistant"), "{roles:?}");
         let row = thread
             .iter()
-            .find(|message| message.role == COMPACTION_ROLE)
-            .unwrap();
+            .find(|message| {
+                message.role == COMPACTION_ROLE
+                    && message
+                        .tool_log
+                        .as_deref()
+                        .is_some_and(|log| log.contains("prune_tool_results"))
+            })
+            .unwrap_or_else(|| panic!("no prune row in the thread"));
         assert!(row.content.contains("context window"), "{}", row.content);
-        assert!(
-            row.tool_log
-                .as_deref()
-                .is_some_and(|log| log.contains("prune_tool_results"))
-        );
     }
 
     /// Phase 3's whole point. The app's stop button shuts the socket, which
@@ -1561,6 +1595,57 @@ print(json.dumps({
         // A conversation with no live turn is not an error — the turn may have
         // finished between the press and the request arriving.
         assert!(!running.contains_key("no-such-conversation"));
+    }
+
+    /// One conversation, one turn at a time — through the real claim.
+    ///
+    /// Two concurrent turns share a single LLM lane, interleave their writes
+    /// into the same thread, and — before the token outlet was keyed by job —
+    /// could stream each other's output. The app's own `isSending` flag is not
+    /// this check: it is per-window, and a relaunch or a second client walks
+    /// straight past it.
+    #[test]
+    fn a_conversation_admits_one_turn_at_a_time() {
+        let running: RunningTurns = std::sync::Mutex::new(std::collections::HashMap::new());
+        let first = CancelToken::new();
+        let second = CancelToken::new();
+
+        let claim = Registration::claim(&running, "c1".to_owned(), &first)
+            .expect("the first turn must be admitted");
+        assert!(
+            Registration::claim(&running, "c1".to_owned(), &second).is_none(),
+            "a second turn on the same conversation must be refused"
+        );
+        // A different conversation is unaffected.
+        assert!(Registration::claim(&running, "c2".to_owned(), &second).is_some());
+
+        drop(claim);
+        assert!(
+            Registration::claim(&running, "c1".to_owned(), &second).is_some(),
+            "the slot must be free once the first turn ends"
+        );
+    }
+
+    /// A turn that ends after a successor took over must not evict it.
+    #[test]
+    fn a_finished_turn_releases_only_its_own_claim() {
+        let running: RunningTurns = std::sync::Mutex::new(std::collections::HashMap::new());
+        let first = CancelToken::new();
+        let claim = Registration::claim(&running, "c1".to_owned(), &first).unwrap();
+
+        // Simulate a successor replacing the entry while the first is finishing.
+        let second = CancelToken::new();
+        running
+            .lock()
+            .unwrap()
+            .insert("c1".to_owned(), second.clone());
+
+        drop(claim);
+        let held = running.lock().unwrap().get("c1").cloned();
+        assert!(
+            held.is_some_and(|token| token.is_same(&second)),
+            "the successor's claim was evicted by its predecessor"
+        );
     }
 
     /// A stopped turn keeps its reasoning too, not just its text.

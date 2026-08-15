@@ -28,6 +28,16 @@ impl Default for CancelToken {
 }
 
 impl CancelToken {
+    /// Whether two handles are the same token, not merely equal in state.
+    ///
+    /// A registry that keys turns by conversation needs this: an entry may only
+    /// be removed by the turn that put it there, or a finishing turn takes its
+    /// successor's token away with it.
+    #[must_use]
+    pub fn is_same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.sender, &other.sender)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         let (sender, _) = watch::channel(false);

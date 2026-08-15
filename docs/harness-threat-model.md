@@ -39,20 +39,29 @@ Their whole argument vocabulary is `from_ms`, `to_ms`, `at_ms`, `day_ms`,
 | The agent cannot… | …because | strength |
 |---|---|---|
 | write, delete or rewrite anything in the vault | tools hold `afterray_store::ReadOnlyVault`; no mutating method exists on the handle | **type system** |
-| read or write files | `tools::jail` fails the build on `std::fs`, `File::open`, `tokio::fs` in a tool surface | test |
-| spawn a process | same check, on `std::process` / `Command::new` | test |
-| open a socket or make an HTTP request | same check, on `std::net`, `TcpStream::connect`, `reqwest`, `tokio::net` | test |
-| reach anything outside the vault from inside the harness | `afterray-harness` depends only on `serde`, `serde_json` and `tokio` (`macros`+`sync`) — no fs, net, process or HTTP crate is linked into it at all | **dependency graph** |
+| read or write files | `tools::jail` fails the build on `std::fs`, `File::open`, `tokio::fs` in a tool surface | review lint |
+| spawn a process | same check, on `std::process` / `Command::new` | review lint |
+| open a socket or make an HTTP request | same check, on `std::net`, `TcpStream::connect`, `reqwest`, `tokio::net` | review lint |
+| speak HTTP from inside the harness | `afterray-harness` links no HTTP client: its dependencies are `serde`, `serde_json` and `tokio` (`macros`+`sync`+`time`). A raw socket needs no dependency, so this bounds HTTP only | dependency list |
 | name a tool that does not exist | `tools::catalog_drift` holds the catalogue and every system prompt to the dispatch table | test |
 | send an embedding query to a remote endpoint | `LlmRouterAdapter` declares `ModelCapability::Llm` and the queue routes by capability; embeddings go to the local worker | **type + routing**, with a test |
 | escape the data fence | tool results are wrapped in `<<<AFTERRAY_DATA kind=tool_result>>>` and the closer is stripped from the body | code + test |
 | loop forever, or fill the window | `ContextBudget` caps rounds and per-result tokens, asserted coherent at compile time | code |
 | keep running after the user stops it | `ChatAbort` fires a `CancelToken` checked at three points, and kills the queue job | code + test |
 
-Two entries are marked **type system** or **dependency graph**; the rest are
-tests. The difference matters: a test can be deleted in the same commit that
-breaks the invariant. It is still far better than nothing, because deleting it
-is a visible act in a diff.
+Only two entries are structural — the read-only handle, which is a type, and
+the absent HTTP client, which is a dependency fact. Everything marked **review
+lint** is a string search over the tool sources. It is bypassable by aliasing,
+by moving code into a helper the scan does not cover, or by going through a
+capability the tools already hold. Calling it confinement would be wrong; its
+job is to make acquiring those powers impossible to do *silently*.
+
+The largest capability the tools legitimately hold is `&ModelQueue`, needed for
+the embedding behind `search_evidence`. It is narrower than it looks — the
+queue routes by capability and the only network-capable adapter declares itself
+LLM-only — but it is a broader handle than the tools need, and narrowing it to
+an embedding port is listed under the remaining work in
+[harness-implementation-notes.md](harness-implementation-notes.md).
 
 ## Prompt injection: what the fence does and does not do
 
@@ -125,9 +134,11 @@ the same provider by design.
 2. **The fence is probabilistic.** A strong enough injection against a weak
    enough model can redirect what the agent looks at, and therefore what it
    says. Bounded by the read-only tool surface.
-3. **The `jail` test is bypassable.** Someone can add `std::fs` to a tool and
-   edit the allowlist in the same commit. That is intentional — the goal is
-   that it cannot happen *silently*.
+3. **The `jail` check is a review lint, not confinement.** Someone can add
+   `std::fs` to a tool and edit the list in the same commit, alias the import,
+   or move the code into a module the scan does not read. That is intentional
+   — the goal is that it cannot happen *silently* — but it should not be
+   mistaken for a sandbox.
 4. **`ToolSurface` is an open trait.** It has to be: the daemon implements it
    outside the harness, where the vault lives. A third implementation that
    writes files would compile. Rust has no capability-based module system —

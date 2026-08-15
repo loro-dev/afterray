@@ -432,7 +432,7 @@ struct AppState {
     /// A `ChatAbort` arrives on a *different* connection from the stream it
     /// stops — the stream's own connection is busy writing events — so the
     /// token has to be reachable by name.
-    running_turns: Arc<std::sync::Mutex<HashMap<String, afterray_harness::CancelToken>>>,
+    running_turns: Arc<crate::stream::RunningTurns>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

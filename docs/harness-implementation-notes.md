@@ -173,10 +173,62 @@ tool calls already live in their own column and our answer is one final text, so
 there is no interleaving to preserve. If we ever round-trip, that judgement
 needs revisiting.
 
+## Answered in review
+
+A read of this branch against pi and DeepSeek Harness found four things worth
+recording, three of them fixed here.
+
+**Concurrent turns could cross-wire tokens.** The chat token outlet was one
+global `Option<Sender>`, armed *before* the job was submitted and taken by
+whichever job the single LLM lane admitted next. Turn A queued while turn B
+armed the outlet would take B's sender, so B's window rendered A's answer — and
+A's guard cleared the slot on the way out regardless of whose sender was in it.
+The outlet is now a map keyed by job id, armed after submit, and a guard removes
+only its own entry. Separately, a conversation now admits one turn at a time:
+the second is refused rather than interleaved, and a finishing turn releases its
+claim only if it still holds it. The app's `isSending` flag was never this
+check — it is per-window, and a relaunch walks past it.
+
+**The tool parser turned valid calls into blank successes.** `ARGS` spread over
+several lines — what most models emit for more than one field — parsed as the
+single character `{`, failed, and was then classified as prose; the answer gate
+hid it for starting with `TOOL`, so the turn reported success and stored an
+empty assistant row. Brace counting also did not understand JSON strings, so a
+`}` inside a query ended the object early. Both are fixed, and a malformed call
+is now its own outcome: the model is handed its own error and given a round to
+correct it, and a turn that never produces a usable call fails loudly.
+
+**The round cap printed raw tool output as the answer.** It handed back the last
+tool result verbatim, which skips synthesis and citation and lifts text out of
+the data fence it arrived in. The last round is now reserved: the model is told
+no tool calls remain and asked to answer from what it has.
+
+**`is_coherent` could not fail.** It compared `transcript/(rounds+1)*rounds`
+against `transcript`, true for every positive input. It now checks properties
+that can be violated, and the opening block — task, clock, folded history — has
+a budget of its own and is trimmed before the first round rather than reaching
+the model unchecked.
+
 ## Not started
 
 Phase 4 (steering) and phase 5 (`SummarizeOldest`), plus the plan's note about
 scoped models for T2 versus chat.
+
+Four more, named in review and genuinely outstanding:
+
+- **`AgentSession` still does not exist.** Turn admission is now enforced, but
+  by a map in `AppState` rather than by a type that owns the session, its tool
+  registry, its policy hooks and its event log. `afterray-agent` remains a
+  queue binding plus error classification; the name is ahead of the contents.
+- **The context window is a constant, not the model's.** `ContextBudget::DEFAULT`
+  assumes 16 384 tokens whatever is configured. It should come from the provider
+  settings, which means carrying a window through `LlmRuntimeConfig`.
+- **Long-term history is still trimmed by character count.** `fold_history`
+  keeps the first message and drops from the middle until it fits, with no
+  summary, no tombstone and no recoverable log. Compaction covers the in-turn
+  transcript only. Until that changes, the `compaction` event and the context
+  meter describe a narrower guarantee than a reader might assume.
+- **Tools hold `&ModelQueue`** where an embedding port would do.
 
 Phase 5 also needs the seam widened first: `CompactionStrategy::compact` is
 synchronous, which no model-backed strategy can satisfy. Making it async while

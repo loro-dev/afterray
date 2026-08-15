@@ -42,17 +42,7 @@ impl ModelSurface for QueueModel<'_> {
         request: GenerateRequest<'_>,
         tokens: mpsc::Sender<StreamDelta>,
     ) -> Result<String, ModelError> {
-        let Some(sink) = self.token_sink else {
-            return self.run_round(request, None).await;
-        };
-        // The harness and the model layer each define their own delta type,
-        // because neither may depend on the other. This is the seam, and the
-        // conversion below is the whole of it.
-        let (adapter_tx, adapter_rx) = mpsc::channel::<LlmDelta>(64);
-        let guard = sink.install(adapter_tx);
-        let result = self.run_round(request, Some((adapter_rx, tokens))).await;
-        drop(guard);
-        result
+        self.run_round(request, tokens).await
     }
 }
 
@@ -72,7 +62,7 @@ impl QueueModel<'_> {
     async fn run_round(
         &self,
         request: GenerateRequest<'_>,
-        mut relay: Option<(mpsc::Receiver<LlmDelta>, mpsc::Sender<StreamDelta>)>,
+        tokens: mpsc::Sender<StreamDelta>,
     ) -> Result<String, ModelError> {
         let job_id = match self
             .models
@@ -90,6 +80,20 @@ impl QueueModel<'_> {
             Err(error) => return Err(ModelError::Failed(error.to_string())),
         };
 
+        // Armed only now, because the outlet is keyed by job id: a sender
+        // installed before submitting could be taken by whichever job the
+        // single LLM lane admits next, which is how one conversation's tokens
+        // reached another's window.
+        //
+        // The cost of arming late is that a job admitted in this gap does not
+        // stream that round; its completed text still returns. Losing the
+        // stream is recoverable, mis-delivering it is not.
+        let mut relay = self.token_sink.map(|sink| {
+            let (adapter_tx, adapter_rx) = mpsc::channel::<LlmDelta>(64);
+            let guard = sink.install(&job_id, adapter_tx);
+            (adapter_rx, tokens, guard)
+        });
+
         // Race the wait against the stop signal, and take the job down with it.
         // Without this the queue keeps generating for a window nobody is
         // reading, and — worse on a single-lane local runtime — holds the LLM
@@ -101,11 +105,11 @@ impl QueueModel<'_> {
                 biased;
                 Some(delta) = async {
                     match relay.as_mut() {
-                        Some((rx, _)) => rx.recv().await,
+                        Some((rx, _, _)) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some((_, tx)) = relay.as_ref()
+                    if let Some((_, tx, _)) = relay.as_ref()
                         && tx.send(convert(delta)).await.is_err()
                     {
                         // The harness stopped listening. Keep generating so the

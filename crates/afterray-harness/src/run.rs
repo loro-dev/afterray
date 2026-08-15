@@ -21,7 +21,7 @@ use crate::fence;
 use crate::progress::{PROGRESS_INTERVAL, Phase, ProgressReport};
 use crate::tokens::estimate_tokens;
 use crate::transcript::Transcript;
-use crate::truncate::Budgeted;
+use crate::truncate::{Budgeted, truncate_head};
 use crate::wire::{AnswerGate, Step, classify};
 
 /// One round's request to the model.
@@ -305,7 +305,25 @@ where
     T: ToolSurface + Sync,
     S: EventSink,
 {
-    let mut transcript = Transcript::new(opening, fence::untrusted);
+    // Budget the input before the first round, not only between rounds.
+    // Compaction prunes round bodies and the opening is never one, so an
+    // oversized opening — a long folded history, a large seed — used to reach
+    // the model unchecked and could exceed the window before any tool ran.
+    let opening = truncate_head(&opening, config.budget.opening_allowance());
+    if opening.truncated {
+        emit(
+            sink,
+            HarnessEvent::Compaction(CompactionNotice {
+                strategy: "trim_opening",
+                from_round: 0,
+                to_round: 0,
+                tokens_before: opening.dropped_tokens + estimate_tokens(&opening.text),
+                tokens_after: estimate_tokens(&opening.text),
+            }),
+        )
+        .await?;
+    }
+    let mut transcript = Transcript::new(opening.text, fence::untrusted);
     let mut turn = Turn::default();
 
     for round in 0..config.budget.max_rounds {
@@ -363,6 +381,34 @@ where
                     "model returned empty output".into(),
                 )));
             }
+            // A tool call whose arguments do not parse is a mistake to correct,
+            // not an answer. Handing the model its own error and spending a
+            // round is what a person would do; the alternative — which is what
+            // happened before — is that the raw `TOOL …` text goes down the
+            // answer path, the gate hides it for starting with `TOOL`, and the
+            // turn reports success having stored nothing.
+            Step::Malformed { name, reason } => {
+                let note = Budgeted::verbatim(format!(
+                    "ERROR: your last reply looked like a call to `{name}` but {reason}. \
+                     Reply again with exactly two lines: TOOL <name>, then ARGS <one JSON object>."
+                ));
+                emit(
+                    sink,
+                    HarnessEvent::ToolResult {
+                        name: name.clone(),
+                        chars: note.text.chars().count(),
+                        truncated: false,
+                        dropped: 0,
+                    },
+                )
+                .await?;
+                transcript.push(name, Value::Null, note);
+                if round + 1 == config.budget.max_rounds {
+                    return Err(LoopError::Model(ModelError::Failed(
+                        "the model never produced a usable tool call or answer".into(),
+                    )));
+                }
+            }
             Step::Call { name, args } => {
                 let result = call_tool(tools, sink, &config.cancel, &name, &args).await?;
                 turn.tool_calls.push(ToolCallRecord {
@@ -373,26 +419,27 @@ where
                 let body = result.text.clone();
                 transcript.push(name.clone(), args, result);
 
-                if round + 1 == config.budget.max_rounds {
-                    // Out of rounds mid-investigation. Handing back the last
-                    // result beats an apology: it is the evidence the model was
-                    // about to reason over, and the user can read it.
-                    let answer = format!(
-                        "I reached the tool limit before finishing. Last tool `{name}` returned:\n{body}"
+                if round + 2 == config.budget.max_rounds {
+                    // One round is held back for an answer. Spending every
+                    // round on tools and then printing the last raw result as
+                    // the reply — which is what happened before — hands the
+                    // user unsynthesised, unfenced tool output and skips the
+                    // citation the prompt asks for. The model gets told instead,
+                    // and answers with what it has.
+                    transcript.push(
+                        "(budget)".to_owned(),
+                        Value::Null,
+                        Budgeted::verbatim(
+                            "No tool calls remain for this turn. Answer now with FINAL, \
+                             from the evidence above, and say what you could not check."
+                                .to_owned(),
+                        ),
                     );
-                    emit(
-                        sink,
-                        HarnessEvent::Token {
-                            text: answer.clone(),
-                        },
-                    )
-                    .await?;
-                    turn.answer = answer;
-                    return Ok(turn);
                 }
             }
         }
     }
+    // The model was given a round to answer in and used it on something else.
     Err(LoopError::Exhausted)
 }
 
@@ -754,22 +801,62 @@ mod tests {
         assert_eq!(rounds, [1, 2]);
     }
 
-    /// Running out of rounds hands back the last evidence rather than an
-    /// apology with nothing in it.
+    /// The last round is held back for an answer, and the model is told so.
+    ///
+    /// Printing the final raw tool result as the reply — which is what happened
+    /// before — hands the user unsynthesised tool output with no citation, and
+    /// slips text that arrived inside a data fence out of it.
     #[tokio::test]
-    async fn the_round_cap_returns_the_last_result() {
-        let calls: Vec<&str> = (0..ContextBudget::DEFAULT.max_rounds)
+    async fn the_round_cap_reserves_a_round_to_answer_in() {
+        let mut script: Vec<&str> = (0..ContextBudget::DEFAULT.max_rounds - 1)
             .map(|_| "TOOL get_now\nARGS {}")
             .collect();
-        let model = ScriptedModel::new(&calls, false);
+        script.push("FINAL\nAs far as I got: you were reading.");
+        let model = ScriptedModel::new(&script, false);
         let tools = EchoTools {
             body: "{\"now_ms\":42}".to_owned(),
         };
         let mut sink = Recorder::default();
         let turn = run(&model, &tools, &mut sink).await.unwrap();
-        assert!(turn.answer.contains("reached the tool limit"));
-        assert!(turn.answer.contains("\"now_ms\":42"));
-        assert_eq!(turn.tool_calls.len(), ContextBudget::DEFAULT.max_rounds);
+
+        assert_eq!(turn.answer, "As far as I got: you were reading.");
+        assert!(
+            !turn.answer.contains("now_ms"),
+            "raw tool output reached the answer: {}",
+            turn.answer
+        );
+        // The model was warned before its last round.
+        let prompts = model.seen.lock().unwrap().clone();
+        assert!(
+            prompts.last().unwrap().contains("No tool calls remain"),
+            "{}",
+            prompts.last().unwrap()
+        );
+    }
+
+    /// A model that ignores the warning fails the turn instead of having a raw
+    /// tool result printed for it.
+    #[tokio::test]
+    async fn a_turn_that_never_answers_is_exhausted_not_dumped() {
+        let script: Vec<&str> = (0..ContextBudget::DEFAULT.max_rounds)
+            .map(|_| "TOOL get_now\nARGS {}")
+            .collect();
+        let model = ScriptedModel::new(&script, false);
+        let tools = EchoTools {
+            body: "{\"now_ms\":42}".to_owned(),
+        };
+        let mut sink = Recorder::default();
+        let error = run(&model, &tools, &mut sink).await.unwrap_err();
+        assert_eq!(error, LoopError::Exhausted);
+        let streamed: String = sink
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::Token { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!streamed.contains("now_ms"), "raw tool output was streamed");
     }
 
     #[tokio::test]
@@ -1199,6 +1286,88 @@ mod tests {
             progress_reports(&sink).is_empty(),
             "{:?}",
             progress_reports(&sink)
+        );
+    }
+
+    /// The end-to-end shape of the parser fix: a model that mangles its first
+    /// call is told, tries again, and the turn produces a real answer — instead
+    /// of reporting success with nothing in it.
+    #[tokio::test]
+    async fn a_malformed_call_is_corrected_rather_than_answered() {
+        let model = ScriptedModel::new(
+            &[
+                // Pretty-printed args used to parse as `"{"`.
+                "TOOL get_now\nARGS {\n  \"unclosed\": true",
+                "TOOL get_now\nARGS {}",
+                "FINAL\nIt is Tuesday.",
+            ],
+            false,
+        );
+        let tools = EchoTools {
+            body: "{\"now_ms\":1}".to_owned(),
+        };
+        let mut sink = Recorder::default();
+        let turn = run(&model, &tools, &mut sink).await.unwrap();
+
+        assert_eq!(turn.answer, "It is Tuesday.");
+        // The model was handed its own mistake.
+        let prompts = model.seen.lock().unwrap().clone();
+        assert!(
+            prompts[1].contains("looked like a call to `get_now`"),
+            "{}",
+            prompts[1]
+        );
+        assert!(prompts[1].contains("ARGS is not a complete JSON object"));
+    }
+
+    /// A model that never gets it right fails the turn loudly rather than
+    /// storing a blank answer.
+    #[tokio::test]
+    async fn a_turn_of_only_malformed_calls_fails() {
+        let calls: Vec<&str> = (0..ContextBudget::DEFAULT.max_rounds)
+            .map(|_| "TOOL get_now\nARGS {broken")
+            .collect();
+        let model = ScriptedModel::new(&calls, false);
+        let tools = EchoTools { body: String::new() };
+        let mut sink = Recorder::default();
+        let error = run(&model, &tools, &mut sink).await.unwrap_err();
+        assert!(
+            matches!(error, LoopError::Model(ModelError::Failed(ref m)) if m.contains("never produced")),
+            "{error:?}"
+        );
+    }
+
+    /// An opening larger than the window must be cut before the first round,
+    /// and the cut must be announced. Compaction never touches the opening, so
+    /// nothing else would have caught it.
+    #[tokio::test]
+    async fn an_oversized_opening_is_trimmed_before_the_first_round() {
+        let model = ScriptedModel::new(&["FINAL\nok"], false);
+        let tools = EchoTools { body: String::new() };
+        let mut sink = Recorder::default();
+        let huge = "a long folded history. ".repeat(20_000);
+        let turn = run_turn(
+            &model,
+            &tools,
+            &mut sink,
+            &config(),
+            "system",
+            huge,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            turn.usage.prompt_tokens <= ContextBudget::DEFAULT.window_tokens,
+            "round one still exceeded the window: {}",
+            turn.usage.prompt_tokens
+        );
+        assert!(
+            sink.events.iter().any(|event| matches!(
+                event,
+                HarnessEvent::Compaction(notice) if notice.strategy == "trim_opening"
+            )),
+            "the trim was silent"
         );
     }
 

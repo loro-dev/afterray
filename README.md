@@ -151,11 +151,12 @@ settings, controlling capture, deleting history, or writing to the vault.
 
 That is enforced rather than promised, and each part is something you can check:
 
-- **The loop has no way to reach the network.** `afterray-harness`, the crate the
-  agent loop lives in, has three dependencies: `serde`, `serde_json`, and
-  `tokio` with default features off and only `macros`, `sync`, and `time`
-  turned on. No HTTP client, no sockets, no runtime. Reaching the network would
-  mean adding a dependency, and that shows up in a diff.
+- **No HTTP client is compiled into the agent loop.** `afterray-harness`, the
+  crate it lives in, has three dependencies: `serde`, `serde_json`, and `tokio`
+  with default features off and only `macros`, `sync`, and `time` turned on.
+  Speaking HTTP would mean adding a dependency, which shows up in a diff. This
+  does not by itself rule out a raw socket — `std::net` needs no dependency —
+  which is what the next point is for.
 - **The tools cannot write to the vault.** They hold a read-only handle whose
   type has no `append`, `insert`, `delete`, or `clear` on it, so a write is a
   compile error rather than an oversight. Widening that handle is a visible
@@ -165,8 +166,9 @@ That is enforced rather than promised, and each part is something you can check:
 - **Nothing in a tool may touch the filesystem, spawn a process, or open a
   socket.** Rust cannot express that as a type — `std::fs` is in scope in every
   crate — so it is a check that fails the build if a tool surface so much as
-  mentions `std::fs`, `std::process`, or an HTTP client. Bypassing it means
-  editing the list, in the open.
+  mentions `std::fs`, `std::process`, `std::net`, or an HTTP client. This is a
+  review lint, not confinement: it is bypassable by aliasing or by moving the
+  code, and it is there so that acquiring those powers cannot happen silently.
 - **Screen text is fenced before the model sees it**, and the system prompt says
   the fence holds observed data, not instructions. Injection is the reason the
   read-only surface matters: it bounds what a successful one could do.

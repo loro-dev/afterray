@@ -19,6 +19,14 @@ pub enum Step {
     Call { name: String, args: Value },
     /// Nothing usable came back.
     Empty,
+    /// The round is clearly a tool call, and its arguments do not parse.
+    ///
+    /// Kept apart from [`Step::Answer`] deliberately. Treating it as prose sent
+    /// the raw `TOOL …` text down the answer path, where the gate hid it for
+    /// starting with `TOOL` — so the turn reported success and stored an empty
+    /// assistant message. A malformed call has to be visible to the loop, which
+    /// can hand the model its own mistake and let it try again.
+    Malformed { name: String, reason: String },
 }
 
 /// Reads one round.
@@ -32,8 +40,10 @@ pub fn classify(text: &str) -> Step {
     if let Some(answer) = parse_final(text) {
         return Step::Answer(answer);
     }
-    if let Some((name, args)) = parse_tool_call(text) {
-        return Step::Call { name, args };
+    match parse_tool_call(text) {
+        ToolCall::Parsed { name, args } => return Step::Call { name, args },
+        ToolCall::Malformed { name, reason } => return Step::Malformed { name, reason },
+        ToolCall::Absent => {}
     }
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -69,56 +79,91 @@ pub fn strip_final_prefix(text: &str) -> Option<String> {
     )
 }
 
+/// What a round's text turned out to be, tool-wise.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolCall {
+    Parsed { name: String, args: Value },
+    /// A `TOOL` line was present and the arguments could not be read.
+    Malformed { name: String, reason: String },
+    /// No tool call here at all.
+    Absent,
+}
+
 /// A `TOOL name` / `ARGS {…}` pair.
 ///
-/// Unparseable arguments make the whole call `None` rather than defaulting to
-/// `{}`. Calling a tool with arguments the model did not write produces a
-/// confidently wrong result — usually a range guard rejection the model then
-/// has to reason about — where refusing sends the round back for a retry.
+/// Arguments are never guessed. Calling a tool with arguments the model did not
+/// write produces a confidently wrong result — usually a range-guard rejection
+/// the model then has to reason about — where reporting the mistake sends the
+/// round back for a retry.
 #[must_use]
-pub fn parse_tool_call(text: &str) -> Option<(String, Value)> {
+pub fn parse_tool_call(text: &str) -> ToolCall {
     let trimmed = text.trim();
     let mut name: Option<String> = None;
-    let mut args_raw: Option<String> = None;
     for line in trimmed.lines() {
         let line = line.trim();
-        let upper = line.to_ascii_uppercase();
-        if let Some(rest) = upper.strip_prefix("TOOL") {
+        if let Some(rest) = line.to_ascii_uppercase().strip_prefix("TOOL") {
             let original = line[line.len() - rest.len()..].trim_start_matches([':', ' ', '\t']);
             if !original.is_empty() {
                 name = Some(original.to_owned());
+                break;
             }
-        } else if let Some(rest) = upper.strip_prefix("ARGS") {
-            let original = line[line.len() - rest.len()..].trim_start_matches([':', ' ', '\t']);
-            args_raw = Some(original.to_owned());
         }
     }
-    // Multi-line ARGS: everything after the first ARGS marker.
-    if args_raw.is_none()
-        && let Some(pos) = trimmed.to_ascii_uppercase().find("ARGS")
-    {
-        let after = trimmed[pos + 4..].trim_start_matches([':', ' ', '\n', '\r', '\t']);
-        if after.starts_with('{') {
-            args_raw = Some(after.to_owned());
-        }
+    let Some(name) = name else {
+        return ToolCall::Absent;
+    };
+
+    // Everything after the first ARGS marker, so a pretty-printed object that
+    // begins on the `ARGS` line and continues over the next several is read as
+    // one value. Taking only the rest of that line — which is what this used to
+    // do — left `{` as the whole of the arguments.
+    let Some(marker) = trimmed.to_ascii_uppercase().find("ARGS") else {
+        return ToolCall::Malformed {
+            name,
+            reason: "no ARGS line".into(),
+        };
+    };
+    let after = trimmed[marker + 4..].trim_start_matches([':', ' ', '\n', '\r', '\t']);
+    let Some(slice) = extract_json_object(after) else {
+        return ToolCall::Malformed {
+            name,
+            reason: "ARGS is not a complete JSON object".into(),
+        };
+    };
+    match serde_json::from_str::<Value>(slice) {
+        Ok(args) if args.is_object() => ToolCall::Parsed { name, args },
+        Ok(_) => ToolCall::Malformed {
+            name,
+            reason: "ARGS must be a JSON object".into(),
+        },
+        Err(error) => ToolCall::Malformed {
+            name,
+            reason: format!("ARGS is not valid JSON: {error}"),
+        },
     }
-    let name = name?;
-    let args_raw = args_raw?;
-    // Take the first JSON object if the model appended prose.
-    let json_slice = extract_json_object(&args_raw).unwrap_or(args_raw.as_str());
-    let args: Value = serde_json::from_str(json_slice).ok()?;
-    if args.is_object() { Some((name, args)) } else { None }
 }
 
-/// The first balanced `{…}` in `text`.
+/// The first balanced `{…}` in `text`, ignoring braces inside JSON strings.
+///
+/// Counting braces blindly breaks on the arguments most worth getting right:
+/// `{"query": "a } b"}` is a legal search, and a naive scan ends the object at
+/// the brace inside the string.
 #[must_use]
 pub fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
     for (idx, ch) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match ch {
-            '{' => depth += 1,
-            '}' => {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(&text[start..=start + idx]);
@@ -228,6 +273,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+
+    /// A pretty-printed ARGS block, which is what most models emit when the
+    /// object has more than one field. This used to parse as `"{"`, fail, and
+    /// then be reported as an answer.
+    #[test]
+    fn parses_args_spread_over_several_lines() {
+        assert_eq!(
+            parse_tool_call("TOOL search_evidence\nARGS {\n  \"query\": \"foo\",\n  \"limit\": 5\n}"),
+            ToolCall::Parsed {
+                name: "search_evidence".into(),
+                args: json!({"query": "foo", "limit": 5}),
+            }
+        );
+    }
+
+    /// A brace inside a JSON string is legal and common in a search query.
+    #[test]
+    fn a_brace_inside_a_string_does_not_end_the_object() {
+        assert_eq!(
+            parse_tool_call(r#"TOOL search_evidence
+ARGS {"query": "a } b"}"#),
+            ToolCall::Parsed {
+                name: "search_evidence".into(),
+                args: json!({"query": "a } b"}),
+            }
+        );
+        // And an escaped quote does not end the string.
+        assert_eq!(
+            extract_json_object(r#"{"query": "say \"} \" now"}"#),
+            Some(r#"{"query": "say \"} \" now"}"#)
+        );
+    }
+
+    /// The failure this all guards: a malformed call must never be mistaken for
+    /// prose, because the gate then hides it and the turn "succeeds" blank.
+    #[test]
+    fn a_malformed_tool_call_is_not_an_answer() {
+        for raw in [
+            "TOOL search_evidence\nARGS {oops",
+            "TOOL search_evidence\nARGS not-json-at-all",
+            "TOOL search_evidence",
+        ] {
+            match classify(raw) {
+                Step::Malformed { name, .. } => assert_eq!(name, "search_evidence"),
+                other => panic!("{raw:?} classified as {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn parses_final_block() {
         assert_eq!(
@@ -242,9 +336,13 @@ mod tests {
 
     #[test]
     fn parses_tool_call() {
-        let (name, args) = parse_tool_call("TOOL get_ocr\nARGS {\"moment_id\":\"m1\"}\n").unwrap();
-        assert_eq!(name, "get_ocr");
-        assert_eq!(args, json!({"moment_id":"m1"}));
+        assert_eq!(
+            parse_tool_call("TOOL get_ocr\nARGS {\"moment_id\":\"m1\"}\n"),
+            ToolCall::Parsed {
+                name: "get_ocr".into(),
+                args: json!({"moment_id":"m1"})
+            }
+        );
     }
 
     #[test]
@@ -257,10 +355,20 @@ mod tests {
     /// tool arguments the model never wrote.
     #[test]
     fn rejects_invalid_or_non_object_tool_args() {
-        assert!(parse_tool_call("TOOL get_ocr\nARGS {not json}").is_none());
-        assert!(parse_tool_call("TOOL get_ocr\nARGS [\"moment_id\"]").is_none());
-        assert!(parse_tool_call("TOOL get_ocr").is_none());
-        assert_eq!(classify("TOOL get_ocr"), Step::Answer("TOOL get_ocr".into()));
+        assert!(matches!(
+            parse_tool_call("TOOL get_ocr\nARGS {not json}"),
+            ToolCall::Malformed { .. }
+        ));
+        assert!(matches!(
+            parse_tool_call("TOOL get_ocr\nARGS [\"moment_id\"]"),
+            ToolCall::Malformed { .. }
+        ));
+        assert!(matches!(
+            parse_tool_call("TOOL get_ocr"),
+            ToolCall::Malformed { .. }
+        ));
+        // And none of those may be mistaken for prose.
+        assert!(matches!(classify("TOOL get_ocr"), Step::Malformed { .. }));
     }
 
     #[test]
