@@ -18,7 +18,6 @@ const en = {
     features: 'Recall',
     cli: 'Agents',
     privacy: 'Privacy',
-    download: 'Download',
     skip: 'Skip to content',
   },
   hero: {
@@ -296,7 +295,6 @@ const zh: Copy = {
     features: '回放',
     cli: 'Agent',
     privacy: '隐私',
-    download: '下载',
     skip: '跳到正文',
   },
   hero: {

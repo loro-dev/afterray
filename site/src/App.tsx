@@ -29,9 +29,6 @@ function Nav() {
         >
           {lang === 'en' ? '中文' : 'EN'}
         </button>
-        <a className="btn btn-small" href="#download">
-          {t.download}
-        </a>
       </div>
     </nav>
   )
