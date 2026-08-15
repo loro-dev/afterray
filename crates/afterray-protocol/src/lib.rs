@@ -821,6 +821,10 @@ pub struct AskAnswer {
 /// Tokens are optional: adapters that cannot stream omit them until the
 /// finished answer is known, then emit a single `token` so clients can
 /// treat every turn the same way.
+///
+/// Growing this enum is additive by contract. A client that meets a `kind` it
+/// does not know must skip the line, and new fields on an existing kind must
+/// be `#[serde(default)]` so an older daemon's lines still decode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
@@ -831,9 +835,37 @@ pub enum ChatStreamEvent {
     ToolResult {
         name: String,
         chars: usize,
+        /// Whether the result was cut to fit its budget. The app says so on the
+        /// bubble: an answer built from a shortened result deserves the caveat.
+        #[serde(default)]
+        truncated: bool,
+        /// Estimated tokens the cut removed.
+        #[serde(default)]
+        dropped: usize,
     },
     Token {
         text: String,
+    },
+    /// How full the context window is, once per round.
+    ///
+    /// Context pressure was invisible from every angle before this: the user
+    /// could not see that a long thread was crowding the window, and neither
+    /// could anyone reading a bug report.
+    Usage {
+        prompt_tokens: usize,
+        window_tokens: usize,
+        round: usize,
+    },
+    /// An earlier part of the turn was dropped to make room.
+    ///
+    /// Announced rather than silent, and carrying the range it covers, so the
+    /// thread can show where the agent stopped being able to see.
+    Compaction {
+        strategy: String,
+        from_round: usize,
+        to_round: usize,
+        tokens_before: usize,
+        tokens_after: usize,
     },
     Done {
         message_id: String,
@@ -1163,10 +1195,32 @@ mod tests {
         let result = ChatStreamEvent::ToolResult {
             name: "get_slot_card".into(),
             chars: 2480,
+            truncated: false,
+            dropped: 0,
         };
         assert_eq!(
             serde_json::to_string(&result).unwrap(),
-            r#"{"kind":"tool_result","name":"get_slot_card","chars":2480}"#
+            r#"{"kind":"tool_result","name":"get_slot_card","chars":2480,"truncated":false,"dropped":0}"#
+        );
+        let usage = ChatStreamEvent::Usage {
+            prompt_tokens: 5_120,
+            window_tokens: 16_384,
+            round: 2,
+        };
+        assert_eq!(
+            serde_json::to_string(&usage).unwrap(),
+            r#"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2}"#
+        );
+        let compaction = ChatStreamEvent::Compaction {
+            strategy: "prune_tool_results".into(),
+            from_round: 0,
+            to_round: 2,
+            tokens_before: 14_000,
+            tokens_after: 6_200,
+        };
+        assert_eq!(
+            serde_json::to_string(&compaction).unwrap(),
+            r#"{"kind":"compaction","strategy":"prune_tool_results","from_round":0,"to_round":2,"tokens_before":14000,"tokens_after":6200}"#
         );
         let token = ChatStreamEvent::Token {
             text: "你今天下午".into(),
@@ -1194,6 +1248,23 @@ mod tests {
         assert!(line.ends_with(b"\n"));
         let parsed: ChatStreamEvent = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
         assert_eq!(parsed, token);
+    }
+
+    /// A line written by a daemon that predates `truncated`/`dropped` must
+    /// still decode, or upgrading the daemon and the app becomes a lockstep.
+    #[test]
+    fn tool_result_decodes_without_the_newer_fields() {
+        let parsed: ChatStreamEvent =
+            serde_json::from_str(r#"{"kind":"tool_result","name":"get_ocr","chars":12}"#).unwrap();
+        assert_eq!(
+            parsed,
+            ChatStreamEvent::ToolResult {
+                name: "get_ocr".into(),
+                chars: 12,
+                truncated: false,
+                dropped: 0,
+            }
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@
 
 use afterray_agent::QueueModel;
 use afterray_harness::{
-    ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError, ModelError, PruneToolResults,
-    run_turn,
+    CompactionNotice, ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError, ModelError,
+    PruneToolResults, run_turn,
 };
 use afterray_models::{JobPriority, LlmTokenSink, ModelQueue};
 use afterray_protocol::{ChatStreamEvent, ConversationMessage, local_calendar_day_bounds_ms};
@@ -36,6 +36,11 @@ pub(crate) struct ChatStreamCtx<'a> {
     pub token_sink: &'a LlmTokenSink,
     pub now_ms: i64,
     pub llm_ready: bool,
+    /// What this turn may spend. Carried rather than read from a constant: a
+    /// 4k-context Ollama model and a 128k hosted one should not share one
+    /// number, and the tests need to reach the pressure path without building
+    /// a vault big enough to fill 16k tokens.
+    pub budget: ContextBudget,
 }
 
 pub(crate) async fn handle_chat_stream(
@@ -51,6 +56,7 @@ pub(crate) async fn handle_chat_stream(
         token_sink: &state.llm_token_sink,
         now_ms: crate::now_ms(),
         llm_ready: crate::llm_is_ready(state),
+        budget: ContextBudget::DEFAULT,
     };
     run_chat_stream(write, ctx, conversation_id.as_deref(), &message).await
 }
@@ -112,17 +118,7 @@ where
     let seed = chat_seed(ctx.store, ctx.now_ms);
     let user = build_user_prompt(&seed, &history, message);
     match run_agent(write, &ctx, &user).await {
-        Ok((answer, tool_log)) => {
-            persist_done(
-                write,
-                ctx.store,
-                &conversation_id,
-                &answer,
-                &tool_log,
-                ctx.now_ms,
-            )
-            .await
-        }
+        Ok(outcome) => persist_done(write, ctx.store, &conversation_id, &outcome, ctx.now_ms).await,
         Err(message) => write_event(write, &ChatStreamEvent::Error { message }).await,
     }
 }
@@ -131,16 +127,36 @@ async fn persist_done<W: AsyncWrite + Unpin>(
     write: &mut W,
     store: &Vault,
     conversation_id: &str,
-    answer: &str,
-    tool_log: &[ToolLogEntry],
+    outcome: &AgentOutcome,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let log = if tool_log.is_empty() {
+    // Non-destructive: compaction adds a row saying what it covered, rather
+    // than rewriting the turn it happened in. Nothing the user already saw
+    // changes under them, and reopening the thread still shows where the agent
+    // stopped being able to see.
+    for notice in &outcome.compactions {
+        if let Err(error) = store.append_message(
+            conversation_id,
+            COMPACTION_ROLE,
+            &compaction_line(notice),
+            serde_json::to_string(&compaction_detail(notice)).ok().as_deref(),
+            now_ms,
+        ) {
+            eprintln!("chat.compaction row failed: {error}");
+        }
+    }
+    let log = if outcome.tool_log.is_empty() {
         None
     } else {
-        Some(serde_json::to_string(tool_log).unwrap_or_else(|_| "[]".into()))
+        Some(serde_json::to_string(&outcome.tool_log).unwrap_or_else(|_| "[]".into()))
     };
-    match store.append_message(conversation_id, "assistant", answer, log.as_deref(), now_ms) {
+    match store.append_message(
+        conversation_id,
+        "assistant",
+        &outcome.answer,
+        log.as_deref(),
+        now_ms,
+    ) {
         Ok(message_id) => {
             write_event(
                 write,
@@ -163,18 +179,50 @@ async fn persist_done<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Role for a compaction row. Not `user` or `assistant`, so a client that has
+/// not learned about it can skip the row rather than render it as speech, and
+/// `fold_history` leaves it out of the next turn's prompt.
+pub(crate) const COMPACTION_ROLE: &str = "compaction";
+
+/// What the thread shows where a compaction happened.
+pub(crate) fn compaction_line(notice: &CompactionNotice) -> String {
+    let rounds = notice.to_round - notice.from_round + 1;
+    let plural = if rounds == 1 { "result" } else { "results" };
+    format!(
+        "Dropped {rounds} earlier tool {plural} to stay inside the context window \
+         (~{} → ~{} tokens). The calls are still on record; ask again and it will look them up.",
+        notice.tokens_before, notice.tokens_after
+    )
+}
+
+/// The same fact in a shape a UI can measure.
+fn compaction_detail(notice: &CompactionNotice) -> Value {
+    serde_json::json!({
+        "strategy": notice.strategy,
+        "from_round": notice.from_round,
+        "to_round": notice.to_round,
+        "tokens_before": notice.tokens_before,
+        "tokens_after": notice.tokens_after,
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct ToolLogEntry {
     name: String,
     args: Value,
     chars: usize,
+    /// Whether the body was cut to fit its budget. Stored, so reopening an old
+    /// thread still shows that an answer was built on a shortened result.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
 }
 
 /// Turns harness events into NDJSON lines on the client's socket, and keeps
-/// the tool log the assistant message is stored with.
+/// what the turn needs to persist afterwards.
 struct StreamSink<'w, W> {
     write: &'w mut W,
     tool_log: Vec<ToolLogEntry>,
+    compactions: Vec<CompactionNotice>,
 }
 
 impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, W> {
@@ -185,10 +233,16 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, W> {
                     name: name.clone(),
                     args: args.clone(),
                     chars: 0,
+                    truncated: false,
                 });
                 ChatStreamEvent::ToolCall { name, args }
             }
-            HarnessEvent::ToolResult { name, chars, .. } => {
+            HarnessEvent::ToolResult {
+                name,
+                chars,
+                truncated,
+                dropped,
+            } => {
                 if let Some(entry) = self
                     .tool_log
                     .iter_mut()
@@ -196,20 +250,25 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, W> {
                     .find(|entry| entry.name == name && entry.chars == 0)
                 {
                     entry.chars = chars;
+                    entry.truncated = truncated;
                 }
-                ChatStreamEvent::ToolResult { name, chars }
+                ChatStreamEvent::ToolResult {
+                    name,
+                    chars,
+                    truncated,
+                    dropped,
+                }
             }
             HarnessEvent::Token { text } => ChatStreamEvent::Token { text },
-            // Not on the wire yet; the log is where context pressure is
-            // visible until the app learns to render it.
             HarnessEvent::Usage {
                 prompt_tokens,
                 window_tokens,
                 round,
-            } => {
-                eprintln!("chat.usage round={round} prompt_tokens={prompt_tokens} window_tokens={window_tokens}");
-                return Ok(());
-            }
+            } => ChatStreamEvent::Usage {
+                prompt_tokens,
+                window_tokens,
+                round,
+            },
             HarnessEvent::Compaction(notice) => {
                 eprintln!(
                     "chat.compaction strategy={} rounds={}..={} tokens={}->{}",
@@ -219,7 +278,14 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, W> {
                     notice.tokens_before,
                     notice.tokens_after
                 );
-                return Ok(());
+                self.compactions.push(notice.clone());
+                ChatStreamEvent::Compaction {
+                    strategy: notice.strategy.to_owned(),
+                    from_round: notice.from_round,
+                    to_round: notice.to_round,
+                    tokens_before: notice.tokens_before,
+                    tokens_after: notice.tokens_after,
+                }
             }
         };
         write_event(self.write, &wire)
@@ -228,12 +294,19 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, W> {
     }
 }
 
+/// What a finished turn leaves behind for the thread.
+struct AgentOutcome {
+    answer: String,
+    tool_log: Vec<ToolLogEntry>,
+    compactions: Vec<CompactionNotice>,
+}
+
 async fn run_agent<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     ctx: &ChatStreamCtx<'_>,
     user: &str,
-) -> Result<(String, Vec<ToolLogEntry>), String> {
-    let budget = ContextBudget::DEFAULT;
+) -> Result<AgentOutcome, String> {
+    let budget = ctx.budget;
     let system = format!("{SYSTEM_PROMPT}\n\n{}", tool_catalog_text());
     let host = ToolHost {
         store: ctx.store,
@@ -250,6 +323,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
     let mut sink = StreamSink {
         write,
         tool_log: Vec::new(),
+        compactions: Vec::new(),
     };
     let turn = run_turn(
         &model,
@@ -267,7 +341,11 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
         LoopError::Model(ModelError::Missing) => AgentError::MissingModel.to_string(),
         other => other.to_string(),
     })?;
-    Ok((turn.answer, sink.tool_log))
+    Ok(AgentOutcome {
+        answer: turn.answer,
+        tool_log: sink.tool_log,
+        compactions: sink.compactions,
+    })
 }
 
 async fn write_event<W: AsyncWrite + Unpin>(
@@ -323,6 +401,14 @@ fn conversation_title(message: &str) -> String {
 }
 
 fn fold_history(messages: &[ConversationMessage]) -> String {
+    // Compaction rows are for the reader, not the model. Folding them back in
+    // would spend context explaining that context ran out, and would grow every
+    // subsequent turn's prompt by one line per pass.
+    let messages: Vec<ConversationMessage> = messages
+        .iter()
+        .filter(|message| message.role != COMPACTION_ROLE)
+        .cloned()
+        .collect();
     if messages.is_empty() {
         return String::new();
     }
@@ -467,6 +553,70 @@ mod tests {
         );
     }
 
+    /// Compaction rows are for the reader. Folding them back into the prompt
+    /// would spend context explaining that context ran out, and would grow
+    /// every later turn by one line per pass.
+    #[test]
+    fn fold_leaves_compaction_rows_out_of_the_prompt() {
+        let messages = vec![
+            ConversationMessage {
+                id: "m0".into(),
+                conversation_id: "c1".into(),
+                role: "user".into(),
+                content: "what did I do".into(),
+                tool_log: None,
+                created_at_ms: 1,
+            },
+            ConversationMessage {
+                id: "m1".into(),
+                conversation_id: "c1".into(),
+                role: COMPACTION_ROLE.into(),
+                content: "Dropped 2 earlier tool results".into(),
+                tool_log: None,
+                created_at_ms: 2,
+            },
+            ConversationMessage {
+                id: "m2".into(),
+                conversation_id: "c1".into(),
+                role: "assistant".into(),
+                content: "You read a design doc".into(),
+                tool_log: None,
+                created_at_ms: 3,
+            },
+        ];
+        let folded = fold_history(&messages);
+        assert!(folded.contains("what did I do"), "{folded}");
+        assert!(folded.contains("You read a design doc"), "{folded}");
+        assert!(!folded.contains("Dropped 2 earlier"), "{folded}");
+    }
+
+    /// The line a user reads where the agent stopped being able to see. It has
+    /// to say what went and that the answer is recoverable, or a shorter answer
+    /// just looks like the assistant got worse.
+    #[test]
+    fn the_compaction_line_says_what_went_and_what_to_do() {
+        let line = compaction_line(&CompactionNotice {
+            strategy: "prune_tool_results",
+            from_round: 0,
+            to_round: 2,
+            tokens_before: 14_000,
+            tokens_after: 6_200,
+        });
+        assert!(line.contains("Dropped 3 earlier tool results"), "{line}");
+        assert!(line.contains("14000"), "{line}");
+        assert!(line.contains("6200"), "{line}");
+        assert!(line.contains("ask again"), "{line}");
+
+        let one = compaction_line(&CompactionNotice {
+            strategy: "prune_tool_results",
+            from_round: 1,
+            to_round: 1,
+            tokens_before: 100,
+            tokens_after: 50,
+        });
+        assert!(one.contains("1 earlier tool result to"), "{one}");
+    }
+
     #[test]
     fn fold_keeps_first_and_recent_turns() {
         let messages: Vec<ConversationMessage> = (0..20)
@@ -498,6 +648,7 @@ mod tests {
             token_sink: &sink,
             now_ms: 1,
             llm_ready: true,
+            budget: ContextBudget::DEFAULT,
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "   ").await.unwrap();
@@ -518,6 +669,7 @@ mod tests {
             token_sink: &sink,
             now_ms: 1,
             llm_ready: false,
+            budget: ContextBudget::DEFAULT,
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "hello").await.unwrap();
@@ -553,23 +705,45 @@ print(json.dumps({
             token_sink: &sink,
             now_ms: 1_786_694_400_000,
             llm_ready: true,
+            budget: ContextBudget::DEFAULT,
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "我今天下午在干嘛")
             .await
             .unwrap();
         let events = parse_events(&buf);
+        // Positions are not asserted: `usage` lands before the first tool call
+        // and more event kinds may be added ahead of these.
         assert!(
-            matches!(
-                events.first(),
-                Some(ChatStreamEvent::ToolCall { name, .. }) if name == "list_activity"
-            ),
+            events.iter().any(|event| matches!(
+                event,
+                ChatStreamEvent::ToolCall { name, .. } if name == "list_activity"
+            )),
             "{events:?}"
         );
         assert!(
-            matches!(events.get(1), Some(ChatStreamEvent::ToolResult { name, .. }) if name == "list_activity"),
+            events.iter().any(|event| matches!(
+                event,
+                ChatStreamEvent::ToolResult { name, truncated: false, .. } if name == "list_activity"
+            )),
             "{events:?}"
         );
+        // Context pressure is reported every round, so it can never be invisible.
+        let usage: Vec<usize> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatStreamEvent::Usage {
+                    round,
+                    prompt_tokens,
+                    window_tokens,
+                } => {
+                    assert!(prompt_tokens > &0 && window_tokens > prompt_tokens);
+                    Some(*round)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage, [1, 2], "{events:?}");
         let tokens: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -582,6 +756,95 @@ print(json.dumps({
         let listed = vault.conversations(10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].message_count, 2);
+    }
+
+    /// The whole visibility chain for a turn that runs out of room: the events
+    /// reach the client, and a row lands in the thread saying what went.
+    ///
+    /// Non-destructive is the point. The user's message and the answer are
+    /// untouched; the compaction is an extra row beside them.
+    #[tokio::test]
+    async fn a_pressured_turn_announces_its_compaction_and_records_it() {
+        let (_dir, vault) = test_vault();
+        let now = 1_786_729_937_000;
+        let session = vault.create_session_sync(now - 60_000).unwrap();
+        vault
+            .insert_moment(&session.id, now - 60_000, "image/jpeg", b"frame")
+            .unwrap();
+
+        let script = r#"
+import json, sys
+req = json.load(sys.stdin)
+prompt = (req.get("input") or {}).get("prompt") or ""
+calls = prompt.count("Assistant called TOOL")
+if calls >= 6:
+    text = "FINAL\nYou were reading."
+else:
+    text = "TOOL get_now\nARGS {}"
+print(json.dumps({
+  "protocol_version": 1,
+  "output": {"type": "llm", "text": text},
+  "retryable": False
+}))
+"#;
+        let models = queue(vec![llm_script(script)]);
+        let sink = LlmTokenSink::default();
+        // A window narrow enough that get_now's own reply crowds it. Real
+        // pressure on a real tool, without building a vault to fill 16k tokens.
+        let budget = ContextBudget {
+            window_tokens: 1_000,
+            reserve_tokens: 256,
+            system_tokens: 256,
+            max_rounds: 8,
+        };
+        let ctx = ChatStreamCtx {
+            store: &vault,
+            models: &models,
+            token_sink: &sink,
+            now_ms: now,
+            llm_ready: true,
+            budget,
+        };
+        let mut buf = Vec::new();
+        run_chat_stream(&mut buf, ctx, None, "what was I reading")
+            .await
+            .unwrap();
+        let events = parse_events(&buf);
+
+        let compaction = events
+            .iter()
+            .find(|event| matches!(event, ChatStreamEvent::Compaction { .. }))
+            .unwrap_or_else(|| panic!("no compaction announced: {events:?}"));
+        assert!(matches!(
+            compaction,
+            ChatStreamEvent::Compaction { strategy, tokens_before, tokens_after, .. }
+                if strategy == "prune_tool_results" && tokens_after < tokens_before
+        ));
+        // A result too big for the per-call cap is cut, and the client hears so.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ChatStreamEvent::ToolResult { truncated: true, dropped, .. } if *dropped > 0
+            )),
+            "{events:?}"
+        );
+
+        let conversation = &vault.conversations(10).unwrap()[0].id;
+        let thread = vault.conversation_messages(conversation).unwrap();
+        let roles: Vec<&str> = thread.iter().map(|message| message.role.as_str()).collect();
+        assert!(roles.contains(&COMPACTION_ROLE), "{roles:?}");
+        assert_eq!(roles.first(), Some(&"user"), "{roles:?}");
+        assert_eq!(roles.last(), Some(&"assistant"), "{roles:?}");
+        let row = thread
+            .iter()
+            .find(|message| message.role == COMPACTION_ROLE)
+            .unwrap();
+        assert!(row.content.contains("context window"), "{}", row.content);
+        assert!(
+            row.tool_log
+                .as_deref()
+                .is_some_and(|log| log.contains("prune_tool_results"))
+        );
     }
 
     /// The tools speak epoch milliseconds; a seed that only spells the clock
@@ -619,6 +882,7 @@ print(json.dumps({
             token_sink: &sink,
             now_ms: 1,
             llm_ready: true,
+            budget: ContextBudget::DEFAULT,
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, Some("missing"), "hello")
@@ -660,6 +924,7 @@ print(json.dumps({
             token_sink: &sink,
             now_ms: 13,
             llm_ready: true,
+            budget: ContextBudget::DEFAULT,
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, Some(&conversation), "and then?")

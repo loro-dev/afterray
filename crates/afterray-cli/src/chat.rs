@@ -135,12 +135,41 @@ fn print_event(event: &ChatStreamEvent, json: bool) -> anyhow::Result<()> {
         ChatStreamEvent::ToolCall { name, args } => {
             println!("tool_call {name} {args}");
         }
-        ChatStreamEvent::ToolResult { name, chars } => {
-            println!("tool_result {name} ({chars} chars)");
+        ChatStreamEvent::ToolResult {
+            name,
+            chars,
+            truncated,
+            dropped,
+        } => {
+            let cut = if *truncated {
+                format!(", ~{dropped} tokens cut")
+            } else {
+                String::new()
+            };
+            println!("tool_result {name} ({chars} chars{cut})");
         }
         ChatStreamEvent::Token { text } => {
             print!("{text}");
             std::io::stdout().flush()?;
+        }
+        ChatStreamEvent::Usage {
+            prompt_tokens,
+            window_tokens,
+            round,
+        } => {
+            println!("usage round={round} {prompt_tokens}/{window_tokens} tokens");
+        }
+        ChatStreamEvent::Compaction {
+            strategy,
+            from_round,
+            to_round,
+            tokens_before,
+            tokens_after,
+        } => {
+            println!(
+                "compaction {strategy} rounds {from_round}..={to_round} \
+                 {tokens_before} -> {tokens_after} tokens"
+            );
         }
         ChatStreamEvent::Done {
             message_id,

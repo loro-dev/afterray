@@ -10,7 +10,7 @@ use chrono::Local;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use afterray_harness::ToolCallRecord;
+use afterray_harness::{CompactionNotice, ToolCallRecord};
 
 use crate::agent::{self, fence_untrusted};
 use afterray_harness::ContextBudget;
@@ -40,6 +40,9 @@ struct PendingTurn<'a> {
     user_text: &'a str,
     answer: &'a str,
     tool_log: Option<&'a str>,
+    /// Compaction passes this turn made, written as their own rows before the
+    /// answer. Non-destructive: nothing the user already saw is rewritten.
+    compactions: &'a [CompactionNotice],
     model_missing: bool,
     now_ms: i64,
 }
@@ -77,6 +80,7 @@ pub(crate) async fn handle_send(
                 user_text: message,
                 answer: MODEL_MISSING_MESSAGE,
                 tool_log: None,
+                compactions: &[],
                 model_missing: true,
                 now_ms,
             },
@@ -106,6 +110,7 @@ pub(crate) async fn handle_send(
                     user_text: message,
                     answer: turn.answer.trim(),
                     tool_log: tool_log.as_deref(),
+                    compactions: &turn.compactions,
                     model_missing: false,
                     now_ms,
                 },
@@ -118,6 +123,7 @@ pub(crate) async fn handle_send(
                 user_text: message,
                 answer: MODEL_MISSING_MESSAGE,
                 tool_log: None,
+                compactions: &[],
                 model_missing: true,
                 now_ms,
             },
@@ -131,6 +137,7 @@ pub(crate) async fn handle_send(
                         user_text: message,
                         answer: MODEL_MISSING_MESSAGE,
                         tool_log: None,
+                        compactions: &[],
                         model_missing: true,
                         now_ms,
                     },
@@ -222,6 +229,17 @@ fn persist_turn(store: &Vault, turn: &PendingTurn<'_>) -> Result<ChatReply, Stri
             turn.now_ms,
         )
         .map_err(|error| error.to_string())?;
+    for notice in turn.compactions {
+        if let Err(error) = store.append_message(
+            turn.conversation_id,
+            crate::stream::COMPACTION_ROLE,
+            &crate::stream::compaction_line(notice),
+            None,
+            turn.now_ms,
+        ) {
+            eprintln!("chat.compaction row failed: {error}");
+        }
+    }
     let assistant_message_id = store
         .append_message(
             turn.conversation_id,
@@ -265,10 +283,17 @@ pub(crate) fn title_from_message(message: &str) -> String {
 /// here; the caller fences the whole block.
 #[must_use]
 pub(crate) fn fold_history(messages: &[ConversationMessage], max_chars: usize) -> String {
+    // Compaction rows are for the reader. Folding them back in would spend
+    // context explaining that context ran out.
+    let messages: Vec<ConversationMessage> = messages
+        .iter()
+        .filter(|message| message.role != crate::stream::COMPACTION_ROLE)
+        .cloned()
+        .collect();
     if messages.is_empty() || max_chars == 0 {
         return String::new();
     }
-    let rounds: Vec<String> = group_rounds(messages)
+    let rounds: Vec<String> = group_rounds(&messages)
         .into_iter()
         .map(|round| render_round(&round, MAX_MESSAGE_CHARS))
         .collect();
