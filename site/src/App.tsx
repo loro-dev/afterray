@@ -11,7 +11,7 @@ function Nav() {
   return (
     <nav className="nav">
       <a className="nav-logo" href="#top">
-        <img src="/logo.png" alt="" className="logo-img" />
+        <img src="/logo.png" alt="" className="logo-img" width="22" height="22" />
         <span className="mono">AfterRay</span>
       </a>
       <div className="nav-actions">
