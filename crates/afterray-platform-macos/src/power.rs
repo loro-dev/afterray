@@ -87,8 +87,9 @@ mod macos {
         // activity in any app counts, not just events this process saw.
         const COMBINED_SESSION_STATE: u32 = 0;
         const ANY_INPUT_EVENT: u32 = 0xFFFF_FFFF;
-        let seconds =
-            unsafe { CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION_STATE, ANY_INPUT_EVENT) };
+        let seconds = unsafe {
+            CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION_STATE, ANY_INPUT_EVENT)
+        };
         if seconds.is_finite() && seconds >= 0.0 {
             seconds
         } else {
@@ -130,7 +131,8 @@ mod macos {
                 if description.is_null() {
                     continue;
                 }
-                let dict = CFDictionary::<CFString, CFString>::wrap_under_get_rule(description.cast());
+                let dict =
+                    CFDictionary::<CFString, CFString>::wrap_under_get_rule(description.cast());
                 if let Some(state) = dict.find(&state_key) {
                     let state = state.to_string();
                     if state == "AC Power" {

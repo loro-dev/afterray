@@ -8,6 +8,8 @@ extension Notification.Name {
 
 enum AfterRayPreferences {
     static let recordAudioKey = "dev.afterray.recordAudio"
+    static let developerOptionsUnlockedKey = "dev.afterray.developer-options.unlocked"
+    static let developerOptionsEnabledKey = "dev.afterray.developer-options.enabled"
 
     static var recordAudio: Bool {
         get {
@@ -40,6 +42,7 @@ final class AfterRaySettingsController: ObservableObject {
 
     func hide() {
         isPresented = false
+        model.pauseDownloadMonitoring()
     }
 }
 
@@ -57,6 +60,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var downloadingID: String?
     @Published var downloadProgress: Double?
     @Published var downloadStatus: String?
+    @Published var isControllingDownload = false
     @Published var isUpdatingAudio = false
     @Published var isUpdatingStorageLimit = false
     @Published var isUpdatingLanguage = false
@@ -72,9 +76,25 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var isInstallingCli = false
     @Published private(set) var cliStatus = AfterRayCliInstall.statusSummary
     @Published private(set) var cliInstalled = AfterRayCliInstall.isInstalled
+    @Published private(set) var developerOptionsUnlocked = UserDefaults.standard.bool(
+        forKey: AfterRayPreferences.developerOptionsUnlockedKey
+    )
+    @Published private(set) var developerOptionsEnabled = UserDefaults.standard.bool(
+        forKey: AfterRayPreferences.developerOptionsUnlockedKey
+    ) && UserDefaults.standard.bool(
+        forKey: AfterRayPreferences.developerOptionsEnabledKey
+    )
+    private var modelDownloadMonitor: Task<Void, Never>?
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
-    var excludedBundleIds: [String] { settings?.excludedBundleIds ?? [] }
+    var excludedBundleIds: [String] {
+        guard let settings else { return [] }
+        let installedProtected = AfterRayPrivacyCatalog.installedBundleIDs(
+            from: settings.protectedBundleIds
+        )
+        return Array(Set(settings.excludedBundleIds + installedProtected))
+            .sorted { appDisplayName($0) < appDisplayName($1) }
+    }
     var excludedDomains: [String] { settings?.excludedDomains ?? [] }
     var dataDirectoryPath: String {
         settings?.dataDir ?? DaemonSupervisor.shared.dataDirectory.path
@@ -84,6 +104,13 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
     var logDirectoryPath: String { AfterRayLog.directory.path }
     var logFilePath: String { AfterRayLog.fileURL.path }
+
+    private func appDisplayName(_ bundleID: String) -> String {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            return AfterRayPrivacyCatalog.protectedName(for: bundleID) ?? bundleID
+        }
+        return FileManager.default.displayName(atPath: url.path)
+    }
 
     func refresh() async {
         isRefreshing = true
@@ -102,6 +129,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             let loaded = try await (nextSettings, nextLibrary, nextJobs)
             settings = loaded.0
             library = loaded.1
+            message = nil
+            applyDownloadState(loaded.1.download)
             recentJobs = Array(loaded.2.suffix(8).reversed())
             applyLlmDrafts(from: loaded.0)
             AfterRayPreferences.recordAudio = loaded.0.recordAudio
@@ -110,7 +139,6 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 modelDirectory: URL(fileURLWithPath: loaded.0.modelDir, isDirectory: true),
                 runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
             )
-            message = nil
             await probeLlm()
             await persistRecommendedOllamaModelIfNeeded()
         } catch {
@@ -162,6 +190,24 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         AfterRayUpdater.shared.checkForUpdates()
     }
 
+    func unlockDeveloperOptions() {
+        guard !developerOptionsUnlocked else { return }
+        developerOptionsUnlocked = true
+        UserDefaults.standard.set(true, forKey: AfterRayPreferences.developerOptionsUnlockedKey)
+        message = "Developer options unlocked."
+    }
+
+    func setDeveloperOptionsEnabled(_ enabled: Bool) {
+        guard developerOptionsUnlocked else { return }
+        developerOptionsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: AfterRayPreferences.developerOptionsEnabledKey)
+    }
+
+    func replayOnboarding() {
+        AfterRaySettingsController.shared.hide()
+        OnboardingController.shared.replay()
+    }
+
     func excludeBundle(_ bundleID: String) async {
         var next = excludedBundleIds
         guard !bundleID.isEmpty, !next.contains(bundleID) else { return }
@@ -170,6 +216,10 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func includeBundle(_ bundleID: String) async {
+        guard settings?.protectedBundleIds.contains(bundleID) != true else {
+            message = "Password managers and system credential apps are always excluded."
+            return
+        }
         await saveExclusions(excludedBundleIds.filter { $0 != bundleID }, message: "Included \(bundleID) again.")
     }
 
@@ -375,37 +425,70 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func download(packID: String?) async {
+        guard downloadingID == nil else { return }
         downloadingID = packID ?? "all"
         downloadProgress = 0
         downloadStatus = packID == nil ? "Starting downloads…" : "Starting \(displayName(for: packID))…"
         message = nil
-        defer {
+
+        let socket = DaemonSupervisor.shared.socketPath
+        do {
+            let next = try await UnixSocketDaemonClient(socketPath: socket).startModelDownloads(
+                packIDs: packID.map { [$0] } ?? []
+            )
+            library = next
+            applyDownloadState(next.download)
+            if next.download?.isActive == true {
+                AfterRayLog.info("started \(packID ?? "missing model") download", source: "download")
+                startDownloadMonitor()
+            } else {
+                downloadingID = nil
+                downloadProgress = nil
+                downloadStatus = nil
+                message = packID == nil ? "All model packs are ready." : "\(displayName(for: packID)) is ready."
+            }
+        } catch {
             downloadingID = nil
             downloadProgress = nil
             downloadStatus = nil
-        }
-
-        let socket = DaemonSupervisor.shared.socketPath
-        let progress = Task { @MainActor in
-            while !Task.isCancelled {
-                if let next = try? await UnixSocketDaemonClient(socketPath: socket).modelLibrary() {
-                    library = next
-                    applyDownloadProgress(next.download, fallbackPackID: packID)
-                }
-                try? await Task.sleep(for: .milliseconds(350))
-            }
-        }
-
-        do {
-            library = try await UnixSocketDaemonClient(socketPath: socket).downloadModels(packID: packID)
-            AfterRayLog.info("downloaded \(packID ?? "missing models")", source: "download")
-            message = packID == nil ? "Downloads finished." : "\(displayName(for: packID)) is ready."
-        } catch {
             message = error.localizedDescription
             AfterRayLog.error(error.localizedDescription, source: "download")
         }
-        progress.cancel()
-        await refresh()
+    }
+
+    func pauseDownloadMonitoring() {
+        modelDownloadMonitor?.cancel()
+        modelDownloadMonitor = nil
+    }
+
+    func pauseModelDownloads() async {
+        await controlModelDownloads { try await $0.pauseModelDownloads() }
+    }
+
+    func resumeModelDownloads() async {
+        await controlModelDownloads { try await $0.resumeModelDownloads() }
+        if library?.download?.isActive == true { startDownloadMonitor() }
+    }
+
+    func cancelModelDownloads() async {
+        await controlModelDownloads { try await $0.cancelModelDownloads() }
+    }
+
+    private func controlModelDownloads(
+        _ operation: (UnixSocketDaemonClient) async throws -> ModelLibrary
+    ) async {
+        guard !isControllingDownload else { return }
+        isControllingDownload = true
+        defer { isControllingDownload = false }
+        do {
+            let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            let next = try await operation(client)
+            library = next
+            applyDownloadState(next.download)
+            message = nil
+        } catch {
+            message = error.localizedDescription
+        }
     }
 
     func remove(packID: String) async {
@@ -560,12 +643,33 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         library?.packs.first(where: { $0.id == packID })?.name ?? "model"
     }
 
-    private func applyDownloadProgress(_ download: ModelDownloadProgress?, fallbackPackID: String?) {
-        guard let download else { return }
-        if let fraction = download.fraction {
-            downloadProgress = min(fraction, 0.99)
+    private func applyDownloadState(_ download: ModelDownloadProgress?) {
+        guard let download else {
+            downloadingID = nil
+            downloadProgress = nil
+            downloadStatus = nil
+            return
         }
-        let name = displayName(for: download.packId.isEmpty ? fallbackPackID : download.packId)
+        if download.isPaused {
+            downloadingID = download.packId
+            downloadProgress = download.fraction
+            downloadStatus = "Paused \(displayName(for: download.packId))"
+            return
+        }
+        guard download.isActive else {
+            downloadingID = nil
+            downloadProgress = nil
+            downloadStatus = nil
+            if download.state == .failed, let error = download.error, !error.isEmpty {
+                message = error
+            }
+            return
+        }
+        downloadingID = download.packId
+        if let fraction = download.fraction {
+            downloadProgress = fraction
+        }
+        let name = displayName(for: download.packId)
         if download.state == .verifying {
             downloadStatus = "Verifying \(name)…"
         } else if let error = download.error, !error.isEmpty {
@@ -576,6 +680,40 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             downloadStatus = "Downloading \(name) · \(download.completedFiles)/\(download.totalFiles) files"
         } else {
             downloadStatus = "Downloading \(name)…"
+        }
+        startDownloadMonitor()
+    }
+
+    private func startDownloadMonitor() {
+        guard modelDownloadMonitor == nil else { return }
+        let socket = DaemonSupervisor.shared.socketPath
+        modelDownloadMonitor = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { modelDownloadMonitor = nil }
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(350))
+                    guard !Task.isCancelled else { return }
+                    let next = try await UnixSocketDaemonClient(socketPath: socket).modelLibrary()
+                    let wasActive = library?.download?.isActive == true
+                    library = next
+                    applyDownloadState(next.download)
+                    if wasActive, next.download == nil {
+                        message = "Model downloads finished."
+                        storage = AfterRayStorageSnapshot.measure(
+                            dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
+                            modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
+                            runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
+                        )
+                    }
+                    guard next.download?.isActive == true else { return }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    message = error.localizedDescription
+                    return
+                }
+            }
         }
     }
 }

@@ -11,20 +11,22 @@ import Foundation
 @MainActor
 final class OnboardingExclusions: ObservableObject {
     @Published private(set) var bundleIds: [String] = []
+    @Published private(set) var protectedBundleIds: Set<String> = []
     @Published private(set) var domains: [String] = []
+    @Published private(set) var message: String?
 
     private var daemon: UnixSocketDaemonClient {
         UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
     }
 
-    init() {
-        Task { await load() }
-    }
-
     func load() async {
-        guard let settings = try? await daemon.settings() else { return }
-        bundleIds = settings.excludedBundleIds
-        domains = settings.excludedDomains
+        do {
+            _ = try await DaemonSupervisor.shared.startIfNeeded()
+            apply(try await daemon.settings())
+            message = nil
+        } catch {
+            message = error.localizedDescription
+        }
     }
 
     /// A file picker rather than "exclude the frontmost app": during onboarding
@@ -36,17 +38,29 @@ final class OnboardingExclusions: ObservableObject {
         panel.canChooseDirectories = false
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         panel.prompt = "Exclude"
-        panel.message = "Choose an app AfterRay should never record."
-        guard panel.runModal() == .OK,
-              let url = panel.url,
-              let bundleID = Bundle(url: url)?.bundleIdentifier,
-              bundleID != "dev.afterray.app",
-              !bundleIds.contains(bundleID)
-        else { return }
+        panel.message = "Choose an app to skip."
+        let response = await present(panel)
+        guard response == .OK, let url = panel.url else { return }
+        guard let bundleID = Bundle(url: url)?.bundleIdentifier else {
+            message = "Could not read that app's identifier."
+            return
+        }
+        guard bundleID != "dev.afterray.app" else {
+            message = "AfterRay already excludes its own windows."
+            return
+        }
+        guard !bundleIds.contains(bundleID) else {
+            message = "That app is already excluded."
+            return
+        }
         await save(bundleIds: bundleIds + [bundleID], domains: nil)
     }
 
     func removeApp(_ bundleID: String) async {
+        guard !protectedBundleIds.contains(bundleID) else {
+            message = "Password apps are always skipped."
+            return
+        }
         await save(bundleIds: bundleIds.filter { $0 != bundleID }, domains: nil)
     }
 
@@ -63,17 +77,49 @@ final class OnboardingExclusions: ObservableObject {
     }
 
     private func save(bundleIds newBundleIds: [String]?, domains newDomains: [String]?) async {
-        guard let settings = try? await daemon.updateSettings(
-            recordAudio: nil,
-            excludedBundleIds: newBundleIds,
-            excludedDomains: newDomains,
-            llmProvider: nil,
-            llmBaseUrl: nil,
-            llmModel: nil,
-            llmApiKey: nil
-        ) else { return }
-        bundleIds = settings.excludedBundleIds
+        do {
+            _ = try await DaemonSupervisor.shared.startIfNeeded()
+            let settings = try await daemon.updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: newBundleIds,
+                excludedDomains: newDomains,
+                llmProvider: nil,
+                llmBaseUrl: nil,
+                llmModel: nil,
+                llmApiKey: nil
+            )
+            apply(settings)
+            message = nil
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func apply(_ settings: AppSettings) {
+        protectedBundleIds = Set(settings.protectedBundleIds)
+        let installedProtected = AfterRayPrivacyCatalog.installedBundleIDs(
+            from: settings.protectedBundleIds
+        )
+        bundleIds = Array(Set(settings.excludedBundleIds + installedProtected))
+            .sorted { Self.displayName(for: $0) < Self.displayName(for: $1) }
         domains = settings.excludedDomains
+    }
+
+    /// The onboarding panel floats at modal-panel level. Attaching the picker
+    /// as its sheet keeps the chooser visibly tied to the button and avoids a
+    /// synchronous nested modal loop that can appear behind that panel.
+    private func present(_ panel: NSOpenPanel) async -> NSApplication.ModalResponse {
+        await withCheckedContinuation { continuation in
+            if let parent = NSApp.keyWindow {
+                panel.beginSheetModal(for: parent) { response in
+                    continuation.resume(returning: response)
+                }
+            } else {
+                panel.begin { response in
+                    continuation.resume(returning: response)
+                }
+            }
+        }
     }
 
     /// Falls back to the identifier when the app is not installed — a stale
@@ -85,8 +131,12 @@ final class OnboardingExclusions: ObservableObject {
                 .object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
                 ?? Bundle(url: url)?.object(forInfoDictionaryKey: "CFBundleName") as? String
         else {
-            return bundleID
+            return AfterRayPrivacyCatalog.protectedName(for: bundleID) ?? bundleID
         }
         return name
+    }
+
+    static func iconPath(for bundleID: String) -> String? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)?.path
     }
 }

@@ -23,6 +23,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var downloadingID: String?
     @Published public var downloadProgress: Double?
     @Published public var downloadStatus: String?
+    @Published public var isControllingDownload = false
     @Published public var isUpdatingAudio = false
     @Published public var isUpdatingStorageLimit = false
     @Published public var isUpdatingLanguage = false
@@ -50,6 +51,8 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var updatesSupported = true
     @Published public var automaticUpdates = true
     @Published public var updateStatus = "You are on 0.0.1 (build 1). AfterRay checks once a day."
+    @Published public var developerOptionsUnlocked = false
+    @Published public var developerOptionsEnabled = false
     @Published public var recentJobs: [ModelJob] = [
         ModelJob(
             id: "job-asr",
@@ -252,6 +255,21 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         message = "Preview marked \(packID ?? "models") as installed."
     }
 
+    public func pauseModelDownloads() async {
+        downloadStatus = "Paused models"
+    }
+
+    public func resumeModelDownloads() async {
+        downloadStatus = "Downloading models · 70%"
+    }
+
+    public func cancelModelDownloads() async {
+        downloadingID = nil
+        downloadProgress = nil
+        downloadStatus = nil
+        message = "Preview download cancelled."
+    }
+
     public func remove(packID: String) async {
         guard let current = library else { return }
         library = ModelLibrary(
@@ -293,6 +311,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             captureIntervalSeconds: 10,
             storageLimitBytes: current?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
             excludedBundleIds: current?.excludedBundleIds ?? excludedBundleIds,
+            protectedBundleIds: current?.protectedBundleIds ?? [],
             llmProvider: provider,
             llmBaseUrl: draftLlmBaseUrl,
             llmModel: draftLlmModel,
@@ -317,6 +336,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             captureIntervalSeconds: current.captureIntervalSeconds,
             storageLimitBytes: storageLimitBytes ?? current.storageLimitBytes,
             excludedBundleIds: current.excludedBundleIds,
+            protectedBundleIds: current.protectedBundleIds,
             llmProvider: current.llmProvider,
             llmBaseUrl: current.llmBaseUrl,
             llmModel: current.llmModel,
@@ -355,5 +375,19 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
 
     public func checkForUpdates() {
         message = "Preview checked for updates."
+    }
+
+    public func unlockDeveloperOptions() {
+        developerOptionsUnlocked = true
+        message = "Developer options unlocked."
+    }
+
+    public func setDeveloperOptionsEnabled(_ enabled: Bool) {
+        guard developerOptionsUnlocked else { return }
+        developerOptionsEnabled = enabled
+    }
+
+    public func replayOnboarding() {
+        message = "Preview would replay onboarding."
     }
 }

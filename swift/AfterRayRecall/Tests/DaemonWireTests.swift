@@ -3,6 +3,33 @@ import XCTest
 @testable import AfterRayRecall
 
 final class DaemonWireTests: XCTestCase {
+    func testDevelopmentSocketPathIsStableAndIndependentOfCheckoutLength() {
+        let cache = URL(fileURLWithPath: "/Users/test/Library/Caches", isDirectory: true)
+        let short = AfterRaySocketPath.development(
+            repoRoot: URL(fileURLWithPath: "/work/afterray", isDirectory: true),
+            cacheDirectory: cache
+        )
+        let long = AfterRaySocketPath.development(
+            repoRoot: URL(
+                fileURLWithPath: "/work/" + String(repeating: "very-long-worktree/", count: 20),
+                isDirectory: true
+            ),
+            cacheDirectory: cache
+        )
+
+        XCTAssertEqual(
+            short,
+            AfterRaySocketPath.development(
+                repoRoot: URL(fileURLWithPath: "/work/afterray", isDirectory: true),
+                cacheDirectory: cache
+            )
+        )
+        XCTAssertNotEqual(short, long)
+        XCTAssertLessThan(short.utf8.count, 104)
+        XCTAssertLessThan(long.utf8.count, 104)
+        XCTAssertEqual(AfterRaySocketPath.fnv1a64("hello".utf8), 0xa430_d846_80aa_bd0b)
+    }
+
     func testTimelineRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "timeline_list"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -162,6 +189,7 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.captureIntervalSeconds, 10)
         XCTAssertEqual(settings.storageLimitBytes, AppSettings.defaultStorageLimitBytes)
         XCTAssertTrue(settings.excludedBundleIds.isEmpty)
+        XCTAssertTrue(settings.protectedBundleIds.isEmpty)
         XCTAssertEqual(settings.uiLanguage, AppSettings.defaultLanguage)
         XCTAssertEqual(settings.summaryLanguage, AppSettings.defaultLanguage)
         XCTAssertTrue(settings.languageOptions.isEmpty)
@@ -241,9 +269,10 @@ final class DaemonWireTests: XCTestCase {
     }
 
     func testAppSettingsDecodesExcludedApps() throws {
-        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"excluded_bundle_ids":["com.apple.Safari"]}"#
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"excluded_bundle_ids":["com.apple.Safari","com.bitwarden.desktop"],"protected_bundle_ids":["com.bitwarden.desktop"]}"#
         let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
-        XCTAssertEqual(settings.excludedBundleIds, ["com.apple.Safari"])
+        XCTAssertEqual(settings.excludedBundleIds, ["com.apple.Safari", "com.bitwarden.desktop"])
+        XCTAssertEqual(settings.protectedBundleIds, ["com.bitwarden.desktop"])
         XCTAssertEqual(settings.llmProvider, .mlxLocal)
         XCTAssertTrue(settings.llmModel.isEmpty)
     }
@@ -340,11 +369,22 @@ final class DaemonWireTests: XCTestCase {
     }
 
     func testModelLibraryDecodesDownloadProgress() throws {
-        let json = #"{"directory":"/tmp/models","packs":[],"download":{"pack_id":"asr","bytes":42,"expected_bytes":100,"completed_files":0,"total_files":1}}"#
+        let json = #"{"directory":"/tmp/models","packs":[],"download":{"pack_id":"asr","queued_pack_ids":["embedding"],"bytes":42,"expected_bytes":100,"completed_files":0,"total_files":1}}"#
         let library = try JSONDecoder().decode(ModelLibrary.self, from: Data(json.utf8))
         XCTAssertEqual(library.download?.packId, "asr")
+        XCTAssertEqual(library.download?.queuedPackIds, ["embedding"])
+        XCTAssertTrue(library.download?.isActive == true)
         XCTAssertEqual(library.download?.percent, 42)
         XCTAssertEqual(library.download?.fraction, 0.42)
+    }
+
+    func testPausedModelDownloadIsControllableButNotActive() throws {
+        let json = #"{"directory":"/tmp/models","packs":[],"download":{"pack_id":"asr","queued_pack_ids":["embedding"],"state":"paused","bytes":42,"expected_bytes":100,"completed_files":0,"total_files":1}}"#
+        let library = try JSONDecoder().decode(ModelLibrary.self, from: Data(json.utf8))
+
+        XCTAssertTrue(library.download?.isPaused == true)
+        XCTAssertFalse(library.download?.isActive == true)
+        XCTAssertEqual(library.download?.percent, 42)
     }
 
     func testModelPackDecodesExpectedBytes() throws {
@@ -354,10 +394,26 @@ final class DaemonWireTests: XCTestCase {
     }
 
     func testDownloadModelsRequestMatchesRustShape() throws {
-        let data = try JSONEncoder().encode(WireRequest(type: "download_models", packID: "asr"))
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "download_models", packIDs: ["asr", "embedding"])
+        )
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(json["type"] as? String, "download_models")
-        XCTAssertEqual(json["pack_id"] as? String, "asr")
+        XCTAssertEqual(json["pack_ids"] as? [String], ["asr", "embedding"])
+        XCTAssertNil(json["pack_id"])
+    }
+
+    func testModelDownloadControlRequestsMatchRustShape() throws {
+        for type in [
+            "pause_model_downloads",
+            "resume_model_downloads",
+            "cancel_model_downloads",
+        ] {
+            let data = try JSONEncoder().encode(WireRequest(type: type))
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(json["type"] as? String, type)
+            XCTAssertEqual(json.count, 1)
+        }
     }
 
     func testRemoveModelRequestMatchesRustShape() throws {
@@ -486,7 +542,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 7)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 8)
     }
 
     func testRecordResultsDecodeBothDaemonBranches() throws {
@@ -510,7 +566,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testStatusDecodesHostBuildStampedByTheApp() throws {
         let json = #"""
-        {"daemon_version":"0.0.1","protocol_version":7,"schema_version":11,\#
+        {"daemon_version":"0.0.1","protocol_version":8,"schema_version":11,\#
         "recording_state":"recording","active_session_id":"s1","host_build":"142"}
         """#
         let status = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))

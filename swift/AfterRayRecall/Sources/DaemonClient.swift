@@ -118,7 +118,10 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
         summaryLanguage: String?
     ) async throws -> AppSettings
     func probeLlm(provider: LlmProvider?, baseUrl: String?) async throws -> LlmEndpointStatus
-    func downloadModels(packID: String?) async throws -> ModelLibrary
+    func startModelDownloads(packIDs: [String]) async throws -> ModelLibrary
+    func pauseModelDownloads() async throws -> ModelLibrary
+    func resumeModelDownloads() async throws -> ModelLibrary
+    func cancelModelDownloads() async throws -> ModelLibrary
     func removeModel(packID: String) async throws -> ModelLibrary
     func jobs() async throws -> [ModelJob]
     func clearHistory(scope: HistoryScope) async throws -> HistoryClearResult
@@ -146,7 +149,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 7
+    public static let protocolVersion = 8
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -238,11 +241,23 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         )
     }
 
-    public func downloadModels(packID: String?) async throws -> ModelLibrary {
+    public func startModelDownloads(packIDs: [String] = []) async throws -> ModelLibrary {
         try await request(
-            WireRequest(type: "download_models", packID: packID),
+            WireRequest(type: "download_models", packIDs: packIDs),
             as: ModelLibrary.self
         )
+    }
+
+    public func pauseModelDownloads() async throws -> ModelLibrary {
+        try await request(WireRequest(type: "pause_model_downloads"), as: ModelLibrary.self)
+    }
+
+    public func resumeModelDownloads() async throws -> ModelLibrary {
+        try await request(WireRequest(type: "resume_model_downloads"), as: ModelLibrary.self)
+    }
+
+    public func cancelModelDownloads() async throws -> ModelLibrary {
+        try await request(WireRequest(type: "cancel_model_downloads"), as: ModelLibrary.self)
     }
 
     public func removeModel(packID: String) async throws -> ModelLibrary {
@@ -457,6 +472,7 @@ struct WireRequest: Encodable, Equatable {
     var recordAudio: Bool?
     var reason: String?
     var packID: String?
+    var packIDs: [String]?
     var segmentID: String?
     var gopIndex: UInt16?
     var gopMode: String?
@@ -494,6 +510,7 @@ struct WireRequest: Encodable, Equatable {
         case recordAudio = "record_audio"
         case reason
         case packID = "pack_id"
+        case packIDs = "pack_ids"
         case segmentID = "segment_id"
         case gopIndex = "index"
         case gopMode = "mode"
@@ -533,6 +550,9 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(recordAudio, forKey: .recordAudio)
         try container.encodeIfPresent(reason, forKey: .reason)
         try container.encodeIfPresent(packID, forKey: .packID)
+        if let packIDs, !packIDs.isEmpty {
+            try container.encode(packIDs, forKey: .packIDs)
+        }
         try container.encodeIfPresent(segmentID, forKey: .segmentID)
         try container.encodeIfPresent(gopIndex, forKey: .gopIndex)
         try container.encodeIfPresent(gopMode, forKey: .gopMode)

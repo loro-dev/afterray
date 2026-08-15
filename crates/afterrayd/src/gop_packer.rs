@@ -230,7 +230,10 @@ fn encode_run(vault: &Vault, run: &[PackCandidate]) -> Result<EncodedGop, anyhow
         // commits, `drop_unpinned_stills` deletes it — and nothing on this side
         // can decode AV1 to get the pixels back.
         if let Err(error) = ensure_thumbnail(vault, &frame.id, &still.bytes) {
-            eprintln!("gop packer: thumbnail failed for moment {}: {error}", frame.id);
+            eprintln!(
+                "gop packer: thumbnail failed for moment {}: {error}",
+                frame.id
+            );
         }
         let (width, height, yuv) = jpeg_to_i420(&still.bytes)?;
         let even_width = frame.width & !1;

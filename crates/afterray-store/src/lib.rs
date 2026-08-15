@@ -74,11 +74,11 @@ pub type MomentAt = (String, i64);
 pub use slot::{
     AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
     SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
-    SlotSummaryState, StoredSlotOverlay, T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport,
-    T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, TimelineEntry, assemble_day_summary,
-    attach_entity_candidates, build_slot_card, dedup_key_of, extract_json_object,
-    local_day_bounds, local_day_for, parse_t2_card, parse_t2_card_v2, render_t2_prompt,
-    shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
+    SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, T2Card, T2CardV2,
+    T2Entity, T2Thread, T2VerifyReport, TimelineEntry, assemble_day_summary,
+    attach_entity_candidates, build_slot_card, dedup_key_of, extract_json_object, local_day_bounds,
+    local_day_for, parse_t2_card, parse_t2_card_v2, render_t2_prompt, shorten_place,
+    slot_clock_label, slot_start_for, verify_t2_card,
 };
 
 pub const SCHEMA_VERSION: u32 = 18;
@@ -1115,9 +1115,7 @@ impl Vault {
         )
         .unwrap_or(i64::MAX);
         let settled = slot_end_ms.saturating_add(Self::CARD_CACHE_SETTLE_MS) <= wall_ms;
-        if settled
-            && let Some(card) = self.card_cache.lock().unwrap().get(&slot_start_ms)
-        {
+        if settled && let Some(card) = self.card_cache.lock().unwrap().get(&slot_start_ms) {
             return Ok(card.clone());
         }
 
@@ -1265,8 +1263,8 @@ impl Vault {
             line_df: HashMap::new(),
             token_df: HashMap::new(),
         };
-        let mut lookup = connection
-            .prepare_cached("SELECT df FROM text_df WHERE kind = ?1 AND key = ?2")?;
+        let mut lookup =
+            connection.prepare_cached("SELECT df FROM text_df WHERE kind = ?1 AND key = ?2")?;
         for key in line_keys {
             if let Some(df) = lookup
                 .query_row(params![0_i64, &key], |row| row.get::<_, i64>(0))
@@ -1476,8 +1474,8 @@ impl Vault {
                     chunk
                         .iter()
                         .map(|(start, slot_rows)| {
-                            let idle_ms = self
-                                .idle_overlap_ms(*start, *start + slot::SLOT_DURATION_MS)?;
+                            let idle_ms =
+                                self.idle_overlap_ms(*start, *start + slot::SLOT_DURATION_MS)?;
                             Ok((
                                 *start,
                                 slot::build_slot_card(
@@ -1588,9 +1586,8 @@ impl Vault {
             let entities_json: Option<String> = row.get(7)?;
             let decisions_json: Option<String> = row.get(8)?;
             let not_captured_json: Option<String> = row.get(9)?;
-            let parse_list = |json: Option<String>| {
-                json.and_then(|raw| serde_json::from_str(&raw).ok())
-            };
+            let parse_list =
+                |json: Option<String>| json.and_then(|raw| serde_json::from_str(&raw).ok());
             let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
             Ok((
                 start,
@@ -1600,10 +1597,8 @@ impl Vault {
                     bullets,
                     category,
                     description: description.filter(|text| !text.is_empty()),
-                    threads: threads_json
-                        .and_then(|raw| serde_json::from_str(&raw).ok()),
-                    entities: entities_json
-                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                    threads: threads_json.and_then(|raw| serde_json::from_str(&raw).ok()),
+                    entities: entities_json.and_then(|raw| serde_json::from_str(&raw).ok()),
                     decisions: parse_list(decisions_json),
                     not_captured: parse_list(not_captured_json),
                 },
@@ -1653,7 +1648,8 @@ impl Vault {
                 has_audio: row.get(9)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Milliseconds of `[from_ms, to_ms)` covered by recorded idle spans.
@@ -1710,7 +1706,8 @@ impl Vault {
         let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Moments captured in a window, oldest first. Entry points for an agent
@@ -1736,7 +1733,8 @@ impl Vault {
         let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Oldest and newest capture held by the vault, or `None` when nothing has
@@ -1818,7 +1816,8 @@ impl Vault {
                 message_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// One conversation by id, if it exists.
@@ -1902,7 +1901,8 @@ impl Vault {
                 created_at_ms: row.get(5)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Renames a conversation — used to replace the placeholder title with
@@ -2799,9 +2799,13 @@ impl Vault {
                 )?;
                 transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
                 transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
-                for artifact_id in [artifact_id, accessibility_artifact_id, thumbnail_artifact_id]
-                    .into_iter()
-                    .flatten()
+                for artifact_id in [
+                    artifact_id,
+                    accessibility_artifact_id,
+                    thumbnail_artifact_id,
+                ]
+                .into_iter()
+                .flatten()
                 {
                     transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
                 }
@@ -2856,9 +2860,13 @@ impl Vault {
             transaction.commit()?;
             drop(connection);
             for (_, artifact_id, accessibility_artifact_id, thumbnail_artifact_id) in candidates {
-                for artifact_id in [artifact_id, accessibility_artifact_id, thumbnail_artifact_id]
-                    .into_iter()
-                    .flatten()
+                for artifact_id in [
+                    artifact_id,
+                    accessibility_artifact_id,
+                    thumbnail_artifact_id,
+                ]
+                .into_iter()
+                .flatten()
                 {
                     let _ = fs::remove_file(self.artifact_path(&artifact_id));
                 }
@@ -5761,7 +5769,9 @@ mod tests {
         // The limit is a byte budget, so it has to be small enough that one
         // moment plus its thumbnail already exceeds it; a count would not
         // evict anything here.
-        let (_directory, vault) = test_vault_with_storage_limit(u64::try_from(ARTIFACT_FILE_OVERHEAD_BYTES).unwrap_or(0) + 64);
+        let (_directory, vault) = test_vault_with_storage_limit(
+            u64::try_from(ARTIFACT_FILE_OVERHEAD_BYTES).unwrap_or(0) + 64,
+        );
         let session = vault.create_session_sync(1).unwrap();
         let evicted = vault
             .insert_moment(&session.id, 1_000, "image/jpeg", b"old")
@@ -6153,7 +6163,11 @@ mod tests {
         let (day_start, _) = local_day_bounds(1_786_698_000_000);
         let first_slot = slot_start_for(day_start + 10 * 3_600_000);
         let second_slot = first_slot + SLOT_DURATION_MS;
-        for (offset, title) in [(0_i64, "gop.rs"), (20_000, "encoder.rs"), (40_000, "ivf.rs")] {
+        for (offset, title) in [
+            (0_i64, "gop.rs"),
+            (20_000, "encoder.rs"),
+            (40_000, "ivf.rs"),
+        ] {
             insert_named_moment(
                 &vault,
                 &session.id,
@@ -6238,7 +6252,10 @@ mod tests {
         assert_eq!(generation, 2);
 
         let prev = vault.previous_slot_titles(second_slot + 1, 4).unwrap();
-        assert_eq!(prev.last().map(|card| card.title.as_str()), Some("Second pass"));
+        assert_eq!(
+            prev.last().map(|card| card.title.as_str()),
+            Some("Second pass")
+        );
     }
 
     #[test]
@@ -6313,7 +6330,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap(), 1);
+        assert_eq!(
+            vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap(),
+            1
+        );
         let remaining: i64 = vault
             .connection
             .lock()

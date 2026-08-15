@@ -195,13 +195,14 @@ impl ToolHost<'_> {
             .day_summary(day_ms, 10_000)
             .map_err(|e| e.to_string())?;
         if summary.slots.is_empty() {
-            return Ok(format!(
-                "Nothing was recorded on {}.",
-                summary.day
-            ));
+            return Ok(format!("Nothing was recorded on {}.", summary.day));
         }
 
-        let mut lines = vec![format!("Day {} — {} half-hours with activity.", summary.day, summary.slots.len())];
+        let mut lines = vec![format!(
+            "Day {} — {} half-hours with activity.",
+            summary.day,
+            summary.slots.len()
+        )];
         let mut unsummarised = 0_usize;
         for slot in &summary.slots {
             let clock = chrono::DateTime::from_timestamp_millis(slot.slot_start_ms).map_or_else(
@@ -232,7 +233,11 @@ impl ToolHost<'_> {
                         "{clock} at_ms={} — [not summarised: {}] apps: {}",
                         slot.slot_start_ms,
                         slot.state.as_str(),
-                        if apps.is_empty() { "none recorded".to_owned() } else { apps }
+                        if apps.is_empty() {
+                            "none recorded".to_owned()
+                        } else {
+                            apps
+                        }
                     ));
                 }
             }
@@ -313,7 +318,8 @@ impl ToolHost<'_> {
     /// numbers the model can copy. A silent `[]` reads as "nothing happened"
     /// and the model stops looking; this makes a mistyped year recoverable.
     fn check_range(&self, from_ms: i64, to_ms: i64) -> Result<(), String> {
-        let Some((first, last)) = self.store.moment_time_bounds().map_err(|e| e.to_string())? else {
+        let Some((first, last)) = self.store.moment_time_bounds().map_err(|e| e.to_string())?
+        else {
             return Err(format!(
                 "the vault holds no captures at all yet. {}",
                 self.clock_hint()
@@ -407,7 +413,11 @@ pub fn ocr_evidence(store: &Vault, moment_id: &str) -> Result<OcrEvidence, Strin
     })
 }
 
-pub fn ax_evidence(store: &Vault, moment_id: &str, digest_only: bool) -> Result<AxEvidence, String> {
+pub fn ax_evidence(
+    store: &Vault,
+    moment_id: &str,
+    digest_only: bool,
+) -> Result<AxEvidence, String> {
     let bytes = store
         .accessibility_bytes_for_moment(moment_id)
         .map_err(|e| e.to_string())?
@@ -485,10 +495,9 @@ fn parse_range(
     default_limit: usize,
     max_limit: usize,
 ) -> Result<(i64, i64, usize), String> {
-    let from_ms = args
-        .get("from_ms")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| "from_ms is required (Unix milliseconds; call get_now for one)".to_owned())?;
+    let from_ms = args.get("from_ms").and_then(Value::as_i64).ok_or_else(|| {
+        "from_ms is required (Unix milliseconds; call get_now for one)".to_owned()
+    })?;
     let to_ms = args
         .get("to_ms")
         .and_then(Value::as_i64)
@@ -511,7 +520,10 @@ fn truncate_tool_output(text: &str) -> String {
     if count <= MAX_TOOL_CHARS {
         return text.to_owned();
     }
-    let taken: String = text.chars().take(MAX_TOOL_CHARS.saturating_sub(1)).collect();
+    let taken: String = text
+        .chars()
+        .take(MAX_TOOL_CHARS.saturating_sub(1))
+        .collect();
     format!("{taken}…")
 }
 
@@ -638,7 +650,11 @@ mod tests {
         // hours would land on yesterday and the day tool would rightly refuse.
         let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
         seed_day(&vault, noon, noon + 1_800_000);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+        let host = ToolHost {
+            store: &vault,
+            models: &models,
+            now_ms: NOW,
+        };
 
         let text = host.invoke("get_day_summary", &json!({})).await.unwrap();
         assert!(text.contains("Chased a GOP header bug"), "{text}");
@@ -656,11 +672,18 @@ mod tests {
         // hours would land on yesterday and the day tool would rightly refuse.
         let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
         seed_day(&vault, noon, noon + 1_800_000);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+        let host = ToolHost {
+            store: &vault,
+            models: &models,
+            now_ms: NOW,
+        };
 
         let text = host.invoke("get_day_summary", &json!({})).await.unwrap();
         assert!(text.contains("not summarised"), "{text}");
-        assert!(text.contains("get_slot_card"), "the gap note must say how to dig in: {text}");
+        assert!(
+            text.contains("get_slot_card"),
+            "the gap note must say how to dig in: {text}"
+        );
     }
 
     /// A day with nothing in it, but inside the recorded span — a weekend
@@ -673,7 +696,11 @@ mod tests {
         seed_day(&vault, today, today + 1_800_000);
         // Push coverage back two days so yesterday sits inside the span.
         seed_moments(&vault, &[today - 2 * DAY]);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+        let host = ToolHost {
+            store: &vault,
+            models: &models,
+            now_ms: NOW,
+        };
 
         let text = host
             .invoke("get_day_summary", &json!({"day_ms": NOW - DAY}))

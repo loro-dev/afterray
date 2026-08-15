@@ -29,7 +29,7 @@ final class DaemonSupervisor {
         let environment = ProcessInfo.processInfo.environment
         if let repoRoot = Self.developmentRepoRoot() {
             socketPath = environment["AFTERRAY_SOCKET"]
-                ?? repoRoot.appendingPathComponent(".afterray-dev/afterray.sock").path
+                ?? AfterRaySocketPath.development(repoRoot: repoRoot)
             defaultDataDirectory = repoRoot.appendingPathComponent(".afterray/v0-data")
             defaultModelDirectory = repoRoot.appendingPathComponent(".afterray/models")
         } else {

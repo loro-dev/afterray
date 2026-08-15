@@ -240,7 +240,19 @@ private actor ControlDaemon: AfterRayDaemonServing {
         HistoryClearResult(deleted: 0, scope: "today")
     }
 
-    func downloadModels(packID: String?) async throws -> ModelLibrary {
+    func startModelDownloads(packIDs _: [String]) async throws -> ModelLibrary {
+        ModelLibrary(directory: "/tmp/afterray-models", packs: [])
+    }
+
+    func pauseModelDownloads() async throws -> ModelLibrary {
+        ModelLibrary(directory: "/tmp/afterray-models", packs: [])
+    }
+
+    func resumeModelDownloads() async throws -> ModelLibrary {
+        ModelLibrary(directory: "/tmp/afterray-models", packs: [])
+    }
+
+    func cancelModelDownloads() async throws -> ModelLibrary {
         ModelLibrary(directory: "/tmp/afterray-models", packs: [])
     }
 

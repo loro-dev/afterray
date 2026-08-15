@@ -8,7 +8,10 @@
 //! `cargo run -p afterray-platform-macos --example power-probe`
 
 fn main() {
-    println!("on AC power     : {}", afterray_platform_macos::on_ac_power());
+    println!(
+        "on AC power     : {}",
+        afterray_platform_macos::on_ac_power()
+    );
     match afterray_platform_macos::battery_fraction() {
         Some(fraction) => println!("battery         : {:.0}%", fraction * 100.0),
         None => println!("battery         : none (desktop)"),

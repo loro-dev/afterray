@@ -163,9 +163,7 @@ impl LlmGate {
 
     /// Whether a waiter of this shape may take a slot right now.
     fn admissible(state: &GateState, interactive: bool, lease: Option<u64>) -> bool {
-        interactive
-            || state.holds.is_empty()
-            || lease.is_some_and(|id| state.holds.contains(&id))
+        interactive || state.holds.is_empty() || lease.is_some_and(|id| state.holds.contains(&id))
     }
 
     async fn acquire(&self, priority: JobPriority) {
@@ -240,9 +238,7 @@ impl LlmGate {
                 .waiters
                 .iter()
                 .enumerate()
-                .filter(|(_, waiter)| {
-                    Self::admissible(state, waiter.interactive, waiter.lease)
-                })
+                .filter(|(_, waiter)| Self::admissible(state, waiter.interactive, waiter.lease))
                 .min_by_key(|(_, waiter)| {
                     let class: u8 = if waiter.interactive { 0 } else { 1 };
                     (class, waiter.seq)
@@ -614,7 +610,14 @@ async fn prepare_attempt(
     inner: &QueueInner,
     id: &str,
     generation: u64,
-) -> Option<(ModelInput, ModelCapability, Cancellation, u32, u32, JobPriority)> {
+) -> Option<(
+    ModelInput,
+    ModelCapability,
+    Cancellation,
+    u32,
+    u32,
+    JobPriority,
+)> {
     let mut jobs = inner.jobs.lock().await;
     let record = jobs.get_mut(id)?;
     if record.generation != generation || record.snapshot.state != JobState::Pending {
@@ -784,9 +787,15 @@ mod tests {
         .unwrap();
 
         let background = JobPriority::Background { lease: None };
-        let first = queue.submit_with(llm_job("bg-running"), background).await.unwrap();
+        let first = queue
+            .submit_with(llm_job("bg-running"), background)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await; // let it start
-        let second = queue.submit_with(llm_job("bg-queued"), background).await.unwrap();
+        let second = queue
+            .submit_with(llm_job("bg-queued"), background)
+            .await
+            .unwrap();
         let urgent = queue
             .submit_with(llm_job("interactive"), JobPriority::Interactive)
             .await
@@ -819,7 +828,9 @@ mod tests {
         .unwrap();
 
         let hold = queue.hold_llm_lease();
-        let leased = JobPriority::Background { lease: Some(hold.id()) };
+        let leased = JobPriority::Background {
+            lease: Some(hold.id()),
+        };
         let plain = JobPriority::Background { lease: None };
 
         // Round 1 runs; a rival queues while it is busy.
@@ -867,10 +878,7 @@ mod tests {
             .unwrap();
         queue.wait(&urgent).await.unwrap();
         drop(hold);
-        assert_eq!(
-            adapter.order.lock().unwrap().clone(),
-            vec!["interactive"]
-        );
+        assert_eq!(adapter.order.lock().unwrap().clone(), vec!["interactive"]);
     }
 
     struct TestAdapter {

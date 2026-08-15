@@ -286,7 +286,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 #[allow(clippy::too_many_lines)]
 async fn request_from_command(
     command: Command,

@@ -191,10 +191,14 @@ make visual-lab        # swift run afterray-visual-lab
 make settings-lab      # settings surface with model rows
 make chat-lab          # conversational overlay
 make snapshots         # offscreen PNGs, override with OUT=/tmp/x
+make onboarding        # rebuild and force the real first-run flow
 ```
 
 The Visual Lab includes empty, short, long-day, processing, and favorites
 scenarios. See [the Visual Lab workflow](visual-lab-workflow.md) for details.
+To reveal the in-app replay control, open **Settings → Advanced**, type `loro`,
+then enable **Developer Options**. Its replay action does not delete the
+onboarding completion preference.
 
 ## Logs and data locations
 

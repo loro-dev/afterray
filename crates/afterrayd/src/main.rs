@@ -8,12 +8,12 @@ mod tools;
 
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
-    JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, ModelAdapter, ModelCapability,
-    ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter, PersistentMlxConfig, ProcessAdapter,
-    ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REVISION,
-    QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig, download_packs, library,
-    model_directory, probe_llm, qwen35_9b_mlx_manifest, qwen35_mlx_manifest, remove_pack,
-    spec_by_id, specs_for_download,
+    Cancellation, DownloadError, JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink,
+    ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter,
+    PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID,
+    QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig,
+    download_packs_with_cancellation, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
+    qwen35_mlx_manifest, remove_pack, spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
@@ -206,6 +206,12 @@ async fn main() -> anyhow::Result<()> {
         models,
         recording: Mutex::new(RecordingRuntime::default()),
         download: std::sync::Mutex::new(None),
+        download_queue: std::sync::Mutex::new(Vec::new()),
+        download_active: AtomicBool::new(false),
+        download_cancellation: std::sync::Mutex::new(None),
+        download_paused: AtomicBool::new(false),
+        download_cancel_requested: AtomicBool::new(false),
+        download_changed: tokio::sync::Notify::new(),
         capture_interval: Duration::from_secs(
             std::env::var("AFTERRAY_CAPTURE_INTERVAL_SECONDS")
                 .ok()
@@ -380,8 +386,8 @@ fn new_mlx_adapter(
     // Cache reuse is the normal path. `=0` remains a narrow recovery switch
     // for a measured upstream regression; failed cache-prefill attempts retry
     // once with a fresh session in this same model container.
-    mlx_config.enable_kv_cache = std::env::var("AFTERRAY_MLX_ENABLE_KV_CACHE")
-        .map_or(true, |value| value.trim() != "0");
+    mlx_config.enable_kv_cache =
+        std::env::var("AFTERRAY_MLX_ENABLE_KV_CACHE").map_or(true, |value| value.trim() != "0");
     Arc::new(PersistentMlxAdapter::new(mlx_config))
 }
 
@@ -406,6 +412,12 @@ struct AppState {
     models: ModelQueue,
     recording: Mutex<RecordingRuntime>,
     download: std::sync::Mutex<Option<ModelDownloadProgress>>,
+    download_queue: std::sync::Mutex<Vec<afterray_models::PackSpec>>,
+    download_active: AtomicBool,
+    download_cancellation: std::sync::Mutex<Option<Cancellation>>,
+    download_paused: AtomicBool,
+    download_cancel_requested: AtomicBool,
+    download_changed: tokio::sync::Notify,
     capture_interval: Duration,
     data_dir: PathBuf,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -430,7 +442,7 @@ struct PersistedSettings {
     record_audio: bool,
     #[serde(default = "default_storage_limit_bytes")]
     storage_limit_bytes: u64,
-    #[serde(default)]
+    #[serde(default = "default_excluded_bundle_ids")]
     excluded_bundle_ids: Vec<String>,
     #[serde(default)]
     excluded_domains: Vec<String>,
@@ -496,7 +508,7 @@ impl Default for PersistedSettings {
         Self {
             record_audio: true,
             storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
-            excluded_bundle_ids: Vec::new(),
+            excluded_bundle_ids: default_excluded_bundle_ids(),
             excluded_domains: Vec::new(),
             llm_provider: LlmProvider::MlxLocal,
             llm_base_url: String::new(),
@@ -633,7 +645,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 schema_version: afterray_store::SCHEMA_VERSION,
                 recording_state: recording_state_of(&recording),
                 active_session_id: recording.active_session_id.clone(),
-                host_build: std::env::var("AFTERRAY_HOST_BUILD").ok().filter(|v| !v.is_empty()),
+                host_build: std::env::var("AFTERRAY_HOST_BUILD")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
             })
         }
         Request::RecordStart => record_start(state).await,
@@ -647,7 +661,10 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             .await
         }
         Request::MomentsList { session_id } => {
-            run_store(state, move |s| into_response(s.store.moments_sync(&session_id))).await
+            run_store(state, move |s| {
+                into_response(s.store.moments_sync(&session_id))
+            })
+            .await
         }
         Request::RecallWindow {
             session_id,
@@ -708,8 +725,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::SlotBackfill { days } => slot_backfill(state, days).await,
         Request::DaySummary { day_ms } => {
             run_store(state, move |s| {
-                let interval_ms =
-                    i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
+                let interval_ms = i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
                 into_response(s.store.day_summary(day_ms, interval_ms))
             })
             .await
@@ -725,8 +741,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             // Multi-day summary assembly is exactly the class of work the
             // blocking pool exists for.
             run_store(state, move |s| {
-                let interval_ms =
-                    i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
+                let interval_ms = i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
                 into_response(s.store.summary_history(before_ms, limit, interval_ms))
             })
             .await
@@ -850,7 +865,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             to_ms,
             limit,
         } => into_response(state.store.memories(from_ms, to_ms, limit.clamp(1, 200))),
-        Request::DownloadModels { pack_id } => download_models(state, pack_id.as_deref()).await,
+        Request::DownloadModels { pack_id, pack_ids } => {
+            start_model_downloads(state, pack_id.as_deref(), &pack_ids)
+        }
+        Request::PauseModelDownloads => pause_model_downloads(state).await,
+        Request::ResumeModelDownloads => resume_model_downloads(state),
+        Request::CancelModelDownloads => cancel_model_downloads(state).await,
         Request::RemoveModel { pack_id } => remove_model(state, &pack_id).await,
         Request::Shutdown => {
             let _ = state.shutdown.send(true);
@@ -1069,6 +1089,7 @@ fn current_settings(state: &AppState) -> AppSettings {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default(),
+        protected_bundle_ids: protected_bundle_ids(),
         excluded_domains: state
             .excluded_domains
             .lock()
@@ -1349,21 +1370,72 @@ fn normalize_bundle_ids(ids: Vec<String>) -> Vec<String> {
     let mut cleaned = ids
         .into_iter()
         .map(|id| id.trim().to_owned())
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && !is_protected_bundle(id))
         .collect::<Vec<_>>();
     cleaned.sort();
     cleaned.dedup();
     cleaned
 }
 
+/// Password managers and system credential surfaces are not ordinary user
+/// exclusions. They are always blocked at the daemon boundary so an older UI,
+/// a hand-edited settings file, or an accidental remove action cannot expose
+/// vault contents to screenshots, OCR, or accessibility capture.
+const PROTECTED_BUNDLE_IDS: &[&str] = &[
+    "com.1password.1password",
+    "com.agilebits.onepassword7",
+    "com.apple.Passwords",
+    "com.apple.keychainaccess",
+    "com.apple.loginwindow",
+    "com.bitwarden.desktop",
+    "com.callpod.keepermac.lite",
+    "com.dashlane.Dashlane",
+    "com.keepassium.intune",
+    "com.keepassium.ios",
+    "com.keepassium.ios.pro",
+    "com.keepersecurity.passwordmanager",
+    "com.lastpass.LastPass",
+    "com.lastpass.lastpassforsafari",
+    "com.markmcguill.strongbox",
+    "com.markmcguill.strongbox.mac.pro",
+    "com.markmcguill.strongbox.pro",
+    "com.nordsec.nordpass",
+    "com.siber.roboform",
+    "com.sibersystems.RoboForm",
+    "dev.afterray.app",
+    "in.sinew.Enpass-Desktop",
+    "me.proton.pass.electron",
+    "org.keepassxc.keepassxc",
+];
+
+fn protected_bundle_ids() -> Vec<String> {
+    PROTECTED_BUNDLE_IDS
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect()
+}
+
+fn default_excluded_bundle_ids() -> Vec<String> {
+    normalize_bundle_ids(Vec::new())
+}
+
+fn is_protected_bundle(bundle_id: &str) -> bool {
+    PROTECTED_BUNDLE_IDS
+        .iter()
+        .any(|protected| protected.eq_ignore_ascii_case(bundle_id))
+}
+
 fn is_excluded_bundle(state: &AppState, bundle_id: Option<&str>) -> bool {
     let Some(bundle_id) = bundle_id else {
         return false;
     };
+    if is_protected_bundle(bundle_id) {
+        return true;
+    }
     state
         .excluded_bundle_ids
         .lock()
-        .map(|ids| ids.iter().any(|id| id == bundle_id))
+        .map(|ids| ids.iter().any(|id| id.eq_ignore_ascii_case(bundle_id)))
         .unwrap_or(false)
 }
 
@@ -1372,9 +1444,7 @@ fn is_excluded_bundle(state: &AppState, bundle_id: Option<&str>) -> bool {
 /// to get an exclusion that silently never matches.
 fn normalize_domain(input: &str) -> Option<String> {
     let trimmed = input.trim().trim_matches('/');
-    let without_scheme = trimmed
-        .split_once("://")
-        .map_or(trimmed, |(_, rest)| rest);
+    let without_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
     // Drop userinfo, then path/query/fragment, then port.
     let after_userinfo = without_scheme
         .rsplit_once('@')
@@ -1386,7 +1456,13 @@ fn normalize_domain(input: &str) -> Option<String> {
         .rsplit_once(':')
         // An IPv6 literal has colons of its own; only strip a numeric port.
         .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
-        .map_or(after_userinfo.split(['/', '?', '#']).next().unwrap_or_default(), |(head, _)| head);
+        .map_or(
+            after_userinfo
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default(),
+            |(head, _)| head,
+        );
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if host.is_empty() || !host.contains('.') {
         return None;
@@ -1456,7 +1532,12 @@ fn load_persisted_settings(data_dir: &Path) -> PersistedSettings {
     let Ok(text) = std::fs::read_to_string(settings_path(data_dir)) else {
         return PersistedSettings::default();
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    let mut settings = serde_json::from_str::<PersistedSettings>(&text).unwrap_or_default();
+    // Older builds copied the complete protected catalogue into this user
+    // preference. Strip those seeded entries: protection is enforced directly
+    // by `is_excluded_bundle`, while the UI shows only apps installed locally.
+    settings.excluded_bundle_ids = normalize_bundle_ids(settings.excluded_bundle_ids);
+    settings
 }
 
 /// Written `0600` through a temporary file, the way the vault writes its own
@@ -2481,7 +2562,9 @@ impl SlotT2Tools<'_> {
         let full = run.lines.join("\n");
         let total = full.chars().count();
         if offset >= total {
-            return Ok(format!("(no text beyond offset {offset}; total {total} chars)"));
+            return Ok(format!(
+                "(no text beyond offset {offset}; total {total} chars)"
+            ));
         }
         let page: String = full.chars().skip(offset).take(T2_TOOL_PAGE_CHARS).collect();
         let next = offset + page.chars().count();
@@ -2623,56 +2706,403 @@ fn mlx_platform_incompatibility() -> Option<&'static str> {
     None
 }
 
-async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Response {
-    let packs = match specs_for_download(pack_id) {
+fn requested_download_packs(
+    pack_id: Option<&str>,
+    pack_ids: &[String],
+) -> Result<Vec<afterray_models::PackSpec>, String> {
+    if pack_ids.is_empty() {
+        return specs_for_download(pack_id);
+    }
+    if pack_id.is_some() {
+        return Err("provide either `pack_id` or `pack_ids`, not both".into());
+    }
+
+    let mut packs = Vec::with_capacity(pack_ids.len());
+    for id in pack_ids {
+        if packs
+            .iter()
+            .any(|pack: &afterray_models::PackSpec| pack.id == *id)
+        {
+            continue;
+        }
+        let Some(pack) = spec_by_id(id) else {
+            return Err(format!("unknown model pack `{id}`"));
+        };
+        if !pack.inspect().present {
+            packs.push(pack);
+        }
+    }
+    Ok(packs)
+}
+
+fn start_model_downloads(
+    state: &Arc<AppState>,
+    pack_id: Option<&str>,
+    pack_ids: &[String],
+) -> Response {
+    let packs = match requested_download_packs(pack_id, pack_ids) {
         Ok(packs) => packs,
         Err(error) => return Response::failure(error),
     };
     if packs.is_empty() {
         return Response::success(model_library(state));
     }
-    let result = download_packs(&packs, |spec, progress| {
-        let snapshot = ModelDownloadProgress {
-            pack_id: spec.id.clone(),
-            state: progress.state,
-            bytes: progress.bytes,
-            expected_bytes: progress.expected_bytes,
-            completed_files: u64::try_from(progress.completed_files).unwrap_or(0),
-            total_files: u64::try_from(progress.total_files).unwrap_or(0),
-            error: None,
-        };
-        if let Some(percent) = progress.percent() {
-            eprintln!("Downloading {} · {percent}%", spec.name);
-        } else {
-            eprintln!(
-                "Downloading {} ({}/{} files)",
-                spec.name, progress.completed_files, progress.total_files
-            );
+
+    let starts_worker = state
+        .download_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+
+    let mut queue = state
+        .download_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current_pack_id = (!starts_worker)
+        .then(|| {
+            state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|progress| progress.pack_id.clone())
+        })
+        .flatten();
+    for pack in packs {
+        if current_pack_id.as_ref() == Some(&pack.id)
+            || queue.iter().any(|queued| queued.id == pack.id)
+        {
+            continue;
         }
+        queue.push(pack);
+    }
+    let queued_ids = queue
+        .iter()
+        .filter(|pack| current_pack_id.as_ref() != Some(&pack.id))
+        .map(|pack| pack.id.clone())
+        .collect::<Vec<_>>();
+    let first = queue.first().cloned();
+    drop(queue);
+
+    let mut download = state
+        .download
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !starts_worker && let Some(progress) = download.as_mut() {
+        progress.queued_pack_ids = queued_ids;
+    } else if let Some(first) = first {
+        let inspected = first.inspect();
+        *download = Some(ModelDownloadProgress {
+            pack_id: first.id,
+            queued_pack_ids: queued_ids,
+            state: afterray_protocol::ModelPackState::Downloading,
+            bytes: inspected.bytes,
+            expected_bytes: Some(first.expected_bytes),
+            completed_files: 0,
+            total_files: 0,
+            error: None,
+        });
+    }
+    drop(download);
+
+    if starts_worker {
+        state
+            .download_cancel_requested
+            .store(false, Ordering::Release);
+        state.download_paused.store(false, Ordering::Release);
+        let task_state = Arc::clone(state);
+        tokio::spawn(async move {
+            run_model_downloads(task_state).await;
+        });
+    } else if state.download_paused.load(Ordering::Acquire) {
+        resume_download_worker(state);
+    }
+    Response::success(model_library(state))
+}
+
+async fn pause_model_downloads(state: &Arc<AppState>) -> Response {
+    if !state.download_active.load(Ordering::Acquire) {
+        return Response::success(model_library(state));
+    }
+    state.download_paused.store(true, Ordering::Release);
+    if let Some(cancellation) = state
+        .download_cancellation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        cancellation.cancel();
+    }
+
+    loop {
+        let changed = state.download_changed.notified();
+        let paused = state
+            .download
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|progress| progress.state == afterray_protocol::ModelPackState::Paused);
+        if paused || !state.download_active.load(Ordering::Acquire) {
+            break;
+        }
+        changed.await;
+    }
+    Response::success(model_library(state))
+}
+
+fn resume_model_downloads(state: &Arc<AppState>) -> Response {
+    resume_download_worker(state);
+    Response::success(model_library(state))
+}
+
+fn resume_download_worker(state: &Arc<AppState>) {
+    if !state.download_paused.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(progress) = state
+        .download
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        progress.state = afterray_protocol::ModelPackState::Downloading;
+    }
+    state.download_changed.notify_waiters();
+}
+
+async fn cancel_model_downloads(state: &Arc<AppState>) -> Response {
+    if !state.download_active.load(Ordering::Acquire) {
+        return Response::success(model_library(state));
+    }
+    state
+        .download_cancel_requested
+        .store(true, Ordering::Release);
+    state.download_paused.store(false, Ordering::Release);
+    let queued = state
+        .download_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain(..)
+        .collect::<Vec<_>>();
+    for pack in queued {
+        if let Err(error) = remove_pack(&pack) {
+            eprintln!("could not remove cancelled {} download: {error}", pack.name);
+        }
+    }
+    if let Some(cancellation) = state
+        .download_cancellation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        cancellation.cancel();
+    }
+    state.download_changed.notify_waiters();
+
+    while state.download_active.load(Ordering::Acquire) {
+        let changed = state.download_changed.notified();
+        if !state.download_active.load(Ordering::Acquire) {
+            break;
+        }
+        changed.await;
+    }
+    Response::success(model_library(state))
+}
+
+async fn run_model_downloads(state: Arc<AppState>) {
+    loop {
+        let pack = {
+            let mut queue = state
+                .download_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if queue.is_empty() {
+                state.download_active.store(false, Ordering::Release);
+                *state
+                    .download_cancellation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                *state
+                    .download
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                state.download_changed.notify_waiters();
+                return;
+            }
+            queue.remove(0)
+        };
+        let queued_pack_ids = state
+            .download_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|queued| queued.id.clone())
+            .collect::<Vec<_>>();
+        let inspected = pack.inspect();
         *state
             .download
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
-    })
-    .await;
-    match result {
-        Ok(()) => {
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ModelDownloadProgress {
+            pack_id: pack.id.clone(),
+            queued_pack_ids,
+            state: afterray_protocol::ModelPackState::Downloading,
+            bytes: inspected.bytes,
+            expected_bytes: Some(pack.expected_bytes),
+            completed_files: 0,
+            total_files: 0,
+            error: None,
+        });
+
+        let cancellation = Cancellation::default();
+        *state
+            .download_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancellation.clone());
+        // Pause/cancel can arrive after the worker claims the queue but before
+        // this per-pack cancellation token exists. Re-check the requested
+        // state here so those early controls cannot wait forever.
+        if state.download_paused.load(Ordering::Acquire)
+            || state.download_cancel_requested.load(Ordering::Acquire)
+        {
+            cancellation.cancel();
+        }
+        let result = download_packs_with_cancellation(
+            std::slice::from_ref(&pack),
+            cancellation,
+            |spec, progress| {
+                let queued_pack_ids = state
+                    .download_queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .map(|queued| queued.id.clone())
+                    .collect();
+                let snapshot = ModelDownloadProgress {
+                    pack_id: spec.id.clone(),
+                    queued_pack_ids,
+                    state: progress.state,
+                    bytes: progress.bytes,
+                    expected_bytes: progress.expected_bytes,
+                    completed_files: u64::try_from(progress.completed_files).unwrap_or(0),
+                    total_files: u64::try_from(progress.total_files).unwrap_or(0),
+                    error: None,
+                };
+                if let Some(percent) = progress.percent() {
+                    eprintln!("Downloading {} · {percent}%", spec.name);
+                } else {
+                    eprintln!(
+                        "Downloading {} ({}/{} files)",
+                        spec.name, progress.completed_files, progress.total_files
+                    );
+                }
+                *state
+                    .download
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+            },
+        )
+        .await;
+        *state
+            .download_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        if matches!(result, Err(DownloadError::Cancelled))
+            && state
+                .download_cancel_requested
+                .swap(false, Ordering::AcqRel)
+        {
+            if let Err(error) = remove_pack(&pack) {
+                eprintln!("could not remove cancelled {} download: {error}", pack.name);
+            }
+            state
+                .download_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             *state
                 .download
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            Response::success(model_library(state))
+            state.download_active.store(false, Ordering::Release);
+            state.download_changed.notify_waiters();
+            return;
         }
-        Err(error) => {
-            let mut download = state
+
+        if matches!(result, Err(DownloadError::Cancelled))
+            && state.download_paused.load(Ordering::Acquire)
+        {
+            let queued_pack_ids = {
+                let mut queue = state
+                    .download_queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                queue.insert(0, pack.clone());
+                queue
+                    .iter()
+                    .skip(1)
+                    .map(|queued| queued.id.clone())
+                    .collect()
+            };
+            if let Some(progress) = state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                progress.state = afterray_protocol::ModelPackState::Paused;
+                progress.queued_pack_ids = queued_pack_ids;
+                progress.error = None;
+            }
+            state.download_changed.notify_waiters();
+
+            loop {
+                let changed = state.download_changed.notified();
+                if state.download_cancel_requested.load(Ordering::Acquire)
+                    || !state.download_paused.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                changed.await;
+            }
+            if state
+                .download_cancel_requested
+                .swap(false, Ordering::AcqRel)
+            {
+                state
+                    .download_queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                *state
+                    .download
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                state.download_active.store(false, Ordering::Release);
+                state.download_changed.notify_waiters();
+                return;
+            }
+            continue;
+        }
+
+        if let Err(error) = result {
+            state
+                .download_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let mut progress = state
                 .download
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(progress) = download.as_mut() {
+            if let Some(progress) = progress.as_mut() {
                 progress.state = afterray_protocol::ModelPackState::Failed;
+                progress.queued_pack_ids.clear();
                 progress.error = Some(error.to_string());
             }
-            Response::failure(error.to_string())
+            eprintln!("model download failed: {error}");
+            state.download_active.store(false, Ordering::Release);
+            state.download_changed.notify_waiters();
+            return;
         }
     }
 }
@@ -2681,28 +3111,27 @@ async fn remove_model(state: &Arc<AppState>, pack_id: &str) -> Response {
     let Some(pack) = spec_by_id(pack_id) else {
         return Response::failure(format!("unknown model pack `{pack_id}`"));
     };
-    if let Some((_, adapter)) = state
-        .mlx_adapters
-        .iter()
-        .find(|(id, _)| id == pack_id)
+    if state.download_active.load(Ordering::Acquire)
+        && state
+            .download
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|progress| {
+                progress.pack_id == pack_id
+                    || progress
+                        .queued_pack_ids
+                        .iter()
+                        .any(|queued| queued == pack_id)
+            })
     {
+        return Response::failure(format!("model pack `{pack_id}` is currently downloading"));
+    }
+    if let Some((_, adapter)) = state.mlx_adapters.iter().find(|(id, _)| id == pack_id) {
         adapter.shutdown().await;
     }
     match remove_pack(&pack) {
-        Ok(()) => {
-            let mut download = state
-                .download
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if download
-                .as_ref()
-                .is_some_and(|progress| progress.pack_id == pack_id)
-            {
-                *download = None;
-            }
-            drop(download);
-            Response::success(model_library(state))
-        }
+        Ok(()) => Response::success(model_library(state)),
         Err(error) => Response::failure(error.to_string()),
     }
 }
@@ -2852,6 +3281,16 @@ mod tests {
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
     use tokio::io::AsyncReadExt;
 
+    #[test]
+    fn model_download_request_rejects_ambiguous_or_unknown_pack_ids() {
+        let ambiguous =
+            requested_download_packs(Some("asr"), &["embedding".to_owned()]).unwrap_err();
+        assert!(ambiguous.contains("either `pack_id` or `pack_ids`"));
+
+        let unknown = requested_download_packs(None, &["not-a-model".to_owned()]).unwrap_err();
+        assert!(unknown.contains("unknown model pack `not-a-model`"));
+    }
+
     #[tokio::test]
     async fn a_bound_socket_is_private_to_its_owner() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -2935,6 +3374,41 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("sk-must-not-be-written"), "{written}");
         assert!(!written.contains("llm_api_key"), "{written}");
+    }
+
+    #[test]
+    fn protected_credential_apps_are_enforced_without_polluting_user_exclusions() {
+        let normalized = normalize_bundle_ids(vec!["com.apple.Safari".to_owned()]);
+        assert_eq!(normalized, ["com.apple.Safari"]);
+        for protected in PROTECTED_BUNDLE_IDS {
+            assert!(is_protected_bundle(protected));
+            assert!(!normalized.iter().any(|id| id == protected));
+        }
+        assert!(is_protected_bundle("COM.BITWARDEN.DESKTOP"));
+    }
+
+    #[test]
+    fn existing_settings_drop_the_legacy_seeded_protected_catalogue() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings_path(directory.path()),
+            br#"{"excluded_bundle_ids":["com.apple.Safari","com.bitwarden.desktop","com.apple.Passwords"]}"#,
+        )
+        .unwrap();
+
+        let settings = load_persisted_settings(directory.path());
+        assert!(
+            settings
+                .excluded_bundle_ids
+                .iter()
+                .any(|id| id == "com.apple.Safari")
+        );
+        assert!(
+            !settings
+                .excluded_bundle_ids
+                .iter()
+                .any(|id| is_protected_bundle(id))
+        );
     }
 
     /// The field is gone from what we write but has to survive what we read,
@@ -3032,7 +3506,10 @@ mod tests {
             "bank.test".into(),
             "not a host".into(),
         ]);
-        assert_eq!(cleaned, vec!["bank.test".to_owned(), "example.com".to_owned()]);
+        assert_eq!(
+            cleaned,
+            vec!["bank.test".to_owned(), "example.com".to_owned()]
+        );
     }
 
     /// A machine that should be summarising: plugged in, charged, untouched,

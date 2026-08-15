@@ -19,9 +19,10 @@ public struct RecallKeycap: View {
         var gap: CGFloat { self == .hero ? 10 : 5 }
     }
 
-    public enum Tone {
+    public enum Tone: Equatable {
         case idle
         case live
+        case pressed
         case waiting
     }
 
@@ -38,7 +39,7 @@ public struct RecallKeycap: View {
     public var body: some View {
         Text(label)
             .font(size.font)
-            .foregroundStyle(tone == .live ? Color.white : RecallPalette.textSecondary)
+            .foregroundStyle(tone == .live || tone == .pressed ? Color.white : RecallPalette.textSecondary)
             .monospacedDigit()
             .padding(.horizontal, label.count > 1 ? size.horizontalPadding : 4)
             .frame(minWidth: size.minWidth, minHeight: size.height)
@@ -56,8 +57,15 @@ public struct RecallKeycap: View {
                     lineWidth: 1
                 )
             }
-            .shadow(color: .black.opacity(0.42), radius: size == .hero ? 8 : 3, y: size == .hero ? 3 : 1)
+            .shadow(
+                color: .black.opacity(0.42),
+                radius: tone == .pressed ? 2 : size == .hero ? 8 : 3,
+                y: tone == .pressed ? 1 : size == .hero ? 3 : 1
+            )
             .shadow(color: glow, radius: 14)
+            .scaleEffect(tone == .pressed ? 0.96 : 1)
+            .offset(y: tone == .pressed ? 2 : 0)
+            .animation(.easeOut(duration: 0.12), value: tone)
             .fixedSize()
     }
 
@@ -79,6 +87,12 @@ public struct RecallKeycap: View {
                 startPoint: .top,
                 endPoint: .bottom
             )
+        case .pressed:
+            LinearGradient(
+                colors: [RecallPalette.ray.opacity(0.66), RecallPalette.ray.opacity(0.84)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
         case .waiting:
             LinearGradient(
                 colors: [.white.opacity(0.07), .white.opacity(0.03)],
@@ -89,7 +103,11 @@ public struct RecallKeycap: View {
     }
 
     private var glow: Color {
-        tone == .live ? RecallPalette.ray.opacity(0.42) : .clear
+        switch tone {
+        case .live: RecallPalette.ray.opacity(0.42)
+        case .pressed: RecallPalette.ray.opacity(0.20)
+        case .idle, .waiting: .clear
+        }
     }
 }
 
@@ -98,6 +116,9 @@ public struct RecallHotKeyField: View {
     @ObservedObject private var store: RecallHotKeyStore
     private let size: RecallKeycap.Size
     private let isHighlighted: Bool
+    private let pressedSegments: Set<String>
+    private let highlightedSegments: Set<String>
+    private let onBeginRecording: (() -> Void)?
 
     @State private var liveModifiers: RecallHotKey.Modifiers = []
     @State private var breathe = false
@@ -105,11 +126,17 @@ public struct RecallHotKeyField: View {
     public init(
         store: RecallHotKeyStore,
         size: RecallKeycap.Size = .compact,
-        isHighlighted: Bool = false
+        isHighlighted: Bool = false,
+        pressedSegments: Set<String> = [],
+        highlightedSegments: Set<String> = [],
+        onBeginRecording: (() -> Void)? = nil
     ) {
         self.store = store
         self.size = size
         self.isHighlighted = isHighlighted
+        self.pressedSegments = pressedSegments
+        self.highlightedSegments = highlightedSegments
+        self.onBeginRecording = onBeginRecording
     }
 
     public var body: some View {
@@ -122,6 +149,8 @@ public struct RecallHotKeyField: View {
         }
         .animation(.spring(response: 0.32, dampingFraction: 0.78), value: store.isRecording)
         .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isHighlighted)
+        .animation(.easeOut(duration: 0.12), value: pressedSegments)
+        .animation(.easeOut(duration: 0.18), value: highlightedSegments)
         .onChange(of: store.isRecording) { _, recording in
             if recording { liveModifiers = [] }
         }
@@ -129,11 +158,15 @@ public struct RecallHotKeyField: View {
 
     private var display: some View {
         Button {
-            store.beginRecording()
+            if let onBeginRecording {
+                onBeginRecording()
+            } else {
+                store.beginRecording()
+            }
         } label: {
             HStack(spacing: size.gap) {
                 ForEach(Array(store.hotKey.segments.enumerated()), id: \.offset) { _, segment in
-                    RecallKeycap(label: segment, size: size, tone: isHighlighted ? .live : .idle)
+                    RecallKeycap(label: segment, size: size, tone: tone(for: segment))
                 }
             }
             .scaleEffect(isHighlighted ? 1.06 : 1)
@@ -142,6 +175,12 @@ public struct RecallHotKeyField: View {
         .buttonStyle(.plain)
         .help("Record a new shortcut")
         .accessibilityLabel("Shortcut \(store.hotKey.displayString). Activate to record a new one.")
+    }
+
+    private func tone(for segment: String) -> RecallKeycap.Tone {
+        if pressedSegments.contains(segment) { return .pressed }
+        if isHighlighted || highlightedSegments.contains(segment) { return .live }
+        return .idle
     }
 
     private var recorder: some View {

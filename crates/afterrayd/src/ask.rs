@@ -405,9 +405,8 @@ pub(crate) async fn handle_ask(
     }
 
     let seed = build_ask_context(question, from_ms, to_ms, &memories, &spans, &hits);
-    let user = format!(
-        "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
-    );
+    let user =
+        format!("{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL.");
     let host = ToolHost {
         store,
         models,

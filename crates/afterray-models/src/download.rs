@@ -1,3 +1,4 @@
+use crate::Cancellation;
 use crate::catalog::{ManifestFile, PackSource, PackSpec, READY_MARKER, inspect_model_path};
 use afterray_protocol::ModelPackState;
 use futures_util::StreamExt as _;
@@ -20,6 +21,8 @@ pub enum DownloadError {
     Io(#[from] io::Error),
     #[error("download request failed: {0}")]
     Http(String),
+    #[error("model download was cancelled")]
+    Cancelled,
 }
 
 impl DownloadError {
@@ -53,10 +56,23 @@ impl DownloadProgress {
 /// Returns a [`DownloadError`] when a listing or file transfer fails.
 pub async fn download_packs(
     packs: &[PackSpec],
+    on_progress: impl FnMut(&PackSpec, DownloadProgress),
+) -> Result<(), DownloadError> {
+    download_packs_with_cancellation(packs, Cancellation::default(), on_progress).await
+}
+
+/// Downloads every requested pack until completion or cooperative cancellation.
+/// Partial files are deliberately preserved so a paused download can resume.
+pub async fn download_packs_with_cancellation(
+    packs: &[PackSpec],
+    cancellation: Cancellation,
     mut on_progress: impl FnMut(&PackSpec, DownloadProgress),
 ) -> Result<(), DownloadError> {
     for pack in packs {
-        download_pack(pack, |progress| on_progress(pack, progress)).await?;
+        download_pack_with_cancellation(pack, cancellation.clone(), |progress| {
+            on_progress(pack, progress);
+        })
+        .await?;
     }
     Ok(())
 }
@@ -69,8 +85,17 @@ pub async fn download_packs(
 /// destination cannot be written.
 pub async fn download_pack(
     pack: &PackSpec,
+    on_progress: impl FnMut(DownloadProgress),
+) -> Result<(), DownloadError> {
+    download_pack_with_cancellation(pack, Cancellation::default(), on_progress).await
+}
+
+pub async fn download_pack_with_cancellation(
+    pack: &PackSpec,
+    cancellation: Cancellation,
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<(), DownloadError> {
+    ensure_not_cancelled(&cancellation)?;
     if pack.inspect().present {
         let bytes = inspect_model_path(&pack.path).1;
         on_progress(DownloadProgress {
@@ -93,6 +118,7 @@ pub async fn download_pack(
                 file,
                 &pack.path,
                 None,
+                &cancellation,
                 |bytes, expected| {
                     on_progress(DownloadProgress {
                         state: ModelPackState::Downloading,
@@ -115,7 +141,7 @@ pub async fn download_pack(
         }
         PackSource::HuggingFaceSnapshot { repository } => {
             fs::create_dir_all(&pack.path)?;
-            let files = list_huggingface_files(repository).await?;
+            let files = list_huggingface_files(repository, &cancellation).await?;
             let total_files = files.len();
             if total_files == 0 {
                 return Err(DownloadError::message(format!(
@@ -130,6 +156,7 @@ pub async fn download_pack(
             };
             let mut finished_bytes = 0_u64;
             for (index, file) in files.iter().enumerate() {
+                ensure_not_cancelled(&cancellation)?;
                 let destination = pack.path.join(&file.path);
                 if destination.is_file() {
                     finished_bytes += file
@@ -153,6 +180,7 @@ pub async fn download_pack(
                     &file.path,
                     &destination,
                     file.size,
+                    &cancellation,
                     |written, _| {
                         on_progress(DownloadProgress {
                             state: ModelPackState::Downloading,
@@ -181,7 +209,15 @@ pub async fn download_pack(
             revision,
             files,
         } => {
-            download_pinned_snapshot(pack, repository, revision, files, &mut on_progress).await?;
+            download_pinned_snapshot(
+                pack,
+                repository,
+                revision,
+                files,
+                &cancellation,
+                &mut on_progress,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -194,6 +230,7 @@ pub async fn download_pack(
 /// Returns an error when a pack file cannot be removed.
 pub fn remove_pack(pack: &PackSpec) -> Result<(), DownloadError> {
     remove_path_if_present(&pack.path)?;
+    remove_path_if_present(&partial_path(&pack.path))?;
     if matches!(pack.source, PackSource::HuggingFacePinnedSnapshot { .. }) {
         remove_path_if_present(&staging_path(&pack.path))?;
     }
@@ -217,8 +254,10 @@ async fn download_pinned_snapshot(
     repository: &str,
     revision: &str,
     files: &[ManifestFile],
+    cancellation: &Cancellation,
     on_progress: &mut impl FnMut(DownloadProgress),
 ) -> Result<(), DownloadError> {
+    ensure_not_cancelled(cancellation)?;
     let staging = staging_path(&pack.path);
     fs::create_dir_all(&staging)?;
     let staged_bytes = directory_size(&staging);
@@ -238,6 +277,7 @@ async fn download_pinned_snapshot(
     let total_files = files.len();
     let mut finished_bytes = 0_u64;
     for (index, file) in files.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
         let destination = staging.join(&file.path);
         if destination
             .metadata()
@@ -263,6 +303,7 @@ async fn download_pinned_snapshot(
             &file.path,
             &destination,
             Some(file.bytes),
+            cancellation,
             |written, _| {
                 on_progress(DownloadProgress {
                     state: ModelPackState::Downloading,
@@ -286,9 +327,16 @@ async fn download_pinned_snapshot(
     });
     let verification_path = staging.clone();
     let verification_files = files.to_vec();
-    tokio::task::spawn_blocking(move || verify_files(&verification_path, &verification_files))
-        .await
-        .map_err(|error| DownloadError::message(format!("verification task failed: {error}")))??;
+    let verification_cancellation = cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        verify_files_with_cancellation(
+            &verification_path,
+            &verification_files,
+            &verification_cancellation,
+        )
+    })
+    .await
+    .map_err(|error| DownloadError::message(format!("verification task failed: {error}")))??;
 
     let marker = serde_json::json!({
         "v": 1,
@@ -326,8 +374,17 @@ async fn download_pinned_snapshot(
 ///
 /// Returns an error for any missing, truncated, or modified file.
 pub fn verify_files(path: &Path, files: &[ManifestFile]) -> Result<(), DownloadError> {
+    verify_files_with_cancellation(path, files, &Cancellation::default())
+}
+
+fn verify_files_with_cancellation(
+    path: &Path,
+    files: &[ManifestFile],
+    cancellation: &Cancellation,
+) -> Result<(), DownloadError> {
     let mut buffer = vec![0_u8; 1024 * 1024];
     for expected in files {
+        ensure_not_cancelled(cancellation)?;
         let file_path = path.join(&expected.path);
         let metadata = fs::metadata(&file_path).map_err(|error| {
             DownloadError::message(format!("{} is missing: {error}", expected.path))
@@ -343,6 +400,7 @@ pub fn verify_files(path: &Path, files: &[ManifestFile]) -> Result<(), DownloadE
         let mut source = fs::File::open(&file_path)?;
         let mut digest = Sha256::new();
         loop {
+            ensure_not_cancelled(cancellation)?;
             let read = source.read(&mut buffer)?;
             if read == 0 {
                 break;
@@ -380,13 +438,17 @@ struct HfFile {
     size: Option<u64>,
 }
 
-async fn list_huggingface_files(repository: &str) -> Result<Vec<HfFile>, DownloadError> {
+async fn list_huggingface_files(
+    repository: &str,
+    cancellation: &Cancellation,
+) -> Result<Vec<HfFile>, DownloadError> {
+    ensure_not_cancelled(cancellation)?;
     let url = format!("https://huggingface.co/api/models/{repository}/tree/main?recursive=1");
-    let response = huggingface_client()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| DownloadError::Http(error.to_string()))?;
+    let request = huggingface_client()?.get(url).send();
+    let response = tokio::select! {
+        () = cancellation.cancelled() => return Err(DownloadError::Cancelled),
+        response = request => response.map_err(|error| DownloadError::Http(error.to_string()))?,
+    };
     if !response.status().is_success() {
         return Err(DownloadError::message(format!(
             "could not list `{repository}`: HTTP {}",
@@ -413,8 +475,10 @@ async fn download_huggingface_file(
     file: &str,
     destination: &Path,
     expected_file_bytes: Option<u64>,
+    cancellation: &Cancellation,
     mut on_chunk: impl FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadError> {
+    ensure_not_cancelled(cancellation)?;
     let url = format!("https://huggingface.co/{repository}/resolve/{revision}/{file}");
     let partial = partial_path(destination);
     let resume_from = fs::metadata(&partial)
@@ -425,10 +489,10 @@ async fn download_huggingface_file(
     if resume_from > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| DownloadError::Http(error.to_string()))?;
+    let response = tokio::select! {
+        () = cancellation.cancelled() => return Err(DownloadError::Cancelled),
+        response = request.send() => response.map_err(|error| DownloadError::Http(error.to_string()))?,
+    };
     if !response.status().is_success() {
         return Err(DownloadError::message(format!(
             "download `{repository}/{file}` failed: HTTP {}",
@@ -460,7 +524,12 @@ async fn download_huggingface_file(
     let mut stream = response.bytes_stream();
     let mut written = if resumed { resume_from } else { 0 };
     on_chunk(written, expected);
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            () = cancellation.cancelled() => return Err(DownloadError::Cancelled),
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|error| DownloadError::Http(error.to_string()))?;
         written = written.saturating_add(chunk.len() as u64);
         output_file.write_all(&chunk).await?;
@@ -478,6 +547,14 @@ async fn download_huggingface_file(
     }
     fs::rename(partial, destination)?;
     Ok(())
+}
+
+fn ensure_not_cancelled(cancellation: &Cancellation) -> Result<(), DownloadError> {
+    if cancellation.is_cancelled() {
+        Err(DownloadError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn huggingface_client() -> Result<reqwest::Client, DownloadError> {
@@ -533,6 +610,22 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    fn file_pack(path: PathBuf) -> PackSpec {
+        PackSpec {
+            id: "test".into(),
+            name: "Test model".into(),
+            capability: "test".into(),
+            path,
+            required: true,
+            note: String::new(),
+            expected_bytes: 4,
+            source: PackSource::HuggingFaceFile {
+                repository: "example/test".into(),
+                file: "weights.bin".into(),
+            },
+        }
+    }
+
     #[test]
     fn partial_files_sit_next_to_the_destination() {
         let path = Path::new("/tmp/models/weights.gguf");
@@ -580,6 +673,37 @@ mod tests {
         assert!(verify_files(&directory, &manifest).is_err());
         fs::remove_file(&file).unwrap();
         assert!(verify_files(&directory, &manifest).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_stops_before_network_or_disk_work() {
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let pack = file_pack(std::env::temp_dir().join("afterray-cancelled-test.bin"));
+
+        let result = download_pack_with_cancellation(&pack, cancellation, |_| {}).await;
+
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert!(!pack.path.exists());
+    }
+
+    #[test]
+    fn removing_a_file_pack_also_removes_its_resumable_partial() {
+        let directory = std::env::temp_dir().join(format!(
+            "afterray-remove-partial-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let pack = file_pack(directory.join("weights.bin"));
+        fs::write(&pack.path, b"done").unwrap();
+        fs::write(partial_path(&pack.path), b"part").unwrap();
+
+        remove_pack(&pack).unwrap();
+
+        assert!(!pack.path.exists());
+        assert!(!partial_path(&pack.path).exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }

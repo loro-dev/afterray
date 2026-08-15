@@ -140,7 +140,7 @@ pub fn is_identifier_like(token: &str) -> bool {
     (has_digit && has_join)                       // qwen3.5:4b, v0.31.4
         || token.contains("://")                  // urls
         || token.contains('/')                    // paths, branches, repos
-        || (has_join && chars >= 8)               // slot_summaries, kebab-names
+        || (has_join && chars >= 8) // slot_summaries, kebab-names
 }
 
 /// One line's standing on its own, before corpus coverage is considered.
@@ -340,12 +340,12 @@ pub fn select_lines(
     };
 
     let commit = |candidate_id: usize,
-                      candidates: &[Candidate],
-                      taken: &mut Vec<bool>,
-                      selected: &mut Vec<Vec<usize>>,
-                      run_used: &mut Vec<usize>,
-                      budget: &mut usize,
-                      covered: &mut HashSet<String>| {
+                  candidates: &[Candidate],
+                  taken: &mut Vec<bool>,
+                  selected: &mut Vec<Vec<usize>>,
+                  run_used: &mut Vec<usize>,
+                  budget: &mut usize,
+                  covered: &mut HashSet<String>| {
         let candidate = &candidates[candidate_id];
         taken[candidate_id] = true;
         selected[candidate.run].push(candidate.index);
@@ -363,7 +363,7 @@ pub fn select_lines(
         let better = slot.is_none_or(|held: usize| {
             let held = &candidates[held];
             match (held.dup, candidate.dup) {
-                (true, false) => true,  // a unique line always beats a duplicate
+                (true, false) => true, // a unique line always beats a duplicate
                 (false, true) => false,
                 _ => candidate.base > held.base,
             }
@@ -448,11 +448,8 @@ pub fn entity_candidates(
         .filter(|(token, count)| **count >= 2 && is_identifier_like(token))
         .map(|(token, &count)| {
             let observed = f64::from(count);
-            let df = background.effective_df(
-                background.token_df.get(token).copied().unwrap_or(0),
-            );
-            let expected =
-                (observed + df) * slot_total / (slot_total + corpus_total).max(1.0);
+            let df = background.effective_df(background.token_df.get(token).copied().unwrap_or(0));
+            let expected = (observed + df) * slot_total / (slot_total + corpus_total).max(1.0);
             let g2 = if expected > 0.0 && observed > expected {
                 2.0 * observed * (observed / expected).ln()
             } else {
@@ -523,8 +520,11 @@ mod tests {
             &[("New chat", 90)],
         );
         let chrome = line_base_score("New chat", &bg, 30);
-        let content =
-            line_base_score("error: GOP header still failing the IVF length check", &bg, 2);
+        let content = line_base_score(
+            "error: GOP header still failing the IVF length check",
+            &bg,
+            2,
+        );
         assert!(
             content > chrome * 3.0,
             "content {content} should dwarf chrome {chrome}"
@@ -543,15 +543,21 @@ mod tests {
     #[test]
     fn near_dup_catches_ocr_jitter_but_not_different_lines() {
         let mut index = NearDupIndex::new();
-        assert!(index
-            .insert("The daemon should own storage while the interface stays replaceable")
-            .is_none());
-        assert!(index
-            .insert("The daemon should own storage while the 1nterface stays replaceable")
-            .is_some());
-        assert!(index
-            .insert("Completely different sentence about timeline scrolling performance")
-            .is_none());
+        assert!(
+            index
+                .insert("The daemon should own storage while the interface stays replaceable")
+                .is_none()
+        );
+        assert!(
+            index
+                .insert("The daemon should own storage while the 1nterface stays replaceable")
+                .is_some()
+        );
+        assert!(
+            index
+                .insert("Completely different sentence about timeline scrolling performance")
+                .is_none()
+        );
     }
 
     #[test]
@@ -618,10 +624,7 @@ mod tests {
             300,
             200,
         );
-        let total: usize = picked[0]
-            .iter()
-            .map(|&i| lines[i].chars().count())
-            .sum();
+        let total: usize = picked[0].iter().map(|&i| lines[i].chars().count()).sum();
         assert!(total <= 200, "per-run cap violated: {total}");
     }
 
@@ -636,6 +639,9 @@ mod tests {
         let picked = entity_candidates(&counts, &bg, 4);
         assert_eq!(picked.first().map(String::as_str), Some("qwen3.5:4b"));
         assert!(!picked.contains(&"the".to_owned()));
-        assert!(!picked.contains(&"工作".to_owned()), "not identifier-shaped");
+        assert!(
+            !picked.contains(&"工作".to_owned()),
+            "not identifier-shaped"
+        );
     }
 }

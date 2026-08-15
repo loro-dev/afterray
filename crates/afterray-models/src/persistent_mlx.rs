@@ -155,7 +155,13 @@ impl PersistentMlxAdapter {
             use_kv_cache: self.config.enable_kv_cache,
         };
         let first = self
-            .run_generate(&mut runtime, request, job_id, token_tx, cancellation.clone())
+            .run_generate(
+                &mut runtime,
+                request,
+                job_id,
+                token_tx,
+                cancellation.clone(),
+            )
             .await;
         // If reuse itself fails before the user has received a token, retry the
         // same request with a fresh session in the already-loaded container.
@@ -379,7 +385,10 @@ impl PersistentMlxAdapter {
             let pid = worker.child.id();
             self.set_health(ModelPackState::Ready, pid, self.health().runtime, None);
         }
-        GenerateAttempt { result, emitted_delta }
+        GenerateAttempt {
+            result,
+            emitted_delta,
+        }
     }
 
     async fn fail_worker(&self, runtime: &mut Runtime, error: String) {
@@ -631,7 +640,12 @@ done
             .execute_streaming("fallback", &prompt("one"), None, Cancellation::default())
             .await
             .unwrap();
-        assert_eq!(output, ModelOutput::Llm { text: "fresh prefill".into() });
+        assert_eq!(
+            output,
+            ModelOutput::Llm {
+                text: "fresh prefill".into()
+            }
+        );
         assert!(matches!(adapter.health().state, ModelPackState::Ready));
         adapter.shutdown().await;
     }

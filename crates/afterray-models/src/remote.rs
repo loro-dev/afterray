@@ -203,13 +203,14 @@ impl ModelAdapter for LlmRouterAdapter {
             LlmProvider::MlxLocal => {
                 let pack_id = config.mlx_pack_id().ok_or_else(|| {
                     AdapterError::MissingModel(
-                        "AfterRay MLX selection is invalid; choose the managed 4B or 9B pack".into(),
+                        "AfterRay MLX selection is invalid; choose the managed 4B or 9B pack"
+                            .into(),
                     )
                 })?;
                 let mlx = self.mlx.get(pack_id).ok_or_else(|| {
-                    AdapterError::MissingModel(
-                        format!("AfterRay MLX worker for `{pack_id}` is unavailable in this installation"),
-                    )
+                    AdapterError::MissingModel(format!(
+                        "AfterRay MLX worker for `{pack_id}` is unavailable in this installation"
+                    ))
                 })?;
                 mlx.execute_streaming(job_id, input, token_tx, cancellation)
                     .await
@@ -828,9 +829,8 @@ mod tests {
     /// would inherit a chat sender that was never meant for it.
     #[tokio::test]
     async fn a_failed_route_consumes_the_token_sink() {
-        let adapter = LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(
-            LlmRuntimeConfig::default(),
-        )));
+        let adapter =
+            LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(LlmRuntimeConfig::default())));
         let sink = adapter.token_sink();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let _guard = sink.install(tx);

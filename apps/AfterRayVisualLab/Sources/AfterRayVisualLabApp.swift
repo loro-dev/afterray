@@ -219,7 +219,7 @@ private struct VisualLabView: View {
             ),
             modelActions: AfterRayOnboardingModelActions(
                 status: { models.library },
-                download: { packID in models.install(packID) }
+                download: { packIDs in models.install(packIDs) }
             )
         )
     }
@@ -318,11 +318,11 @@ private struct VisualLabView: View {
             ]
         )
 
-        func install(_ packID: String) -> ModelLibrary {
+        func install(_ packIDs: [String]) -> ModelLibrary {
             library = ModelLibrary(
                 directory: library.directory,
                 packs: library.packs.map { pack in
-                    guard pack.id == packID else { return pack }
+                    guard packIDs.contains(pack.id) else { return pack }
                     return ModelPack(
                         id: pack.id,
                         name: pack.name,

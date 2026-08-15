@@ -877,7 +877,11 @@ print(json.dumps({
         );
         assert!(seed.contains("today_ms: "), "{seed}");
         assert!(
-            seed.contains(&format!("vault_covers_ms: {}–{}", now - 60_000, now - 60_000)),
+            seed.contains(&format!(
+                "vault_covers_ms: {}–{}",
+                now - 60_000,
+                now - 60_000
+            )),
             "{seed}"
         );
     }
