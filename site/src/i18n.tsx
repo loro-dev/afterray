@@ -280,7 +280,7 @@ const en = {
   },
   footer: {
     tagline: 'A ray that persists after the day is gone.',
-    rights: '© 2026 · Local-first · Private by design',
+    rights: '© 2026',
   },
 }
 
@@ -545,7 +545,7 @@ const zh: Copy = {
   },
   footer: {
     tagline: 'A ray that persists after the day is gone.',
-    rights: '© 2026 · 纯本地 · 纯隐私',
+    rights: '© 2026',
   },
 }
 

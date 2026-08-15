@@ -1219,11 +1219,17 @@ button.sa-chip.sa-chip-active {
 .final-cta .hero-ctas {
   justify-content: center;
 }
+.footer-brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
 .footer {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  gap: 1rem;
+  align-items: baseline;
+  gap: 0.6rem 2rem;
   flex-wrap: wrap;
   max-width: var(--maxw);
   margin: 0 auto;

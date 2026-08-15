@@ -71,8 +71,11 @@ export default function Closer() {
       </section>
 
       <footer className="footer">
-        <span className="mono">AfterRay</span>
-        <span className="dim">{t.footer.tagline}</span>
+        {/* the tagline explains the name, so the two belong together */}
+        <p className="footer-brand">
+          <span className="mono">AfterRay</span>
+          <span className="dim">{t.footer.tagline}</span>
+        </p>
         <span className="mono dim">{t.footer.rights}</span>
       </footer>
     </>
