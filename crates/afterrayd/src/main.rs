@@ -251,16 +251,9 @@ fn local_model_adapters(
         QWEN35_9B_MLX_REVISION,
         qwen35_9b_mlx_manifest(),
     );
-    let llm = LlmRouterAdapter::new(
-        ProcessAdapter::new(ProcessAdapterConfig::new(
-            "llama-llm",
-            ModelCapability::Llm,
-            general_worker.clone(),
-        )),
-        llm_config,
-    )
-    .with_mlx(QWEN35_4B_MLX_PACK_ID, Arc::clone(&mlx_4b))
-    .with_mlx(QWEN35_9B_MLX_PACK_ID, Arc::clone(&mlx_9b));
+    let llm = LlmRouterAdapter::new(llm_config)
+        .with_mlx(QWEN35_4B_MLX_PACK_ID, Arc::clone(&mlx_4b))
+        .with_mlx(QWEN35_9B_MLX_PACK_ID, Arc::clone(&mlx_9b));
     let token_sink = llm.token_sink();
     (
         vec![
@@ -420,7 +413,7 @@ impl Default for PersistedSettings {
             storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
             excluded_bundle_ids: Vec::new(),
             excluded_domains: Vec::new(),
-            llm_provider: LlmProvider::Builtin,
+            llm_provider: LlmProvider::MlxLocal,
             llm_base_url: String::new(),
             llm_model: String::new(),
             llm_api_key: String::new(),
@@ -1198,7 +1191,7 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
 }
 
 fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
-    LlmRuntimeConfig {
+    let mut config = LlmRuntimeConfig {
         provider: std::env::var("AFTERRAY_LLM_PROVIDER")
             .ok()
             .as_deref()
@@ -1216,7 +1209,14 @@ fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
                 Some(key.to_owned())
             }
         }),
+    };
+    // Settings carried over from the retired built-in provider can hold a
+    // remote chat model id, which is not a managed MLX pack. Drop it so the
+    // local path falls back to the recommended 4B instead of refusing to run.
+    if config.provider == LlmProvider::MlxLocal && config.mlx_pack_id().is_none() {
+        config.model.clear();
     }
+    config
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -2710,6 +2710,24 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    /// Settings saved against the retired built-in provider decode as the
+    /// local MLX path. Any chat model id left over from that era is not a
+    /// managed pack, so it must be dropped rather than left to fail the route.
+    #[test]
+    fn settings_from_the_retired_builtin_provider_land_on_the_recommended_pack() {
+        let persisted = PersistedSettings {
+            llm_model: "qwen3.6:latest".to_owned(),
+            ..PersistedSettings::default()
+        };
+        let config = resolve_llm_config(&persisted);
+        assert_eq!(config.provider, LlmProvider::MlxLocal);
+        assert!(config.model.is_empty());
+        assert_eq!(
+            config.mlx_pack_id(),
+            Some(afterray_models::QWEN35_4B_MLX_PACK_ID)
+        );
     }
 
     /// A bare word is a typo, not a host. Storing it would leave a row in the

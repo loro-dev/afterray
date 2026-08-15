@@ -2,7 +2,7 @@ mod stream;
 
 use crate::{
     AdapterError, Cancellation, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
-    PersistentMlxAdapter, ProcessAdapter, QWEN35_4B_MLX_PACK_ID, QWEN35_9B_MLX_PACK_ID,
+    PersistentMlxAdapter, QWEN35_4B_MLX_PACK_ID, QWEN35_9B_MLX_PACK_ID,
 };
 use afterray_protocol::{LlmEndpointStatus, LlmProvider, LlmRemoteModel};
 use async_trait::async_trait;
@@ -31,7 +31,7 @@ pub struct LlmRuntimeConfig {
 impl Default for LlmRuntimeConfig {
     fn default() -> Self {
         Self {
-            provider: LlmProvider::Builtin,
+            provider: LlmProvider::MlxLocal,
             base_url: String::new(),
             model: String::new(),
             api_key: None,
@@ -40,20 +40,13 @@ impl Default for LlmRuntimeConfig {
 }
 
 impl LlmRuntimeConfig {
+    /// `mlx_present` says whether the selected managed MLX pack is on disk;
+    /// the remote providers only need a chat model to be chosen.
     #[must_use]
-    pub fn is_ready(&self, builtin_present: bool) -> bool {
-        match self.provider {
-            LlmProvider::Builtin => builtin_present,
-            LlmProvider::MlxLocal => false,
-            LlmProvider::Ollama | LlmProvider::OpenaiCompatible => !self.chat_model().is_empty(),
-        }
-    }
-
-    #[must_use]
-    pub fn is_ready_with_mlx(&self, builtin_present: bool, mlx_present: bool) -> bool {
+    pub fn is_ready(&self, mlx_present: bool) -> bool {
         match self.provider {
             LlmProvider::MlxLocal => mlx_present,
-            _ => self.is_ready(builtin_present),
+            LlmProvider::Ollama | LlmProvider::OpenaiCompatible => !self.chat_model().is_empty(),
         }
     }
 
@@ -81,9 +74,7 @@ impl LlmRuntimeConfig {
         }
         match self.provider {
             LlmProvider::Ollama => DEFAULT_OLLAMA_BASE_URL.to_owned(),
-            LlmProvider::Builtin | LlmProvider::MlxLocal | LlmProvider::OpenaiCompatible => {
-                String::new()
-            }
+            LlmProvider::MlxLocal | LlmProvider::OpenaiCompatible => String::new(),
         }
     }
 }
@@ -131,10 +122,9 @@ impl Drop for LlmTokenSinkGuard {
     }
 }
 
-/// Routes LLM jobs to the built-in llama.cpp worker or an OpenAI-compatible HTTP
-/// endpoint (Ollama included).
+/// Routes LLM jobs to a managed MLX worker on this Mac or an
+/// OpenAI-compatible HTTP endpoint (Ollama included).
 pub struct LlmRouterAdapter {
-    builtin: ProcessAdapter,
     mlx: BTreeMap<String, Arc<PersistentMlxAdapter>>,
     config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     client: reqwest::Client,
@@ -143,9 +133,8 @@ pub struct LlmRouterAdapter {
 
 impl LlmRouterAdapter {
     #[must_use]
-    pub fn new(builtin: ProcessAdapter, config: Arc<std::sync::Mutex<LlmRuntimeConfig>>) -> Self {
+    pub fn new(config: Arc<std::sync::Mutex<LlmRuntimeConfig>>) -> Self {
         Self {
-            builtin,
             mlx: BTreeMap::new(),
             config,
             client: reqwest::Client::builder()
@@ -184,7 +173,6 @@ impl ModelAdapter for LlmRouterAdapter {
 
     fn name(&self) -> &str {
         match self.snapshot().provider {
-            LlmProvider::Builtin => "llama-llm",
             LlmProvider::MlxLocal => "mlx-local-llm",
             LlmProvider::Ollama => "ollama-llm",
             LlmProvider::OpenaiCompatible => "openai-llm",
@@ -204,11 +192,10 @@ impl ModelAdapter for LlmRouterAdapter {
             )));
         }
         let config = self.snapshot();
-        // Consume the outlet even on the builtin path so a later remote job
-        // cannot inherit a chat sender that was never claimed.
+        // Consume the outlet on every path so a later remote job cannot
+        // inherit a chat sender that was never claimed.
         let token_tx = self.token_sink.take();
         match config.provider {
-            LlmProvider::Builtin => self.builtin.execute(job_id, input, cancellation).await,
             LlmProvider::MlxLocal => {
                 let pack_id = config.mlx_pack_id().ok_or_else(|| {
                     AdapterError::MissingModel(
@@ -257,9 +244,8 @@ pub async fn probe_llm(
             .map(normalize_origin)
             .filter(|value| !value.is_empty())
             .unwrap_or_default(),
-        LlmProvider::Builtin => String::new(),
     };
-    if matches!(provider, LlmProvider::Builtin | LlmProvider::MlxLocal) {
+    if matches!(provider, LlmProvider::MlxLocal) {
         return LlmEndpointStatus {
             reachable: false,
             models: Vec::new(),
@@ -303,7 +289,6 @@ pub async fn probe_llm(
         LlmProvider::Ollama => probe_ollama(&client, &origin).await,
         LlmProvider::OpenaiCompatible => probe_openai(&client, &origin, api_key).await,
         LlmProvider::MlxLocal => unreachable!("local probe returns earlier"),
-        LlmProvider::Builtin => unreachable!("builtin probe returns earlier"),
     };
     match result {
         Ok(models) => {
@@ -625,21 +610,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_is_ready_only_when_pack_is_present() {
+    fn mlx_is_the_default_and_is_ready_only_with_the_verified_pack() {
         let config = LlmRuntimeConfig::default();
+        assert_eq!(config.provider, LlmProvider::MlxLocal);
         assert!(!config.is_ready(false));
         assert!(config.is_ready(true));
-    }
-
-    #[test]
-    fn mlx_is_ready_only_when_the_verified_mlx_pack_is_present() {
-        let config = LlmRuntimeConfig {
-            provider: LlmProvider::MlxLocal,
-            ..LlmRuntimeConfig::default()
-        };
-        assert!(!config.is_ready(false));
-        assert!(!config.is_ready_with_mlx(true, false));
-        assert!(config.is_ready_with_mlx(false, true));
         assert!(config.resolved_base_url().is_empty());
     }
 
@@ -746,28 +721,17 @@ mod tests {
         assert_eq!(chat_message_content(&parts).as_deref(), Some("hi there"));
     }
 
+    /// A failed route must still claim the outlet, or the next queued job
+    /// would inherit a chat sender that was never meant for it.
     #[tokio::test]
-    async fn builtin_execute_consumes_sink_without_tokens() {
-        let script = r#"
-import json, sys
-req = json.load(sys.stdin)
-print(json.dumps({
-  "protocol_version": 1,
-  "output": {"type": "llm", "text": "one shot"},
-  "retryable": False
-}))
-"#;
-        let mut builtin =
-            crate::ProcessAdapterConfig::new("test-llm", ModelCapability::Llm, "/usr/bin/python3");
-        builtin.args = vec!["-c".to_owned(), script.to_owned()];
-        let adapter = LlmRouterAdapter::new(
-            crate::ProcessAdapter::new(builtin),
-            Arc::new(std::sync::Mutex::new(LlmRuntimeConfig::default())),
-        );
+    async fn a_failed_route_consumes_the_token_sink() {
+        let adapter = LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(
+            LlmRuntimeConfig::default(),
+        )));
         let sink = adapter.token_sink();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let _guard = sink.install(tx);
-        let output = adapter
+        let error = adapter
             .execute(
                 "job-1",
                 &ModelInput::Llm {
@@ -777,17 +741,12 @@ print(json.dumps({
                 Cancellation::default(),
             )
             .await
-            .unwrap();
-        assert_eq!(
-            output,
-            ModelOutput::Llm {
-                text: "one shot".into()
-            }
-        );
-        assert!(rx.try_recv().is_err(), "builtin must not emit token deltas");
+            .expect_err("no MLX worker is registered on this router");
+        assert!(matches!(error, AdapterError::MissingModel(_)));
+        assert!(rx.try_recv().is_err());
         assert!(
             sink.take().is_none(),
-            "builtin must consume the outlet so a later job cannot inherit it"
+            "the outlet must be consumed so a later job cannot inherit it"
         );
     }
 }

@@ -29,14 +29,6 @@ those lines. For a user-facing response, output FINAL followed by the answer.";
 const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
 #[must_use]
-pub(crate) fn llm_pack_present(library: &ModelLibrary) -> bool {
-    library
-        .packs
-        .iter()
-        .any(|pack| pack.id == "llm" && pack.present)
-}
-
-#[must_use]
 pub(crate) fn mlx_pack_present(library: &ModelLibrary, config: &LlmRuntimeConfig) -> bool {
     config.mlx_pack_id().is_some_and(|pack_id| {
         library
@@ -48,7 +40,7 @@ pub(crate) fn mlx_pack_present(library: &ModelLibrary, config: &LlmRuntimeConfig
 
 #[must_use]
 pub(crate) fn llm_ready(library: &ModelLibrary, config: &LlmRuntimeConfig) -> bool {
-    config.is_ready_with_mlx(llm_pack_present(library), mlx_pack_present(library, config))
+    config.is_ready(mlx_pack_present(library, config))
 }
 
 pub(crate) fn resolve_ask_range(
@@ -470,40 +462,14 @@ mod tests {
     }
 
     #[test]
-    fn llm_pack_present_requires_installed_llm() {
-        let missing = ModelLibrary {
-            directory: "/tmp".into(),
-            packs: vec![ModelPack {
-                id: "llm".into(),
-                name: "Local LLM".into(),
-                capability: "llm".into(),
-                path: "/tmp/missing.gguf".into(),
-                present: false,
-                state: afterray_protocol::ModelPackState::NotDownloaded,
-                bytes: 0,
-                required: false,
-                note: None,
-                expected_bytes: None,
-                revision: None,
-                error: None,
-            }],
-            download: None,
-        };
-        assert!(!llm_pack_present(&missing));
-        let mut present = missing.clone();
-        present.packs[0].present = true;
-        assert!(llm_pack_present(&present));
-    }
-
-    #[test]
     fn llm_ready_accepts_configured_remote_without_local_pack() {
         let missing = ModelLibrary {
             directory: "/tmp".into(),
             packs: vec![ModelPack {
-                id: "llm".into(),
-                name: "Qwen3.6 27B".into(),
-                capability: "llm".into(),
-                path: "/tmp/missing.gguf".into(),
+                id: "llm_qwen35_4b_mlx4".into(),
+                name: "Qwen3.5 4B · MLX 4-bit".into(),
+                capability: "llm_vlm".into(),
+                path: "/tmp/Qwen3.5-4B-MLX-4bit".into(),
                 present: false,
                 state: afterray_protocol::ModelPackState::NotDownloaded,
                 bytes: 0,

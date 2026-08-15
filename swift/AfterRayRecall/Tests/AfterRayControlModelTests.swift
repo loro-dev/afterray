@@ -206,7 +206,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
             recordAudio: recordAudio ?? true,
             captureIntervalSeconds: 10,
             storageLimitBytes: storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
-            llmProvider: llmProvider ?? .builtin,
+            llmProvider: llmProvider ?? .mlxLocal,
             llmBaseUrl: llmBaseUrl ?? "",
             llmModel: llmModel ?? "",
             uiLanguage: uiLanguage ?? AppSettings.defaultLanguage,

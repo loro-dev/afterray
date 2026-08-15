@@ -12,14 +12,12 @@ mod queue;
 mod remote;
 
 pub use catalog::{
-    FALLBACK_LLM_FILE, FALLBACK_LLM_REPOSITORY, ManifestFile, PackSource, PackSpec,
-    QWEN35_4B_MLX_EXPECTED_BYTES, QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REPOSITORY,
-    QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_EXPECTED_BYTES, QWEN35_9B_MLX_PACK_ID,
-    QWEN35_9B_MLX_REPOSITORY, QWEN35_9B_MLX_REVISION,
-    QWEN36_27B_Q4_EXPECTED_BYTES, QWEN38_27B_Q4_EXPECTED_BYTES, READY_MARKER, catalog_in,
-    default_catalog, inspect_model_path, library, library_in, llm_pack_from, model_directory,
-    qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack,
-    spec_by_id, specs_for_download, specs_for_download_in,
+    ManifestFile, PackSource, PackSpec, QWEN35_4B_MLX_EXPECTED_BYTES, QWEN35_4B_MLX_PACK_ID,
+    QWEN35_4B_MLX_REPOSITORY, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_EXPECTED_BYTES,
+    QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REPOSITORY, QWEN35_9B_MLX_REVISION, READY_MARKER,
+    catalog_in, default_catalog, inspect_model_path, library, library_in, model_directory,
+    qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
+    specs_for_download, specs_for_download_in,
 };
 pub use download::{
     DownloadError, DownloadProgress, download_pack, download_packs, remove_pack, verify_files,

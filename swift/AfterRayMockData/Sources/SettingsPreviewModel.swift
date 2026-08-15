@@ -120,17 +120,6 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
                     note: "nomic-embed-text v1.5 Q4 · llama.cpp",
                     expectedBytes: 84_000_000
                 ),
-                ModelPack(
-                    id: "llm",
-                    name: "Qwen3.6 27B",
-                    capability: "llm",
-                    path: "\(modelDirectoryPath)/Qwen3.6-27B-Q4_K_M.gguf",
-                    present: false,
-                    bytes: 0,
-                    required: false,
-                    note: "Powers overlay Q&A · optional. Built-in download is Qwen3.6-27B Q4 (~17 GB). Qwen 3.7 has no local GGUF — use Ollama or an OpenAI-compatible URL for a hosted 3.7.",
-                    expectedBytes: 16_817_244_384
-                ),
             ]
         )
     }

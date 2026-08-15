@@ -886,9 +886,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var providerFootnote: String {
-        switch model.settings?.llmProvider ?? .builtin {
-        case .builtin:
-            "Downloads Qwen3.6-27B Q4 (~17 GB) and runs it on this Mac. Capture keeps working without it."
+        switch model.settings?.llmProvider ?? .mlxLocal {
         case .mlxLocal:
             "Choose Qwen3.5 4B or the optional higher-quality 9B pack. Both run inside AfterRay through MLX."
         case .ollama:
@@ -900,7 +898,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var llmProviderBinding: Binding<LlmProvider> {
         Binding(
-            get: { model.settings?.llmProvider ?? .builtin },
+            get: { model.settings?.llmProvider ?? .mlxLocal },
             set: { provider in
                 Task { await model.setLlmProvider(provider) }
             }
@@ -909,9 +907,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var llmProviderPanel: some View {
-        switch model.settings?.llmProvider ?? .builtin {
-        case .builtin:
-            EmptyView()
+        switch model.settings?.llmProvider ?? .mlxLocal {
         case .mlxLocal:
             mlxLocalPanel
         case .ollama:

@@ -461,8 +461,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func probeLlm() async {
-        let provider = settings?.llmProvider ?? .builtin
-        guard provider != .builtin else {
+        let provider = settings?.llmProvider ?? .mlxLocal
+        guard provider != .mlxLocal else {
             llmProbe = nil
             return
         }
@@ -524,8 +524,6 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
 
     private func assistantSourceMessage(_ provider: LlmProvider) -> String {
         switch provider {
-        case .builtin:
-            "Ask will use the on-device pack when it is installed."
         case .mlxLocal:
             "Ask will use the selected Qwen3.5 MLX model through AfterRay's signed worker."
         case .ollama:

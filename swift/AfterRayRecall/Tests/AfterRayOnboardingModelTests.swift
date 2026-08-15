@@ -36,7 +36,9 @@ final class AfterRayOnboardingModelTests: XCTestCase {
 
         XCTAssertEqual(downloaded, ["asr"])
         XCTAssertTrue(model.requiredModelsReady)
-        XCTAssertFalse(model.modelLibrary?.packs.first(where: { $0.id == "llm" })?.present ?? true)
+        XCTAssertFalse(
+            model.modelLibrary?.packs.first(where: { $0.id == "llm_qwen35_4b_mlx4" })?.present ?? true
+        )
     }
 
     private func makeModel(
@@ -69,14 +71,14 @@ final class AfterRayOnboardingModelTests: XCTestCase {
                     expectedBytes: 4_200_000_000
                 ),
                 ModelPack(
-                    id: "llm",
-                    name: "Local assistant",
-                    capability: "llm",
-                    path: "/tmp/models/llm",
+                    id: "llm_qwen35_4b_mlx4",
+                    name: "Qwen3.5 4B · MLX 4-bit",
+                    capability: "llm_vlm",
+                    path: "/tmp/models/Qwen3.5-4B-MLX-4bit",
                     present: false,
                     bytes: 0,
                     required: false,
-                    expectedBytes: 17_000_000_000
+                    expectedBytes: 3_061_129_077
                 ),
             ]
         )

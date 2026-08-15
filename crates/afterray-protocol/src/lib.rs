@@ -310,11 +310,10 @@ pub struct Status {
     pub active_session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProvider {
     #[default]
-    Builtin,
     MlxLocal,
     Ollama,
     OpenaiCompatible,
@@ -324,22 +323,38 @@ impl LlmProvider {
     #[must_use]
     pub const fn as_label(self) -> &'static str {
         match self {
-            Self::Builtin => "builtin",
             Self::MlxLocal => "mlx_local",
             Self::Ollama => "ollama",
             Self::OpenaiCompatible => "openai_compatible",
         }
     }
 
+    /// `builtin`/`local` are the retired llama.cpp GGUF backend. Settings
+    /// saved before it was removed still carry those labels, so they land on
+    /// the managed MLX packs rather than failing the whole settings load.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "builtin" | "built_in" | "local" => Some(Self::Builtin),
-            "mlx" | "mlx_local" | "mlx-local" => Some(Self::MlxLocal),
+            "mlx" | "mlx_local" | "mlx-local" | "builtin" | "built_in" | "local" => {
+                Some(Self::MlxLocal)
+            }
             "ollama" => Some(Self::Ollama),
             "openai" | "openai_compatible" | "openai-compatible" => Some(Self::OpenaiCompatible),
             _ => None,
         }
+    }
+}
+
+/// Decoded through `parse` so a settings file written by an older build —
+/// or a client sending an unknown label — degrades to the default provider
+/// instead of rejecting the message.
+impl<'de> Deserialize<'de> for LlmProvider {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw).unwrap_or_default())
     }
 }
 
@@ -955,11 +970,23 @@ mod tests {
             r#"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#,
         )
         .unwrap();
-        assert_eq!(settings.llm_provider, LlmProvider::Builtin);
+        assert_eq!(settings.llm_provider, LlmProvider::MlxLocal);
         assert!(settings.llm_base_url.is_empty());
         assert!(settings.llm_model.is_empty());
         assert!(!settings.llm_api_key_set);
         assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn retired_builtin_provider_decodes_as_the_local_mlx_pack() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"llm_provider":"builtin"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.llm_provider, LlmProvider::MlxLocal);
+        assert_eq!(LlmProvider::parse("built_in"), Some(LlmProvider::MlxLocal));
+        assert_eq!(LlmProvider::parse("local"), Some(LlmProvider::MlxLocal));
+        assert_eq!(LlmProvider::parse("nonsense"), None);
     }
 
     #[test]

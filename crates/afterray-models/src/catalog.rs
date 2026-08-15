@@ -158,14 +158,6 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
                 ),
             },
         },
-        llm_pack_from(
-            directory,
-            &env_or("AFTERRAY_LLM_REPOSITORY", FALLBACK_LLM_REPOSITORY),
-            &env_or("AFTERRAY_LLM_FILE", FALLBACK_LLM_FILE),
-            std::env::var_os("AFTERRAY_LLM_MODEL")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-        ),
         qwen35_mlx_pack(directory),
         qwen35_9b_mlx_pack(directory),
     ]
@@ -349,43 +341,6 @@ pub fn qwen35_9b_mlx_manifest() -> Vec<ManifestFile> {
             sha256: (*sha256).into(),
         })
         .collect()
-}
-
-/// Built-in overlay Q&A GGUF. Retarget with `AFTERRAY_LLM_REPOSITORY` +
-/// `AFTERRAY_LLM_FILE` (and optionally `AFTERRAY_LLM_MODEL`) — no protocol
-/// change. Qwen 3.7 has no local GGUF.
-pub const FALLBACK_LLM_REPOSITORY: &str = "unsloth/Qwen3.6-27B-GGUF";
-pub const FALLBACK_LLM_FILE: &str = "Qwen3.6-27B-Q4_K_M.gguf";
-
-/// Exact size of `Qwen3.6-27B-Q4_K_M.gguf` on Hugging Face. Used as
-/// download `expected_bytes` so Settings progress stays honest.
-pub const QWEN36_27B_Q4_EXPECTED_BYTES: u64 = 16_817_244_384;
-
-/// Alias kept for older call sites that documented a 27B Q4 budget.
-pub const QWEN38_27B_Q4_EXPECTED_BYTES: u64 = QWEN36_27B_Q4_EXPECTED_BYTES;
-
-/// Builds the optional assistant pack. `file` is both the Hugging Face
-/// filename and the local basename unless `model_path` overrides the path.
-#[must_use]
-pub fn llm_pack_from(
-    directory: &Path,
-    repository: &str,
-    file: &str,
-    model_path: Option<PathBuf>,
-) -> PackSpec {
-    PackSpec {
-        id: "llm".into(),
-        name: "Qwen3.6 27B".into(),
-        capability: "llm".into(),
-        path: model_path.unwrap_or_else(|| directory.join(file)),
-        required: false,
-        note: "Powers overlay Q&A · optional. Built-in download is Qwen3.6-27B Q4 (~17 GB). Qwen 3.7 has no local GGUF — use Ollama or an OpenAI-compatible URL for a hosted 3.7.".into(),
-        expected_bytes: QWEN36_27B_Q4_EXPECTED_BYTES,
-        source: PackSource::HuggingFaceFile {
-            repository: repository.to_owned(),
-            file: file.to_owned(),
-        },
-    }
 }
 
 #[must_use]
@@ -581,7 +536,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn catalog_has_asr_embedding_and_optional_llm() {
+    fn catalog_has_asr_embedding_and_the_managed_mlx_packs() {
         let catalog = catalog_in(Path::new("/tmp/afterray-models"));
         let ids: Vec<_> = catalog.iter().map(|spec| spec.id.as_str()).collect();
         assert_eq!(
@@ -589,7 +544,6 @@ mod tests {
             [
                 "asr",
                 "embedding",
-                "llm",
                 QWEN35_4B_MLX_PACK_ID,
                 QWEN35_9B_MLX_PACK_ID
             ]
@@ -597,27 +551,19 @@ mod tests {
         assert!(catalog[0].required);
         assert!(catalog[1].required);
         assert!(!catalog[2].required);
-        assert_eq!(catalog[2].name, "Qwen3.6 27B");
-        assert!(catalog[2].note.contains("overlay Q&A"));
-        assert!(catalog[2].note.contains("optional"));
-        assert!(catalog[2].note.contains("Qwen3.6-27B"));
-        assert_eq!(catalog[2].expected_bytes, QWEN36_27B_Q4_EXPECTED_BYTES);
-        assert_eq!(
-            catalog[2].path,
-            Path::new("/tmp/afterray-models").join(FALLBACK_LLM_FILE)
-        );
-        assert_eq!(catalog[3].expected_bytes, QWEN35_4B_MLX_EXPECTED_BYTES);
-        assert_eq!(catalog[3].revision(), Some(QWEN35_4B_MLX_REVISION));
+        assert!(!catalog[3].required);
+        assert_eq!(catalog[2].expected_bytes, QWEN35_4B_MLX_EXPECTED_BYTES);
+        assert_eq!(catalog[2].revision(), Some(QWEN35_4B_MLX_REVISION));
         assert_eq!(
             QWEN35_4B_MLX_REPOSITORY,
             "mlx-community/Qwen3.5-4B-MLX-4bit"
         );
         assert!(matches!(
-            catalog[3].source,
+            catalog[2].source,
             PackSource::HuggingFacePinnedSnapshot { .. }
         ));
-        assert_eq!(catalog[4].expected_bytes, QWEN35_9B_MLX_EXPECTED_BYTES);
-        assert_eq!(catalog[4].revision(), Some(QWEN35_9B_MLX_REVISION));
+        assert_eq!(catalog[3].expected_bytes, QWEN35_9B_MLX_EXPECTED_BYTES);
+        assert_eq!(catalog[3].revision(), Some(QWEN35_9B_MLX_REVISION));
         assert_eq!(
             QWEN35_9B_MLX_REPOSITORY,
             "mlx-community/Qwen3.5-9B-MLX-4bit"
@@ -668,55 +614,15 @@ mod tests {
         assert_eq!(weights.len(), 2);
         assert_eq!(weights[0].bytes, 5_349_771_222);
         assert_eq!(weights[1].bytes, 600_449_850);
-        assert_eq!(
-            catalog[2].source,
-            PackSource::HuggingFaceFile {
-                repository: FALLBACK_LLM_REPOSITORY.into(),
-                file: FALLBACK_LLM_FILE.into(),
-            }
-        );
     }
 
+    /// The 27B GGUF assistant pack is gone: nothing in the catalog should
+    /// still offer a multi-gigabyte llama.cpp download.
     #[test]
-    fn llm_repository_and_file_retarget_download_without_protocol_change() {
-        let pack = llm_pack_from(
-            Path::new("/tmp/afterray-models"),
-            "org/Qwen3.8-27B-GGUF",
-            "Qwen3.8-27B-Q4_K_M.gguf",
-            None,
-        );
-        assert_eq!(pack.id, "llm");
-        assert!(!pack.required);
-        assert_eq!(
-            pack.path,
-            PathBuf::from("/tmp/afterray-models/Qwen3.8-27B-Q4_K_M.gguf")
-        );
-        assert_eq!(
-            pack.source,
-            PackSource::HuggingFaceFile {
-                repository: "org/Qwen3.8-27B-GGUF".into(),
-                file: "Qwen3.8-27B-Q4_K_M.gguf".into(),
-            }
-        );
-        assert_eq!(pack.expected_bytes, QWEN36_27B_Q4_EXPECTED_BYTES);
-    }
-
-    #[test]
-    fn llm_model_path_override_wins_over_file_name() {
-        let pack = llm_pack_from(
-            Path::new("/tmp/afterray-models"),
-            FALLBACK_LLM_REPOSITORY,
-            "Qwen3.8-27B-Q4_K_M.gguf",
-            Some(PathBuf::from("/custom/weights.gguf")),
-        );
-        assert_eq!(pack.path, PathBuf::from("/custom/weights.gguf"));
-        assert_eq!(
-            pack.source,
-            PackSource::HuggingFaceFile {
-                repository: FALLBACK_LLM_REPOSITORY.into(),
-                file: "Qwen3.8-27B-Q4_K_M.gguf".into(),
-            }
-        );
+    fn catalog_no_longer_offers_the_retired_gguf_assistant_pack() {
+        let catalog = catalog_in(Path::new("/tmp/afterray-models"));
+        assert!(catalog.iter().all(|spec| spec.id != "llm"));
+        assert!(catalog.iter().all(|spec| spec.capability != "llm"));
     }
 
     #[test]

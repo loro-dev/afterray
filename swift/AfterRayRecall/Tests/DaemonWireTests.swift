@@ -244,8 +244,17 @@ final class DaemonWireTests: XCTestCase {
         let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"excluded_bundle_ids":["com.apple.Safari"]}"#
         let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
         XCTAssertEqual(settings.excludedBundleIds, ["com.apple.Safari"])
-        XCTAssertEqual(settings.llmProvider, .builtin)
+        XCTAssertEqual(settings.llmProvider, .mlxLocal)
         XCTAssertTrue(settings.llmModel.isEmpty)
+    }
+
+    /// Settings written before the built-in GGUF backend was removed still say
+    /// `builtin`. That must resolve to the managed MLX packs rather than
+    /// failing the whole decode and stranding the Settings window.
+    func testAppSettingsMapsRetiredBuiltinProviderToLocalMlx() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"llm_provider":"builtin"}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.llmProvider, .mlxLocal)
     }
 
     func testAppSettingsDecodesExcludedWebsites() throws {
