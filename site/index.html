@@ -36,6 +36,30 @@
     />
     <meta name="twitter:image" content="https://afterray.com/og.png" />
 
+    <!-- No offers or ratings: the app is not packaged for distribution yet,
+         and inventing either would be a claim the product cannot back. -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "AfterRay",
+        "url": "https://afterray.com/",
+        "image": "https://afterray.com/og.png",
+        "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "macOS 15 or later, Apple Silicon",
+        "description": "Local-first computer history for Mac. AfterRay records your screen and audio all day so any moment stays searchable — replay it, search it, or let a coding agent look it up. Capture, indexing, and the model all run on the machine.",
+        "featureList": [
+          "Replay any moment of your day: the screen as it was, the audio as it sounded",
+          "Full-text and on-device semantic search over OCR text and transcripts",
+          "Answers cited to replayable moments",
+          "Half-hour summaries written on device",
+          "Read-only CLI and Agent Skill for Claude Code and Codex",
+          "Exclude apps and sites, pause, or delete history at any time",
+          "Encrypted vault: SQLCipher and XChaCha20-Poly1305, key in the macOS Keychain"
+        ]
+      }
+    </script>
+
     <link rel="icon" type="image/png" href="/favicon.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
