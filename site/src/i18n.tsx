@@ -35,7 +35,7 @@ const en = {
     sub: 'AfterRay records your screen and audio all day — so you and your agent can find anything you saw or heard.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
-    facts: ['macOS 15+', 'Exclude any app', 'Pause or delete anytime', 'Nothing leaves this Mac'],
+    facts: ['macOS 15+', 'Exclude apps and sites', 'Pause or delete anytime', 'Nothing leaves this Mac'],
   },
   jtbd: [
     {
@@ -52,7 +52,7 @@ const en = {
     },
   ],
   recall: {
-    body: '⇧⌘Space from any app. Zoom from one second out to a month.',
+    body: '⇧⌘Space from any app. Drag the timeline back to any moment.',
     mock: {
       status: 'Recording',
       searchHint: 'Search your day — Tab for AI chat',
@@ -98,9 +98,9 @@ const en = {
   memories: {
     titleA: ['You did a lot today.'] as Part[],
     titleB: ["Here's ", { em: 'what it was.' }] as Part[],
-    body: 'AfterRay writes your day back to you, hour by hour. The model runs here, and it is told never to invent a file, a URL, or a task it did not see.',
+    body: 'AfterRay writes your day back to you in half-hour slots. The model runs here, and it is told never to invent a file, a URL, or a task it did not see.',
     points: [
-      'Written on the hour, without being asked',
+      'Written as you go, without being asked',
       'Every line opens to the moment behind it',
     ],
     mock: {
@@ -108,22 +108,22 @@ const en = {
       label: 'Memories',
       rows: [
         {
-          span: '9:00–10:00',
+          span: '9:00–9:30',
           summary: 'Traced the agent loop in afterrayd, then started a note on retention.',
           apps: 'Xcode · Notes',
         },
         {
-          span: '10:00–11:00',
+          span: '10:30–11:00',
           summary: 'Read hot-stills-cold-gop.md and compared HEIF against the JPEG decode path.',
           apps: 'Safari · Xcode',
         },
         {
-          span: '2:00–3:00 PM',
+          span: '2:00–2:30 PM',
           summary: 'Closed out the disk chapter of the v1 spec.',
           apps: 'Notes · GitHub',
         },
         {
-          span: '3:00–4:00 PM',
+          span: '3:30–4:00 PM',
           summary: 'Debugged the GOP encoder memory spike on a call, then filed PR #128.',
           apps: 'Zoom · GitHub',
         },
@@ -166,12 +166,12 @@ const en = {
               app: 'GitHub',
               time: 'Wed 3:15 PM',
               c: '#8a7a70',
-              text: 'PR #128 — the retention ceiling applies to non-favorites only',
-              match: 'retention ceiling',
+              text: 'PR #128 — the storage budget applies to unstarred moments only',
+              match: 'storage budget',
             },
           ],
           answer:
-            'Anything you star is exempt and never expires. Everything else is bounded by a retention ceiling.',
+            'Anything you star is exempt and never expires. Everything else lives inside the storage budget you set.',
         },
         {
           chip: 'That memory spike',
@@ -237,7 +237,7 @@ const en = {
     note: 'Read-only. The vault key never leaves the daemon.',
     mock: [
       { cmd: 'afterray search "keeping favorites" --limit 1', out: '[ { "source": "transcript", "time": "Wed 11:02 AM",\n    "text": "favorites never expire…" } ]' },
-      { cmd: 'afterray ask "where did we land on retention?"', out: '{ "answer": "Stars are exempt; the rest is bounded.",\n  "citations": [ "Wed 3:15 PM · GitHub" ] }' },
+      { cmd: 'afterray ask "where did we land on retention?"', out: '{ "answer": "Stars are exempt; the rest fits the storage budget.",\n  "citations": [ "Wed 3:15 PM · GitHub" ] }' },
       { cmd: 'afterray memories --from-ms … --to-ms …', out: '[ { "span": "3:00–4:00 PM",\n    "summary": "Debugged the GOP encoder memory spike" } ]' },
       { cmd: 'afterray activity --from-ms … --to-ms …', out: '[ { "app": "Xcode", "duration": "2h 14m" },\n  { "app": "Zoom", "duration": "24m" } ]' },
     ],
@@ -256,11 +256,11 @@ const en = {
       },
       {
         title: 'Modeled locally',
-        body: 'Summaries and answers come from a model running on your machine — a built-in GGUF or your own Ollama.',
+        body: 'Summaries and answers come from a model running on your machine — a built-in GGUF, an MLX pack, or your own Ollama.',
       },
       {
         title: 'Encrypted at rest',
-        body: 'SQLCipher + XChaCha20-Poly1305 encrypt every record. The key lives only in the macOS Keychain.',
+        body: 'SQLCipher + XChaCha20-Poly1305 encrypt every record. The key lives in the macOS Keychain.',
       },
     ],
   },
@@ -269,10 +269,10 @@ const en = {
     rows: [
       ['Platform', 'macOS 15+ · Apple Silicon (M3 recommended)'],
       ['Storage', 'SQLCipher + XChaCha20-Poly1305, key in the Keychain'],
-      ['On disk', 'Older captures repack to closed-GOP AV1 — measured at 7% of the original JPEG'],
-      ['Retention', 'Non-favorites are bounded automatically; starred moments never expire'],
-      ['Models', 'On-device ASR / Embedding / LLM, or your own Ollama'],
-      ['Upload', 'None. No account, no telemetry, no cloud sync'],
+      ['On disk', 'Older captures repack to closed-GOP AV1 — 7–10% of the original JPEG'],
+      ['Retention', 'A storage budget you set, 100 GB by default — oldest unstarred go first, favorites never expire'],
+      ['Models', 'On-device ASR, embeddings, and LLM — or your own Ollama or OpenAI-compatible endpoint'],
+      ['Upload', 'No account, no telemetry, no cloud sync — nothing leaves unless you point it at a remote model'],
     ],
   },
   final: {
@@ -308,7 +308,7 @@ const zh: Copy = {
     sub: 'AfterRay 整天记录你的屏幕和声音——你看到、听到的一切，你和你的 agent 都能再找到。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
-    facts: ['macOS 15+', '可排除任意 App', '随时暂停或删除', '数据不出这台 Mac'],
+    facts: ['macOS 15+', '可排除 App 和网站', '随时暂停或删除', '数据不出这台 Mac'],
   },
   jtbd: [
     {
@@ -325,7 +325,7 @@ const zh: Copy = {
     },
   ],
   recall: {
-    body: '任意 App 里按 ⇧⌘Space。从一秒缩放到一个月。',
+    body: '任意 App 里按 ⇧⌘Space。拖动时间线回到任意时刻。',
     mock: {
       status: '录制中',
       searchHint: '搜索你的一天 — Tab 打开 AI 对话',
@@ -369,9 +369,9 @@ const zh: Copy = {
   memories: {
     titleA: ['今天你做了很多，'],
     titleB: ['它都替你', { em: '记下来了。' }],
-    body: 'AfterRay 按小时把这一天写回给你。模型跑在本机，并且被明确要求：没看见的文件、链接、任务，一个字都不能编。',
+    body: 'AfterRay 按半小时把这一天写回给你。模型跑在本机，并且被明确要求：没看见的文件、链接、任务，一个字都不能编。',
     points: [
-      '整点自动写好，不用你开口',
+      '自动写好，不用你开口',
       '每一行都能翻回背后那一刻',
     ],
     mock: {
@@ -379,22 +379,22 @@ const zh: Copy = {
       label: '记忆',
       rows: [
         {
-          span: '9:00–10:00',
+          span: '9:00–9:30',
           summary: '通读 afterrayd 的 agent 循环，随后开了一篇 retention 的笔记。',
           apps: 'Xcode · Notes',
         },
         {
-          span: '10:00–11:00',
+          span: '10:30–11:00',
           summary: '读 hot-stills-cold-gop.md，对比 HEIF 与 JPEG 的解码路径。',
           apps: 'Safari · Xcode',
         },
         {
-          span: '14:00–15:00',
+          span: '14:00–14:30',
           summary: '收尾 v1 spec 的磁盘章节。',
           apps: 'Notes · GitHub',
         },
         {
-          span: '15:00–16:00',
+          span: '15:30–16:00',
           summary: '在会上调试 GOP 编码的内存峰值，之后提了 PR #128。',
           apps: 'Zoom · GitHub',
         },
@@ -437,11 +437,11 @@ const zh: Copy = {
               app: 'GitHub',
               time: '周三 15:15',
               c: '#8a7a70',
-              text: 'PR #128 —— 保留上限只作用于非收藏的时刻',
-              match: '保留上限',
+              text: 'PR #128 —— 存储预算只作用于未收藏的时刻',
+              match: '存储预算',
             },
           ],
-          answer: '标了收藏的永远豁免，不会过期；其余的按保留上限自动清理。',
+          answer: '标了收藏的永远豁免，不会过期；其余的都在你设的存储预算之内。',
         },
         {
           chip: '那个内存峰值',
@@ -505,7 +505,7 @@ const zh: Copy = {
     note: '只读。Vault 密钥永不离开守护进程。',
     mock: [
       { cmd: 'afterray search "收藏会不会被清掉" --limit 1', out: '[ { "source": "transcript", "time": "周三 11:02",\n    "text": "收藏的永不过期…" } ]' },
-      { cmd: 'afterray ask "retention 最后怎么定的？"', out: '{ "answer": "收藏豁免，其余自动限额。",\n  "citations": [ "周三 15:15 · GitHub" ] }' },
+      { cmd: 'afterray ask "retention 最后怎么定的？"', out: '{ "answer": "收藏豁免，其余的在存储预算内。",\n  "citations": [ "周三 15:15 · GitHub" ] }' },
       { cmd: 'afterray memories --from-ms … --to-ms …', out: '[ { "span": "15:00–16:00",\n    "summary": "调试 GOP 编码的内存峰值" } ]' },
       { cmd: 'afterray activity --from-ms … --to-ms …', out: '[ { "app": "Xcode", "duration": "2h 14m" },\n  { "app": "Zoom", "duration": "24m" } ]' },
     ],
@@ -524,11 +524,11 @@ const zh: Copy = {
       },
       {
         title: '模型在本地',
-        body: '总结与问答由本机运行的大模型完成——内置 GGUF 或你自己的 Ollama。',
+        body: '总结与问答由本机运行的大模型完成——内置 GGUF、MLX 包，或你自己的 Ollama。',
       },
       {
         title: '存储已加密',
-        body: 'SQLCipher + XChaCha20-Poly1305 逐条加密，密钥只存在于 macOS Keychain。',
+        body: 'SQLCipher + XChaCha20-Poly1305 逐条加密，密钥存于 macOS Keychain。',
       },
     ],
   },
@@ -537,10 +537,10 @@ const zh: Copy = {
     rows: [
       ['平台', 'macOS 15+ · Apple Silicon（推荐 M3）'],
       ['存储', 'SQLCipher + XChaCha20-Poly1305，密钥存于 Keychain'],
-      ['磁盘', '较早的画面后台重打包成 closed-GOP AV1——实测为原 JPEG 的 7%'],
-      ['保留', '非收藏的时刻自动限额；标了收藏的永不过期'],
-      ['模型', '本机 ASR / Embedding / LLM，或你自己的 Ollama'],
-      ['上传', '无。没有账号，没有遥测，没有云端同步'],
+      ['磁盘', '较早的画面后台重打包成 closed-GOP AV1——原 JPEG 的 7–10%'],
+      ['保留', '你自己设的存储预算，默认 100 GB——先清最早的非收藏，收藏永不过期'],
+      ['模型', '本机 ASR / Embedding / LLM，或你自己的 Ollama、OpenAI 兼容接口'],
+      ['上传', '没有账号，没有遥测，没有云端同步——除非你自己接了远程模型'],
     ],
   },
   final: {
