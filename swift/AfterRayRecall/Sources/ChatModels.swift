@@ -65,6 +65,13 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
     public var content: String
     public var toolLog: String?
     public var createdAtMs: Int64
+    /// The model's reasoning, as the daemon's JSON array of rounds.
+    public var reasoning: String?
+    /// `streaming`, `complete` or `aborted`. Nil on rows written before turns
+    /// were persisted as they ran — all of which finished.
+    public var status: String?
+    /// Context occupancy of the turn that wrote this row, as JSON.
+    public var usageJSON: String?
 
     public init(
         id: String,
@@ -72,7 +79,10 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
         role: ChatRole,
         content: String,
         toolLog: String? = nil,
-        createdAtMs: Int64
+        createdAtMs: Int64,
+        reasoning: String? = nil,
+        status: String? = nil,
+        usageJSON: String? = nil
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -80,6 +90,32 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
         self.content = content
         self.toolLog = toolLog
         self.createdAtMs = createdAtMs
+        self.reasoning = reasoning
+        self.status = status
+        self.usageJSON = usageJSON
+    }
+
+    /// Whether this row was stopped part-way. The text it holds is real; it is
+    /// just not the whole of what was coming.
+    public var wasAborted: Bool { status == "aborted" }
+
+    /// Reasoning rounds, decoded. Empty when there are none.
+    public var reasoningRounds: [ChatReasoningRound] {
+        ChatReasoningRound.parse(reasoning)
+    }
+
+    /// Occupancy stored with this row, if the daemon recorded any.
+    public var usage: ChatContextUsage? {
+        guard let usageJSON, let data = usageJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        let window = intValue(object["window_tokens"]) ?? 0
+        guard window > 0 else { return nil }
+        return ChatContextUsage(
+            promptTokens: intValue(object["prompt_tokens"]) ?? 0,
+            windowTokens: window,
+            round: intValue(object["round"]) ?? 0
+        )
     }
 
     enum CodingKeys: String, CodingKey {
@@ -89,6 +125,9 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
         case content
         case toolLog = "tool_log"
         case createdAtMs = "created_at_ms"
+        case reasoning
+        case status
+        case usageJSON = "usage_json"
     }
 
     public init(from decoder: Decoder) throws {
@@ -100,6 +139,9 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
         content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
         toolLog = try container.decodeIfPresent(String.self, forKey: .toolLog)
         createdAtMs = try container.decodeIfPresent(Int64.self, forKey: .createdAtMs) ?? 0
+        reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
+        status = try container.decodeIfPresent(String.self, forKey: .status)
+        usageJSON = try container.decodeIfPresent(String.self, forKey: .usageJSON)
     }
 
     public var toolCalls: [ChatToolCall] { ChatToolLog.parse(toolLog) }
@@ -282,6 +324,29 @@ public struct ChatContextUsage: Equatable, Sendable {
     }
 }
 
+/// One round's reasoning, as stored beside the answer it produced.
+public struct ChatReasoningRound: Equatable, Identifiable, Sendable {
+    public var round: Int
+    public var text: String
+
+    public var id: Int { round }
+
+    public init(round: Int, text: String) {
+        self.round = round
+        self.text = text
+    }
+
+    static func parse(_ raw: String?) -> [ChatReasoningRound] {
+        guard let raw, let data = raw.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return [] }
+        return rows.compactMap { row in
+            guard let text = row["text"] as? String, !text.isEmpty else { return nil }
+            return ChatReasoningRound(round: intValue(row["round"]) ?? 0, text: text)
+        }
+    }
+}
+
 /// Proof that a turn is alive while it has nothing to show.
 ///
 /// Three separate stretches leave the window empty and only one is about
@@ -384,6 +449,7 @@ public enum ChatStreamEvent: Equatable, Sendable {
     case toolResult(name: String, chars: Int, truncated: Bool = false, dropped: Int = 0)
     case token(text: String)
     case usage(ChatContextUsage)
+    case started(messageId: String, conversationId: String)
     case progress(ChatProgress)
     case compaction(ChatCompactionNotice)
     case done(messageId: String, conversationId: String)
@@ -456,6 +522,11 @@ public enum ChatStreamEventDecoder {
                     windowTokens: intValue(object["window_tokens"]) ?? 0,
                     round: intValue(object["round"]) ?? 0
                 )
+            )
+        case "started":
+            return .started(
+                messageId: object["message_id"] as? String ?? "",
+                conversationId: object["conversation_id"] as? String ?? ""
             )
         case "progress":
             return .progress(
@@ -569,6 +640,11 @@ public enum ChatStreamReducer {
             }
         case .usage(let usage):
             state.usage = usage
+        case .started(let messageId, let conversationId):
+            // The row already exists in the vault. Naming it now is what stops
+            // the app inventing a placeholder that no reload would match.
+            if !messageId.isEmpty { state.messageId = messageId }
+            if !conversationId.isEmpty { state.conversationId = conversationId }
         case .progress(let progress):
             state.progress = progress
         case .compaction(let notice):
@@ -749,6 +825,10 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
     public let createdAtMs: Int64
     /// Set on the streaming bubble while the turn has nothing to show yet.
     public let progress: ChatProgress?
+    /// The model's reasoning for this answer. Shown folded away.
+    public let reasoning: [ChatReasoningRound]
+    /// Whether the turn behind this bubble was stopped part-way.
+    public let wasAborted: Bool
 
     public init(
         id: String,
@@ -757,7 +837,9 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         tools: [ChatToolCall] = [],
         isStreaming: Bool = false,
         createdAtMs: Int64,
-        progress: ChatProgress? = nil
+        progress: ChatProgress? = nil,
+        reasoning: [ChatReasoningRound] = [],
+        wasAborted: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -766,6 +848,8 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         self.isStreaming = isStreaming
         self.createdAtMs = createdAtMs
         self.progress = progress
+        self.reasoning = reasoning
+        self.wasAborted = wasAborted
     }
 
     public var markdownBlocks: [MarkdownBlock] {
@@ -792,13 +876,19 @@ public enum ChatTranscript {
         liveCompactions: [ChatCompactionNotice] = [],
         progress: ChatProgress? = nil
     ) -> [ChatBubble] {
-        var items = messages.map { message in
+        var items = messages
+            // The row for the turn in flight is already on screen as the
+            // streaming bubble; showing the half-written row too would double it.
+            .filter { !(isSending && $0.status == "streaming") }
+            .map { message in
             ChatBubble(
                 id: message.id,
                 role: message.role,
                 text: message.content,
                 tools: message.toolCalls,
-                createdAtMs: message.createdAtMs
+                createdAtMs: message.createdAtMs,
+                reasoning: message.reasoningRounds,
+                wasAborted: message.wasAborted
             )
         }
         if isSending {

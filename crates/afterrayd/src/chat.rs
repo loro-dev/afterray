@@ -549,6 +549,9 @@ mod tests {
             role: role.into(),
             content: content.into(),
             tool_log: None,
+            reasoning: None,
+            status: None,
+            usage_json: None,
             created_at_ms: at,
         }
     }

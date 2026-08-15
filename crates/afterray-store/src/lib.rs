@@ -81,7 +81,7 @@ pub use slot::{
     shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
 };
 
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Cosine floor for a semantic hit to count as a hit at all.
 ///
@@ -557,6 +557,21 @@ impl ReadPool {
             .unwrap()
     }
 }
+
+/// What one [`Vault::update_message`] call writes.
+///
+/// Every field is overwritten, so a caller passes the whole current state
+/// rather than a delta: the turn holds it in memory anyway, and a partial
+/// update would let a crash leave two halves written at different beats.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MessageUpdate<'a> {
+    pub content: &'a str,
+    pub tool_log: Option<&'a str>,
+    pub reasoning: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub usage_json: Option<&'a str>,
+}
+
 
 impl Vault {
     pub fn open(config: VaultConfig, provider: &dyn KeyProvider) -> Result<Self, StoreError> {
@@ -1876,6 +1891,59 @@ impl Vault {
         Ok(id)
     }
 
+    /// Overwrites a message's body as a turn produces it.
+    ///
+    /// The row is inserted empty when the stream opens and updated as it runs,
+    /// so an interrupted turn leaves what it had rather than nothing. Callers
+    /// throttle: this is a write per call, and a token-rate write would spend
+    /// the whole turn in `SQLite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn update_message(
+        &self,
+        id: &str,
+        update: &MessageUpdate<'_>,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "UPDATE conversation_messages
+                SET content = ?2, tool_log = ?3, reasoning = ?4, status = ?5, usage_json = ?6
+              WHERE id = ?1",
+            params![
+                id,
+                update.content,
+                update.tool_log,
+                update.reasoning,
+                update.status,
+                update.usage_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks every row still flagged `streaming` as stopped.
+    ///
+    /// Run at startup: a row in that state means the daemon died mid-turn, and
+    /// nothing will ever finish it. Leaving it would show a permanently live
+    /// spinner in the thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn settle_orphaned_streams(&self) -> Result<usize, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let changed = connection.execute(
+            "UPDATE conversation_messages SET status = ?1 WHERE status = ?2",
+            params![
+                afterray_protocol::MESSAGE_STATUS_ABORTED,
+                afterray_protocol::MESSAGE_STATUS_STREAMING
+            ],
+        )?;
+        Ok(changed)
+    }
+
     /// Messages of one conversation in order.
     ///
     /// # Errors
@@ -1887,7 +1955,8 @@ impl Vault {
     ) -> Result<Vec<ConversationMessage>, StoreError> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "SELECT id, conversation_id, role, content, tool_log, created_at_ms
+            "SELECT id, conversation_id, role, content, tool_log, created_at_ms,
+                    reasoning, status, usage_json
                FROM conversation_messages
               WHERE conversation_id = ?1
               ORDER BY created_at_ms, id",
@@ -1900,6 +1969,9 @@ impl Vault {
                 content: row.get(3)?,
                 tool_log: row.get(4)?,
                 created_at_ms: row.get(5)?,
+                reasoning: row.get(6)?,
+                status: row.get(7)?,
+                usage_json: row.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -3098,6 +3170,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_15(connection)?;
     migrate_schema_16(connection)?;
     migrate_schema_18(connection, from_version)?;
+    migrate_schema_19(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -3541,6 +3614,35 @@ fn migrate_schema_16(connection: &Connection) -> Result<(), StoreError> {
 /// stamped 17 has `人々` split across two tokens that the query no longer asks
 /// for. Either way nothing recovers the old rows but a rebuild, so it happens
 /// once, on the open that finds the older file.
+/// Assistant messages gain the state a turn needs to survive being interrupted.
+///
+/// `status` distinguishes a row that is still being written from one that
+/// finished and one that was stopped part-way — before this, a turn that did
+/// not reach `done` left nothing at all. `reasoning` keeps the model's thinking
+/// beside the answer it produced. `usage_json` keeps the occupancy of the turn
+/// that wrote the row, so reopening a thread can show it without inventing a
+/// number.
+///
+/// Purely additive: existing rows read back as `status = NULL`, which means
+/// "finished", because every row written before this migration did.
+fn migrate_schema_19(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(conversation_messages)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for column in ["reasoning TEXT", "status TEXT", "usage_json TEXT"] {
+        let name = column.split(' ').next().unwrap_or_default();
+        if !existing.iter().any(|held| held == name) {
+            connection.execute(
+                &format!("ALTER TABLE conversation_messages ADD COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn migrate_schema_18(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
     if from_version >= 18 {
         return Ok(());

@@ -616,6 +616,9 @@ private var chatScenes: [SnapshotScene] {
         // the chat window looks like most of the time it is working.
         chatScene(name: "18-chat-thinking", scenario: .thinking),
         chatScene(name: "19-chat-waiting", scenario: .waiting),
+        // Reasoning kept beside the answer, folded away, and a turn that was
+        // stopped part-way keeping what it had produced.
+        chatScene(name: "20-chat-reasoning", scenario: .reasoning),
     ]
 }
 

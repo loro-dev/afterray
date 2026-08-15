@@ -70,6 +70,12 @@ public protocol AfterRayChatServing: Sendable {
     func chatDelete(conversationID: String) async throws
     func chatSend(conversationID: String?, message: String) async throws -> ChatSendResult
     func chatStream(conversationID: String?, message: String) -> AsyncThrowingStream<ChatStreamEvent, Error>
+    /// Stops the turn running on a conversation.
+    ///
+    /// Explicit, and on its own connection, because closing the stream socket
+    /// means the opposite thing: the daemon reads a hang-up as "I will read it
+    /// later" and lets the turn finish.
+    func chatAbort(conversationID: String) async throws
 }
 
 public extension AfterRayChatServing {
@@ -93,6 +99,10 @@ public extension AfterRayChatServing {
         AsyncThrowingStream { continuation in
             continuation.finish(throwing: DaemonClientError.rejected("chat is not available"))
         }
+    }
+
+    func chatAbort(conversationID _: String) async throws {
+        throw DaemonClientError.rejected("chat is not available")
     }
 }
 
@@ -279,6 +289,14 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
             WireRequest(type: "chat_history", conversationID: conversationID),
             as: ChatHistoryPayload.self
         ).messages
+    }
+
+    public func chatAbort(conversationID: String) async throws {
+        let _: EmptyResponse = try await request(
+            WireRequest(type: "chat_abort", conversationID: conversationID),
+            as: EmptyResponse.self,
+            allowEmptyObject: true
+        )
     }
 
     public func chatDelete(conversationID: String) async throws {

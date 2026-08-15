@@ -428,11 +428,15 @@ private struct ChatConversationRow: View {
 private struct ChatBubbleView: View {
     let bubble: ChatBubble
     @State private var toolsExpanded = false
+    @State private var reasoningExpanded = false
 
     var body: some View {
         HStack {
             if bubble.role == .user { Spacer(minLength: 48) }
             VStack(alignment: bubble.role == .user ? .trailing : .leading, spacing: 6) {
+                if !bubble.reasoning.isEmpty {
+                    reasoningChip
+                }
                 if !bubble.tools.isEmpty {
                     toolChip
                 }
@@ -451,6 +455,48 @@ private struct ChatBubbleView: View {
     private func resultNote(chars: Int, tool: ChatToolCall) -> String {
         guard tool.truncated else { return "\(chars) characters back" }
         return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
+    }
+
+    /// The model's reasoning, folded away.
+    ///
+    /// Collapsed by default and never streamed: it is long, unedited, and for
+    /// "what did I do today" the user wants the answer, not the deliberation.
+    /// Kept reachable because when an answer looks wrong, the reasoning is
+    /// usually where the wrongness is visible.
+    private var reasoningChip: some View {
+        DisclosureGroup(isExpanded: $reasoningExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(bubble.reasoning) { round in
+                    VStack(alignment: .leading, spacing: 3) {
+                        if bubble.reasoning.count > 1 {
+                            Text("Round \(round.round)")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(ChatPalette.tertiary)
+                        }
+                        Text(round.text)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(ChatPalette.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            Text(reasoningLabel)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ChatPalette.tertiary)
+        }
+        .tint(ChatPalette.tertiary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var reasoningLabel: String {
+        bubble.reasoning.count > 1
+            ? "Thought it through in \(bubble.reasoning.count) rounds"
+            : "Thought it through"
     }
 
     private var toolChip: some View {
@@ -517,6 +563,14 @@ private struct ChatBubbleView: View {
                     ChatMarkdownView(blocks: bubble.markdownBlocks)
                     if bubble.isStreaming {
                         ChatStreamCaret()
+                    }
+                    if bubble.wasAborted {
+                        // What is above is real, just not all of what was
+                        // coming. Saying so stops a half answer reading as a
+                        // confident short one.
+                        Text("Stopped — this is as far as it got.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ChatPalette.tertiary)
                     }
                 }
             }

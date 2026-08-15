@@ -160,6 +160,15 @@ pub enum Request {
         conversation_id: Option<String>,
         message: String,
     },
+    /// Stop the turn running on `conversation_id`, from a second connection.
+    ///
+    /// Explicit, rather than inferred from a closed socket, because the two
+    /// mean opposite things: pressing stop is "do not finish this", while
+    /// closing the panel is "I will read it later". Only the first should end
+    /// the turn — see the daemon's `run_watching_for_hangup`.
+    ChatAbort {
+        conversation_id: String,
+    },
     ChatList,
     ChatHistory {
         conversation_id: String,
@@ -511,8 +520,31 @@ pub struct ConversationMessage {
     /// looked up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_log: Option<String>,
+    /// The model's reasoning for this turn, as a JSON array of
+    /// `{"round": n, "text": "…"}`.
+    ///
+    /// A JSON array rather than one blob because reasoning is produced per
+    /// round, and the one API that requires it back — `DeepSeek`'s
+    /// `reasoning_content`, which 400s on multi-turn without it — wants it
+    /// verbatim per assistant message. Keeping the rounds apart leaves that
+    /// possible; concatenating would not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// `streaming`, `complete` or `aborted`. `None` on every row written
+    /// before turns were persisted as they ran, all of which finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Context occupancy of the turn that wrote this row, as JSON. Read back
+    /// when a thread is reopened so the meter does not have to be invented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_json: Option<String>,
     pub created_at_ms: i64,
 }
+
+/// What a stored assistant row is: still being written, finished, or stopped.
+pub const MESSAGE_STATUS_STREAMING: &str = "streaming";
+pub const MESSAGE_STATUS_COMPLETE: &str = "complete";
+pub const MESSAGE_STATUS_ABORTED: &str = "aborted";
 
 /// Reply to [`Request::ChatSend`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -884,6 +916,15 @@ pub enum ChatStreamEvent {
         to_round: usize,
         tokens_before: usize,
         tokens_after: usize,
+    },
+    /// The row this turn will be written to, sent before any output.
+    ///
+    /// The assistant message exists in the vault from the moment the stream
+    /// opens, so a client can name it immediately and does not have to invent a
+    /// local placeholder that no reload would ever match.
+    Started {
+        message_id: String,
+        conversation_id: String,
     },
     Done {
         message_id: String,

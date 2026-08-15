@@ -145,6 +145,14 @@ pub enum HarnessEvent {
     /// The turn is alive but has nothing to show yet. See [`crate::progress`]
     /// for the three stretches this covers.
     Progress(ProgressReport),
+    /// A piece of the model's reasoning.
+    ///
+    /// Emitted so a host can keep it; **not** meant for a chat window. The
+    /// daemon accumulates these and never puts them on the wire.
+    Reasoning {
+        text: String,
+        round: usize,
+    },
     Compaction(CompactionNotice),
 }
 
@@ -187,7 +195,24 @@ pub struct Turn {
     /// a tool returned during the turn.
     pub tool_results: Vec<String>,
     pub compactions: Vec<CompactionNotice>,
+    /// The model's reasoning, one entry per round that produced any.
+    pub reasoning: Vec<RoundReasoning>,
     pub usage: TurnUsage,
+}
+
+/// One round's reasoning, kept whole.
+///
+/// Per round rather than concatenated because the one API that demands it back
+/// — `DeepSeek`'s `reasoning_content`, which 400s on multi-turn without it —
+/// wants it verbatim per assistant message. `signature` is the slot for the
+/// opaque payload the `OpenAI` Responses API returns; no provider we speak to
+/// today sends one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundReasoning {
+    pub round: usize,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// One tool the model invoked.
@@ -316,7 +341,14 @@ where
             round: round + 1,
             cancel: &config.cancel,
         };
-        let (text, mut gate) = generate_gated(model, sink, request).await?;
+        let (text, mut gate, reasoning) = generate_gated(model, sink, request).await?;
+        if !reasoning.trim().is_empty() {
+            turn.reasoning.push(RoundReasoning {
+                round: round + 1,
+                text: reasoning,
+                signature: None,
+            });
+        }
 
         match classify(&text) {
             Step::Answer(answer) => {
@@ -369,7 +401,7 @@ async fn generate_gated<M, S>(
     model: &M,
     sink: &mut S,
     request: GenerateRequest<'_>,
-) -> Result<(String, AnswerGate), LoopError>
+) -> Result<(String, AnswerGate, String), LoopError>
 where
     M: ModelSurface + Sync,
     S: EventSink,
@@ -383,6 +415,7 @@ where
     let cancel = request.cancel.clone();
     let started = Instant::now();
     let mut reasoning_deltas = 0_usize;
+    let mut reasoning = String::new();
     let mut shown_anything = false;
     let mut heartbeat = tokio::time::interval(PROGRESS_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -399,7 +432,14 @@ where
             biased;
             Some(delta) = receiver.recv() => {
                 match delta.kind {
-                    DeltaKind::Reasoning => reasoning_deltas += 1,
+                    DeltaKind::Reasoning => {
+                        reasoning_deltas += 1;
+                        reasoning.push_str(&delta.text);
+                        emit(sink, HarnessEvent::Reasoning {
+                            text: delta.text,
+                            round,
+                        }).await?;
+                    }
                     DeltaKind::Content => {
                         for text in gate.push(&delta.text) {
                             shown_anything = true;
@@ -435,7 +475,7 @@ where
             }
         }
     }
-    Ok((text, gate))
+    Ok((text, gate, reasoning))
 }
 
 fn elapsed_ms(since: Instant) -> u64 {

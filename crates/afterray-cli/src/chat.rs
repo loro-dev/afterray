@@ -159,6 +159,9 @@ fn print_event(event: &ChatStreamEvent, json: bool) -> anyhow::Result<()> {
         } => {
             println!("usage round={round} {prompt_tokens}/{window_tokens} tokens");
         }
+        // The row the answer is being written into. Nothing to print: the CLI
+        // shows the text, and the id only matters to a client that reloads.
+        ChatStreamEvent::Started { .. } => {}
         ChatStreamEvent::Progress {
             phase,
             reasoning_deltas,

@@ -53,23 +53,44 @@ final class AfterRayChatModelTests: XCTestCase {
         XCTAssertEqual(sent, "hello")
     }
 
-    func testStopKeepsPartialAssistantText() async {
+    /// Stopping used to leave a local assistant message with an invented id,
+    /// which no reload could match — switch away and back and the answer was
+    /// gone. The daemon now owns the partial, so the app shows what it stored.
+    func testStopShowsTheStoredPartialRatherThanALocalGhost() async {
         let daemon = ChatDaemon()
-        await daemon.setEvents([
-            .token(text: "partial"),
+        await daemon.seed(
+            conversations: [
+                ChatConversation(id: "c1", title: "One", createdAtMs: 1, updatedAtMs: 2, messageCount: 2)
+            ],
+            history: [:]
+        )
+        await daemon.setEvents([.token(text: "partial")])
+        // What the daemon has written into the row by the time stop lands.
+        await daemon.setHistory("c1", [
+            ChatMessage(id: "u1", conversationId: "c1", role: .user, content: "go", createdAtMs: 1),
+            ChatMessage(
+                id: "row-1",
+                conversationId: "c1",
+                role: .assistant,
+                content: "partial",
+                createdAtMs: 2,
+                status: "aborted"
+            ),
         ])
-        await daemon.setBlockAfterFirstEvent(true)
 
         let model = AfterRayChatModel(daemon: daemon, clock: { 7 })
+        await model.select("c1")
         model.draft = "go"
         model.send()
-        await waitUntil { model.streamText == "partial" }
+        await waitUntil { !model.streamText.isEmpty || !model.isSending }
         model.stop()
         await waitUntil { !model.isSending }
 
-        XCTAssertEqual(model.messages.last?.role, .assistant)
-        XCTAssertEqual(model.messages.last?.content, "partial")
-        XCTAssertFalse(model.isSending)
+        let assistant = model.messages.last
+        XCTAssertEqual(assistant?.role, .assistant)
+        XCTAssertEqual(assistant?.content, "partial")
+        XCTAssertEqual(assistant?.id, "row-1", "the id must be the daemon's, so a reload finds it")
+        XCTAssertTrue(assistant?.wasAborted == true)
     }
 
     func testDeleteRemovesConversationAndClearsThread() async {
@@ -112,6 +133,108 @@ extension AfterRayChatModelTests {
     /// The trap. Occupancy belongs to a turn, not to the app, so it must not
     /// survive a conversation switch — the number looks authoritative enough
     /// that showing the previous thread's would simply be believed.
+    /// Switching into a thread that is already crowded has to show that, not
+    /// wait for the next message — which is the point at which the meter is
+    /// least useful. The number comes from the row, so nothing is invented.
+    func testContextUsageIsRestoredFromTheStoredTurn() async {
+        let daemon = ChatDaemon()
+        await daemon.seed(
+            conversations: [
+                ChatConversation(id: "c1", title: "One", createdAtMs: 1, updatedAtMs: 2, messageCount: 2),
+                ChatConversation(id: "c2", title: "Two", createdAtMs: 1, updatedAtMs: 3, messageCount: 2),
+            ],
+            history: [:]
+        )
+        await daemon.setHistory("c2", [
+            ChatMessage(id: "u1", conversationId: "c2", role: .user, content: "hi", createdAtMs: 1),
+            ChatMessage(
+                id: "a1",
+                conversationId: "c2",
+                role: .assistant,
+                content: "a full thread",
+                createdAtMs: 2,
+                usageJSON: #"{"prompt_tokens":13910,"window_tokens":16384,"round":5}"#
+            ),
+        ])
+
+        let model = AfterRayChatModel(daemon: daemon, clock: { 99 })
+        await model.select("c2")
+        XCTAssertEqual(model.contextUsage?.promptTokens, 13_910)
+        XCTAssertTrue(model.contextUsage?.isTight == true)
+
+        // A thread whose rows carry no usage still shows nothing rather than
+        // the previous thread's number.
+        await daemon.setHistory("c1", [
+            ChatMessage(id: "u2", conversationId: "c1", role: .user, content: "hi", createdAtMs: 1)
+        ])
+        await model.select("c1")
+        XCTAssertNil(model.contextUsage)
+    }
+
+    /// The daemon writes the answer into its row from before the first token,
+    /// so a stopped turn is recovered by reloading — not by keeping a local
+    /// message whose id no reload would ever match.
+    func testStoppingReloadsTheStoredPartialInsteadOfFakingOne() async {
+        let daemon = ChatDaemon()
+        await daemon.seed(
+            conversations: [
+                ChatConversation(id: "c1", title: "One", createdAtMs: 1, updatedAtMs: 2, messageCount: 2)
+            ],
+            history: [:]
+        )
+        await daemon.setHistory("c1", [
+            ChatMessage(id: "u1", conversationId: "c1", role: .user, content: "hi", createdAtMs: 1),
+            ChatMessage(
+                id: "real-row",
+                conversationId: "c1",
+                role: .assistant,
+                content: "half an ans",
+                createdAtMs: 2,
+                reasoning: #"[{"round":1,"text":"weighing it up"}]"#,
+                status: "aborted"
+            ),
+        ])
+
+        let model = AfterRayChatModel(daemon: daemon, clock: { 99 })
+        await model.select("c1")
+
+        let assistant = model.messages.first { $0.role == .assistant }
+        XCTAssertEqual(assistant?.id, "real-row", "the row must be the one the daemon wrote")
+        XCTAssertTrue(assistant?.wasAborted == true)
+        XCTAssertEqual(assistant?.reasoningRounds.first?.text, "weighing it up")
+
+        // And the bubble says so, rather than presenting a half answer as whole.
+        let bubble = model.bubbles.first { $0.role == .assistant }
+        XCTAssertTrue(bubble?.wasAborted == true)
+        XCTAssertEqual(bubble?.reasoning.count, 1)
+    }
+
+    /// Pressing stop must tell the daemon, not merely drop the socket: a
+    /// dropped socket now means "I will read it later" and lets the turn run.
+    func testStopSendsAnExplicitAbort() async {
+        let daemon = ChatDaemon()
+        await daemon.seed(
+            conversations: [
+                ChatConversation(id: "c1", title: "One", createdAtMs: 1, updatedAtMs: 2, messageCount: 0)
+            ],
+            history: [:]
+        )
+        await daemon.setEvents([.token(text: "partial")])
+        let model = AfterRayChatModel(daemon: daemon, clock: { 99 })
+        await model.select("c1")
+        model.draft = "hi"
+        model.send()
+        await waitUntil { !model.streamText.isEmpty || !model.isSending }
+        model.stop()
+        // `stop()` fires the abort from a detached task; give it a beat.
+        var aborted: [String] = []
+        for _ in 0..<200 where aborted.isEmpty {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            aborted = await daemon.abortedConversations()
+        }
+        XCTAssertEqual(aborted, ["c1"], "stop must tell the daemon, not just drop the socket")
+    }
+
     func testContextUsageResetsWhenTheConversationChanges() async {
         let daemon = ChatDaemon()
         await daemon.seed(
@@ -148,7 +271,7 @@ extension AfterRayChatModelTests {
     }
 
     /// Compaction rows are stored, so reopening a thread still shows where the
-    /// agent stopped being able to see. Usage is not stored, and is not faked.
+    /// agent stopped being able to see.
     func testCompactionNoticesAreRestoredFromHistory() async {
         let daemon = ChatDaemon()
         await daemon.seed(
@@ -233,6 +356,13 @@ private actor ChatDaemon: AfterRayChatServing {
     func setEvents(_ events: [ChatStreamEvent]) { self.events = events }
     func setSendResult(_ result: ChatSendResult) { sendResult = result }
     func setHistory(_ id: String, _ messages: [ChatMessage]) { histories[id] = messages }
+
+    private var aborted: [String] = []
+    func abortedConversations() -> [String] { aborted }
+
+    func chatAbort(conversationID: String) async throws {
+        aborted.append(conversationID)
+    }
     func setListShouldFail(_ value: Bool) { listShouldFail = value }
     func setBlockAfterFirstEvent(_ value: Bool) { blockAfterFirstEvent = value }
 

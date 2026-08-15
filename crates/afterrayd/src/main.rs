@@ -5,6 +5,7 @@ mod gop_packer;
 mod memory;
 mod stream;
 mod tools;
+mod turn_row;
 
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
@@ -31,6 +32,7 @@ use afterray_store::{
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -228,7 +230,10 @@ async fn main() -> anyhow::Result<()> {
         llm_config,
         llm_token_sink,
         mlx_adapters,
+        running_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
+
+    settle_orphaned_turns(&state);
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
         Ok(0) => {}
@@ -422,6 +427,12 @@ struct AppState {
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     llm_token_sink: LlmTokenSink,
     mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
+    /// Cancel tokens for turns currently running, by conversation.
+    ///
+    /// A `ChatAbort` arrives on a *different* connection from the stream it
+    /// stops — the stream's own connection is busy writing events — so the
+    /// token has to be reachable by name.
+    running_turns: Arc<std::sync::Mutex<HashMap<String, afterray_harness::CancelToken>>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -554,10 +565,10 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                 conversation_id,
                 message,
             }) => {
-                // The app's stop button shuts the socket down, which shows up
-                // here as EOF on the read half. Watch for it while the turn
-                // runs: the old code only noticed at the next token write, so a
-                // long tool call or a slow first token went uncancelled.
+                // A hang-up no longer cancels. Closing the panel means "I will
+                // read it later": the turn runs on and writes itself into its
+                // row, so coming back finds the finished answer. Only an
+                // explicit ChatAbort stops a turn — see Request::ChatAbort.
                 let cancel = afterray_harness::CancelToken::new();
                 let (result, peer_present) = stream::run_watching_for_hangup(
                     stream::handle_chat_stream(
@@ -568,7 +579,6 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                         cancel.clone(),
                     ),
                     &mut lines,
-                    &cancel,
                 )
                 .await;
                 result?;
@@ -642,6 +652,35 @@ where
         .expect("blocking store task panicked")
 }
 
+/// A row still marked `streaming` means the daemon died mid-turn and nothing
+/// will ever finish it. Left alone it would show a live spinner forever.
+fn settle_orphaned_turns(state: &AppState) {
+    match state.store.settle_orphaned_streams() {
+        Ok(0) => {}
+        Ok(count) => eprintln!("chat: settled {count} turn(s) orphaned by a previous run"),
+        Err(error) => eprintln!("chat: could not settle orphaned turns: {error}"),
+    }
+}
+
+/// Stops the turn running on a conversation, if one is.
+fn abort_turn(state: &AppState, conversation_id: &str) -> Response {
+    let token = state
+        .running_turns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(conversation_id)
+        .cloned();
+    match token {
+        Some(token) => {
+            token.cancel();
+            Response::success(serde_json::json!({"aborted": true}))
+        }
+        // Not an error: the turn may have finished between the user pressing
+        // stop and this arriving, which is a race the app should not report.
+        None => Response::success(serde_json::json!({"aborted": false})),
+    }
+}
+
 async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
     match request {
         Request::Ping => Response::success(serde_json::json!({"pong": true})),
@@ -691,6 +730,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::ChatStream { .. } => {
             Response::failure("chat streams are framed as NDJSON events and are handled separately")
         }
+        Request::ChatAbort { conversation_id } => abort_turn(state, &conversation_id),
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),

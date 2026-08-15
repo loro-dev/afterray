@@ -72,17 +72,14 @@ Shipped: `{"kind":"usage","prompt_tokens":…,"window_tokens":…,"round":…}`.
 to clamp it for a meter anyway. `round` was added because usage is emitted per
 round and a client otherwise cannot tell a stale line from a current one.
 
-### 6. `contextUsage` is not restored from history
+### 6. `contextUsage` — resolved as the plan wanted
 
-The plan says it should be "restored from the last assistant message's stored
-usage when history loads". It is not, because the daemon does not store usage
-anywhere — so restoring it would mean inventing a number, and a meter is exactly
-the kind of UI that gets believed. It resets to `nil` on conversation switch and
-stays empty until the next turn reports.
-
-Persisting usage on the assistant row would make the plan's version work, and is
-the better end state. Compaction notices *are* restored, from the `compaction`
-rows themselves.
+Initially not restored, because nothing stored usage and a restored meter would
+have been an invented number. Now the assistant row carries `usage_json`, so
+`loadHistory` reads it back exactly as the plan described. Switching still
+clears first, and the restore only overwrites when a row actually carries one —
+so a thread whose rows predate the column shows nothing rather than the previous
+thread's pressure.
 
 ### 7. The usage indicator is always shown once known
 
@@ -91,19 +88,17 @@ shown whenever a round has reported, turning coral past 75%. A meter that
 appears only when things are going badly is also a meter whose absence carries
 no information — but this is a taste call and easily changed.
 
-### 8. Cancellation took neither route the plan lists
+### 8. Cancellation ended up at the plan's "correct" option
 
-The plan offers "cheap: poll whether the write half is open between rounds" and
-"correct: a `ChatAbort` request on a second connection".
+First landed as read-half EOF detection, which needed no protocol change. That
+turned out to be the wrong seam rather than merely a cheap one: it gave the
+daemon a single signal for two opposite intents. `ChatAbort` on a second
+connection is now the stop, and EOF means "I will read it later" — see
+[Interruption](#interruption-what-is-guaranteed-and-what-is-not).
 
-What landed watches the **read** half for EOF concurrently with the turn, which
-needs no protocol change and catches a stop during a long tool call — the case
-the cheap option misses — while also cancelling the in-flight queue job, which
-neither option mentions and which matters most on a single-lane local runtime,
-where an abandoned job holds the lane against the next question.
-
-`ChatAbort` is still worth having for explicitness, and phase 4 needs a second
-channel anyway.
+The one thing neither option mentioned is still there: the abort kills the
+in-flight queue job, which matters most on a single-lane local runtime where an
+abandoned job holds the lane against the next question.
 
 ### 9. pi's compaction thresholds do not transfer
 
@@ -123,6 +118,60 @@ The rule implemented instead runs the other way: **a system prompt may not name
 tools at all.** Ordering advice lives in the catalogue, beside the tools it
 orders, where adding one puts the advice in front of whoever adds it. Restoring
 the exact line that shipped now fails the build.
+
+## Interruption: what is guaranteed, and what is not
+
+A turn's assistant row is created before the model is asked anything and
+rewritten as output arrives (throttled to ~500 ms). Two intents are now
+distinguished, because they are opposite:
+
+| | how | turn | row |
+|---|---|---|---|
+| **Stop** | `ChatAbort { conversation_id }` on a second connection | cancelled: the queue job is killed and the LLM lane freed | keeps what it produced, `status = aborted` |
+| **Walk away** (close the panel, quit, crash) | socket EOF | **runs to completion** | full answer, `status = complete` |
+
+The socket used to carry both, and the daemon could not tell them apart. It now
+reads a hang-up as "I will read it later" and only an explicit abort ends a
+turn. A daemon that dies mid-turn leaves rows marked `streaming`; the next
+start settles them to `aborted`, so nothing shows a live spinner forever.
+
+**What this does not do: resume.** Coming back does not reattach to a running
+turn's token stream. If the turn finished while the panel was closed, reopening
+the thread shows the finished answer, which covers the ordinary case. If it is
+still running, the thread shows the row as it stood at the last flush and does
+not update until the next reload. Real resume — a server-side event buffer and
+a client reconnecting with a cursor — is a different order of work and is not
+started.
+
+## Reasoning, and why it is stored
+
+Kept in a `reasoning` column as a JSON array of `{round, text}`, capped at
+~2 048 tokens per turn with the cut marked. Rounds are kept apart rather than
+concatenated, and there is a `signature` slot, because of what the providers
+turn out to require:
+
+- **Ollama** accepts `thinking` on an inbound assistant message but drops it
+  from the model's context. Verified: a passphrase placed in `thinking` is
+  invisible to the next turn, while the same passphrase in `content` comes back
+  verbatim. No signature, nothing to round-trip.
+- **OpenAI-compatible** is the opposite. `DeepSeek` V4 requires
+  `reasoning_content` echoed back verbatim in the assistant message and returns
+  400 on the second turn without it — which broke a long list of tools in
+  April–May 2026.
+
+Neither bites us **today**, because AfterRay never sends an assistant message
+at all: `chat_messages` builds `[system, user]` and history is folded into the
+user prompt as flat text. So storage is currently for the reader, not for
+correctness. It stops being optional the moment anyone moves the chat path to a
+structured `messages` array, and the shape above is what makes that possible
+rather than a rewrite.
+
+Full content blocks — pi's `AssistantMessage.content` array of
+`TextContent | ThinkingContent | ToolCall` — were considered and not taken. That
+array exists to preserve *interleaving order* for verbatim round-tripping; our
+tool calls already live in their own column and our answer is one final text, so
+there is no interleaving to preserve. If we ever round-trip, that judgement
+needs revisiting.
 
 ## Not started
 

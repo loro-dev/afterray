@@ -10,6 +10,9 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
     case pressure
     /// A thinking model mid-turn: reasoning is streaming, nothing is visible.
     case thinking
+    /// A finished answer with its reasoning kept beside it, and a turn that
+    /// was stopped part-way but kept what it had.
+    case reasoning
     /// The general case the thinking one is a special case of — a turn that has
     /// produced nothing at all yet, as during a cold model load.
     case waiting
@@ -25,6 +28,7 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
         case .tools: "Tool calls"
         case .pressure: "Context pressure"
         case .thinking: "Thinking"
+        case .reasoning: "Reasoning kept"
         case .waiting: "Waiting"
         }
     }
@@ -264,6 +268,11 @@ public enum ChatFixtures {
                 [conversation("c-short", "What did I ship?", count: 4, updated: nowMs - 3_600_000)],
                 ["c-short": shortMessages]
             )
+        case .reasoning:
+            return (
+                [conversation("c-reason", "Why the build broke", count: 3, updated: nowMs)],
+                ["c-reason": reasoningMessages]
+            )
         case .thinking, .waiting:
             return (
                 [conversation("c-think", "Yesterday's reading", count: 1, updated: nowMs)],
@@ -339,6 +348,8 @@ public enum ChatFixtures {
         case .pressure: ChatContextUsage(promptTokens: 13_910, windowTokens: 16_384, round: 5)
         case .thinking, .waiting:
             ChatContextUsage(promptTokens: 2_240, windowTokens: 16_384, round: 1)
+        case .reasoning:
+            ChatContextUsage(promptTokens: 5_050, windowTokens: 16_384, round: 2)
         }
     }
 
@@ -355,6 +366,47 @@ public enum ChatFixtures {
             ChatProgress(phase: .generating, reasoningDeltas: 0, elapsedMs: 12_700, round: 1)
         default: nil
         }
+    }
+
+    /// An answer with its reasoning stored beside it, then a turn that was
+    /// stopped part-way and kept what it had produced.
+    static var reasoningMessages: [ChatMessage] {
+        [
+            ChatMessage(
+                id: "u-reason",
+                conversationId: "c-reason",
+                role: .user,
+                content: "为什么昨天的构建挂了",
+                createdAtMs: nowMs - 200_000
+            ),
+            ChatMessage(
+                id: "a-reason",
+                conversationId: "c-reason",
+                role: .assistant,
+                content: "The IVF length check rejected the header rav1e writes for a single-frame GOP.",
+                toolLog: #"[{"name":"get_slot_card","args":{"at_ms":1},"chars":2480}]"#,
+                createdAtMs: nowMs - 190_000,
+                reasoning: #"[{"round":1,"text":"The user is asking about a build failure yesterday. I should look at the half hour around the last commit rather than search blindly — a slot card will show which files were open and what the terminal said."},{"round":2,"text":"The card shows an IVF header assertion. That points at the length field, not the encoder itself."}]"#,
+                status: "complete",
+                usageJSON: #"{"prompt_tokens":5050,"window_tokens":16384,"round":2}"#
+            ),
+            ChatMessage(
+                id: "u-reason-2",
+                conversationId: "c-reason",
+                role: .user,
+                content: "那前一天呢",
+                createdAtMs: nowMs - 60_000
+            ),
+            ChatMessage(
+                id: "a-reason-2",
+                conversationId: "c-reason",
+                role: .assistant,
+                content: "On the day before, the last green build was at 18:12, and the first failure came",
+                createdAtMs: nowMs - 50_000,
+                reasoning: #"[{"round":1,"text":"Widen to the previous day and find the boundary between green and red."}]"#,
+                status: "aborted"
+            ),
+        ]
     }
 
     /// A thread that ran out of room: a shortened lookup, then a compaction row
