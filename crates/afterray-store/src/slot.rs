@@ -372,6 +372,17 @@ pub struct DaySummary {
     pub slots: Vec<DaySlot>,
 }
 
+/// A bounded page for the history-summary panel. Days are ordered newest
+/// first. `next_before_ms` is an exclusive cursor rather than a timestamp to
+/// display, which keeps pagination stable when the user captures new work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SummaryHistoryPage {
+    pub days: Vec<DaySummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_before_ms: Option<i64>,
+    pub has_more: bool,
+}
+
 /// Local midnight containing `at_ms` and the next local midnight, as UTC ms.
 ///
 /// DST days are 23 or 25 hours; callers must not assume an 86400000 ms span.

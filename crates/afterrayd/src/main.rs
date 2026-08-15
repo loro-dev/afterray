@@ -525,6 +525,10 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
             into_response(state.store.day_summary(day_ms, interval_ms))
         }
+        Request::SummaryHistory { before_ms, limit } => {
+            let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+            into_response(state.store.summary_history(before_ms, limit, interval_ms))
+        }
         Request::SlotPrompt { at_ms } => match slot_prompt_for(state, at_ms) {
             Ok(prompt) => Response::success(prompt),
             Err(error) => Response::failure(error.to_string()),

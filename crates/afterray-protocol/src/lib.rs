@@ -3,7 +3,7 @@ use serde_json::Value;
 use zeroize::Zeroize as _;
 
 pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +106,15 @@ pub enum Request {
     /// Slots the model has never touched are included with facts only.
     DaySummary {
         day_ms: i64,
+    },
+    /// A cursor-paginated run of occupied local days, newest first. The
+    /// cursor is exclusive: pass `next_before_ms` unchanged to get older
+    /// summaries without overlaps.
+    SummaryHistory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_ms: Option<i64>,
+        #[serde(default = "default_summary_history_limit")]
+        limit: usize,
     },
     EvidenceOcr {
         moment_id: String,
@@ -541,6 +550,10 @@ fn default_activity_spans_limit() -> usize {
     100
 }
 
+const fn default_summary_history_limit() -> usize {
+    7
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -854,6 +867,19 @@ mod tests {
     fn day_summary_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::DaySummary { day_ms: 42 }).unwrap();
         assert_eq!(json, r#"{"type":"day_summary","day_ms":42}"#);
+    }
+
+    #[test]
+    fn summary_history_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::SummaryHistory {
+            before_ms: Some(42),
+            limit: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"summary_history","before_ms":42,"limit":7}"#
+        );
     }
 
     #[test]

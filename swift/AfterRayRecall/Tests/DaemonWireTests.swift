@@ -27,6 +27,17 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual((json["day_ms"] as? NSNumber)?.int64Value, 1_786_698_000_000)
     }
 
+    func testSummaryHistoryRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "summary_history", limit: 7, beforeMs: 1_786_698_000_000)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["type"] as? String, "summary_history")
+        XCTAssertEqual((json["before_ms"] as? NSNumber)?.int64Value, 1_786_698_000_000)
+        XCTAssertEqual(json["limit"] as? Int, 7)
+    }
+
     func testRecallWindowRequestMatchesRustShape() throws {
         let request = WireRequest(type: "recall_window", sessionID: "session-1", centerMs: 42, limit: 120)
         let data = try JSONEncoder().encode(request)
@@ -426,7 +437,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 6)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 7)
     }
 
     func testRecordResultsDecodeBothDaemonBranches() throws {

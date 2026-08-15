@@ -26,6 +26,7 @@ public protocol RecallDaemonServing: Sendable {
     func moments(sessionID: String) async throws -> [RecallMoment]
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment]
     func daySummary(dayMs: Int64) async throws -> DaySummary
+    func summaryHistory(beforeMs: Int64?, limit: Int) async throws -> SummaryHistoryPage
     func artifact(id: String) async throws -> ArtifactPayload
     func gopSegment(id: String) async throws -> ArtifactPayload
     func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload
@@ -48,6 +49,10 @@ public extension RecallDaemonServing {
 
     func daySummary(dayMs _: Int64) async throws -> DaySummary {
         .empty
+    }
+
+    func summaryHistory(beforeMs _: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
+        SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
     }
 
     func thumbnail(momentID _: String, maxEdge _: Int?) async throws -> ArtifactPayload {
@@ -134,7 +139,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 6
+    public static let protocolVersion = 7
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -324,6 +329,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         try await request(WireRequest(type: "day_summary", dayMs: dayMs), as: DaySummary.self)
     }
 
+    public func summaryHistory(beforeMs: Int64?, limit: Int = 7) async throws -> SummaryHistoryPage {
+        try await request(
+            WireRequest(type: "summary_history", limit: limit, beforeMs: beforeMs),
+            as: SummaryHistoryPage.self
+        )
+    }
+
     public func recallWindow(sessionID: String, centerMs: Int64, limit: Int = 120) async throws -> [RecallMoment] {
         try await request(
             WireRequest(type: "recall_window", sessionID: sessionID, centerMs: centerMs, limit: limit),
@@ -425,6 +437,7 @@ struct WireRequest: Encodable, Equatable {
     var toMs: Int64?
     var sinceMs: Int64?
     var dayMs: Int64?
+    var beforeMs: Int64?
     var recordAudio: Bool?
     var reason: String?
     var packID: String?
@@ -460,6 +473,7 @@ struct WireRequest: Encodable, Equatable {
         case toMs = "to_ms"
         case sinceMs = "since_ms"
         case dayMs = "day_ms"
+        case beforeMs = "before_ms"
         case recordAudio = "record_audio"
         case reason
         case packID = "pack_id"
@@ -497,6 +511,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(toMs, forKey: .toMs)
         try container.encodeIfPresent(sinceMs, forKey: .sinceMs)
         try container.encodeIfPresent(dayMs, forKey: .dayMs)
+        try container.encodeIfPresent(beforeMs, forKey: .beforeMs)
         try container.encodeIfPresent(recordAudio, forKey: .recordAudio)
         try container.encodeIfPresent(reason, forKey: .reason)
         try container.encodeIfPresent(packID, forKey: .packID)

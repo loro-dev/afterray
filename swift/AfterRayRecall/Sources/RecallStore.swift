@@ -8,10 +8,15 @@ public final class RecallStore: ObservableObject {
     @Published public private(set) var selectedIndex: Int = 0
     @Published public private(set) var loadState: RecallLoadState = .ready
     @Published public private(set) var daySummary: DaySummary = .empty
+    @Published public private(set) var summaryHistory: [DaySummary] = []
+    @Published public private(set) var summaryHistoryHasMore = false
+    @Published public private(set) var isLoadingSummaryHistory = false
 
     private let daemon: any RecallDaemonServing
     private var sensitiveGeneration: UInt64 = 0
     private var loadedDayKey: String?
+    private var summaryHistoryCursorMs: Int64?
+    private var summaryHistoryGeneration: UInt64 = 0
 
     public init(daemon: any RecallDaemonServing) {
         self.daemon = daemon
@@ -164,9 +169,49 @@ public final class RecallStore: ObservableObject {
             guard sensitiveGeneration == requestGeneration else { return }
             daySummary = loaded
             loadedDayKey = key
+            summaryHistoryGeneration &+= 1
+            summaryHistory = [loaded]
+            summaryHistoryCursorMs = loaded.dayStartMs
+            summaryHistoryHasMore = true
+            isLoadingSummaryHistory = false
+            await loadOlderSummaryHistory()
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) { return }
+        }
+    }
+
+    /// Fetches one small page when the history-summary panel reaches its
+    /// bottom. Keeping this cursor in the store avoids virtual-list rows ever
+    /// querying the daemon on their own.
+    public func loadOlderSummaryHistory() async {
+        guard summaryHistoryHasMore,
+              !isLoadingSummaryHistory,
+              let beforeMs = summaryHistoryCursorMs
+        else { return }
+
+        isLoadingSummaryHistory = true
+        let requestGeneration = summaryHistoryGeneration
+        let sensitiveRequestGeneration = sensitiveGeneration
+        do {
+            let page = try await daemon.summaryHistory(beforeMs: beforeMs, limit: 7)
+            guard sensitiveGeneration == sensitiveRequestGeneration,
+                  summaryHistoryGeneration == requestGeneration
+            else { return }
+            let knownDays = Set(summaryHistory.map(\.dayStartMs))
+            summaryHistory.append(contentsOf: page.days.filter { !knownDays.contains($0.dayStartMs) })
+            summaryHistoryCursorMs = page.nextBeforeMs
+            summaryHistoryHasMore = page.hasMore && page.nextBeforeMs != nil
+        } catch {
+            guard sensitiveGeneration == sensitiveRequestGeneration,
+                  summaryHistoryGeneration == requestGeneration
+            else { return }
+            if !Self.isDaemonConnectionError(error) {
+                summaryHistoryHasMore = false
+            }
+        }
+        if summaryHistoryGeneration == requestGeneration {
+            isLoadingSummaryHistory = false
         }
     }
 
@@ -202,6 +247,11 @@ public final class RecallStore: ObservableObject {
         moments = []
         applyPlayhead(0)
         daySummary = .empty
+        summaryHistory = []
+        summaryHistoryHasMore = false
+        summaryHistoryCursorMs = nil
+        summaryHistoryGeneration &+= 1
+        isLoadingSummaryHistory = false
         loadedDayKey = nil
         loadState = .ready
     }

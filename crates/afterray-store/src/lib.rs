@@ -1079,6 +1079,59 @@ impl Vault {
         ))
     }
 
+    /// A small, cursor-paginated slice of occupied local days for the history
+    /// summary panel. The query only keeps one page in memory; clients pass
+    /// `next_before_ms` back unchanged to continue toward older history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn summary_history(
+        &self,
+        before_ms: Option<i64>,
+        limit: usize,
+        capture_interval_ms: i64,
+    ) -> Result<slot::SummaryHistoryPage, StoreError> {
+        let mut cursor = before_ms.unwrap_or(i64::MAX);
+        let mut days = Vec::with_capacity(limit.clamp(1, 31));
+
+        for _ in 0..limit.clamp(1, 31) {
+            let Some(latest_ms) = self.latest_moment_before(cursor)? else {
+                break;
+            };
+            let summary = self.day_summary(latest_ms, capture_interval_ms)?;
+            // The cursor is the local midnight, rather than a fixed 24-hour
+            // subtraction, so it remains correct over DST changes too.
+            cursor = summary.day_start_ms;
+            if !summary.slots.is_empty() {
+                days.push(summary);
+            }
+        }
+
+        let has_more = self.latest_moment_before(cursor)?.is_some();
+        Ok(slot::SummaryHistoryPage {
+            days,
+            next_before_ms: has_more.then_some(cursor),
+            has_more,
+        })
+    }
+
+    fn latest_moment_before(&self, before_ms: i64) -> Result<Option<i64>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT captured_at_ms
+                   FROM moments
+                  WHERE captured_at_ms < ?1
+                  ORDER BY captured_at_ms DESC, id DESC
+                  LIMIT 1",
+                params![before_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     fn slot_overlays_for_day(
         &self,
         local_day: &str,
@@ -5355,6 +5408,48 @@ mod tests {
 
         let prev = vault.previous_slot_titles(second_slot + 1, 4).unwrap();
         assert_eq!(prev.last().map(|card| card.title.as_str()), Some("Second pass"));
+    }
+
+    #[test]
+    fn summary_history_pages_unique_days_with_an_exclusive_cursor() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (first_day_start, first_day_end) = local_day_bounds(1_786_698_000_000);
+        let (second_day_start, second_day_end) = local_day_bounds(first_day_end + 12 * 3_600_000);
+        assert!(second_day_start > first_day_start);
+
+        insert_named_moment(
+            &vault,
+            &session.id,
+            first_day_start + 10 * 3_600_000,
+            "Xcode",
+            "com.apple.dt.Xcode",
+            "first.rs",
+        );
+        insert_named_moment(
+            &vault,
+            &session.id,
+            second_day_start + 10 * 3_600_000,
+            "Safari",
+            "com.apple.Safari",
+            "second.dev",
+        );
+
+        let newest = vault
+            .summary_history(Some(second_day_end), 1, 10_000)
+            .unwrap();
+        assert_eq!(newest.days.len(), 1);
+        assert_eq!(newest.days[0].day_start_ms, second_day_start);
+        assert!(newest.has_more);
+        assert_eq!(newest.next_before_ms, Some(second_day_start));
+
+        let older = vault
+            .summary_history(newest.next_before_ms, 7, 10_000)
+            .unwrap();
+        assert_eq!(older.days.len(), 1);
+        assert_eq!(older.days[0].day_start_ms, first_day_start);
+        assert!(!older.has_more);
+        assert_eq!(older.next_before_ms, None);
     }
 
     #[test]

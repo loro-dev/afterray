@@ -29,6 +29,12 @@ public struct RecallView: View {
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
     public var daySummary: DaySummary
+    /// Newest first; SwiftUI's LazyVStack only instantiates visible summary
+    /// sections while the store pages older days from the daemon.
+    public var summaryHistory: [DaySummary]
+    public var summaryHistoryHasMore: Bool
+    public var isLoadingSummaryHistory: Bool
+    public var onLoadOlderSummaryHistory: (() -> Void)?
     public var onVisibleDayChange: ((Int64) -> Void)?
     /// Non-nil puts the view in search mode: the bottom bar becomes a filmstrip
     /// of matched frames and travel snaps between them instead of wall clock.
@@ -75,6 +81,10 @@ public struct RecallView: View {
         chromeTopPadding: CGFloat = 22,
         trailingChromeInset: CGFloat = 0,
         daySummary: DaySummary = .empty,
+        summaryHistory: [DaySummary] = [],
+        summaryHistoryHasMore: Bool = false,
+        isLoadingSummaryHistory: Bool = false,
+        onLoadOlderSummaryHistory: (() -> Void)? = nil,
         onVisibleDayChange: ((Int64) -> Void)? = nil,
         searchSession: RecallSearchSession? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
@@ -101,6 +111,10 @@ public struct RecallView: View {
         self.chromeTopPadding = chromeTopPadding
         self.trailingChromeInset = trailingChromeInset
         self.daySummary = daySummary
+        self.summaryHistory = summaryHistory
+        self.summaryHistoryHasMore = summaryHistoryHasMore
+        self.isLoadingSummaryHistory = isLoadingSummaryHistory
+        self.onLoadOlderSummaryHistory = onLoadOlderSummaryHistory
         self.onVisibleDayChange = onVisibleDayChange
         self.searchSession = searchSession
         self.thumbnailLoader = thumbnailLoader
@@ -200,10 +214,13 @@ public struct RecallView: View {
                 if daySummaryExpanded {
                     HStack(alignment: .bottom, spacing: 0) {
                         DaySummaryPanel(
-                            summary: daySummary,
+                            summaries: summaryHistory.isEmpty ? [daySummary] : summaryHistory,
                             playheadMs: playheadMs,
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
-                            onSelectSlot: { selectPlayhead(playheadMs: $0) }
+                            hasMore: summaryHistoryHasMore,
+                            isLoadingMore: isLoadingSummaryHistory,
+                            onSelectSlot: { selectPlayhead(playheadMs: $0) },
+                            onLoadMore: { onLoadOlderSummaryHistory?() }
                         )
                         Spacer(minLength: 0)
                     }

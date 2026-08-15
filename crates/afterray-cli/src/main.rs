@@ -205,6 +205,14 @@ enum SlotCommand {
         #[arg(long = "at-ms")]
         at_ms: i64,
     },
+    /// Historical day summaries, newest first. Reuse `next_before_ms` from
+    /// the previous JSON response to continue toward older history.
+    History {
+        #[arg(long = "before-ms")]
+        before_ms: Option<i64>,
+        #[arg(long, default_value_t = 7)]
+        limit: usize,
+    },
     /// Summarise every ready-but-untouched slot in the last N days. The daemon
     /// sweeps the last two on its own; this is for older history.
     Backfill {
@@ -326,6 +334,9 @@ async fn request_from_command(
         Command::Slot {
             command: SlotCommand::Day { at_ms },
         } => Request::DaySummary { day_ms: at_ms },
+        Command::Slot {
+            command: SlotCommand::History { before_ms, limit },
+        } => Request::SummaryHistory { before_ms, limit },
         Command::Slot {
             command: SlotCommand::Backfill { days },
         } => Request::SlotBackfill { days },

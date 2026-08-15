@@ -103,6 +103,26 @@ public struct DaySummary: Codable, Equatable, Sendable {
     }
 }
 
+/// A bounded, descending slice of the history-summary panel. The daemon owns
+/// the cursor so the app never needs to enumerate the encrypted vault.
+public struct SummaryHistoryPage: Codable, Equatable, Sendable {
+    public let days: [DaySummary]
+    public let nextBeforeMs: Int64?
+    public let hasMore: Bool
+
+    public init(days: [DaySummary], nextBeforeMs: Int64?, hasMore: Bool) {
+        self.days = days
+        self.nextBeforeMs = nextBeforeMs
+        self.hasMore = hasMore
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case days
+        case nextBeforeMs = "next_before_ms"
+        case hasMore = "has_more"
+    }
+}
+
 public struct DaySummaryHeading: Equatable, Sendable {
     public let kicker: String
     public let title: String

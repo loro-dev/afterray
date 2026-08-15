@@ -1,26 +1,35 @@
 import SwiftUI
 
+/// The history-summary panel is deliberately a single lazy scroll view: it
+/// can keep walking toward the earliest capture without retaining every row
+/// in the SwiftUI view tree or asking each row to hit the daemon.
 struct DaySummaryPanel: View {
-    let summary: DaySummary
+    let summaries: [DaySummary]
     let playheadMs: Int64
     let nowMs: Int64
+    let hasMore: Bool
+    let isLoadingMore: Bool
     let onSelectSlot: (Int64) -> Void
+    let onLoadMore: () -> Void
 
     private var highlightedStart: Int64? {
-        DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: summary.slots)
+        summaries.lazy.compactMap {
+            DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots)
+        }.first
     }
 
-    private var heading: DaySummaryHeading {
-        DaySummaryLayout.dateHeading(dayStartMs: summary.dayStartMs, nowMs: nowMs)
+    private var dayCountLabel: String {
+        let count = summaries.count
+        return count == 1 ? "1 DAY" : "\(count) DAYS"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if summary.slots.isEmpty {
+            if summaries.isEmpty {
                 emptyState
             } else {
-                slotList
+                historyList
             }
         }
         .frame(width: RecallGeometry.daySummaryPanelWidth, alignment: .topLeading)
@@ -31,24 +40,25 @@ struct DaySummaryPanel: View {
                 .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.28), radius: 18, y: 10)
+        .accessibilityIdentifier("history-summary-panel")
     }
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(heading.kicker)
+                Text("HISTORY")
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .tracking(1.6)
                     .foregroundStyle(RecallPalette.ray.opacity(0.78))
-                Text(heading.title)
+                Text("Summaries")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
             }
             Spacer(minLength: 8)
-            if !summary.slots.isEmpty {
-                Text("\(summary.slots.count)")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
+            if !summaries.isEmpty {
+                Text(dayCountLabel)
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .tracking(0.8)
                     .foregroundStyle(.white.opacity(0.38))
             }
         }
@@ -59,10 +69,10 @@ struct DaySummaryPanel: View {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Nothing recorded this day.")
+            Text("Nothing recorded yet.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white.opacity(0.74))
-            Text("Drag the timeline to a day AfterRay was watching.")
+            Text("Your past days will appear here as AfterRay captures them.")
                 .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.42))
                 .fixedSize(horizontal: false, vertical: true)
@@ -71,19 +81,23 @@ struct DaySummaryPanel: View {
         .padding(.bottom, 14)
     }
 
-    private var slotList: some View {
+    private var historyList: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(summary.slots) { slot in
-                        DaySummaryRow(
-                            slot: slot,
-                            isCurrent: slot.slotStartMs == highlightedStart,
-                            onSelect: { onSelectSlot(slot.slotStartMs) }
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(summaries, id: \.dayStartMs) { summary in
+                        DaySummarySection(
+                            summary: summary,
+                            playheadMs: playheadMs,
+                            nowMs: nowMs,
+                            onSelectSlot: onSelectSlot
                         )
-                        .id(slot.slotStartMs)
+                    }
+                    if hasMore {
+                        HistorySummaryLoadTrigger(isLoading: isLoadingMore, onAppear: onLoadMore)
                     }
                 }
+                .padding(.horizontal, 6)
                 .padding(.bottom, 8)
             }
             .frame(maxHeight: RecallGeometry.daySummaryListMaxHeight)
@@ -101,6 +115,84 @@ struct DaySummaryPanel: View {
         withTransaction(transaction) {
             proxy.scrollTo(highlightedStart, anchor: .center)
         }
+    }
+}
+
+private struct DaySummarySection: View {
+    let summary: DaySummary
+    let playheadMs: Int64
+    let nowMs: Int64
+    let onSelectSlot: (Int64) -> Void
+
+    private var heading: DaySummaryHeading {
+        DaySummaryLayout.dateHeading(dayStartMs: summary.dayStartMs, nowMs: nowMs)
+    }
+
+    private var highlightedStart: Int64? {
+        DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: summary.slots)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(heading.kicker)
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .tracking(1.25)
+                    .foregroundStyle(heading.isToday ? RecallPalette.ray.opacity(0.85) : .white.opacity(0.45))
+                Text(heading.title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.8))
+                Spacer(minLength: 8)
+                Text("\(summary.slots.count)")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.32))
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 5)
+            .padding(.bottom, 4)
+
+            if summary.slots.isEmpty {
+                Text("No recordings")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.38))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+            } else {
+                ForEach(summary.slots) { slot in
+                    DaySummaryRow(
+                        slot: slot,
+                        isCurrent: slot.slotStartMs == highlightedStart,
+                        onSelect: { onSelectSlot(slot.slotStartMs) }
+                    )
+                    .id(slot.slotStartMs)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+        .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct HistorySummaryLoadTrigger: View {
+    let isLoading: Bool
+    let onAppear: () -> Void
+
+    var body: some View {
+        Group {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(RecallPalette.ray)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            } else {
+                Color.clear
+                    .frame(height: 1)
+                    .onAppear(perform: onAppear)
+            }
+        }
+        .accessibilityLabel(isLoading ? "Loading older summaries" : "Load older summaries")
     }
 }
 
@@ -123,9 +215,6 @@ private struct DaySummaryRow: View {
                     .foregroundStyle(isCurrent ? RecallPalette.ray : .white.opacity(0.38))
                     .frame(width: 42, alignment: .leading)
                 VStack(alignment: .leading, spacing: 4) {
-                    // No line limit anywhere in this row: the panel exists to
-                    // be read, and a clipped title is the one thing the user
-                    // cannot recover without opening the half hour itself.
                     Text(text.primary)
                         .font(.system(size: 12, weight: text.isT2 ? .medium : .regular))
                         .foregroundStyle(text.isT2 ? .white.opacity(0.92) : .white.opacity(0.56))
@@ -185,9 +274,6 @@ private struct DaySummaryRow: View {
         .help(text.primary)
     }
 
-    /// A failure is the only badge worth a warm colour — it is the one the user
-    /// can act on. The rest are states, not problems, and should not compete
-    /// with the summarised rows for attention.
     private func badgeTint(_ badge: String) -> Color {
         badge == "Summary failed" ? RecallPalette.ray : .white.opacity(0.5)
     }
