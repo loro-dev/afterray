@@ -8,6 +8,7 @@ mod tools;
 mod turn_row;
 
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
+use afterray_harness::ContextBudget;
 use afterray_models::{
     JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, ModelAdapter, ModelCapability,
     ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter, PersistentMlxConfig, ProcessAdapter,
@@ -823,7 +824,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             from_ms,
             to_ms,
         } => {
-            let llm_ready = ensure_remote_llm_model(state).await;
+            let model = ready_model(state).await;
             ask::handle_ask(
                 &state.store,
                 &state.models,
@@ -831,7 +832,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 from_ms,
                 to_ms,
                 now_ms(),
-                llm_ready,
+                model,
             )
             .await
         }
@@ -839,14 +840,14 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             conversation_id,
             message,
         } => {
-            let llm_ready = ensure_remote_llm_model(state).await;
+            let model = ready_model(state).await;
             chat::handle_send(
                 &state.store,
                 &state.models,
                 conversation_id.as_deref(),
                 &message,
                 now_ms(),
-                llm_ready,
+                model,
             )
             .await
         }
@@ -1064,6 +1065,48 @@ async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
         let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
     }
     start_capture_runtime(state, session_id).await
+}
+
+/// Everything a turn needs to know about the model: that there is one, and
+/// what window it has.
+///
+/// The window is worked out here rather than at startup because it is not a
+/// property of our settings — it is a property of what the server has loaded
+/// right now, and that changes between turns.
+pub(crate) async fn ready_model(state: &AppState) -> ask::TurnModel {
+    if !ensure_remote_llm_model(state).await {
+        return ask::TurnModel::missing();
+    }
+    ask::TurnModel::ready(resolve_context_budget(state).await)
+}
+
+/// Probes the provider for this turn's context window, records it on the shared
+/// config so the outgoing request declares the same number, and turns it into a
+/// budget.
+///
+/// Runs per turn. `/api/ps` only reports a window once the model is resident,
+/// so a value read at startup would be the wrong one exactly when it mattered;
+/// two localhost round trips are cheap next to the generation that follows.
+async fn resolve_context_budget(state: &AppState) -> ContextBudget {
+    let config = current_llm_config(state);
+    let afford = afterray_platform_macos::local_context_tokens();
+    let probe = afterray_models::probe_context_tokens(&config, afford).await;
+    let changed = {
+        let mut llm = state
+            .llm_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = llm.context_tokens != Some(probe.resolved);
+        llm.context_tokens = Some(probe.resolved);
+        changed
+    };
+    // Once per change, not once per turn: the interesting event is the window
+    // moving, and a user whose window came out small needs the inputs to know
+    // whether it was their machine or their model.
+    if changed {
+        eprintln!("llm.{}", probe.summary());
+    }
+    ContextBudget::for_window(probe.resolved)
 }
 
 fn current_llm_config(state: &AppState) -> LlmRuntimeConfig {
@@ -1376,6 +1419,7 @@ fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
                 let key = persisted.legacy_llm_api_key.trim();
                 (!key.is_empty()).then(|| key.to_owned())
             }),
+        context_tokens: None,
     };
     // Settings carried over from the retired built-in provider can hold a
     // remote chat model id, which is not a managed MLX pack. Drop it so the

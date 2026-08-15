@@ -15,6 +15,10 @@ use serde_json::Value;
 
 use crate::tools::{ToolHost, tool_catalog_text};
 
+/// The fence the harness puts around untrusted text. Production code never
+/// calls it directly — `run_turn` fences as it renders — but the tests that
+/// prove a prompt is fenced need the same function the renderer uses.
+#[cfg(test)]
 pub(crate) use afterray_harness::fence::untrusted as fence_untrusted;
 
 #[derive(Debug)]

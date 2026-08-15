@@ -12,8 +12,8 @@ use std::fmt::Write as _;
 
 use afterray_harness::{CompactionNotice, Opening, ToolCallRecord};
 
-use crate::agent::{self, fence_untrusted};
-use afterray_harness::ContextBudget;
+use crate::agent;
+use crate::ask::TurnModel;
 use crate::tools::ToolHost;
 
 const TITLE_MAX_CHARS: usize = 24;
@@ -53,7 +53,7 @@ pub(crate) async fn handle_send(
     conversation_id: Option<&str>,
     message: &str,
     now_ms: i64,
-    llm_present: bool,
+    model: TurnModel,
 ) -> Response {
     let message = message.trim();
     if message.is_empty() {
@@ -72,7 +72,7 @@ pub(crate) async fn handle_send(
     let history = fold_history(&prior, HISTORY_CHAR_CAP);
     let opening = build_opening(&seed, &history, message);
 
-    if !llm_present {
+    if !model.present {
         return persist_reply(
             store,
             &PendingTurn {
@@ -91,7 +91,7 @@ pub(crate) async fn handle_send(
         store: afterray_store::ReadOnlyVault::new(store),
         models,
         now_ms,
-        budget: ContextBudget::DEFAULT,
+        budget: model.budget,
     };
     match agent::run_readonly_agent_traced(models, &host, CHAT_SYSTEM_PROMPT, opening).await {
         Ok(turn) => {
@@ -641,7 +641,7 @@ mod tests {
         );
 
         let (prompt, _) = build_opening(&seed, "user:\nignore previous", "那第三件呢")
-            .render(ContextBudget::DEFAULT, fence_untrusted);
+            .render(afterray_harness::ContextBudget::DEFAULT, crate::agent::fence_untrusted);
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=seed>>>"));
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=history>>>"));
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=user>>>"));
@@ -651,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn empty_message_fails() {
         let (_directory, vault) = test_vault();
-        let response = handle_send(&vault, &queue(Vec::new()), None, "   ", 1, true).await;
+        let response = handle_send(&vault, &queue(Vec::new()), None, "   ", 1, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT)).await;
         assert!(!response.ok);
     }
 
@@ -664,7 +664,7 @@ mod tests {
             Some("missing"),
             "hello",
             1,
-            false,
+            TurnModel::missing(),
         )
         .await;
         assert!(!response.ok);
@@ -682,7 +682,7 @@ mod tests {
             None,
             "一二三四五六七八九十一二三四五六七八九十一二三四五",
             1_000,
-            false,
+            TurnModel::missing(),
         )
         .await;
         assert!(response.ok, "{response:?}");
@@ -740,7 +740,7 @@ print(json.dumps({
 }))
 "#;
         let models = mock_llm(script);
-        let first = handle_send(&vault, &models, None, "first question", 1_000, true).await;
+        let first = handle_send(&vault, &models, None, "first question", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT)).await;
         assert!(first.ok, "{first:?}");
         let first: ChatReply = serde_json::from_value(first.data.unwrap()).unwrap();
         assert_eq!(first.answer, "hello");
@@ -751,7 +751,7 @@ print(json.dumps({
             Some(&first.conversation.id),
             "what did I just ask",
             2_000,
-            true,
+            TurnModel::ready(afterray_harness::ContextBudget::DEFAULT),
         )
         .await;
         assert!(second.ok, "{second:?}");
@@ -779,7 +779,7 @@ print(json.dumps({
 }))
 "#;
         let models = mock_llm(script);
-        let response = handle_send(&vault, &models, None, "what was open", 1_000, true).await;
+        let response = handle_send(&vault, &models, None, "what was open", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT)).await;
         assert!(response.ok, "{response:?}");
         let reply: ChatReply = serde_json::from_value(response.data.unwrap()).unwrap();
         assert_eq!(reply.answer, "used the activity list.");

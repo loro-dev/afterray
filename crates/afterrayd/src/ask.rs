@@ -30,6 +30,37 @@ those lines. For a user-facing response, output FINAL followed by the answer.";
 
 const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
+/// What the model layer offers a turn: whether there is a model at all, and
+/// the window it actually has.
+///
+/// The two travel together because they are decided together, one probe before
+/// the turn starts. Passing the window separately is how it ends up defaulted
+/// at one call site and real at another.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TurnModel {
+    pub present: bool,
+    pub budget: ContextBudget,
+}
+
+impl TurnModel {
+    /// A model is available, on whatever window was worked out for it.
+    pub fn ready(budget: ContextBudget) -> Self {
+        Self {
+            present: true,
+            budget,
+        }
+    }
+
+    /// Nothing configured. The budget is unused on this path but must be
+    /// something; the default is as good a placeholder as any.
+    pub fn missing() -> Self {
+        Self {
+            present: false,
+            budget: ContextBudget::DEFAULT,
+        }
+    }
+}
+
 #[must_use]
 pub(crate) fn mlx_pack_present(library: &ModelLibrary, config: &LlmRuntimeConfig) -> bool {
     config.mlx_pack_id().is_some_and(|pack_id| {
@@ -363,7 +394,7 @@ pub(crate) async fn handle_ask(
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     now_ms: i64,
-    llm_present: bool,
+    model: TurnModel,
 ) -> Response {
     let question = question.trim();
     if question.is_empty() {
@@ -401,7 +432,7 @@ pub(crate) async fn handle_ask(
     let hits: Vec<SearchHit> = search.into_iter().take(SEARCH_HIT_LIMIT).collect();
     let citations = citations_from_evidence(&memories, &spans, &hits);
 
-    if !llm_present {
+    if !model.present {
         return Response::success(missing_model_answer(&memories, &spans));
     }
 
@@ -426,7 +457,7 @@ pub(crate) async fn handle_ask(
         store: afterray_store::ReadOnlyVault::new(store),
         models,
         now_ms,
-        budget: ContextBudget::DEFAULT,
+        budget: model.budget,
     };
     let system = format!("{ASK_SYSTEM_PROMPT}\n\n{QWEN35_TOOL_PROTOCOL_SUFFIX}");
     match agent::run_readonly_agent(models, &host, &system, opening).await {
@@ -501,6 +532,7 @@ mod tests {
             base_url: String::new(),
             model: "qwen3.6:latest".into(),
             api_key: None,
+            context_tokens: None,
         };
         assert!(llm_ready(&missing, &remote));
         assert!(!llm_ready(&missing, &LlmRuntimeConfig::default()));
@@ -624,7 +656,7 @@ mod tests {
             Some(0),
             Some(10),
             5,
-            false,
+            TurnModel::missing(),
         )
         .await;
         assert!(response.ok);
@@ -636,7 +668,7 @@ mod tests {
     #[tokio::test]
     async fn empty_question_fails() {
         let (_directory, vault) = test_vault();
-        let response = handle_ask(&vault, &queue(Vec::new()), "   ", None, None, 1, true).await;
+        let response = handle_ask(&vault, &queue(Vec::new()), "   ", None, None, 1, TurnModel::ready(ContextBudget::DEFAULT)).await;
         assert!(!response.ok);
     }
 
@@ -650,7 +682,7 @@ mod tests {
             Some(0),
             Some(10),
             5,
-            true,
+            TurnModel::ready(ContextBudget::DEFAULT),
         )
         .await;
         assert!(response.ok);
@@ -706,7 +738,7 @@ print(json.dumps({
         let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
 
         let response =
-            handle_ask(&vault, &models, "design", Some(0), Some(2_000), 1_500, true).await;
+            handle_ask(&vault, &models, "design", Some(0), Some(2_000), 1_500, TurnModel::ready(ContextBudget::DEFAULT)).await;
         assert!(response.ok, "{response:?}");
         let answer: AskAnswer = serde_json::from_value(response.data.unwrap()).unwrap();
         assert!(!answer.model_missing);

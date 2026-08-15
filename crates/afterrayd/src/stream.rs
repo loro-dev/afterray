@@ -54,14 +54,17 @@ pub(crate) async fn handle_chat_stream(
     message: String,
     cancel: CancelToken,
 ) -> anyhow::Result<()> {
-    crate::ensure_remote_llm_model(state).await;
+    // One probe, before the turn: whether there is a model, and the window it
+    // actually has. The same number goes out as `num_ctx`, so what the harness
+    // budgets for and what the server allocates cannot drift apart.
+    let model = crate::ready_model(state).await;
     let ctx = ChatStreamCtx {
         store: &state.store,
         models: &state.models,
         token_sink: &state.llm_token_sink,
         now_ms: crate::now_ms(),
-        llm_ready: crate::llm_is_ready(state),
-        budget: ContextBudget::DEFAULT,
+        llm_ready: model.present,
+        budget: model.budget,
         cancel: cancel.clone(),
     };
     run_chat_stream_registered(
@@ -1111,6 +1114,141 @@ print(json.dumps({
         assert!(row.content.contains("context window"), "{}", row.content);
     }
 
+    /// A 16 GB Mac gets a 4 096-token window from Ollama, and the server cuts
+    /// anything longer *before the model reads it* — no error, no event, just
+    /// an answer to a question with its front missing.
+    ///
+    /// So the turn has to stay inside that window itself. The worker reports
+    /// the size of every prompt it was handed; the assertion is that not one of
+    /// them would have needed cutting.
+    #[tokio::test]
+    async fn a_small_machines_window_is_respected_before_the_server_has_to_cut() {
+        let (_dir, vault) = test_vault();
+        let now = 1_786_729_937_000;
+        let session = vault.create_session_sync(now - 60_000).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, now - 60_000, "image/jpeg", b"frame")
+            .unwrap();
+        // A screenful of text far larger than the window, so the pressure is
+        // real evidence rather than a contrived transcript.
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&moment.id),
+                None,
+                "ocr",
+                &"the quick brown fox jumped over the lazy dog\n".repeat(1_200),
+                now - 60_000,
+                None,
+                "test",
+                None,
+            )
+            .unwrap();
+
+        // Reads the same oversized screen every round, so the transcript grows
+        // under pressure instead of ending on the first reply. Every prompt it
+        // sees is reported back in the answer text.
+        let script = r#"
+import json, sys
+req = json.load(sys.stdin)
+prompt = (req.get("input") or {}).get("prompt") or ""
+calls = prompt.count("Assistant called TOOL")
+if calls >= 3:
+    text = "FINAL\nprompt_chars=%d" % len(prompt)
+else:
+    text = "TOOL get_ocr\nARGS {\"moment_id\": \"%MOMENT%\"}"
+print(json.dumps({
+  "protocol_version": 1,
+  "output": {"type": "llm", "text": text},
+  "retryable": False
+}))
+"#
+        .replace("%MOMENT%", &moment.id);
+        let models = queue(vec![llm_script(&script)]);
+        let sink = LlmTokenSink::default();
+        // Not a hand-picked number: the tier a 16 GB machine actually reports.
+        let budget = ContextBudget::for_window(4_096);
+        let ctx = ChatStreamCtx {
+            store: &vault,
+            models: &models,
+            token_sink: &sink,
+            now_ms: now,
+            llm_ready: true,
+            budget,
+            cancel: CancelToken::new(),
+        };
+        let mut buf = Vec::new();
+        run_chat_stream(&mut buf, ctx, None, "what was I reading")
+            .await
+            .unwrap();
+        let events = parse_events(&buf);
+
+        // Every `usage` event is one prompt that was actually sent.
+        let usage: Vec<(usize, usize)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatStreamEvent::Usage {
+                    round,
+                    prompt_tokens,
+                    window_tokens,
+                } => {
+                    assert_eq!(*window_tokens, budget.window_tokens, "{events:?}");
+                    Some((*round, *prompt_tokens))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(usage.len() >= 2, "expected a multi-round turn: {usage:?}");
+        eprintln!(
+            "4k tier: window={} transcript={} tool_cap={} rounds={} usage={usage:?}",
+            budget.window_tokens,
+            budget.transcript_tokens(),
+            budget.tool_result_tokens(),
+            budget.max_rounds,
+        );
+        for (round, prompt_tokens) in &usage {
+            assert!(
+                prompt_tokens + budget.system_tokens + budget.reserve_tokens
+                    <= budget.window_tokens,
+                "round {round} sent {prompt_tokens} tokens into a {} window",
+                budget.window_tokens
+            );
+        }
+
+        // And the same thing measured from the far end: the worker's own count
+        // of the characters it received, against the estimator's Latin rule of
+        // four characters per token. The prompt fixture is ASCII, so this is a
+        // faithful conversion rather than a lucky one.
+        let answer: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatStreamEvent::Token { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let chars: usize = answer
+            .trim()
+            .strip_prefix("prompt_chars=")
+            .unwrap_or_else(|| panic!("worker did not report a prompt size: {answer:?}"))
+            .parse()
+            .unwrap();
+        eprintln!("4k tier: last prompt {chars} chars ~= {} tokens", chars / 4);
+        // The fit is our doing, not the fixture's: the tool results were cut to
+        // the per-call cap on the way in, and the client was told.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ChatStreamEvent::ToolResult { truncated: true, dropped, .. } if *dropped > 0
+            )),
+            "nothing was cut, so this proves nothing: {events:?}"
+        );
+        assert!(
+            chars / 4 <= budget.transcript_tokens(),
+            "the last prompt was {chars} chars, over a {}-token transcript share",
+            budget.transcript_tokens()
+        );
+    }
+
     /// Phase 3's whole point. The app's stop button shuts the socket, which
     /// arrives here as EOF, and the turn has to notice *while* it is waiting —
     /// not at the next token write, which during a long tool call never comes.
@@ -1258,6 +1396,7 @@ print(json.dumps({
                 base_url: String::new(),
                 model,
                 api_key: None,
+                context_tokens: None,
             },
         ));
         let router = afterray_models::LlmRouterAdapter::new(config);
@@ -1462,6 +1601,7 @@ print(json.dumps({
                 base_url: String::new(),
                 model,
                 api_key: None,
+                context_tokens: None,
             },
         ));
         let router = afterray_models::LlmRouterAdapter::new(config);
