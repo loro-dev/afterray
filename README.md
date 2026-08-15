@@ -16,206 +16,41 @@
 
 <p align="center">
   <a href="https://afterray.com">Website</a> ·
-  <a href="#install">Install</a> ·
-  <a href="#using-afterray">Using AfterRay</a> ·
-  <a href="#privacy">Privacy</a> ·
-  <a href="docs/development.md">Development</a>
+  <a href="https://afterray.com/download/latest">Download for macOS</a> ·
+  <a href="#cli-for-agents">CLI for agents</a>
 </p>
 
 AfterRay is a local-first computer-history app for macOS. It captures your
 screen and, when enabled, system and microphone audio plus foreground-app
-Accessibility context. Local OCR, speech recognition, and search turn that
-recording into a timeline you can return to: the exact screen, words, app, and
-audio around a moment. Captures, indexes, and the vault key stay on your Mac.
+Accessibility context, then turns them into a timeline you can search and
+return to. Everything AfterRay captures and indexes stays local on your Mac.
 
-## What you can do
+Download the public signed build from
+[afterray.com/download/latest](https://afterray.com/download/latest). You do
+not need to build AfterRay or run separate first-launch setup commands.
 
-- **Scrub back to any moment** on a native timeline, with the audio that went
-  with it.
-- **Search by words or by meaning** across OCR text, transcripts, window
-  titles, and Accessibility context. Return lands you on the newest match,
-  highlighted in place on the frame.
-- **Ask questions and get citations** from a built-in assistant that can only
-  read your history.
-- **Keep what matters** — favorited moments survive retention cleanup.
-- **Exclude apps and websites** you would rather it skipped. Exclusion is
-  best-effort in V0 — [what it covers](#what-exclusion-covers) is worth
-  reading before you rely on it.
-- **Let your agents use it** — Claude Code, Codex, and similar tools can query
-  history through the `afterray` CLI you install explicitly.
+Choose local models, such as your own Ollama, or any AI provider with an
+OpenAI-compatible API.
 
-> [!IMPORTANT]
-> AfterRay is a developer V0. There is no public signed build yet, so today you
-> install it by building from source, and the bundled CLI is still a developer
-> CLI rather than the scoped read-only gateway planned for the public release.
+## What is cool about it
 
-## Install
+- **Rewind your work.** Browse a native timeline back to the exact screen,
+  words, app context, and audio around a moment.
+- **Find the right moment.** Search OCR, transcripts, window titles, and
+  Accessibility context by exact words or meaning, then land on the match.
+- **Ask with evidence.** The built-in assistant answers from your history and
+  cites the moments it used.
+- **Summarize your work locally.** A local model turns your activity into a
+  work log, so the day is easier to review than a raw timeline.
+- **Turn history into better workflows (WIP).** As it accumulates, models will
+  help improve your process and distill reusable Skills for your agents.
 
-**Requirements:** an Apple Silicon Mac (M3 or newer recommended), macOS 15+,
-and about 8 GB free for the transcription and search models — plus another
-~17 GB if you want the optional local assistant.
+## CLI for agents
 
-Signed DMGs will be published on the
-[Releases page](https://github.com/loro-dev/afterray/releases). Until then,
-build from a checkout. You need Xcode with the Command Line Tools and a Rust
-toolchain ([rustup.rs](https://rustup.rs/)):
-
-```sh
-git clone https://github.com/loro-dev/afterray.git
-cd afterray
-
-# One time: build the CLI and download the local models
-cargo build -p afterray-cli --release
-./scripts/download-models/download.sh
-
-# Build and launch a signed development AfterRay.app
-make v0
-```
-
-`make v0` runs in the foreground; stop it with `Control-C`. A source build
-keeps its recordings in `.afterray/v0-data` inside the checkout. Everything
-else about working from source is in [Development](docs/development.md).
-
-## First launch
-
-AfterRay walks you through four steps: pick the shortcut that opens it
-(**⇧⌘Space** by default), exclude any apps and websites it should never see,
-optionally install the `afterray` CLI for your coding agents, and download the
-on-device models.
-
-macOS then asks separately for **Screen & System Audio Recording**,
-**Microphone**, and **Accessibility** — the last one must be enabled in System
-Settings. Recording starts automatically once permissions are granted, taking a
-screenshot every 10 seconds.
-
-## Using AfterRay
-
-| Action | How |
-| --- | --- |
-| Open AfterRay | ⇧⌘Space |
-| Move through time | Drag the recall strip left or right |
-| Play a moment's audio | Space |
-| Search or ask | Type in the query field; Tab switches between **Search** and **Ask** |
-| Jump to a match | Return lands on the newest match; the filmstrip holds the rest |
-| Protect a moment | Favorite it |
-| Stop capturing | **Pause** |
-| Close AfterRay | Esc or ⌘W |
-
-Each moment carries its screenshot, OCR text, Accessibility context,
-transcript, and audio segment when one exists.
-
-**Your data** lives in `~/Library/Application Support/AfterRay`, logs in
-`~/Library/Logs/AfterRay`, and the vault key in the macOS Keychain. Metadata is
-stored in an encrypted SQLCipher database and artifacts are encrypted
-individually; the UI never opens the database or holds the key. The vault has a
-100 GB budget — adjust it in **Settings → General → Storage**, where you can
-also delete the last hour, today, or everything.
-
-**The assistant** is chosen in **Settings → AI Models**: a local Qwen3.5 MLX
-pack that runs inside AfterRay (the recommended 4B, or the higher-quality 9B),
-your local Ollama, or any OpenAI-compatible `/v1` endpoint. Capture, OCR, and
-search work fine with no assistant configured.
-
-## Using it from your agent
-
-AfterRay installs its CLI to `~/.local/bin/afterray` during onboarding, or
-later from **Settings → Advanced → CLI for agents**. With that directory on
-your `PATH`, agents query history directly:
-
-```sh
-afterray search 'the pricing table I saw yesterday' --json
-afterray moment <moment-id> --json
-afterray ask 'what did I decide about the release?'
-```
-
-This repository also ships an Agent Skill at
-[`skills/afterray`](skills/afterray/SKILL.md) that teaches Claude Code, Codex,
-and similar tools which commands to use.
-
-## Privacy
-
-Capture, storage, OCR, transcription, embeddings, and search are local. Only
-two choices extend that boundary, and both are explicit:
-
-| Path | Where data can go |
-| --- | --- |
-| Local MLX model | Prompts and retrieved evidence stay on the Mac |
-| Local Ollama | The Ollama endpoint you configured — normally a local process |
-| OpenAI-compatible URL | The provider you chose; their storage, logging, and training policies apply |
-| External agent through the CLI | The agent's process and any model provider it uses |
-
-The assistant is deliberately not a general-purpose computer agent. It
-can search and read moments, activity, memories, OCR, and Accessibility
-evidence, and has no tool for running shell commands, editing files, changing
-settings, controlling capture, deleting history, or writing to the vault.
-
-Anything returned through the CLI becomes visible to that agent. The V0 CLI is
-the full developer CLI, so treat it as trusted local access rather than a
-security boundary.
-
-### What exclusion covers
-
-Excluding an app or a site is a real filter, not a promise about everything
-that was on screen. In V0:
-
-- It follows the **foreground app**. A window merely beside the one you are
-  working in — a split view, a picture-in-picture, an open password manager —
-  is still in the pixels of the frame.
-- A site is matched by the URL the browser reports through Accessibility.
-  Browsers that do not expose one, Firefox and some Electron apps among them,
-  cannot be matched, so a domain exclusion silently does not fire there.
-- The screenshot is taken first. When the app or URL that arrives with it
-  turns out to be excluded, the moment and its artifacts are deleted from the
-  vault — but they were written before that was known.
-- System audio is one mix of the whole machine. Excluding an app does not take
-  its sound out of a recording.
-- AfterRay checks private-window state before asking ScreenCaptureKit for an
-  image. Chromium browsers use their read-only AppleScript window mode,
-  Firefox uses its localized private-window title suffix, and browser-owned
-  Accessibility chrome is a positive fallback. A detected private window is
-  discarded before screenshots, Accessibility artifacts, OCR, activity spans,
-  or memory summaries can be created. macOS has no cross-browser private-mode
-  flag, so Safari and unsupported browser versions remain best-effort; system
-  audio still follows the normal whole-machine capture path.
-
-Moving exclusion into the capture filter, before a frame exists, is planned
-before the public release.
-
-## Troubleshooting
-
-**Recording never starts.** Check all three permissions in **System Settings →
-Privacy & Security**. In a source build the permission belongs to the terminal
-that launched AfterRay, and macOS may need that app quit and reopened.
-
-**A model is missing.** Use **Settings → AI Models → Download Missing**, or
-re-run `./scripts/download-models/download.sh` — existing files are reused.
-
-**Something else.** **Settings → Diagnostics** reveals the log folder and
-copies a diagnostic report.
-
-## Uninstall
-
-Quit AfterRay and move it to the Trash, then:
-
-```sh
-rm -rf ~/Library/Application\ Support/AfterRay ~/Library/Logs/AfterRay
-rm -f ~/.local/bin/afterray
-```
-
-Delete the `dev.afterray.v0.vault` entry in Keychain Access to remove the vault
-key; without it any leftover copy of the vault is unreadable. Delete
-`dev.afterray.v0.secrets` too if you configured an API key for a remote
-assistant.
-
-## Documentation
-
-- [Development](docs/development.md) — build from source, dev CLI, architecture,
-  environment variables
-- [Releasing AfterRay](docs/releasing.md) — signing, notarization, DMG
-- [Vault encryption design](docs/vault-encryption-design.md) — threat model and
-  key hierarchy
-- [V0 implementation plan](docs/afterray-v0-implementation-plan.md) — frozen
-  scope and technical decisions
+AfterRay can install an `afterray` CLI from **Settings → Advanced → CLI for
+agents**. It lets tools such as Claude Code and Codex query the history you
+choose to share. This repository also includes an Agent Skill at
+[`skills/afterray`](skills/afterray/SKILL.md) for agents that support skills.
 
 ## License
 
@@ -226,9 +61,6 @@ competing commercial product or service. Each version turns Apache-2.0 two
 years after its release. [`afterray-protocol`](crates/afterray-protocol/LICENSE)
 is Apache-2.0 today so clients can implement the integration boundary. The
 license grants no rights to the AfterRay name, logo, or marks.
-
-AfterRay is still in developer preview and external contributions are not yet
-being accepted.
 
 ---
 
