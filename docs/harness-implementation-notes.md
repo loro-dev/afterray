@@ -329,10 +329,26 @@ question re-enters the array as its own message and never moves again.
 **Tool calls were invisible across turns.** `tool_log` was written to the vault
 and never read back, so a follow-up could not see what the previous turn had
 looked up and simply looked it up again. A past turn now replays as the
-assistant's `TOOL`/`ARGS` message plus a note naming what ran. Result bodies are
-not replayed — they are not stored, and re-running the calls to fill them in
-would be a silent vault read on every turn — so the model sees what was checked
-and can check again if it needs the detail.
+assistant's `TOOL`/`ARGS` message and the result itself, inside the same fence
+the live round used.
+
+What is stored is **the bytes that were sent** — `Budgeted.text`, already cut to
+that turn's cap — and replay puts them back verbatim with no budget logic on the
+path. Storing the raw result and re-cutting it per turn would look equivalent
+and is not: `tool_result_tokens` differs with the machine's memory and with the
+user's settings, so the same past would render differently on a different Mac,
+the cut would land elsewhere, and every message after it would be a different
+message. Nothing would report that. A test renders one stored turn under a 32k
+and a 256k budget and asserts the arrays are byte-identical, and under a 4 096
+budget — too small to hold the thread — asserts that what survives is still
+byte-identical, because messages are dropped whole and never re-cut.
+
+The results ride in the existing `tool_log` column rather than a new one. No
+migration, and `conversation_bytes` already sums that column, so the chat pool
+accounts for them the day they start being written; a new column would have
+needed adding to that sum, and forgetting it is exactly how a budget stops being
+one. Rows written before this replay as the call plus a note that its result was
+not kept.
 
 **Two kinds of "out of room" behaved differently.** In-turn pressure announced
 itself, wrote a row and showed in the UI; cross-turn pressure silently deleted
@@ -340,6 +356,11 @@ the middle of the conversation. `CompactionStrategy` now has a second method for
 the conversation, `PruneToolResults` implements both, and the cross-turn pass
 emits the same `CompactionNotice` — so it writes the same row, renders the same
 separator, and leaves an `[AfterRay]` marker where the dropped messages were.
+The order of loss is the same too: tool results fold first, whole messages go
+only if that was not enough. A result can be fetched again; a question cannot,
+and an answer vanishing from the thread's context is how a follow-up stops
+making sense. `Message::kind` exists so that rule is applied to a boundary
+rather than to whatever text happens to look like a fence marker.
 After a fold the prefix settles again and stays settled, which is the most a
 non-model policy can offer; `SummarizeOldest` remains phase 5.
 
