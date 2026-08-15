@@ -39,19 +39,19 @@ export default function LangMenu() {
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
       >
+        {/* Lucide "languages" — the conventional translate mark */}
         <svg
           width="16"
           height="16"
           viewBox="0 0 24 24"
           fill="none"
           stroke="currentColor"
-          strokeWidth="1.7"
+          strokeWidth="2"
           strokeLinecap="round"
+          strokeLinejoin="round"
           aria-hidden="true"
         >
-          <circle cx="12" cy="12" r="9" />
-          <path d="M3.6 9h16.8M3.6 15h16.8" />
-          <path d="M12 3c-2.3 2.5-3.5 5.6-3.5 9s1.2 6.5 3.5 9c2.3-2.5 3.5-5.6 3.5-9s-1.2-6.5-3.5-9z" />
+          <path d="m5 8l6 6m-7 0l6-6l2-3M2 5h12M7 2h1m14 20l-5-10l-5 10m2-4h6" />
         </svg>
       </button>
       {open && (
