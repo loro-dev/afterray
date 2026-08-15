@@ -105,7 +105,7 @@ struct SnapshotScene {
     @MainActor
     static var all: [SnapshotScene] {
         chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
-            + captionScenes
+            + captionScenes + chatScenes
     }
 }
 
@@ -596,6 +596,34 @@ private func settingsScene(name: String, model: SettingsPreviewModel) -> Snapsho
         content: AnyView(
             AfterRaySettingsView(model: model, onClose: {}, initialPage: .general)
                 .frame(width: 900, height: 700)
+        )
+    )
+}
+
+// MARK: - Chat panel
+
+/// The chat chrome that reports on itself: the context meter in the header, the
+/// compaction rule in the thread, and the caveat on an answer built from a
+/// shortened lookup. All three are easy to get subtly wrong — a meter that
+/// misreads, a rule that looks like a message — and only pixels show it.
+@MainActor
+private var chatScenes: [SnapshotScene] {
+    [
+        chatScene(name: "16-chat-context-pressure", scenario: .pressure),
+        chatScene(name: "17-chat-tools", scenario: .tools),
+    ]
+}
+
+@MainActor
+private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
+    let model = ChatPreviewModel(scenario: scenario)
+    return SnapshotScene(
+        name: name,
+        size: CGSize(width: 980, height: 680),
+        settleSeconds: 1.2,
+        content: AnyView(
+            AfterRayChatView(model: model, onClose: {})
+                .frame(width: 980, height: 680)
         )
     )
 }

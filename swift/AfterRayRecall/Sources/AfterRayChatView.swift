@@ -177,7 +177,10 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .foregroundStyle(ChatPalette.secondary)
             }
             Spacer(minLength: 12)
-            HStack(spacing: 6) {
+            HStack(spacing: 10) {
+                if let usage = model.contextUsage {
+                    ChatContextMeter(usage: usage)
+                }
                 if model.isLoadingHistory {
                     ProgressView().controlSize(.small).tint(ChatPalette.accent)
                 }
@@ -198,8 +201,13 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                             .padding(.top, 48)
                     }
                     ForEach(model.bubbles) { bubble in
-                        ChatBubbleView(bubble: bubble)
-                            .id(bubble.id)
+                        if bubble.role == .compaction {
+                            ChatCompactionRule(text: bubble.text)
+                                .id(bubble.id)
+                        } else {
+                            ChatBubbleView(bubble: bubble)
+                                .id(bubble.id)
+                        }
                     }
                 }
                 .padding(.horizontal, ChatMetrics.gutter)
@@ -298,6 +306,76 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 }
 
+/// How full the model's context window is.
+///
+/// A bar rather than a number alone: the useful question is "how much room is
+/// left", which a proportion answers at a glance and a token count does not.
+/// It only appears once the daemon has reported a round — an app that guessed
+/// would be inventing the one number the user has no way to check.
+private struct ChatContextMeter: View {
+    let usage: ChatContextUsage
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.10))
+                Capsule()
+                    .fill(tint)
+                    .frame(width: max(2, 44 * usage.fraction))
+            }
+            .frame(width: 44, height: 4)
+            Text(usage.shortLabel)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(usage.isTight ? ChatPalette.coral : ChatPalette.tertiary)
+                .monospacedDigit()
+        }
+        .help("Context used this turn: \(usage.promptTokens) of \(usage.windowTokens) tokens")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Context window")
+        .accessibilityValue("\(Int(usage.fraction * 100)) percent used")
+    }
+
+    private var tint: Color {
+        usage.isTight ? ChatPalette.coral : ChatPalette.accent.opacity(0.75)
+    }
+}
+
+/// Where the agent stopped being able to see.
+///
+/// Drawn as a rule across the thread rather than a bubble: it is not something
+/// anyone said, and a shorter answer below it needs the explanation to not
+/// simply read as the assistant getting worse.
+private struct ChatCompactionRule: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            line
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(text)
+                    .font(.system(size: 10.5))
+                    // One line, always. A wrapped divider reads as a message.
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .foregroundStyle(ChatPalette.tertiary)
+            .layoutPriority(1)
+            line
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var line: some View {
+        Rectangle()
+            .fill(ChatPalette.separator)
+            .frame(height: 1)
+    }
+}
+
 private struct ChatConversationRow: View {
     let conversation: ChatConversation
     let isSelected: Bool
@@ -367,6 +445,14 @@ private struct ChatBubbleView: View {
         }
     }
 
+    /// Says when an answer stands on a shortened lookup. Without it, a reply
+    /// that missed something the tool did return looks like the model failing
+    /// rather than the budget biting.
+    private func resultNote(chars: Int, tool: ChatToolCall) -> String {
+        guard tool.truncated else { return "\(chars) characters back" }
+        return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
+    }
+
     private var toolChip: some View {
         DisclosureGroup(isExpanded: $toolsExpanded) {
             VStack(alignment: .leading, spacing: 8) {
@@ -380,18 +466,31 @@ private struct ChatBubbleView: View {
                             .foregroundStyle(ChatPalette.secondary)
                             .textSelection(.enabled)
                         if let chars = tool.resultChars {
-                            Text("\(chars) characters back")
+                            Text(resultNote(chars: chars, tool: tool))
                                 .font(.system(size: 10.5))
-                                .foregroundStyle(ChatPalette.tertiary)
+                                .foregroundStyle(tool.truncated ? ChatPalette.coral.opacity(0.85) : ChatPalette.tertiary)
                         }
                     }
                 }
             }
             .padding(.top, 6)
         } label: {
-            Text(ChatToolSummary.collapsed(bubble.tools))
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(ChatPalette.tertiary)
+            HStack(spacing: 5) {
+                Text(ChatToolSummary.collapsed(bubble.tools))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(ChatPalette.tertiary)
+                if bubble.hasTruncatedEvidence {
+                    Text("shortened")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(ChatPalette.coral.opacity(0.9))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(
+                            ChatPalette.coral.opacity(0.12),
+                            in: Capsule()
+                        )
+                }
+            }
         }
         .tint(ChatPalette.tertiary)
         .padding(.horizontal, 10)

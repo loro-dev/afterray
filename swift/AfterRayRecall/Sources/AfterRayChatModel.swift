@@ -13,6 +13,12 @@ public protocol AfterRayChatModeling: ObservableObject {
     var streamTools: [ChatToolCall] { get }
     var errorMessage: String? { get }
     var statusMessage: String? { get }
+    /// Context occupancy for the turn in progress, or the last one in this
+    /// conversation. Nil when unknown — an older daemon says nothing, and the
+    /// header then shows nothing rather than a wrong number.
+    var contextUsage: ChatContextUsage? { get }
+    /// Passes where the daemon dropped earlier evidence, live and restored.
+    var compactionNotices: [ChatCompactionNotice] { get }
 
     func refresh() async
     func select(_ id: String) async
@@ -37,7 +43,8 @@ public extension AfterRayChatModeling {
             streamingText: streamText,
             streamingTools: streamTools,
             isSending: isSending,
-            nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            liveCompactions: isSending ? compactionNotices : []
         )
     }
 }
@@ -55,6 +62,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var streamTools: [ChatToolCall] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
+    @Published public private(set) var contextUsage: ChatContextUsage?
+    @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
 
     private let daemon: any AfterRayChatServing
     private var sendTask: Task<Void, Never>?
@@ -88,6 +97,11 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     public func select(_ id: String) async {
         if isSending { stop() }
         selectedID = id
+        // Occupancy belongs to a turn, not to the app. Carrying it across a
+        // conversation switch would show this thread the previous one's
+        // pressure — and the number looks authoritative enough to be believed.
+        contextUsage = nil
+        compactionNotices = []
         await loadHistory(id)
     }
 
@@ -98,6 +112,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         errorMessage = nil
+        contextUsage = nil
+        compactionNotices = []
     }
 
     public func deleteConversation(_ id: String) async {
@@ -125,6 +141,9 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         isSending = true
         streamText = ""
         streamTools = []
+        // A new turn starts from this conversation's stored history, not from
+        // the last turn's live notices.
+        compactionNotices = ChatTranscript.compactions(in: messages)
         sendTask = Task { await self.performSend(text) }
     }
 
@@ -144,6 +163,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamTools = []
         errorMessage = nil
         statusMessage = nil
+        contextUsage = nil
+        compactionNotices = []
     }
 
     private func performSend(_ text: String) async {
@@ -160,6 +181,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
                 ChatStreamReducer.apply(event, to: &state)
                 streamText = state.text
                 streamTools = state.tools
+                if let usage = state.usage { contextUsage = usage }
+                if !state.compactions.isEmpty { compactionNotices = state.compactions }
                 if let conversationId = state.conversationId {
                     bindConversation(conversationId)
                 }
@@ -260,6 +283,11 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         defer { isLoadingHistory = false }
         do {
             messages = try await daemon.chatHistory(conversationID: id)
+            // Restored from the thread's own rows, so reopening a conversation
+            // still shows where the agent stopped being able to see. Usage is
+            // not restored: the daemon does not store it, and inventing one
+            // would be worse than showing none.
+            compactionNotices = ChatTranscript.compactions(in: messages)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

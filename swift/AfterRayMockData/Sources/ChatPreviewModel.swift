@@ -7,6 +7,7 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
     case streaming
     case markdown
     case tools
+    case pressure
 
     public var id: String { rawValue }
 
@@ -17,6 +18,7 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
         case .streaming: "Streaming"
         case .markdown: "Markdown"
         case .tools: "Tool calls"
+        case .pressure: "Context pressure"
         }
     }
 }
@@ -34,6 +36,8 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var streamTools: [ChatToolCall] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
+    @Published public private(set) var contextUsage: ChatContextUsage?
+    @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
 
     public private(set) var scenario: ChatScenario = .markdown
     private var store: [String: [ChatMessage]] = [:]
@@ -55,10 +59,12 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         errorMessage = nil
         statusMessage = nil
         let fixture = ChatFixtures.load(scenario)
+        contextUsage = ChatFixtures.usage(scenario)
         conversations = fixture.conversations
         store = fixture.histories
         selectedID = fixture.conversations.first?.id
         messages = selectedID.flatMap { store[$0] } ?? []
+        compactionNotices = ChatTranscript.compactions(in: messages)
     }
 
     public func refresh() async {
@@ -72,6 +78,10 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamTools = []
         selectedID = id
         messages = store[id] ?? []
+        // Same rule as the real model: occupancy belongs to a turn, so it does
+        // not survive a conversation switch.
+        contextUsage = nil
+        compactionNotices = ChatTranscript.compactions(in: messages)
     }
 
     public func startNew() {
@@ -82,6 +92,8 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         errorMessage = nil
+        contextUsage = nil
+        compactionNotices = []
     }
 
     public func deleteConversation(_ id: String) async {
@@ -138,6 +150,8 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
             ChatStreamReducer.apply(event, to: &state)
             streamText = state.text
             streamTools = state.tools
+            if let usage = state.usage { contextUsage = usage }
+            if !state.compactions.isEmpty { compactionNotices = state.compactions }
             try? await Task.sleep(for: .milliseconds(28))
         }
         if Task.isCancelled {
@@ -281,7 +295,81 @@ public enum ChatFixtures {
                 [conversation("c-tools", "The third error", count: 2, updated: nowMs - 40_000)],
                 ["c-tools": toolMessages]
             )
+        case .pressure:
+            return (
+                [conversation("c-pressure", "Everything since Monday", count: 4, updated: nowMs - 20_000)],
+                ["c-pressure": pressureMessages]
+            )
         }
+    }
+
+    /// What the header shows for each scenario. Nil is the honest default: a
+    /// daemon that has not reported occupancy must not produce a meter.
+    public static func usage(_ scenario: ChatScenario) -> ChatContextUsage? {
+        switch scenario {
+        case .empty, .short: nil
+        case .markdown: ChatContextUsage(promptTokens: 3_180, windowTokens: 16_384, round: 2)
+        case .streaming, .tools: ChatContextUsage(promptTokens: 6_420, windowTokens: 16_384, round: 3)
+        case .pressure: ChatContextUsage(promptTokens: 13_910, windowTokens: 16_384, round: 5)
+        }
+    }
+
+    /// A thread that ran out of room: a shortened lookup, then a compaction row
+    /// where the daemon dropped earlier evidence to keep going.
+    static var pressureMessages: [ChatMessage] {
+        [
+            ChatMessage(
+                id: "u-pressure",
+                conversationId: "c-pressure",
+                role: .user,
+                content: "Everything I touched since Monday, with the errors",
+                createdAtMs: nowMs - 240_000
+            ),
+            ChatMessage(
+                id: "x-pressure",
+                conversationId: "c-pressure",
+                role: .compaction,
+                content: "Dropped 3 earlier lookups · 14.0k → 6.2k",
+                createdAtMs: nowMs - 60_000
+            ),
+            ChatMessage(
+                id: "a-pressure",
+                conversationId: "c-pressure",
+                role: .assistant,
+                content: """
+                Four days, mostly two threads.
+
+                - **Mon–Tue** the GOP header bug, in Zed and the IVF spec
+                - **Wed** the chat stream, plus the stand-up
+
+                I could not hold all of Monday's screen text at once, so the \
+                earlier detail is summarised rather than quoted.
+                """,
+                toolLog: ChatToolLog.encode([
+                    ChatToolCall(
+                        id: "p1",
+                        name: "get_day_summary",
+                        argsJSON: #"{"day_ms":1786622400000}"#,
+                        resultChars: 3_120
+                    ),
+                    ChatToolCall(
+                        id: "p2",
+                        name: "get_slot_card",
+                        argsJSON: #"{"at_ms":1786640400000}"#,
+                        resultChars: 8_192,
+                        truncated: true,
+                        droppedTokens: 1_940
+                    ),
+                    ChatToolCall(
+                        id: "p3",
+                        name: "search_evidence",
+                        argsJSON: #"{"query":"IVF length check"}"#,
+                        resultChars: 2_040
+                    ),
+                ]),
+                createdAtMs: nowMs - 20_000
+            ),
+        ]
     }
 
     private static func conversation(_ id: String, _ title: String, count: Int, updated: Int64) -> ChatConversation {
