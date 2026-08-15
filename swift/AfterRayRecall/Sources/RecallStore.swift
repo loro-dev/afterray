@@ -7,9 +7,16 @@ public final class RecallStore: ObservableObject {
     @Published public private(set) var playheadMs: Int64 = 0
     @Published public private(set) var selectedIndex: Int = 0
     @Published public private(set) var loadState: RecallLoadState = .ready
+    @Published public private(set) var daySummary: DaySummary = .empty
+    @Published public private(set) var summaryHistory: [DaySummary] = []
+    @Published public private(set) var summaryHistoryHasMore = false
+    @Published public private(set) var isLoadingSummaryHistory = false
 
     private let daemon: any RecallDaemonServing
     private var sensitiveGeneration: UInt64 = 0
+    private var loadedDayKey: String?
+    private var summaryHistoryCursorMs: Int64?
+    private var summaryHistoryGeneration: UInt64 = 0
 
     public init(daemon: any RecallDaemonServing) {
         self.daemon = daemon
@@ -27,6 +34,7 @@ public final class RecallStore: ObservableObject {
             guard sensitiveGeneration == requestGeneration else { return }
             sessions = loadedSessions
             apply(loaded, preservingSelection: preservingSelection)
+            await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
@@ -34,6 +42,8 @@ public final class RecallStore: ObservableObject {
             }
             moments = []
             applyPlayhead(0)
+            daySummary = .empty
+            loadedDayKey = nil
             loadState = .failed(message: error.localizedDescription)
         }
     }
@@ -61,6 +71,7 @@ public final class RecallStore: ObservableObject {
             let existingOverlap = Array(moments.dropFirst(prefix.count))
             guard existingOverlap != updated else { return }
             apply(Array(prefix) + updated, preservingSelection: preservingSelection)
+            await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
@@ -80,6 +91,7 @@ public final class RecallStore: ObservableObject {
         let loaded = try await daemon.moments(sessionID: id).sorted { $0.capturedAtMs < $1.capturedAtMs }
         guard sensitiveGeneration == requestGeneration else { return }
         apply(loaded, selecting: momentID, preservingSelection: preservingSelection)
+        await loadDaySummary(dayMs: playheadMs, force: true)
     }
 
     private func apply(
@@ -111,11 +123,20 @@ public final class RecallStore: ObservableObject {
     }
 
     public func openSearchHit(_ hit: RecallSearchHit) async {
+        await openMoment(id: hit.momentId)
+    }
+
+    /// Reloads the timeline and parks the playhead on `momentID`.
+    ///
+    /// The full reload is the point: a search hit is routinely outside the
+    /// window currently in memory.
+    public func openMoment(id momentID: String) async {
         let requestGeneration = sensitiveGeneration
         do {
             let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
             guard sensitiveGeneration == requestGeneration else { return }
-            apply(loaded, selecting: hit.momentId)
+            apply(loaded, selecting: momentID)
+            await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) { return }
@@ -123,8 +144,75 @@ public final class RecallStore: ObservableObject {
         }
     }
 
+    /// Moves the playhead to a moment already in memory.
+    ///
+    /// Returns `false` when it is not loaded, so callers stepping through
+    /// search results can fall back to `openMoment` instead of paying for a
+    /// full timeline reload on every step.
+    @discardableResult
+    public func selectLoaded(momentID: String) -> Bool {
+        guard let moment = moments.first(where: { $0.id == momentID }) else { return false }
+        applyPlayhead(moment.capturedAtMs)
+        return true
+    }
+
     public func select(playheadMs ms: Int64) {
         applyPlayhead(ms)
+    }
+
+    public func loadDaySummary(dayMs: Int64, force: Bool = false) async {
+        let key = DaySummaryLayout.localDayKey(ms: dayMs)
+        if !force, key == loadedDayKey { return }
+        let requestGeneration = sensitiveGeneration
+        do {
+            let loaded = try await daemon.daySummary(dayMs: dayMs)
+            guard sensitiveGeneration == requestGeneration else { return }
+            daySummary = loaded
+            loadedDayKey = key
+            summaryHistoryGeneration &+= 1
+            summaryHistory = [loaded]
+            summaryHistoryCursorMs = loaded.dayStartMs
+            summaryHistoryHasMore = true
+            isLoadingSummaryHistory = false
+            await loadOlderSummaryHistory()
+        } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
+            if Self.isDaemonConnectionError(error) { return }
+        }
+    }
+
+    /// Fetches one small page when the history-summary panel reaches its
+    /// bottom. Keeping this cursor in the store avoids virtual-list rows ever
+    /// querying the daemon on their own.
+    public func loadOlderSummaryHistory() async {
+        guard summaryHistoryHasMore,
+              !isLoadingSummaryHistory,
+              let beforeMs = summaryHistoryCursorMs
+        else { return }
+
+        isLoadingSummaryHistory = true
+        let requestGeneration = summaryHistoryGeneration
+        let sensitiveRequestGeneration = sensitiveGeneration
+        do {
+            let page = try await daemon.summaryHistory(beforeMs: beforeMs, limit: 7)
+            guard sensitiveGeneration == sensitiveRequestGeneration,
+                  summaryHistoryGeneration == requestGeneration
+            else { return }
+            let knownDays = Set(summaryHistory.map(\.dayStartMs))
+            summaryHistory.append(contentsOf: page.days.filter { !knownDays.contains($0.dayStartMs) })
+            summaryHistoryCursorMs = page.nextBeforeMs
+            summaryHistoryHasMore = page.hasMore && page.nextBeforeMs != nil
+        } catch {
+            guard sensitiveGeneration == sensitiveRequestGeneration,
+                  summaryHistoryGeneration == requestGeneration
+            else { return }
+            if !Self.isDaemonConnectionError(error) {
+                summaryHistoryHasMore = false
+            }
+        }
+        if summaryHistoryGeneration == requestGeneration {
+            isLoadingSummaryHistory = false
+        }
     }
 
     public func select(index: Int) {
@@ -158,6 +246,13 @@ public final class RecallStore: ObservableObject {
         sessions = []
         moments = []
         applyPlayhead(0)
+        daySummary = .empty
+        summaryHistory = []
+        summaryHistoryHasMore = false
+        summaryHistoryCursorMs = nil
+        summaryHistoryGeneration &+= 1
+        isLoadingSummaryHistory = false
+        loadedDayKey = nil
         loadState = .ready
     }
 
@@ -210,6 +305,17 @@ public actor RecallImageRepository {
             inFlight[artifactID] = nil
             throw error
         }
+    }
+
+    /// Filmstrip pixels. Cached alongside stills because the daemon may answer
+    /// with a full IVF frame for moments packed before thumbnails existed, and
+    /// re-fetching one of those is the expensive case worth avoiding.
+    public func thumbnail(momentID: String) async throws -> ArtifactPayload {
+        try await daemon.thumbnail(momentID: momentID, maxEdge: nil)
+    }
+
+    public func ocrEvidence(momentID: String) async throws -> OcrEvidence {
+        try await daemon.evidenceOcr(momentID: momentID)
     }
 
     public func prefetch(artifactIDs: [String]) async {

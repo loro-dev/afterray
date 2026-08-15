@@ -104,6 +104,11 @@ final class DaemonSupervisor {
             bundledName: "afterray-model-worker",
             developmentPath: "target/release/afterray-model-worker"
         ).path
+        environment["AFTERRAY_MLX_WORKER"] = try resolveExecutable(
+            environmentKey: "AFTERRAY_MLX_WORKER",
+            bundledName: "afterray-mlx-vlm-worker",
+            developmentPath: ".build/release/afterray-mlx-vlm-worker"
+        ).path
         environment["AFTERRAY_MODEL_DIR"] = defaultModelDirectory.path
         applyModelDefaults(to: &environment)
         child.environment = environment

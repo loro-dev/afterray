@@ -12,8 +12,11 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var downloadProgress: Double? { get }
     var downloadStatus: String? { get }
     var isUpdatingAudio: Bool { get }
+    var isUpdatingStorageLimit: Bool { get }
+    var isUpdatingLanguage: Bool { get }
     var recordAudio: Bool { get }
     var excludedBundleIds: [String] { get }
+    var excludedDomains: [String] { get }
     var isUpdatingExclusions: Bool { get }
     var isClearingHistory: Bool { get }
     var dataDirectoryPath: String { get }
@@ -33,12 +36,19 @@ public protocol AfterRaySettingsModeling: ObservableObject {
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
+    func setStorageLimitBytes(_ bytes: UInt64) async
+    func setUiLanguage(_ code: String) async
+    func setSummaryLanguage(_ code: String) async
     func excludeBundle(_ bundleID: String) async
     func includeBundle(_ bundleID: String) async
     func excludeFrontmostApp() async
+    func excludeChosenApp() async
+    func excludeDomain(_ input: String) async
+    func includeDomain(_ domain: String) async
     func clearHistory(_ scope: HistoryScope) async
     func reveal(_ path: String)
     func download(packID: String?) async
+    func remove(packID: String) async
     func revealLogs()
     func copyDiagnostics()
     func setLlmProvider(_ provider: LlmProvider) async
@@ -262,6 +272,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     let onClose: () -> Void
     @State private var page: AfterRaySettingsPage
     @State private var copied = false
+    @State private var confirmingMlxRemoval = false
+    @State private var domainDraft = ""
 
     public init(
         model: Model,
@@ -462,6 +474,33 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
 
         SettingsSection(
+            title: "Language",
+            footnote: "Interface language is stored for later localization. Summaries use their own language."
+        ) {
+            SettingsRow(
+                title: "Interface",
+                subtitle: "AfterRay's own chrome. Not applied yet."
+            ) {
+                languageMenu(
+                    title: "Interface language",
+                    selection: uiLanguageBinding,
+                    options: languagePickerOptions(selected: model.settings?.uiLanguage)
+                )
+            }
+            SettingsSeparator()
+            SettingsRow(
+                title: "Summaries",
+                subtitle: "Language for generated memory cards."
+            ) {
+                languageMenu(
+                    title: "Summary language",
+                    selection: summaryLanguageBinding,
+                    options: languagePickerOptions(selected: model.settings?.summaryLanguage)
+                )
+            }
+        }
+
+        SettingsSection(
             title: "Excluded apps",
             footnote: "AfterRay skips a moment when an excluded app is in front."
         ) {
@@ -472,7 +511,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     title: "Nothing excluded",
                     subtitle: "Every app you use is captured."
                 ) {
-                    excludeFrontmostButton
+                    excludeAppButtons
                 }
             } else {
                 ForEach(Array(model.excludedBundleIds.enumerated()), id: \.element) { index, bundleID in
@@ -487,7 +526,36 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     }
                 }
                 SettingsSeparator()
-                SettingsFooterBar { excludeFrontmostButton }
+                SettingsFooterBar { excludeAppButtons }
+            }
+        }
+
+        SettingsSection(
+            title: "Excluded websites",
+            footnote: "Nothing on these hosts is recorded, subdomains included. "
+                + "A page is identified by the address the browser reports, so this "
+                + "only covers browsers that publish one."
+        ) {
+            if model.excludedDomains.isEmpty {
+                SettingsRow(
+                    title: "Nothing excluded",
+                    subtitle: "Every site you visit is captured."
+                ) {
+                    addDomainField
+                }
+            } else {
+                ForEach(Array(model.excludedDomains.enumerated()), id: \.element) { index, domain in
+                    if index > 0 { SettingsSeparator() }
+                    SettingsRow(title: domain, subtitle: nil) {
+                        Button("Include") {
+                            Task { await model.includeDomain(domain) }
+                        }
+                        .buttonStyle(SettingsButtonStyle())
+                        .disabled(model.isUpdatingExclusions)
+                    }
+                }
+                SettingsSeparator()
+                SettingsFooterBar { addDomainField }
             }
         }
 
@@ -514,12 +582,51 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
     }
 
+    /// Two ways in, because they answer different questions. "Frontmost" is for
+    /// the app you are looking at right now; the picker is for the one you know
+    /// you want excluded but are not currently in — and during onboarding the
+    /// frontmost app is AfterRay itself, so the picker is the only one that works.
+    private var excludeAppButtons: some View {
+        HStack(spacing: 7) {
+            Button("Choose App…") {
+                Task { await model.excludeChosenApp() }
+            }
+            .buttonStyle(SettingsButtonStyle())
+            .disabled(model.isUpdatingExclusions)
+
+            excludeFrontmostButton
+        }
+    }
+
     private var excludeFrontmostButton: some View {
         Button("Exclude Frontmost App") {
             Task { await model.excludeFrontmostApp() }
         }
         .buttonStyle(SettingsButtonStyle())
         .disabled(model.isUpdatingExclusions)
+    }
+
+    private var addDomainField: some View {
+        HStack(spacing: 7) {
+            TextField("example.com", text: $domainDraft)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .rounded))
+                .frame(width: 170)
+                .onSubmit { submitDomain() }
+            Button("Exclude", action: submitDomain)
+                .buttonStyle(SettingsButtonStyle())
+                .disabled(
+                    model.isUpdatingExclusions
+                        || domainDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+        }
+    }
+
+    private func submitDomain() {
+        let typed = domainDraft
+        guard !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        domainDraft = ""
+        Task { await model.excludeDomain(typed) }
     }
 
     private var storageSection: some View {
@@ -543,7 +650,99 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 Text(model.storage.diskShareText)
                     .font(.settingsCaption)
                     .foregroundStyle(SettingsPalette.tertiaryLabel)
+                Rectangle()
+                    .fill(SettingsPalette.separator)
+                    .frame(height: 1)
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Memory limit")
+                            .font(.settingsRowTitle)
+                            .foregroundStyle(SettingsPalette.label)
+                        Text("Oldest unstarred moments are removed first. Favorites and a small metadata overhead may exceed this limit.")
+                            .font(.settingsRowSubtitle)
+                            .foregroundStyle(SettingsPalette.secondaryLabel)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 16)
+                    if model.isUpdatingStorageLimit {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Picker("Memory limit", selection: storageLimitBinding) {
+                        ForEach(storageLimitOptions, id: \.self) { bytes in
+                            Text(AfterRayStorageSnapshot.byteCount(bytes)).tag(bytes)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 110)
+                    .disabled(model.isUpdatingStorageLimit)
+                }
             }
+        }
+    }
+
+    private var storageLimitOptions: [UInt64] {
+        let presets: [UInt64] = [
+            10_000_000_000,
+            25_000_000_000,
+            50_000_000_000,
+            100_000_000_000,
+            250_000_000_000,
+            500_000_000_000,
+            1_000_000_000_000,
+        ]
+        let current = model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes
+        return Array(Set(presets + [current])).sorted()
+    }
+
+    private var storageLimitBinding: Binding<UInt64> {
+        Binding(
+            get: { model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes },
+            set: { bytes in Task { await model.setStorageLimitBytes(bytes) } }
+        )
+    }
+
+    private var uiLanguageBinding: Binding<String> {
+        Binding(
+            get: { model.settings?.uiLanguage ?? AppSettings.defaultLanguage },
+            set: { code in Task { await model.setUiLanguage(code) } }
+        )
+    }
+
+    private var summaryLanguageBinding: Binding<String> {
+        Binding(
+            get: { model.settings?.summaryLanguage ?? AppSettings.defaultLanguage },
+            set: { code in Task { await model.setSummaryLanguage(code) } }
+        )
+    }
+
+    private func languagePickerOptions(selected: String?) -> [LanguageOption] {
+        model.settings?.languagePickerOptions(selected: selected ?? AppSettings.defaultLanguage)
+            ?? [LanguageOption.followSystem]
+    }
+
+    private func languageMenu(
+        title: String,
+        selection: Binding<String>,
+        options: [LanguageOption]
+    ) -> some View {
+        HStack(spacing: 8) {
+            if model.isUpdatingLanguage {
+                ProgressView().controlSize(.mini)
+            }
+            Picker(title, selection: selection) {
+                ForEach(options) { option in
+                    Text(option.menuTitle)
+                        .tag(option.code)
+                        .accessibilityLabel(option.englishName)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(minWidth: 132, maxWidth: 176)
+            .disabled(model.isUpdatingLanguage)
+            .accessibilityLabel(title)
         }
     }
 
@@ -607,7 +806,9 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 SettingsPill("Built in", tone: .neutral)
             }
             if let library = model.library {
-                ForEach(library.packs) { pack in
+                ForEach(library.packs.filter {
+                    $0.id != qwen35MlxPackID && $0.id != qwen35Mlx9BPackID
+                }) { pack in
                     SettingsSeparator()
                     modelPackRow(pack)
                 }
@@ -688,6 +889,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         switch model.settings?.llmProvider ?? .builtin {
         case .builtin:
             "Downloads Qwen3.6-27B Q4 (~17 GB) and runs it on this Mac. Capture keeps working without it."
+        case .mlxLocal:
+            "Choose Qwen3.5 4B or the optional higher-quality 9B pack. Both run inside AfterRay through MLX."
         case .ollama:
             "AfterRay talks to Ollama over HTTP on this Mac. Nothing leaves the machine."
         case .openaiCompatible:
@@ -709,10 +912,160 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         switch model.settings?.llmProvider ?? .builtin {
         case .builtin:
             EmptyView()
+        case .mlxLocal:
+            mlxLocalPanel
         case .ollama:
             ollamaPanel
         case .openaiCompatible:
             openaiPanel
+        }
+    }
+
+    private let qwen35MlxPackID = "llm_qwen35_4b_mlx4"
+    private let qwen35Mlx9BPackID = "llm_qwen35_9b_mlx4"
+
+    @ViewBuilder
+    private var mlxLocalPanel: some View {
+        let selectedPackID = selectedMlxPackID
+        if let pack = model.library?.packs.first(where: { $0.id == selectedPackID }) {
+            VStack(alignment: .leading, spacing: 12) {
+                SettingsField(label: "Model") {
+                    Picker("AfterRay MLX model", selection: mlxModelBinding) {
+                        Text("Recommended · Qwen3.5 4B").tag(qwen35MlxPackID)
+                        Text("Higher quality · Qwen3.5 9B").tag(qwen35Mlx9BPackID)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .disabled(model.isUpdatingLlm)
+                }
+                HStack(spacing: 8) {
+                    SettingsPill(mlxStateLabel(pack.state), tone: mlxStateTone(pack.state))
+                    Text("mlx-community · Apache 2.0")
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                    Spacer(minLength: 8)
+                    if pack.state == .downloading || pack.state == .verifying {
+                        ProgressView().controlSize(.mini)
+                    }
+                }
+
+                Text(mlxDescription(for: pack.id))
+                    .font(.settingsCaption)
+                    .foregroundStyle(SettingsPalette.secondaryLabel)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let error = pack.error, !error.isEmpty {
+                    Text(error)
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.danger)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let download = model.library?.download,
+                   download.packId == pack.id,
+                   download.state == .downloading || download.state == .verifying
+                {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(download.state == .verifying ? "Verifying files…" : "Downloading model…")
+                                .font(.settingsCaption)
+                                .foregroundStyle(SettingsPalette.secondaryLabel)
+                            Spacer()
+                            if let percent = download.percent {
+                                Text("\(percent)%")
+                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                    .monospacedDigit()
+                            }
+                        }
+                        ProgressView(value: download.fraction ?? 0)
+                            .progressViewStyle(.linear)
+                            .tint(SettingsPalette.accent)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    switch pack.state {
+                    case .notDownloaded, .failed:
+                        Button(pack.state == .failed ? "Retry Download" : "Download \(mlxDownloadLabel(for: pack.id))") {
+                            Task { await model.download(packID: pack.id) }
+                        }
+                        .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                        .disabled(model.downloadingID != nil)
+                    case .ready, .inUse:
+                        Button("Show Files") { model.reveal(pack.path) }
+                            .buttonStyle(SettingsButtonStyle())
+                        Button("Remove…") { confirmingMlxRemoval = true }
+                            .buttonStyle(SettingsButtonStyle())
+                            .disabled(pack.state == .inUse || model.downloadingID != nil)
+                    case .downloading, .verifying, .incompatible:
+                        EmptyView()
+                    }
+                    Spacer()
+                }
+            }
+            .confirmationDialog(
+                "Remove \(pack.name) from this Mac?",
+                isPresented: $confirmingMlxRemoval,
+                titleVisibility: .visible
+            ) {
+                Button("Remove Download", role: .destructive) {
+                    Task { await model.remove(packID: pack.id) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("AfterRay can download the verified snapshot again later.")
+            }
+        } else {
+            Text("The managed MLX model is unavailable in this daemon build.")
+                .font(.settingsCaption)
+                .foregroundStyle(SettingsPalette.secondaryLabel)
+        }
+    }
+
+    private var selectedMlxPackID: String {
+        let candidate = model.settings?.llmModel.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return [qwen35MlxPackID, qwen35Mlx9BPackID].contains(candidate) ? candidate : qwen35MlxPackID
+    }
+
+    private var mlxModelBinding: Binding<String> {
+        Binding(
+            get: { selectedMlxPackID },
+            set: { next in
+                model.draftLlmModel = next
+                Task { await model.saveLlmConnection() }
+            }
+        )
+    }
+
+    private func mlxDownloadLabel(for packID: String) -> String {
+        packID == qwen35Mlx9BPackID ? "~5.97 GB" : "~3.06 GB"
+    }
+
+    private func mlxDescription(for packID: String) -> String {
+        if packID == qwen35Mlx9BPackID {
+            return "Pinned Qwen3.5-9B 4-bit VLM. It is the higher-quality option and downloads approximately 5.97 GB. Requires Apple Silicon and macOS 14 or later; check unified-memory headroom before downloading."
+        }
+        return "Pinned Qwen3.5-4B 4-bit VLM. Requires Apple Silicon and macOS 14 or later; download size is approximately 3.06 GB. On M2, 8 GB is experimental; 16 GB and 24 GB remain subject to real-device validation."
+    }
+
+    private func mlxStateLabel(_ state: ModelPackState) -> String {
+        switch state {
+        case .notDownloaded: "Not downloaded"
+        case .downloading: "Downloading"
+        case .verifying: "Verifying"
+        case .ready: "Ready"
+        case .inUse: "Loaded"
+        case .failed: "Failed"
+        case .incompatible: "Incompatible"
+        }
+    }
+
+    private func mlxStateTone(_ state: ModelPackState) -> SettingsTone {
+        switch state {
+        case .ready, .inUse: .positive
+        case .downloading, .verifying: .neutral
+        case .notDownloaded: .warning
+        case .failed, .incompatible: .danger
         }
     }
 
@@ -898,12 +1251,17 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private func packStatus(_ pack: ModelPack) -> String {
+        if pack.state == .failed { return "Failed" }
+        if pack.state == .incompatible { return "Incompatible" }
+        if pack.state == .verifying { return "Verifying" }
+        if pack.state == .inUse { return "Loaded" }
         if pack.present { return "Ready" }
         if pack.bytes > 0 { return "Incomplete" }
         return pack.required ? "Needed" : "Optional"
     }
 
     private func packTone(_ pack: ModelPack) -> SettingsTone {
+        if pack.state == .failed || pack.state == .incompatible { return .danger }
         if pack.present { return .positive }
         if pack.bytes > 0 { return .warning }
         return pack.required ? .warning : .neutral

@@ -273,6 +273,161 @@ final class TimelineLayoutTests: XCTestCase {
         XCTAssertTrue(toLive.isLive)
     }
 
+    // MARK: - Scroll-path optimisations
+    //
+    // Lookup, culling and caching were rewritten to stop a scroll tick from
+    // re-scanning the whole day. These pin the behaviour that rewrite must
+    // preserve; the reference implementations below are the code they replaced.
+
+    func testBinarySearchAgreesWithTheLinearScanItReplaced() {
+        let moments = clusteredShortSwitchesThenLongRun()
+        let layout = TimelineLayout(moments: moments, viewportWidth: 1_000, density: 0.12)
+
+        var time = layout.startMs - 5_000
+        while time <= layout.endMs + 5_000 {
+            XCTAssertEqual(
+                layout.run(containingMs: time)?.id,
+                linearRun(containingMs: time, in: layout.runs)?.id,
+                "run lookup diverged at \(time)"
+            )
+            XCTAssertEqual(
+                RecallPlayhead.resolveIndex(playheadMs: time, moments: moments),
+                linearResolveIndex(playheadMs: time, moments: moments),
+                "playhead index diverged at \(time)"
+            )
+            time += 250
+        }
+
+        var x = -40 as CGFloat
+        while x <= layout.contentWidth + 40 {
+            XCTAssertEqual(
+                layout.run(atX: x)?.id,
+                linearRun(atX: x, in: layout.runs)?.id,
+                "run-at-x diverged at \(x)"
+            )
+            x += 3
+        }
+    }
+
+    /// The track is wider than the screen by a large factor. Drawing only the
+    /// visible slice is the point — but it must be the *whole* visible slice,
+    /// or segments pop in at the edges while scrolling.
+    func testVisibleSliceCoversTheRangeAndNothingElse() {
+        let moments = evenlySpacedMoments(count: 900)
+        let layout = TimelineLayout(moments: moments, viewportWidth: 900, density: 4)
+        XCTAssertGreaterThan(layout.contentWidth, 3_000)
+
+        for start in stride(from: CGFloat(0), through: layout.contentWidth, by: 137) {
+            let range = start...(start + 600)
+            let slice = layout.runs(intersecting: range)
+            let expected = layout.runs.filter { $0.startX <= range.upperBound && $0.endX >= range.lowerBound }
+            XCTAssertEqual(
+                slice.map(\.id),
+                expected.map(\.id),
+                "culled slice at \(start) is not the set of runs touching the range"
+            )
+        }
+    }
+
+    func testEveryRunIsDrawnAtLeastOnceAcrossAFullScroll() {
+        let moments = clusteredShortSwitchesThenLongRun()
+        let layout = TimelineLayout(moments: moments, viewportWidth: 300, density: 2)
+        var seen = Set<Int>()
+        for centre in stride(from: CGFloat(0), through: layout.contentWidth, by: 25) {
+            seen.formUnion(layout.runs(intersecting: (centre - 150)...(centre + 150)).map(\.id))
+        }
+        XCTAssertEqual(seen.count, layout.runs.count, "scrolling past a run must draw it")
+    }
+
+    func testFavouritesArePlacedWhereTheTimeMapsThem() {
+        var moments = evenlySpacedMoments(count: 40)
+        moments[3].isFavorite = true
+        moments[21].isFavorite = true
+        let layout = TimelineLayout(moments: moments, viewportWidth: 800, density: 0.4)
+
+        XCTAssertEqual(layout.favorites.map(\.id), ["m3", "m21"])
+        for favorite in layout.favorites {
+            let moment = try? XCTUnwrap(moments.first { $0.id == favorite.id })
+            XCTAssertEqual(favorite.x, layout.x(ms: moment?.capturedAtMs ?? 0), accuracy: 0.001)
+        }
+    }
+
+    /// The layout was a computed property, so one scroll tick built it three
+    /// times. It must now survive a frame untouched, and still notice every
+    /// input that genuinely changes it.
+    func testCacheRebuildsOnlyWhenAnInputChanges() {
+        let moments = evenlySpacedMoments(count: 300)
+        let cache = TimelineLayoutCache()
+
+        let first = cache.layout(moments: moments, viewportWidth: 800, density: 0.12)
+        // A scroll tick reads the layout three times. None of them may rebuild.
+        for _ in 0..<300 {
+            _ = cache.layout(moments: moments, viewportWidth: 800, density: 0.12)
+        }
+        XCTAssertEqual(cache.scans, 1, "a steady scroll must not rescan the captures")
+        XCTAssertEqual(cache.placements, 1, "a steady scroll must not re-place the runs")
+
+        let zoomed = cache.layout(moments: moments, viewportWidth: 800, density: 0.48)
+        XCTAssertGreaterThan(zoomed.contentWidth, first.contentWidth)
+        // Zoom re-places the runs but must not touch the captures again.
+        XCTAssertEqual(cache.scans, 1)
+        XCTAssertEqual(cache.placements, 2)
+
+        let resized = cache.layout(moments: moments, viewportWidth: 1_600, density: 0.48)
+        XCTAssertGreaterThanOrEqual(resized.contentWidth, zoomed.contentWidth)
+        XCTAssertEqual(cache.scans, 1)
+
+        var grown = moments
+        grown.append(moment(id: "extra", at: 9_000_000, app: "Zed", bundle: "zed"))
+        let extended = cache.layout(moments: grown, viewportWidth: 1_600, density: 0.48)
+        XCTAssertEqual(extended.moments.count, grown.count)
+        XCTAssertGreaterThan(extended.runs.count, resized.runs.count)
+        XCTAssertEqual(cache.scans, 2, "new captures must invalidate the spine")
+    }
+
+    /// Re-placing a spine at a new width is the zoom path. It must land on the
+    /// same layout as building from scratch, or zooming would drift.
+    func testSpineReplacementMatchesAFullBuild() {
+        let moments = clusteredShortSwitchesThenLongRun()
+        let spine = TimelineSpine(moments: moments)
+        let replaced = TimelineLayout(
+            spine: spine,
+            moments: moments,
+            viewportWidth: 640,
+            density: 0.9
+        )
+        let built = TimelineLayout(moments: moments, viewportWidth: 640, density: 0.9)
+        XCTAssertEqual(replaced, built)
+    }
+
+    private func linearRun(containingMs ms: Int64, in runs: [AppUsageRun]) -> AppUsageRun? {
+        guard let last = runs.last else { return nil }
+        if let match = runs.dropLast().first(where: { $0.contains(ms: ms, isLast: false) }) {
+            return match
+        }
+        if last.contains(ms: ms, isLast: true) || ms >= last.startMs { return last }
+        return runs.first
+    }
+
+    private func linearRun(atX x: CGFloat, in runs: [AppUsageRun]) -> AppUsageRun? {
+        guard let last = runs.last else { return nil }
+        if let match = runs.dropLast().first(where: { $0.contains(x: x, isLast: false) }) {
+            return match
+        }
+        if last.contains(x: x, isLast: true) || x >= last.startX { return last }
+        return runs.first
+    }
+
+    private func linearResolveIndex(playheadMs: Int64, moments: [RecallMoment]) -> Int? {
+        guard !moments.isEmpty else { return nil }
+        if playheadMs < moments[0].capturedAtMs { return 0 }
+        var resolved = 0
+        for (index, moment) in moments.enumerated() {
+            if moment.capturedAtMs <= playheadMs { resolved = index } else { break }
+        }
+        return resolved
+    }
+
     private func evenlySpacedMoments(count: Int) -> [RecallMoment] {
         (0..<count).map { index in
             moment(

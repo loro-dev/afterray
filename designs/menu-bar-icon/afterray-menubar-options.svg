@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720">
+  <defs>
+    <g id="simple" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+      <path d="M1.6 16.4 5.8 12.2M12.2 5.8 16.4 1.6"/>
+      <circle cx="9" cy="9" r="4.75"/>
+    </g>
+
+    <g id="weighted">
+      <g fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round">
+        <path d="M1.35 16.65 5.55 12.45M12.45 5.55 16.65 1.35"/>
+      </g>
+      <path fill="currentColor" fill-rule="evenodd"
+        d="M9 3.8a5.2 5.2 0 1 1 0 10.4A5.2 5.2 0 0 1 9 3.8Zm-.4 1.95a3.55 3.55 0 1 0 0 7.1 3.55 3.55 0 0 0 0-7.1Z"/>
+    </g>
+
+    <g id="wrapped" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M1.35 16.65 5.15 12.85c1.78 1.65 4.5 1.93 6.6.7 2.1-1.23 3.15-3.72 2.55-6.08"/>
+      <path d="M16.65 1.35 12.85 5.15c-1.78-1.65-4.5-1.93-6.6-.7-2.1 1.23-3.15 3.72-2.55 6.08"/>
+    </g>
+
+    <g id="echo" fill="none" stroke="currentColor" stroke-linecap="round">
+      <path d="M1.35 16.65 5.55 12.45M12.45 5.55 16.65 1.35" stroke-width="1.5"/>
+      <circle cx="9" cy="9" r="4.6" stroke-width="1.35"/>
+      <path d="M3.52 6.15a6.17 6.17 0 0 1 8.33-2.63M14.48 11.85a6.17 6.17 0 0 1-8.33 2.63" stroke-width=".8"/>
+    </g>
+
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="15" flood-color="#000" flood-opacity=".12"/>
+    </filter>
+  </defs>
+
+  <rect width="1120" height="720" fill="#ececec"/>
+  <text x="64" y="64" fill="#171717" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="28" font-weight="650">AfterRay menu bar mark — shape study</text>
+  <text x="64" y="94" fill="#666" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="15">Judge the 18 pt rows first. Enlarged marks reveal construction, not their real visual weight.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="64" y="126" width="992" height="104" rx="18" fill="#fafafa"/>
+    <text x="92" y="156" fill="#777" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="650">LIGHT MENU BAR · 18 PT</text>
+    <g transform="translate(152 178)" color="#202020"><use href="#simple"/></g>
+    <g transform="translate(387 178)" color="#202020"><use href="#weighted"/></g>
+    <g transform="translate(622 178)" color="#202020"><use href="#wrapped"/></g>
+    <g transform="translate(857 178)" color="#202020"><use href="#echo"/></g>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="64" y="246" width="992" height="104" rx="18" fill="#242424"/>
+    <text x="92" y="276" fill="#999" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="650">DARK MENU BAR · 18 PT</text>
+    <g transform="translate(152 298)" color="#f5f5f5"><use href="#simple"/></g>
+    <g transform="translate(387 298)" color="#f5f5f5"><use href="#weighted"/></g>
+    <g transform="translate(622 298)" color="#f5f5f5"><use href="#wrapped"/></g>
+    <g transform="translate(857 298)" color="#f5f5f5"><use href="#echo"/></g>
+  </g>
+
+  <g transform="translate(64 386)">
+    <rect width="228" height="270" rx="22" fill="#fafafa"/>
+    <text x="22" y="34" fill="#777" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="650">01 · SIMPLE HALO</text>
+    <g transform="translate(42 62) scale(8)" color="#1e1e1e"><use href="#simple"/></g>
+    <text x="22" y="232" fill="#777" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13">Previous draft</text>
+    <text x="22" y="253" fill="#999" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12">Clear, but generic</text>
+  </g>
+
+  <g transform="translate(310 386)">
+    <rect width="228" height="270" rx="22" fill="#fafafa"/>
+    <text x="22" y="34" fill="#777" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="650">02 · LENSED CORE</text>
+    <g transform="translate(42 62) scale(8)" color="#1e1e1e"><use href="#weighted"/></g>
+    <text x="22" y="232" fill="#171717" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Variable horizon weight</text>
+    <text x="22" y="253" fill="#999" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12">Bright caustic at upper right</text>
+  </g>
+
+  <g transform="translate(556 386)">
+    <rect width="228" height="270" rx="22" fill="#161616"/>
+    <text x="22" y="34" fill="#999" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="650">03 · GRAVITY WRAP</text>
+    <g transform="translate(42 62) scale(8)" color="#f5f5f5"><use href="#wrapped"/></g>
+    <text x="22" y="232" fill="#f5f5f5" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Two moments of one ray</text>
+    <text x="22" y="253" fill="#888" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12">Ownable, more abstract</text>
+  </g>
+
+  <g transform="translate(802 386)">
+    <rect width="254" height="270" rx="22" fill="#fafafa"/>
+    <text x="22" y="34" fill="#777" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="650">04 · AFTERIMAGE ECHO</text>
+    <g transform="translate(55 62) scale(8)" color="#1e1e1e"><use href="#echo"/></g>
+    <text x="22" y="232" fill="#171717" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Secondary delayed orbit</text>
+    <text x="22" y="253" fill="#999" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12">Richest, highest detail</text>
+  </g>
+</svg>

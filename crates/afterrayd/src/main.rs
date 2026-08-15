@@ -1,25 +1,32 @@
 mod agent;
 mod ask;
+mod chat;
 mod gop_packer;
 mod memory;
+mod stream;
 mod tools;
 
-use afterray_codec::CONTENT_TYPE_IVF_AV01;
+use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
-    JobState, LlmRouterAdapter, LlmRuntimeConfig, ModelAdapter, ModelCapability, ModelInput,
-    ModelOutput, ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig, download_packs,
-    library, model_directory, probe_llm, specs_for_download,
+    JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, ModelAdapter, ModelCapability,
+    ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter, PersistentMlxConfig, ProcessAdapter,
+    ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REVISION,
+    QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig, download_packs, library,
+    model_directory, probe_llm, qwen35_9b_mlx_manifest, qwen35_mlx_manifest, remove_pack,
+    spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
     apply_background_qos,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, HistoryScope, LlmProvider, ModelDownloadProgress,
-    PROTOCOL_VERSION, PackStatus, RecordingState, Request, Response, SearchHit, Status,
-    local_calendar_day_bounds_ms,
+    AppSettings, ArtifactPayload, DEFAULT_STORAGE_LIMIT_BYTES, GopReadMode, HistoryScope,
+    LlmProvider, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState, Request,
+    Response, SearchHit, Status, local_calendar_day_bounds_ms,
 };
-use afterray_store::{MacOsKeychainProvider, StoreError, Vault, VaultConfig, fuse_search_results};
+use afterray_store::{
+    MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig, fuse_search_results,
+};
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{
@@ -73,15 +80,13 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
         vault_config.data_dir = PathBuf::from(path);
     }
-    if let Ok(value) = std::env::var("AFTERRAY_MAX_UNSTARRED_MOMENTS") {
-        vault_config.max_unstarred_moments = value.parse().context("invalid retention limit")?;
-    }
     let staging_dir = vault_config.data_dir.join("capture-staging");
     let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
     if removed_staging_files > 0 {
         eprintln!("removed {removed_staging_files} stale capture staging file(s)");
     }
     let persisted = load_persisted_settings(&vault_config.data_dir);
+    vault_config.max_storage_bytes = persisted.storage_limit_bytes;
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
@@ -105,10 +110,18 @@ async fn main() -> anyhow::Result<()> {
         || PathBuf::from(".build/release/afterray-native-model-worker"),
         PathBuf::from,
     );
-    let models = ModelQueue::new(
-        local_model_adapters(native_worker_path, worker_path, Arc::clone(&llm_config)),
-        QueueConfig::default(),
-    )?;
+    let mlx_worker_path = resolve_helper_path(
+        "AFTERRAY_MLX_WORKER",
+        "afterray-mlx-vlm-worker",
+        ".build/release/afterray-mlx-vlm-worker",
+    );
+    let (adapters, llm_token_sink, mlx_adapters) = local_model_adapters(
+        native_worker_path,
+        worker_path,
+        mlx_worker_path,
+        Arc::clone(&llm_config),
+    );
+    let models = ModelQueue::new(adapters, QueueConfig::default())?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let migration_store = Arc::clone(&store);
@@ -137,8 +150,15 @@ async fn main() -> anyhow::Result<()> {
         last_capture_ms,
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
+        excluded_domains: std::sync::Mutex::new(persisted.excluded_domains.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
+        languages: std::sync::Mutex::new((
+            persisted.ui_language.clone(),
+            persisted.summary_language.clone(),
+        )),
         llm_config,
+        llm_token_sink,
+        mlx_adapters,
     });
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
@@ -147,6 +167,8 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => eprintln!("background artifact maintenance paused: {error}"),
     });
     spawn_gop_packer(Arc::clone(&state));
+    spawn_slot_summarizer(Arc::clone(&state));
+    spawn_text_df_maintainer(Arc::clone(&state));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -210,34 +232,96 @@ async fn shutdown_signal() {
 fn local_model_adapters(
     native_worker: PathBuf,
     general_worker: PathBuf,
+    mlx_worker: PathBuf,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
-) -> Vec<Arc<dyn ModelAdapter>> {
-    let llm = Arc::new(LlmRouterAdapter::new(
+) -> (
+    Vec<Arc<dyn ModelAdapter>>,
+    LlmTokenSink,
+    Vec<(String, Arc<PersistentMlxAdapter>)>,
+) {
+    let mlx_4b = new_mlx_adapter(
+        &mlx_worker,
+        QWEN35_4B_MLX_PACK_ID,
+        QWEN35_4B_MLX_REVISION,
+        qwen35_mlx_manifest(),
+    );
+    let mlx_9b = new_mlx_adapter(
+        &mlx_worker,
+        QWEN35_9B_MLX_PACK_ID,
+        QWEN35_9B_MLX_REVISION,
+        qwen35_9b_mlx_manifest(),
+    );
+    let llm = LlmRouterAdapter::new(
         ProcessAdapter::new(ProcessAdapterConfig::new(
             "llama-llm",
             ModelCapability::Llm,
             general_worker.clone(),
         )),
         llm_config,
-    ));
-    vec![
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "vision-ocr",
-            ModelCapability::Ocr,
-            native_worker,
-        ))) as Arc<dyn ModelAdapter>,
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "qwen3-asr",
-            ModelCapability::Asr,
-            general_worker.clone(),
-        ))),
-        Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-            "llama-embedding",
-            ModelCapability::Embedding,
-            general_worker,
-        ))),
-        llm,
-    ]
+    )
+    .with_mlx(QWEN35_4B_MLX_PACK_ID, Arc::clone(&mlx_4b))
+    .with_mlx(QWEN35_9B_MLX_PACK_ID, Arc::clone(&mlx_9b));
+    let token_sink = llm.token_sink();
+    (
+        vec![
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "vision-ocr",
+                ModelCapability::Ocr,
+                native_worker,
+            ))) as Arc<dyn ModelAdapter>,
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "qwen3-asr",
+                ModelCapability::Asr,
+                general_worker.clone(),
+            ))),
+            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
+                "llama-embedding",
+                ModelCapability::Embedding,
+                general_worker,
+            ))),
+            Arc::new(llm),
+        ],
+        token_sink,
+        vec![
+            (QWEN35_4B_MLX_PACK_ID.into(), mlx_4b),
+            (QWEN35_9B_MLX_PACK_ID.into(), mlx_9b),
+        ],
+    )
+}
+
+fn new_mlx_adapter(
+    worker: &Path,
+    pack_id: &str,
+    revision: &str,
+    manifest: Vec<afterray_models::ManifestFile>,
+) -> Arc<PersistentMlxAdapter> {
+    let model_dir = spec_by_id(pack_id)
+        .map(|spec| spec.path)
+        .unwrap_or_else(|| model_directory().join(pack_id));
+    let mut mlx_config = PersistentMlxConfig::new(worker, model_dir);
+    mlx_config.revision = revision.into();
+    mlx_config.manifest = manifest;
+    // Cache reuse is the normal path. `=0` remains a narrow recovery switch
+    // for a measured upstream regression; failed cache-prefill attempts retry
+    // once with a fresh session in this same model container.
+    mlx_config.enable_kv_cache = std::env::var("AFTERRAY_MLX_ENABLE_KV_CACHE")
+        .map_or(true, |value| value.trim() != "0");
+    Arc::new(PersistentMlxAdapter::new(mlx_config))
+}
+
+fn resolve_helper_path(env_key: &str, helper_name: &str, development_path: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(env_key).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let bundled = directory.join(helper_name);
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    PathBuf::from(development_path)
 }
 
 struct AppState {
@@ -254,16 +338,26 @@ struct AppState {
     last_capture_ms: Arc<AtomicI64>,
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
+    excluded_domains: std::sync::Mutex<Vec<String>>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
+    /// (ui_language, summary_language) as stored preferences; `auto` until
+    /// the user picks, resolved against the system locale at prompt time.
+    languages: std::sync::Mutex<(String, String)>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
+    llm_token_sink: LlmTokenSink,
+    mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedSettings {
     #[serde(default = "default_record_audio")]
     record_audio: bool,
+    #[serde(default = "default_storage_limit_bytes")]
+    storage_limit_bytes: u64,
     #[serde(default)]
     excluded_bundle_ids: Vec<String>,
+    #[serde(default)]
+    excluded_domains: Vec<String>,
     #[serde(default)]
     llm_provider: LlmProvider,
     #[serde(default)]
@@ -272,21 +366,66 @@ struct PersistedSettings {
     llm_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     llm_api_key: String,
+    #[serde(default = "default_language")]
+    ui_language: String,
+    #[serde(default = "default_language")]
+    summary_language: String,
+}
+
+fn default_language() -> String {
+    "auto".to_owned()
+}
+
+/// Resolves a stored language preference to the English name a model should
+/// be told to write in. `auto` follows the system language, defaulting to
+/// English when the locale is unset or unrecognised.
+/// The explicit setting always wins. `auto` asks macOS for the user's
+/// ordered language list — a GUI-launched daemon has no `LANG`, so the old
+/// environment sniffing silently answered English for everyone.
+fn resolve_summary_language(stored: &str) -> String {
+    if !stored.eq_ignore_ascii_case("auto") {
+        return afterray_protocol::language_display_name(stored);
+    }
+    let tag = afterray_platform_macos::preferred_languages()
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let code = if tag.starts_with("zh") {
+        if tag.contains("hant") || tag.contains("-tw") || tag.contains("-hk") {
+            "zh-Hant".to_owned()
+        } else {
+            "zh-Hans".to_owned()
+        }
+    } else if let Some(primary) = tag.split('-').next().filter(|part| !part.is_empty()) {
+        primary.to_owned()
+    } else {
+        "en".to_owned()
+    };
+    afterray_protocol::language_display_name(&code)
 }
 
 const fn default_record_audio() -> bool {
     true
 }
 
+const fn default_storage_limit_bytes() -> u64 {
+    DEFAULT_STORAGE_LIMIT_BYTES
+}
+
 impl Default for PersistedSettings {
     fn default() -> Self {
         Self {
             record_audio: true,
+            storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
             excluded_bundle_ids: Vec::new(),
+            excluded_domains: Vec::new(),
             llm_provider: LlmProvider::Builtin,
             llm_base_url: String::new(),
             llm_model: String::new(),
             llm_api_key: String::new(),
+            ui_language: default_language(),
+            summary_language: default_language(),
         }
     }
 }
@@ -333,6 +472,22 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                 )
                 .await?;
             }
+            Ok(Request::ChatStream {
+                conversation_id,
+                message,
+            }) => {
+                stream::handle_chat_stream(&mut write, &state, conversation_id, message).await?;
+            }
+            Ok(Request::ReadThumbnail {
+                moment_id,
+                max_edge,
+            }) => {
+                write_artifact_response(
+                    &mut write,
+                    read_moment_thumbnail(&state.store, &moment_id, max_edge),
+                )
+                .await?;
+            }
             Ok(request) => {
                 write_json_response(&mut write, &dispatch(request, &state).await).await?;
             }
@@ -374,6 +529,21 @@ async fn write_artifact_response(
     Ok(())
 }
 
+/// Runs store/CPU-heavy work on the blocking pool. Every synchronous Vault
+/// call made directly from async context occupies a tokio worker for its
+/// whole duration; a handful of card builds used to freeze the entire async
+/// surface — socket accepts and chat streams included.
+async fn run_store<T, F>(state: &Arc<AppState>, task: F) -> T
+where
+    F: FnOnce(&AppState) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || task(&state))
+        .await
+        .expect("blocking store task panicked")
+}
+
 async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
     match request {
         Request::Ping => Response::success(serde_json::json!({"pong": true})),
@@ -390,11 +560,16 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::RecordStart => record_start(state).await,
         Request::RecordStop { reason } => record_stop(state, reason.as_deref()).await,
         Request::SessionsList => into_response(state.store.sessions_sync()),
-        Request::TimelineList => into_response(state.store.timeline_sync()),
+        Request::TimelineList => run_store(state, |s| into_response(s.store.timeline_sync())).await,
         Request::TimelineSince { since_ms } => {
-            into_response(state.store.timeline_since_sync(since_ms))
+            run_store(state, move |s| {
+                into_response(s.store.timeline_since_sync(since_ms))
+            })
+            .await
         }
-        Request::MomentsList { session_id } => into_response(state.store.moments_sync(&session_id)),
+        Request::MomentsList { session_id } => {
+            run_store(state, move |s| into_response(s.store.moments_sync(&session_id))).await
+        }
         Request::RecallWindow {
             session_id,
             center_ms,
@@ -410,9 +585,13 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         },
         Request::ReadArtifact { .. }
         | Request::ReadGopSegment { .. }
-        | Request::ReadGopFrame { .. } => Response::failure(
+        | Request::ReadGopFrame { .. }
+        | Request::ReadThumbnail { .. } => Response::failure(
             "artifact reads are framed as a JSON header plus raw bytes and are handled separately",
         ),
+        Request::ChatStream { .. } => {
+            Response::failure("chat streams are framed as NDJSON events and are handled separately")
+        }
         Request::PackStatus => pack_status(state),
         Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
@@ -421,22 +600,58 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             limit,
             from_ms,
             to_ms,
-        } => {
-            match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
-                Ok(mut hits) => {
-                    if let (Some(from), Some(to)) = (from_ms, to_ms) {
-                        let (from, to) = if from <= to { (from, to) } else { (to, from) };
-                        hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
-                    }
-                    Response::success(hits)
+        } => match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
+            Ok(mut hits) => {
+                if let (Some(from), Some(to)) = (from_ms, to_ms) {
+                    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+                    hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
                 }
-                Err(error) => Response::failure(error.to_string()),
+                Response::success(hits)
             }
-        }
+            Err(error) => Response::failure(error.to_string()),
+        },
         Request::MomentGet { moment_id } => match tools::moment_detail(&state.store, &moment_id) {
             Ok(moment) => Response::success(moment),
             Err(error) => Response::failure(error),
         },
+        Request::MomentAt { at_ms } => match state.store.moment_nearest(at_ms) {
+            Ok(Some(moment_id)) => match tools::moment_detail(&state.store, &moment_id) {
+                Ok(moment) => Response::success(moment),
+                Err(error) => Response::failure(error),
+            },
+            Ok(None) => Response::failure("no moment has been captured yet"),
+            Err(error) => Response::failure(error.to_string()),
+        },
+        Request::SlotCard { at_ms } => {
+            run_store(state, move |s| into_response(slot_card_for(s, at_ms))).await
+        }
+        Request::SlotSummarize { at_ms } => slot_summarize(state, at_ms).await,
+        Request::SlotBackfill { days } => slot_backfill(state, days).await,
+        Request::DaySummary { day_ms } => {
+            run_store(state, move |s| {
+                let interval_ms =
+                    i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
+                into_response(s.store.day_summary(day_ms, interval_ms))
+            })
+            .await
+        }
+        Request::SlotPrompt { at_ms } => {
+            run_store(state, move |s| match slot_prompt_for(s, at_ms) {
+                Ok(prompt) => Response::success(prompt),
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
+        }
+        Request::SummaryHistory { before_ms, limit } => {
+            // Multi-day summary assembly is exactly the class of work the
+            // blocking pool exists for.
+            run_store(state, move |s| {
+                let interval_ms =
+                    i64::try_from(s.capture_interval.as_millis()).unwrap_or(10_000);
+                into_response(s.store.summary_history(before_ms, limit, interval_ms))
+            })
+            .await
+        }
         Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(&state.store, &moment_id) {
             Ok(evidence) => Response::success(evidence),
             Err(error) => Response::failure(error),
@@ -481,10 +696,36 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             )
             .await
         }
+        Request::ChatSend {
+            conversation_id,
+            message,
+        } => {
+            let llm_ready = ensure_remote_llm_model(state).await;
+            chat::handle_send(
+                &state.store,
+                &state.models,
+                conversation_id.as_deref(),
+                &message,
+                now_ms(),
+                llm_ready,
+            )
+            .await
+        }
+        Request::ChatList => chat::handle_list(&state.store),
+        Request::ChatHistory { conversation_id } => {
+            chat::handle_history(&state.store, &conversation_id)
+        }
+        Request::ChatDelete { conversation_id } => {
+            chat::handle_delete(&state.store, &conversation_id)
+        }
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
             record_audio,
+            ui_language,
+            summary_language,
+            storage_limit_bytes,
             excluded_bundle_ids,
+            excluded_domains,
             llm_provider,
             llm_base_url,
             llm_model,
@@ -492,19 +733,22 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         } => {
             update_settings(
                 state,
-                record_audio,
-                excluded_bundle_ids,
-                llm_provider,
-                llm_base_url,
-                llm_model,
-                llm_api_key,
+                SettingsPatch {
+                    record_audio,
+                    ui_language,
+                    summary_language,
+                    storage_limit_bytes,
+                    excluded_bundle_ids,
+                    excluded_domains,
+                    llm_provider,
+                    llm_base_url,
+                    llm_model,
+                    llm_api_key,
+                },
             )
             .await
         }
-        Request::LlmProbe {
-            provider,
-            base_url,
-        } => {
+        Request::LlmProbe { provider, base_url } => {
             let config = current_llm_config(state);
             let provider = provider.unwrap_or(config.provider);
             let base_url = base_url
@@ -518,12 +762,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     }
                 });
             Response::success(
-                probe_llm(
-                    provider,
-                    base_url.as_deref(),
-                    config.api_key.as_deref(),
-                )
-                .await,
+                probe_llm(provider, base_url.as_deref(), config.api_key.as_deref()).await,
             )
         }
         Request::ClearHistory { scope } => clear_history(state, scope).await,
@@ -533,6 +772,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             limit,
         } => into_response(state.store.memories(from_ms, to_ms, limit.clamp(1, 200))),
         Request::DownloadModels { pack_id } => download_models(state, pack_id.as_deref()).await,
+        Request::RemoveModel { pack_id } => remove_model(state, &pack_id).await,
         Request::Shutdown => {
             let _ = state.shutdown.send(true);
             Response::success(serde_json::json!({
@@ -744,10 +984,16 @@ fn current_settings(state: &AppState) -> AppSettings {
         model_dir: model_directory().display().to_string(),
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
+        storage_limit_bytes: state.store.storage_limit_bytes(),
         excluded_bundle_ids: state
             .excluded_bundle_ids
             .lock()
             .map(|ids| ids.clone())
+            .unwrap_or_default(),
+        excluded_domains: state
+            .excluded_domains
+            .lock()
+            .map(|domains| domains.clone())
             .unwrap_or_default(),
         llm_provider: llm.provider,
         llm_base_url: llm.base_url,
@@ -756,37 +1002,108 @@ fn current_settings(state: &AppState) -> AppSettings {
             .api_key
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()),
+        ui_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.0.clone()),
+        summary_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.1.clone()),
+        language_options: afterray_protocol::summary_language_options(),
     }
 }
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
-    let llm = current_llm_config(state);
-    save_persisted_settings(
-        &state.data_dir,
-        &PersistedSettings {
-            record_audio: state.capture.record_audio(),
-            excluded_bundle_ids: state
-                .excluded_bundle_ids
-                .lock()
-                .map(|ids| ids.clone())
-                .unwrap_or_default(),
-            llm_provider: llm.provider,
-            llm_base_url: llm.base_url,
-            llm_model: llm.model,
-            llm_api_key: llm.api_key.unwrap_or_default(),
-        },
-    )
+    save_persisted_settings(&state.data_dir, &persisted_settings(state))
 }
 
-async fn update_settings(
-    state: &Arc<AppState>,
+fn persisted_settings(state: &AppState) -> PersistedSettings {
+    let llm = current_llm_config(state);
+    PersistedSettings {
+        record_audio: state.capture.record_audio(),
+        storage_limit_bytes: state.store.storage_limit_bytes(),
+        excluded_bundle_ids: state
+            .excluded_bundle_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default(),
+        excluded_domains: state
+            .excluded_domains
+            .lock()
+            .map(|domains| domains.clone())
+            .unwrap_or_default(),
+        llm_provider: llm.provider,
+        llm_base_url: llm.base_url,
+        llm_model: llm.model,
+        llm_api_key: llm.api_key.unwrap_or_default(),
+        ui_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.0.clone()),
+        summary_language: state
+            .languages
+            .lock()
+            .map_or_else(|_| default_language(), |langs| langs.1.clone()),
+    }
+}
+
+/// Every field a settings update may carry. Grouped so the handler keeps
+/// one parameter as the surface grows.
+struct SettingsPatch {
     record_audio: Option<bool>,
+    ui_language: Option<String>,
+    summary_language: Option<String>,
+    storage_limit_bytes: Option<u64>,
     excluded_bundle_ids: Option<Vec<String>>,
+    excluded_domains: Option<Vec<String>>,
     llm_provider: Option<LlmProvider>,
     llm_base_url: Option<String>,
     llm_model: Option<String>,
     llm_api_key: Option<String>,
-) -> Response {
+}
+
+async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Response {
+    let SettingsPatch {
+        record_audio,
+        ui_language,
+        summary_language,
+        storage_limit_bytes,
+        excluded_bundle_ids,
+        excluded_domains,
+        llm_provider,
+        llm_base_url,
+        llm_model,
+        llm_api_key,
+    } = patch;
+    if ui_language.is_some() || summary_language.is_some() {
+        let mut pending = persisted_settings(state);
+        if let Some(value) = ui_language.clone() {
+            pending.ui_language = value;
+        }
+        if let Some(value) = summary_language.clone() {
+            pending.summary_language = value;
+        }
+        if let Ok(mut langs) = state.languages.lock() {
+            langs.0 = pending.ui_language.clone();
+            langs.1 = pending.summary_language.clone();
+        }
+        let _ = save_persisted_settings(&state.data_dir, &pending);
+    }
+    if let Some(bytes) = storage_limit_bytes {
+        let previous = state.store.storage_limit_bytes();
+        let mut pending = persisted_settings(state);
+        pending.storage_limit_bytes = bytes;
+        if let Err(error) = save_persisted_settings(&state.data_dir, &pending) {
+            return Response::failure(format!("could not save storage limit: {error}"));
+        }
+        if let Err(error) = state.store.set_storage_limit_bytes(bytes) {
+            let mut rollback = persisted_settings(state);
+            rollback.storage_limit_bytes = previous;
+            let _ = save_persisted_settings(&state.data_dir, &rollback);
+            return Response::failure(format!("could not apply storage limit: {error}"));
+        }
+    }
     if let Some(enabled) = record_audio {
         let previous = state.capture.record_audio();
         state.capture.set_record_audio(enabled);
@@ -815,11 +1132,28 @@ async fn update_settings(
             return Response::failure(format!("could not save settings: {error}"));
         }
     }
+    if let Some(domains) = excluded_domains {
+        let cleaned = normalize_domains(domains);
+        {
+            let mut excluded = state
+                .excluded_domains
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *excluded = cleaned;
+        }
+        if let Err(error) = persist_current_settings(state) {
+            return Response::failure(format!("could not save settings: {error}"));
+        }
+    }
     if llm_provider.is_some()
         || llm_base_url.is_some()
         || llm_model.is_some()
         || llm_api_key.is_some()
     {
+        let previous_llm = current_llm_config(state);
+        let previous_mlx_pack = (previous_llm.provider == LlmProvider::MlxLocal)
+            .then(|| previous_llm.mlx_pack_id().map(ToOwned::to_owned))
+            .flatten();
         {
             let mut llm = state
                 .llm_config
@@ -846,6 +1180,19 @@ async fn update_settings(
         if let Err(error) = persist_current_settings(state) {
             return Response::failure(format!("could not save assistant settings: {error}"));
         }
+        let selected_llm = current_llm_config(state);
+        let selected_mlx_pack = (selected_llm.provider == LlmProvider::MlxLocal)
+            .then(|| selected_llm.mlx_pack_id().map(ToOwned::to_owned))
+            .flatten();
+        if previous_mlx_pack != selected_mlx_pack
+            && let Some(previous_mlx_pack) = previous_mlx_pack
+            && let Some((_, adapter)) = state
+                .mlx_adapters
+                .iter()
+                .find(|(pack_id, _)| pack_id == &previous_mlx_pack)
+        {
+            adapter.shutdown().await;
+        }
     }
     Response::success(current_settings(state))
 }
@@ -859,7 +1206,8 @@ fn resolve_llm_config(persisted: &PersistedSettings) -> LlmRuntimeConfig {
             .unwrap_or(persisted.llm_provider),
         base_url: env_nonempty("AFTERRAY_LLM_BASE_URL")
             .unwrap_or_else(|| persisted.llm_base_url.clone()),
-        model: env_nonempty("AFTERRAY_LLM_CHAT_MODEL").unwrap_or_else(|| persisted.llm_model.clone()),
+        model: env_nonempty("AFTERRAY_LLM_CHAT_MODEL")
+            .unwrap_or_else(|| persisted.llm_model.clone()),
         api_key: env_nonempty("AFTERRAY_LLM_API_KEY").or_else(|| {
             let key = persisted.llm_api_key.trim();
             if key.is_empty() {
@@ -900,6 +1248,68 @@ fn is_excluded_bundle(state: &AppState, bundle_id: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// The host part of whatever the user typed. People paste a full URL as often
+/// as they type a bare host, and asking them to know the difference is a way
+/// to get an exclusion that silently never matches.
+fn normalize_domain(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_matches('/');
+    let without_scheme = trimmed
+        .split_once("://")
+        .map_or(trimmed, |(_, rest)| rest);
+    // Drop userinfo, then path/query/fragment, then port.
+    let after_userinfo = without_scheme
+        .rsplit_once('@')
+        .map_or(without_scheme, |(_, rest)| rest);
+    let host = after_userinfo
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once(':')
+        // An IPv6 literal has colons of its own; only strip a numeric port.
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(after_userinfo.split(['/', '?', '#']).next().unwrap_or_default(), |(head, _)| head);
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    Some(host)
+}
+
+fn normalize_domains(inputs: Vec<String>) -> Vec<String> {
+    let mut cleaned = inputs
+        .iter()
+        .filter_map(|input| normalize_domain(input))
+        .collect::<Vec<_>>();
+    cleaned.sort();
+    cleaned.dedup();
+    cleaned
+}
+
+/// Subdomains are covered: excluding `example.com` has to stop
+/// `mail.example.com` too, or the exclusion is a false promise. It must not
+/// stop `notexample.com`, which is a different site entirely.
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn is_excluded_url(state: &AppState, url: Option<&str>) -> bool {
+    let Some(host) = url.and_then(normalize_domain) else {
+        return false;
+    };
+    state
+        .excluded_domains
+        .lock()
+        .map(|domains| {
+            domains
+                .iter()
+                .any(|domain| host_matches_domain(&host, domain))
+        })
+        .unwrap_or(false)
+}
+
 async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
     let now = now_ms();
     let (from_ms, to_ms) = match scope {
@@ -907,13 +1317,7 @@ async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
         HistoryScope::Today => local_calendar_day_bounds_ms(now),
         HistoryScope::All => (0, now),
     };
-    memory::flush(
-        &state.store,
-        &state.models,
-        &state.memories,
-        llm_is_ready(state),
-    )
-    .await;
+    memory::flush(&state.store, &state.memories);
     match state.store.delete_history(from_ms, to_ms) {
         Ok(deleted) => Response::success(serde_json::json!({
             "scope": scope,
@@ -945,7 +1349,7 @@ fn save_persisted_settings(data_dir: &Path, settings: &PersistedSettings) -> std
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
-    memory::flush(&state.store, &state.models, &state.memories, llm_is_ready(state)).await;
+    memory::flush(&state.store, &state.memories);
     let _ = state
         .store
         .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
@@ -1173,7 +1577,12 @@ async fn import_artifact(
         ArtifactKind::Accessibility => {
             let metadata =
                 serde_json::from_slice::<AccessibilityMetadata>(&bytes).unwrap_or_default();
-            if is_excluded_bundle(state, metadata.bundle_identifier.as_deref()) {
+            // The URL only exists in this snapshot, so a page on an excluded
+            // host is identified here or not at all — the screen JPEG has
+            // already landed by now and has to be deleted, not skipped.
+            if is_excluded_bundle(state, metadata.bundle_identifier.as_deref())
+                || is_excluded_url(state, metadata.url.as_deref())
+            {
                 if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
                 {
                     let _ = state.store.delete_moment_and_artifacts(&moment_id);
@@ -1193,14 +1602,11 @@ async fn import_artifact(
                 {
                     memory::observe_and_maybe_commit(
                         &state.store,
-                        &state.models,
                         &state.memories,
                         started_at_ms,
                         &moment_id,
                         &bytes,
-                        llm_is_ready(state),
-                    )
-                    .await;
+                    );
                 }
             } else {
                 eprintln!(
@@ -1217,6 +1623,10 @@ async fn import_artifact(
 struct AccessibilityMetadata {
     application_name: Option<String>,
     bundle_identifier: Option<String>,
+    /// Present when the foreground app exposes one — browsers do, via the web
+    /// area's `AXURL`. This is the only place a page's address is visible;
+    /// the screenshot itself carries no such thing.
+    url: Option<String>,
 }
 
 fn attach_accessibility_artifact(
@@ -1330,6 +1740,398 @@ fn limit_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
     hits
 }
 
+/// Runs the T2 pass: T1 card → configured model → parsed card.
+///
+/// Goes through `ModelQueue` like every other inference, so the builtin
+/// GGUF worker, Ollama and any OpenAI-compatible endpoint are all reachable
+/// by switching settings alone. Emits `slot.t2` carrying the same
+/// `slot_start_ms` as the `slot.t1` line, so a card's full history is
+/// recoverable from the log.
+async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
+    match run_slot_t2(state, at_ms).await {
+        Ok(value) => Response::success(value),
+        Err(error) => Response::failure(error),
+    }
+}
+
+/// One T2 pass over the slot containing `at_ms`: render the prompt, run it
+/// through the configured model, persist the card. Shared by the RPC and the
+/// background sweeper so both agree on what "summarised" means.
+async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
+    /// Rounds are model calls, so this bounds both cost and transcript
+    /// growth. The transcript is append-only — never clipped — so a
+    /// prefix-caching runtime re-prefills only each round's delta.
+    const T2_MAX_ROUNDS: usize = 8;
+
+    let started = std::time::Instant::now();
+    let inputs = run_store(state, move |s| slot_t2_inputs(s, at_ms))
+        .await
+        .map_err(|error| error.to_string())?;
+    let slot_start_ms = inputs.card.slot_start_ms;
+
+    ensure_remote_llm_model(state).await;
+    // Reserve the LLM lane for this loop's rounds. Interactive chat still
+    // preempts; other background summaries wait until the guard drops.
+    let lease_hold = state.models.hold_llm_lease();
+    let tools = SlotT2Tools {
+        store: &state.store,
+        card: &inputs.card,
+    };
+    let turn = agent::run_agent_loop(
+        &state.models,
+        &tools,
+        inputs.system,
+        &inputs.user,
+        agent::AgentLoopConfig {
+            max_rounds: T2_MAX_ROUNDS,
+            clip_chars: None,
+            priority: afterray_models::JobPriority::Background {
+                lease: Some(lease_hold.id()),
+            },
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    drop(lease_hold);
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let mut parsed = afterray_store::parse_t2_card_v2(&turn.answer);
+    // Grounding: a claim may come from the prompt or from anything a tool
+    // returned this turn. Entities that match neither are dropped in code —
+    // the check the prompt alone can never be.
+    let verification = parsed.as_mut().map(|card| {
+        let mut evidence = inputs.user.clone();
+        for result in &turn.tool_results {
+            evidence.push('\n');
+            evidence.push_str(result);
+        }
+        let valid_ids: std::collections::HashSet<String> =
+            inputs.card.evidence.moment_ids.iter().cloned().collect();
+        afterray_store::verify_t2_card(card, &evidence, &valid_ids)
+    });
+
+    let tool_names: Vec<&str> = turn
+        .tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect();
+    eprintln!(
+        "slot.t2 slot={slot_start_ms} prompt_chars={} rounds={} tools={tool_names:?} \
+         out_chars={} latency_ms={latency_ms} parsed={} entities_dropped={}",
+        inputs.user.chars().count(),
+        turn.tool_calls.len() + 1,
+        turn.answer.chars().count(),
+        parsed.is_some(),
+        verification
+            .as_ref()
+            .map_or(0, |report| report.entities_dropped.len()),
+    );
+
+    let Some(t2) = parsed else {
+        return Err(format!(
+            "the model returned no parseable T2 card ({} chars)",
+            turn.answer.chars().count()
+        ));
+    };
+    if let Err(error) = state.store.put_t2_summary_v2(
+        &inputs.card,
+        &t2,
+        "t2-agent",
+        now_ms(),
+        i64::try_from(latency_ms).ok(),
+    ) {
+        eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
+    }
+
+    Ok(serde_json::json!({
+        "slot_start_ms": slot_start_ms,
+        "latency_ms": latency_ms,
+        "prompt_chars": inputs.user.chars().count(),
+        "card": serde_json::to_value(&t2).ok(),
+        "tool_calls": serde_json::to_value(&turn.tool_calls).ok(),
+        "tool_results": turn.tool_results,
+        "verification": serde_json::to_value(&verification).ok(),
+        "raw": turn.answer,
+    }))
+}
+
+/// How long after a slot closes before it is eligible. Frames captured near the
+/// boundary land in the vault a beat late; summarising immediately would read a
+/// slot that is still filling in.
+const T2_SETTLE_MS: i64 = 3 * 60 * 1000;
+/// How far back a sweep looks. Bounded so a first run on an old vault does not
+/// try to summarise months of history in one go — `slot backfill` is the
+/// deliberate way to do that.
+const T2_LOOKBACK_DAYS: i64 = 2;
+/// Attempts per slot per daemon run. A slot that fails this often is failing
+/// for a reason a retry loop will not fix; a restart is a good time to find out
+/// whether it has changed, so the count is deliberately not persisted.
+const T2_MAX_ATTEMPTS: u32 = 3;
+/// Slots summarised per tick. The queue is shared with OCR, so a backlog drains
+/// gradually instead of monopolising the model for minutes at a time.
+const T2_PER_TICK: usize = 2;
+/// Charge below which T2 waits even on AC — a laptop plugged in at 8% is still
+/// recovering, and a local model is the last thing it needs.
+const T2_MIN_BATTERY: f64 = 0.30;
+/// How long the machine must have been untouched. Long enough not to fire
+/// between two keystrokes, short enough to find a gap in a working morning.
+///
+/// Two minutes never opened. On a day of continuous work the idle time hovered
+/// under a minute for hours and four slots went unsummarised — the sweeper
+/// logged the same refusal every five minutes from 08:00 on. The load check
+/// below is the one that actually predicts whether the user will feel a model
+/// start; this one only needs to rule out a pause mid-sentence.
+const T2_MIN_IDLE_SECONDS: f64 = 30.0;
+/// One-minute load average per core. Above this something else already wants
+/// the machine, and the user will feel a local model piling on.
+const T2_MAX_LOAD_PER_CORE: f64 = 0.7;
+
+/// What the machine looked like when the sweeper woke up.
+#[derive(Debug, Clone, Copy)]
+struct MachineConditions {
+    on_ac: bool,
+    /// `None` on a desktop, which has no battery to conserve.
+    battery: Option<f64>,
+    idle_seconds: f64,
+    /// `None` when the load average could not be read.
+    load_per_core: Option<f64>,
+}
+
+impl MachineConditions {
+    fn probe() -> Self {
+        Self {
+            on_ac: afterray_platform_macos::on_ac_power(),
+            battery: afterray_platform_macos::battery_fraction(),
+            idle_seconds: afterray_platform_macos::seconds_since_user_input(),
+            load_per_core: afterray_platform_macos::load_per_core(),
+        }
+    }
+}
+
+/// Whether a T2 pass may run now, or the reason it may not.
+///
+/// T2 is the most expensive thing this daemon does — a local model over a
+/// 16k-character prompt — and it is never urgent. Every check here fails
+/// closed: an unreadable probe means wait, because the cost of waiting is a
+/// summary arriving late and the cost of guessing wrong is the user's machine
+/// stuttering while they work.
+fn t2_may_run(conditions: MachineConditions) -> Result<(), String> {
+    if !conditions.on_ac {
+        return Err("on battery".to_owned());
+    }
+    // A desktop reports no battery; nothing to conserve, so nothing to check.
+    if let Some(battery) = conditions.battery
+        && battery < T2_MIN_BATTERY
+    {
+        return Err(format!(
+            "battery at {:.0}% is below {:.0}%",
+            battery * 100.0,
+            T2_MIN_BATTERY * 100.0
+        ));
+    }
+    if conditions.idle_seconds < T2_MIN_IDLE_SECONDS {
+        return Err(format!(
+            "in use {:.0}s ago, needs {T2_MIN_IDLE_SECONDS:.0}s",
+            conditions.idle_seconds
+        ));
+    }
+    match conditions.load_per_core {
+        Some(load) if load > T2_MAX_LOAD_PER_CORE => Err(format!(
+            "load {load:.2}/core is above {T2_MAX_LOAD_PER_CORE:.2}"
+        )),
+        // An unreadable load average is not permission to add to it.
+        None => Err("load average unavailable".to_owned()),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Every occupied slot that T1 marked ready, has closed and settled, and has no
+/// T2 card yet — oldest first, so a backlog fills in the order it happened.
+fn slots_awaiting_t2(state: &Arc<AppState>, now: i64, lookback_days: i64) -> Vec<i64> {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+    let mut due = Vec::new();
+    for day in 0..=lookback_days.max(0) {
+        let day_ms = now - day * 24 * 60 * 60 * 1000;
+        let Ok(summary) = state.store.day_summary(day_ms, interval_ms) else {
+            continue;
+        };
+        due.extend(due_slot_starts(&summary.slots, now));
+    }
+    due.sort_unstable();
+    due.dedup();
+    due
+}
+
+/// The selection rule on its own, so the two things that make it wrong — the
+/// state filter and the settle window — can be tested without a vault.
+fn due_slot_starts(slots: &[afterray_store::DaySlot], now: i64) -> Vec<i64> {
+    slots
+        .iter()
+        // Degraded is precisely "T1 said summarise me, nothing has".
+        .filter(|slot| slot.state == SlotSummaryState::Degraded)
+        .filter(|slot| slot.slot_end_ms + T2_SETTLE_MS <= now)
+        .map(|slot| slot.slot_start_ms)
+        .collect()
+}
+
+/// Ceiling on one backfill call. The RPC blocks until it returns, and each slot
+/// is a full model round trip — better to finish and report than to hold the
+/// socket open for an hour. Re-run to continue.
+const T2_BACKFILL_CAP: usize = 40;
+
+async fn slot_backfill(state: &Arc<AppState>, days: i64) -> Response {
+    let due = slots_awaiting_t2(state, now_ms(), days);
+    let total = due.len();
+    let mut summarised = 0_usize;
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    for slot_start_ms in due.into_iter().take(T2_BACKFILL_CAP) {
+        match run_slot_t2(state, slot_start_ms).await {
+            Ok(_) => summarised += 1,
+            Err(error) => failures.push(serde_json::json!({
+                "slot_start_ms": slot_start_ms,
+                "error": error,
+            })),
+        }
+    }
+    Response::success(serde_json::json!({
+        "eligible": total,
+        "attempted": summarised + failures.len(),
+        "summarised": summarised,
+        "remaining": total.saturating_sub(T2_BACKFILL_CAP),
+        "failures": failures,
+    }))
+}
+
+/// Closes the loop the day panel was missing: T1 has been marking slots ready
+/// since capture began, but nothing ever ran T2 on them, so every row fell back
+/// to a bare app list. This is the only automatic caller.
+/// Keeps the text DF corpus current: the background frequencies that let T1
+/// tell a slot's own content from the user's everyday chrome. Small batches
+/// on a timer — a cold vault backfills two weeks over a few minutes without
+/// ever holding the store lock long.
+fn spawn_text_df_maintainer(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::spawn(async move {
+        // After the model runtimes settle; this touches only SQLite.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+        let mut total = 0_usize;
+        loop {
+            let processed = {
+                let state = Arc::clone(&state);
+                tokio::task::spawn_blocking(move || {
+                    state.store.advance_text_df(now_ms(), interval_ms, 12)
+                })
+                .await
+                .unwrap_or_else(|join| {
+                    eprintln!("text.df task panicked: {join}");
+                    Ok(0)
+                })
+                .unwrap_or_else(|error| {
+                    eprintln!("text.df advance failed: {error}");
+                    0
+                })
+            };
+            total += processed;
+            if processed > 0 && total % 96 < 12 {
+                eprintln!("text.df corpus advanced ({total} slots this run)");
+            }
+            // Drained: check twice a minute for newly closed slots. Behind:
+            // keep pulling with short pauses so a backfill finishes promptly.
+            let pause = if processed == 0 { 30 } else { 2 };
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_secs(pause)) => {}
+            }
+        }
+    });
+}
+
+fn spawn_slot_summarizer(state: Arc<AppState>) {
+    let period = Duration::from_secs(
+        std::env::var("AFTERRAY_T2_SWEEP_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+    );
+    if period.is_zero() {
+        eprintln!("slot.t2 sweeper: disabled by AFTERRAY_T2_SWEEP_SECONDS=0");
+        return;
+    }
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::spawn(async move {
+        // Long enough for the model runtime to come up; a sweep that races it
+        // just burns an attempt on every slot.
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        let mut attempts: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+        // Logged on change only. At one tick every five minutes, a machine in
+        // use all day would otherwise write the same line hundreds of times.
+        let mut blocked_reason: Option<String> = None;
+        let mut timer = tokio::time::interval(period);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                _ = timer.tick() => {}
+            }
+
+            // OCR is on the critical path for the frames still arriving; T2 is
+            // not. Yield the queue and pick the backlog up next tick.
+            if state.models.ocr_in_flight() {
+                continue;
+            }
+
+            // Cheap to check, so check before touching the vault at all.
+            if let Err(reason) = t2_may_run(MachineConditions::probe()) {
+                if blocked_reason.as_deref() != Some(reason.as_str()) {
+                    eprintln!("slot.t2 sweeper: holding off — {reason}");
+                    blocked_reason = Some(reason);
+                }
+                continue;
+            }
+            if blocked_reason.take().is_some() {
+                eprintln!("slot.t2 sweeper: conditions met, resuming");
+            }
+
+            let due = slots_awaiting_t2(&state, now_ms(), T2_LOOKBACK_DAYS);
+            let mut ran = 0;
+            for slot_start_ms in due {
+                if ran >= T2_PER_TICK {
+                    break;
+                }
+                let attempt = attempts.entry(slot_start_ms).or_default();
+                if *attempt >= T2_MAX_ATTEMPTS {
+                    continue;
+                }
+                *attempt += 1;
+                let attempt = *attempt;
+                ran += 1;
+                match run_slot_t2(&state, slot_start_ms).await {
+                    Ok(_) => {
+                        attempts.remove(&slot_start_ms);
+                        eprintln!("slot.t2 sweeper: summarised slot={slot_start_ms}");
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "slot.t2 sweeper: slot={slot_start_ms} attempt={attempt}/{T2_MAX_ATTEMPTS} failed: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("slot.t2 sweeper: stopped");
+    });
+}
+
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     let text = match state.store.session_text(session_id) {
         Ok(text) if !text.is_empty() => text,
@@ -1362,14 +2164,279 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     }
 }
 
+/// Builds the T1 card and records what it was derived from.
+///
+/// The log line is the audit trail for the T1 half of a card: which slot, how
+/// many moments went in, what the gate decided, and which map entries a T2
+/// agent will see. Pair it with the `slot.t2` line emitted by the summariser
+/// to reconstruct a card's full history.
+fn slot_card_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<afterray_store::SlotCard, afterray_store::StoreError> {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+    let card = state.store.slot_card(at_ms, interval_ms)?;
+    let (run_count, gap_count, dedup_chars) =
+        card.timeline
+            .iter()
+            .fold(
+                (0_usize, 0_usize, 0_usize),
+                |(runs, gaps, chars), entry| match entry {
+                    afterray_store::TimelineEntry::Run(run) => {
+                        (runs + 1, gaps, chars + run.total_chars)
+                    }
+                    afterray_store::TimelineEntry::Gap(_) => (runs, gaps + 1, chars),
+                },
+            );
+    eprintln!(
+        "slot.t1 slot={} day={} state={:?} moments={} ocr={} ax={} switches={} idle={:.2} \
+         runs={run_count} gaps={gap_count} revisits={} dedup_chars={dedup_chars} theme={:?}",
+        card.slot_start_ms,
+        card.local_day,
+        card.state,
+        card.facts.moment_count,
+        card.facts.ocr_moment_count,
+        card.facts.ax_moment_count,
+        card.facts.switch_count,
+        card.facts.idle_ratio,
+        card.revisits.len(),
+        card.theme_key.as_deref().unwrap_or("-"),
+    );
+    Ok(card)
+}
+
+/// Everything one T2 pass needs: the card (for the tool host and
+/// persistence) and the rendered prompt pair.
+struct SlotT2Inputs {
+    card: afterray_store::SlotCard,
+    system: &'static str,
+    user: String,
+}
+
+fn slot_t2_inputs(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<SlotT2Inputs, afterray_store::StoreError> {
+    let mut card = slot_card_for(state, at_ms)?;
+    let stored = state
+        .languages
+        .lock()
+        .map_or_else(|_| default_language(), |langs| langs.1.clone());
+    let language = resolve_summary_language(&stored);
+    let prev_cards = state
+        .store
+        .previous_slot_titles(card.slot_start_ms, 3)
+        .unwrap_or_default();
+    // History-aware rendering: the DF corpus decides which lines carry
+    // information and which are the user's everyday chrome. An empty corpus
+    // (first run) degrades to pattern-and-position scoring, never an error.
+    let background = state.store.background_stats(&card).unwrap_or_else(|error| {
+        eprintln!("slot.prompt background stats unavailable: {error}");
+        afterray_store::infoscore::BackgroundStats::empty()
+    });
+    afterray_store::attach_entity_candidates(&mut card, &background);
+    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language, &background);
+    eprintln!(
+        "slot.prompt slot={} language={language} user_chars={}",
+        card.slot_start_ms,
+        user.chars().count()
+    );
+    Ok(SlotT2Inputs {
+        card,
+        system: afterray_store::T2_SYSTEM_PROMPT_V2,
+        user,
+    })
+}
+
+/// Renders the full T2 prompt: system instructions plus the JSON card view.
+fn slot_prompt_for(
+    state: &AppState,
+    at_ms: i64,
+) -> Result<serde_json::Value, afterray_store::StoreError> {
+    let inputs = slot_t2_inputs(state, at_ms)?;
+    Ok(serde_json::json!({
+        "slot_start_ms": inputs.card.slot_start_ms,
+        "slot_end_ms": inputs.card.slot_end_ms,
+        "local_day": inputs.card.local_day,
+        "state": inputs.card.state,
+        "system": inputs.system,
+        "user": inputs.user,
+    }))
+}
+
+/// The slot-scoped tools a T2 agent may call. Every tool reads only this
+/// slot's evidence; the summariser has no business elsewhere in the vault.
+struct SlotT2Tools<'a> {
+    store: &'a afterray_store::Vault,
+    card: &'a afterray_store::SlotCard,
+}
+
+/// One page of a paginated tool result.
+const T2_TOOL_PAGE_CHARS: usize = 3_000;
+
+impl SlotT2Tools<'_> {
+    fn run_by_id(&self, id: &str) -> Option<&afterray_store::RunRow> {
+        self.card.timeline.iter().find_map(|entry| match entry {
+            afterray_store::TimelineEntry::Run(run) if run.moment_id == id => Some(run),
+            _ => None,
+        })
+    }
+
+    fn get_run_text(&self, args: &serde_json::Value) -> Result<String, String> {
+        let id = args
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "get_run_text requires id (a run id from the input)".to_owned())?;
+        let offset = args
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let run = self
+            .run_by_id(id)
+            .ok_or_else(|| format!("no run with id `{id}` in this slot"))?;
+        let full = run.lines.join("\n");
+        let total = full.chars().count();
+        if offset >= total {
+            return Ok(format!("(no text beyond offset {offset}; total {total} chars)"));
+        }
+        let page: String = full.chars().skip(offset).take(T2_TOOL_PAGE_CHARS).collect();
+        let next = offset + page.chars().count();
+        if next < total {
+            Ok(format!(
+                "{page}\n…(continues; call again with offset {next}; total {total} chars)"
+            ))
+        } else {
+            Ok(page)
+        }
+    }
+
+    fn get_transcript(&self) -> Result<String, String> {
+        let rows = self
+            .store
+            .transcripts_in_range(self.card.slot_start_ms, self.card.slot_end_ms, 400)
+            .map_err(|error| error.to_string())?;
+        if rows.is_empty() {
+            return Ok("(no speech was recorded in this half hour)".to_owned());
+        }
+        let mut out = String::new();
+        for (at_ms, track, text) in rows {
+            let line = format!(
+                "{} {}: {}\n",
+                afterray_store::slot_clock_label(at_ms),
+                track,
+                text.trim()
+            );
+            if out.chars().count() + line.chars().count() > T2_TOOL_PAGE_CHARS {
+                out.push_str("…(transcript truncated)\n");
+                break;
+            }
+            out.push_str(&line);
+        }
+        Ok(out)
+    }
+
+    fn get_ocr(&self, args: &serde_json::Value) -> Result<String, String> {
+        let id = args
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "get_ocr requires id (a run id from the input)".to_owned())?;
+        // Accept any moment in the slot, not only run anchors: the model may
+        // hold an id from a thread citation.
+        if !self.card.evidence.moment_ids.iter().any(|held| held == id) {
+            return Err(format!("`{id}` is not a frame of this slot"));
+        }
+        let row = self
+            .store
+            .ocr_evidence_for_moment(id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("no OCR stored for `{id}`"))?;
+        let (text, _layout) = row;
+        let clipped: String = text.chars().take(T2_TOOL_PAGE_CHARS).collect();
+        Ok(clipped)
+    }
+
+    fn get_prev_cards(&self, args: &serde_json::Value) -> Result<String, String> {
+        let n = args
+            .get("n")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(3)
+            .clamp(1, 8) as usize;
+        let cards = self
+            .store
+            .previous_slot_titles(self.card.slot_start_ms, n)
+            .map_err(|error| error.to_string())?;
+        if cards.is_empty() {
+            return Ok("(no earlier cards)".to_owned());
+        }
+        Ok(cards
+            .into_iter()
+            .map(|card| format!("{}: {}", card.from_label, card.title))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+impl agent::ToolSurface for SlotT2Tools<'_> {
+    async fn invoke(&self, name: &str, args: &serde_json::Value) -> Result<String, String> {
+        match name {
+            "get_run_text" => self.get_run_text(args),
+            "get_transcript" => self.get_transcript(),
+            "get_ocr" => self.get_ocr(args),
+            "get_prev_cards" => self.get_prev_cards(args),
+            other => Err(format!(
+                "unknown tool `{other}`; available: get_run_text, get_transcript, get_ocr, get_prev_cards"
+            )),
+        }
+    }
+}
+
 fn model_library(state: &AppState) -> afterray_protocol::ModelLibrary {
     let mut library = library();
-    library.download = state
+    let download = state
         .download
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    if let Some(progress) = &download
+        && let Some(pack) = library
+            .packs
+            .iter_mut()
+            .find(|pack| pack.id == progress.pack_id)
+    {
+        pack.state = progress.state;
+        pack.error.clone_from(&progress.error);
+    }
+    for (pack_id, adapter) in &state.mlx_adapters {
+        if let Some(pack) = library.packs.iter_mut().find(|pack| pack.id == *pack_id) {
+            if let Some(error) = mlx_platform_incompatibility() {
+                pack.state = afterray_protocol::ModelPackState::Incompatible;
+                pack.error = Some(error.into());
+                continue;
+            }
+            let mlx_health = adapter.health();
+            if matches!(
+                mlx_health.state,
+                afterray_protocol::ModelPackState::Verifying
+                    | afterray_protocol::ModelPackState::InUse
+                    | afterray_protocol::ModelPackState::Failed
+            ) {
+                pack.state = mlx_health.state;
+                pack.error = mlx_health.error;
+            }
+        }
+    }
+    library.download = download;
     library
+}
+
+fn mlx_platform_incompatibility() -> Option<&'static str> {
+    if !cfg!(target_os = "macos") {
+        return Some("AfterRay Local (MLX) requires macOS 14 or later on Apple Silicon");
+    }
+    if !cfg!(target_arch = "aarch64") {
+        return Some("AfterRay Local (MLX) requires Apple Silicon");
+    }
+    None
 }
 
 async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Response {
@@ -1383,10 +2450,12 @@ async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Respon
     let result = download_packs(&packs, |spec, progress| {
         let snapshot = ModelDownloadProgress {
             pack_id: spec.id.clone(),
+            state: progress.state,
             bytes: progress.bytes,
             expected_bytes: progress.expected_bytes,
             completed_files: u64::try_from(progress.completed_files).unwrap_or(0),
             total_files: u64::try_from(progress.total_files).unwrap_or(0),
+            error: None,
         };
         if let Some(percent) = progress.percent() {
             eprintln!("Downloading {} · {percent}%", spec.name);
@@ -1402,12 +2471,54 @@ async fn download_models(state: &Arc<AppState>, pack_id: Option<&str>) -> Respon
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     })
     .await;
-    *state
-        .download
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     match result {
-        Ok(()) => Response::success(model_library(state)),
+        Ok(()) => {
+            *state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            Response::success(model_library(state))
+        }
+        Err(error) => {
+            let mut download = state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(progress) = download.as_mut() {
+                progress.state = afterray_protocol::ModelPackState::Failed;
+                progress.error = Some(error.to_string());
+            }
+            Response::failure(error.to_string())
+        }
+    }
+}
+
+async fn remove_model(state: &Arc<AppState>, pack_id: &str) -> Response {
+    let Some(pack) = spec_by_id(pack_id) else {
+        return Response::failure(format!("unknown model pack `{pack_id}`"));
+    };
+    if let Some((_, adapter)) = state
+        .mlx_adapters
+        .iter()
+        .find(|(id, _)| id == pack_id)
+    {
+        adapter.shutdown().await;
+    }
+    match remove_pack(&pack) {
+        Ok(()) => {
+            let mut download = state
+                .download
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if download
+                .as_ref()
+                .is_some_and(|progress| progress.pack_id == pack_id)
+            {
+                *download = None;
+            }
+            drop(download);
+            Response::success(model_library(state))
+        }
         Err(error) => Response::failure(error.to_string()),
     }
 }
@@ -1472,6 +2583,50 @@ fn read_still_artifact(state: &AppState, artifact_id: &str) -> Result<ArtifactPa
     Ok(payload)
 }
 
+/// Smallest pixels available for a moment, for the search filmstrip.
+///
+/// Tries, in order: a cached thumbnail; building one from the hot still; the
+/// cold GOP frame itself. That last case exists only for moments packed before
+/// thumbnails shipped — this process can encode AV1 but not decode it, so the
+/// client has to do the downscaling. The packer thumbnails everything it packs,
+/// so the fallback drains as the legacy corpus ages out.
+fn read_moment_thumbnail(
+    store: &Vault,
+    moment_id: &str,
+    max_edge: Option<u32>,
+) -> Result<ArtifactPayload, StoreError> {
+    if let Some(artifact_id) = store.thumbnail_artifact_id(moment_id)? {
+        return store.read_artifact(&artifact_id);
+    }
+    let moment = store
+        .moment_by_id(moment_id)?
+        .ok_or_else(|| StoreError::MomentNotFound(moment_id.to_owned()))?;
+
+    if let Some(image_artifact_id) = moment.image_artifact_id.as_deref() {
+        let still = store.read_artifact(image_artifact_id)?;
+        let max_edge = max_edge.unwrap_or(DEFAULT_THUMBNAIL_MAX_EDGE);
+        match still_thumbnail(&still.bytes, max_edge) {
+            Ok(bytes) => {
+                let artifact_id = store.set_thumbnail(moment_id, &bytes)?;
+                return store.read_artifact(&artifact_id);
+            }
+            Err(error) => {
+                // A still we cannot re-encode is still a still. Hand over the
+                // original rather than leaving a hole in the filmstrip.
+                eprintln!("thumbnail encode failed for moment {moment_id}: {error}");
+                return Ok(still);
+            }
+        }
+    }
+
+    if let Some(gop) = moment.gop {
+        return gop_packer::read_gop_frame(store, &gop.segment_id, gop.index, GopReadMode::Exact);
+    }
+    Err(StoreError::ArtifactNotFound(format!(
+        "moment {moment_id} has no still, thumbnail, or packed frame"
+    )))
+}
+
 fn pack_status(state: &AppState) -> Response {
     match state.store.pack_status_counts() {
         Ok((running, done, failed, ready)) => Response::success(PackStatus {
@@ -1513,6 +2668,278 @@ mod tests {
     use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
     use tokio::io::AsyncReadExt;
 
+    /// People paste what is in the address bar. Every one of these means the
+    /// same site, and rejecting any of them produces an exclusion that looks
+    /// saved and silently never fires.
+    #[test]
+    fn a_domain_is_recognised_however_it_was_typed() {
+        for input in [
+            "example.com",
+            "  example.com  ",
+            "EXAMPLE.com",
+            "https://example.com",
+            "https://example.com/",
+            "http://example.com/inbox?q=1#top",
+            "example.com:8443",
+            "https://user:pw@example.com/path",
+            "example.com.",
+        ] {
+            assert_eq!(
+                normalize_domain(input).as_deref(),
+                Some("example.com"),
+                "{input}"
+            );
+        }
+    }
+
+    /// A bare word is a typo, not a host. Storing it would leave a row in the
+    /// list that can never match anything.
+    #[test]
+    fn things_that_are_not_hosts_are_rejected() {
+        for input in ["", "   ", "localhost", "https://", "/", "just some text"] {
+            assert_eq!(normalize_domain(input), None, "{input}");
+        }
+    }
+
+    /// Excluding a site has to cover its subdomains, or the promise is false:
+    /// most of what a user wants hidden lives on `mail.` or `app.`.
+    #[test]
+    fn excluding_a_domain_covers_its_subdomains() {
+        assert!(host_matches_domain("example.com", "example.com"));
+        assert!(host_matches_domain("mail.example.com", "example.com"));
+        assert!(host_matches_domain("a.b.example.com", "example.com"));
+    }
+
+    /// And must not reach past the dot. `notexample.com` is somebody else's
+    /// site, and a suffix test written with `ends_with` alone would eat it.
+    #[test]
+    fn excluding_a_domain_stops_at_the_label_boundary() {
+        assert!(!host_matches_domain("notexample.com", "example.com"));
+        assert!(!host_matches_domain("example.com.evil.test", "example.com"));
+        assert!(!host_matches_domain("example.co", "example.com"));
+        // The narrower entry must not be widened by the broader one.
+        assert!(!host_matches_domain("example.com", "mail.example.com"));
+    }
+
+    #[test]
+    fn the_saved_list_is_deduplicated_and_ordered() {
+        let cleaned = normalize_domains(vec![
+            "https://example.com/inbox".into(),
+            "EXAMPLE.COM".into(),
+            "  ".into(),
+            "bank.test".into(),
+            "not a host".into(),
+        ]);
+        assert_eq!(cleaned, vec!["bank.test".to_owned(), "example.com".to_owned()]);
+    }
+
+    /// A machine that should be summarising: plugged in, charged, untouched,
+    /// quiet. Each test spoils exactly one of those.
+    const IDEAL: MachineConditions = MachineConditions {
+        on_ac: true,
+        battery: Some(0.9),
+        idle_seconds: 600.0,
+        load_per_core: Some(0.1),
+    };
+
+    #[test]
+    fn ideal_conditions_allow_t2() {
+        assert!(t2_may_run(IDEAL).is_ok());
+    }
+
+    #[test]
+    fn each_condition_alone_blocks_t2() {
+        let cases = [
+            (
+                "battery",
+                MachineConditions {
+                    on_ac: false,
+                    ..IDEAL
+                },
+            ),
+            (
+                "low charge",
+                MachineConditions {
+                    battery: Some(0.1),
+                    ..IDEAL
+                },
+            ),
+            (
+                "in use",
+                MachineConditions {
+                    idle_seconds: 5.0,
+                    ..IDEAL
+                },
+            ),
+            (
+                "busy",
+                MachineConditions {
+                    load_per_core: Some(3.0),
+                    ..IDEAL
+                },
+            ),
+        ];
+        for (label, conditions) in cases {
+            assert!(
+                t2_may_run(conditions).is_err(),
+                "{label} should have blocked the sweep"
+            );
+        }
+    }
+
+    /// A desktop has no battery to conserve, so a missing reading is not a
+    /// reason to never summarise on one.
+    #[test]
+    fn a_machine_without_a_battery_is_not_blocked_by_charge() {
+        assert!(
+            t2_may_run(MachineConditions {
+                battery: None,
+                ..IDEAL
+            })
+            .is_ok()
+        );
+    }
+
+    /// An unreadable load average is not permission to add to it. Every other
+    /// probe fails closed and this one must too, or a machine that cannot
+    /// report load would run T2 while pinned.
+    #[test]
+    fn an_unreadable_load_average_blocks_t2() {
+        assert!(
+            t2_may_run(MachineConditions {
+                load_per_core: None,
+                ..IDEAL
+            })
+            .is_err()
+        );
+    }
+
+    /// The thresholds are boundaries, not approximations: exactly at the limit
+    /// counts as acceptable, one step past does not.
+    #[test]
+    fn thresholds_are_exact() {
+        assert!(
+            t2_may_run(MachineConditions {
+                battery: Some(T2_MIN_BATTERY),
+                ..IDEAL
+            })
+            .is_ok()
+        );
+        assert!(
+            t2_may_run(MachineConditions {
+                idle_seconds: T2_MIN_IDLE_SECONDS,
+                ..IDEAL
+            })
+            .is_ok()
+        );
+        assert!(
+            t2_may_run(MachineConditions {
+                idle_seconds: T2_MIN_IDLE_SECONDS - 0.1,
+                ..IDEAL
+            })
+            .is_err()
+        );
+        assert!(
+            t2_may_run(MachineConditions {
+                load_per_core: Some(T2_MAX_LOAD_PER_CORE),
+                ..IDEAL
+            })
+            .is_ok()
+        );
+    }
+
+    /// The reason reaches the log, so it has to name the thing that is wrong.
+    #[test]
+    fn the_block_reason_names_the_condition() {
+        let reason = t2_may_run(MachineConditions {
+            on_ac: false,
+            ..IDEAL
+        })
+        .unwrap_err();
+        assert!(reason.contains("battery"), "{reason}");
+        let reason = t2_may_run(MachineConditions {
+            idle_seconds: 3.0,
+            ..IDEAL
+        })
+        .unwrap_err();
+        assert!(reason.contains("in use"), "{reason}");
+    }
+
+    fn day_slot(start_ms: i64, state: SlotSummaryState) -> afterray_store::DaySlot {
+        afterray_store::DaySlot {
+            slot_start_ms: start_ms,
+            slot_end_ms: start_ms + afterray_store::SLOT_DURATION_MS,
+            state,
+            facts: afterray_store::SlotFacts {
+                apps: Vec::new(),
+                top_windows: Vec::new(),
+                top_documents: Vec::new(),
+                top_urls: Vec::new(),
+                has_audio: false,
+                audio_moment_count: 0,
+                moment_count: 12,
+                ocr_moment_count: 0,
+                ax_moment_count: 0,
+                switch_count: 0,
+                longest_focus_ms: 0,
+                idle_ratio: 0.0,
+            },
+            title: None,
+            bullets: None,
+            category: None,
+            description: None,
+            threads: None,
+            entities: None,
+            decisions: None,
+            not_captured: None,
+        }
+    }
+
+    /// Everything except `Degraded` is either already summarised, deliberately
+    /// skipped, or has nothing to summarise. Picking any of them up would mean
+    /// re-running the model over work it already did.
+    #[test]
+    fn only_degraded_slots_are_swept() {
+        let base = 1_700_000_000_000;
+        let long_ago = base - 10 * afterray_store::SLOT_DURATION_MS;
+        let slots = [
+            day_slot(long_ago, SlotSummaryState::Degraded),
+            day_slot(long_ago + 60_000, SlotSummaryState::Done),
+            day_slot(long_ago + 120_000, SlotSummaryState::SkippedIdle),
+            day_slot(long_ago + 180_000, SlotSummaryState::NoData),
+            day_slot(long_ago + 240_000, SlotSummaryState::Failed),
+        ];
+        assert_eq!(due_slot_starts(&slots, base), vec![long_ago]);
+    }
+
+    /// A slot is not eligible the instant it closes: frames captured near the
+    /// boundary are still landing, and summarising then reads a partial slot.
+    #[test]
+    fn a_slot_waits_out_the_settle_window() {
+        let start = 1_700_000_000_000;
+        let end = start + afterray_store::SLOT_DURATION_MS;
+        let slots = [day_slot(start, SlotSummaryState::Degraded)];
+
+        assert!(
+            due_slot_starts(&slots, end).is_empty(),
+            "closed but not settled"
+        );
+        assert!(
+            due_slot_starts(&slots, end + T2_SETTLE_MS - 1).is_empty(),
+            "one millisecond short still counts as unsettled"
+        );
+        assert_eq!(due_slot_starts(&slots, end + T2_SETTLE_MS), vec![start]);
+    }
+
+    /// The slot the user is inside right now has not closed at all.
+    #[test]
+    fn the_slot_in_progress_is_never_swept() {
+        let start = 1_700_000_000_000;
+        let slots = [day_slot(start, SlotSummaryState::Degraded)];
+        let midway = start + afterray_store::SLOT_DURATION_MS / 2;
+        assert!(due_slot_starts(&slots, midway).is_empty());
+    }
+
     #[test]
     fn stale_capture_cleanup_only_removes_files() {
         let directory = tempfile::tempdir().unwrap();
@@ -1525,17 +2952,115 @@ mod tests {
         assert_eq!(clear_stale_capture_files(directory.path()).unwrap(), 0);
     }
 
+    #[test]
+    fn legacy_settings_default_to_one_hundred_gigabytes() {
+        let settings: PersistedSettings =
+            serde_json::from_str(r#"{"record_audio":false}"#).unwrap();
+        assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+    }
+
     fn test_vault() -> (tempfile::TempDir, Vault) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 100,
+                ..VaultConfig::default()
             },
             [9_u8; 32],
         )
         .unwrap();
         (directory, vault)
+    }
+
+    /// A committed 96x64 JPEG so thumbnail tests never depend on ffmpeg.
+    fn fixture_jpeg() -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../afterray-codec/fixtures/still-96x64.jpg");
+        std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    #[test]
+    fn thumbnail_is_built_from_a_hot_still_then_cached() {
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", &fixture_jpeg())
+            .unwrap();
+        assert!(vault.thumbnail_artifact_id(&moment.id).unwrap().is_none());
+
+        let first = read_moment_thumbnail(&vault, &moment.id, Some(48)).unwrap();
+        assert_eq!(first.content_type, "image/jpeg");
+        assert!(first.bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+
+        // The build is cached, so a second read returns the same artifact
+        // instead of decoding the full still again.
+        let cached_id = vault
+            .thumbnail_artifact_id(&moment.id)
+            .unwrap()
+            .expect("thumbnail should have been cached");
+        assert_eq!(cached_id, first.id);
+        let second = read_moment_thumbnail(&vault, &moment.id, Some(48)).unwrap();
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.bytes, first.bytes);
+    }
+
+    #[test]
+    fn thumbnail_of_an_unknown_moment_fails_cleanly() {
+        let (_directory, vault) = test_vault();
+        let error = read_moment_thumbnail(&vault, "nope", None).unwrap_err();
+        assert!(
+            matches!(error, StoreError::MomentNotFound(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn packing_thumbnails_every_still_before_dropping_it() {
+        let jpegs = load_e2e_jpegs();
+        if jpegs.len() < 2 {
+            eprintln!("skip: no JPEG fixtures and ffmpeg unavailable");
+            return;
+        }
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let mut ids = Vec::new();
+        for (index, jpeg) in jpegs.iter().enumerate() {
+            let captured = 1_000 + i64::try_from(index).unwrap() * 10_000;
+            let moment = vault
+                .insert_moment(&session.id, captured, "image/jpeg", jpeg)
+                .unwrap();
+            ids.push(moment.id);
+        }
+        let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
+            archive: true,
+            require_ac: false,
+            policy: afterray_store::PackPolicy {
+                hot_window_ms: 0,
+                hot_min_stills: 0,
+                ocr_grace_ms: 0,
+                keyint: 6,
+            },
+        });
+        packer
+            .pack_one(&vault, 10_000_000)
+            .unwrap()
+            .expect("packer should emit a GOP");
+
+        // Once packed the JPEG is gone, so the thumbnail is the only cheap way
+        // back to these pixels. Every packed moment must already have one.
+        for id in &ids {
+            let moment = vault.moment_by_id(id).unwrap().unwrap();
+            if moment.gop.is_none() {
+                continue;
+            }
+            assert!(
+                moment.image_artifact_id.is_none(),
+                "packed moment kept its still"
+            );
+            let thumbnail = read_moment_thumbnail(&vault, id, None).unwrap();
+            assert_eq!(thumbnail.content_type, "image/jpeg");
+            assert!(thumbnail.bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+        }
     }
 
     fn queue(adapters: Vec<Arc<dyn ModelAdapter>>) -> ModelQueue {
@@ -1757,8 +3282,8 @@ print(json.dumps({
                     captured,
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
             ids.push(moment.id);
         }
@@ -2104,8 +3629,8 @@ print(json.dumps({
                     moment.captured_at_ms,
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
         }
         eprintln!("imported {want} JPEG bytes into an isolated vault");

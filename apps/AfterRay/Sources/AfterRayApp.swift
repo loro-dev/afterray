@@ -42,6 +42,11 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_: Notification) {
         AfterRayLog.install()
         AfterRayLog.info("application launched")
+        // Before anything else that could wedge: a hung main thread under a
+        // status-bar-level, all-spaces overlay is a locked screen. The
+        // watchdog samples the stall for the log, then kills the process so
+        // the user gets their machine back.
+        HangWatchdog.shared.start(logDirectory: AfterRayLog.directory)
         installAppMenu()
         AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()
@@ -309,17 +314,14 @@ private final class AfterRayMenuBar: NSObject {
         guard let button = statusItem?.button else { return }
         statusItem?.isVisible = true
         button.image = Self.icon()
+        button.alphaValue = isRecording ? 1 : 0.46
         let state = isRecording ? "AfterRay is recording" : "AfterRay is paused"
         button.toolTip = "\(state) · press \(shortcut.displayString) to open"
         pauseItem?.title = isRecording ? "Pause Capture" : "Resume Capture"
     }
 
     private static func icon() -> NSImage {
-        let image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "AfterRay")
-            ?? NSImage(size: NSSize(width: 18, height: 18))
-        image.size = NSSize(width: 18, height: 18)
-        image.isTemplate = true
-        return image
+        AfterRayMenuBarIcon.make()
     }
 }
 
@@ -475,6 +477,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.orderFrontRegardless()
         panel.makeFirstResponder(panel)
         AfterRayMenuBar.shared.setOverlayVisible(true)
+        OverlayVisibility.shared.set(true)
     }
 
     func hide(returnFocus: Bool) {
@@ -484,6 +487,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.orderOut(nil)
         panel.alphaValue = 1
         AfterRayMenuBar.shared.setOverlayVisible(false)
+        OverlayVisibility.shared.set(false)
         application?.activate(options: [])
     }
 
@@ -871,7 +875,10 @@ private struct AfterRayRootView: View {
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
     @ObservedObject private var settings = AfterRaySettingsController.shared
+    @StateObject private var chat: AfterRayChatModel
     @State private var isLive = true
+    @State private var isChatPresented = false
+    @State private var queryMode = ImmersiveQueryMode.search
     private let images: RecallImageRepository
 
     init() {
@@ -879,6 +886,7 @@ private struct AfterRayRootView: View {
         let repository = RecallImageRepository(daemon: daemon)
         _store = StateObject(wrappedValue: RecallStore(daemon: daemon))
         _control = StateObject(wrappedValue: AfterRayControlModel(daemon: daemon))
+        _chat = StateObject(wrappedValue: AfterRayChatModel(daemon: daemon))
         _audioPlayer = StateObject(wrappedValue: ArtifactAudioPlayer(repository: repository))
         images = repository
     }
@@ -906,7 +914,28 @@ private struct AfterRayRootView: View {
             playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
-            chromeTopPadding: controlBarTopPadding
+            recordingState: control.status?.recordingState,
+            isChangingRecording: control.isChangingRecording,
+            onToggleRecording: toggleRecording,
+            chromeTopPadding: controlBarTopPadding,
+            daySummary: store.daySummary,
+            summaryHistory: store.summaryHistory,
+            summaryHistoryHasMore: store.summaryHistoryHasMore,
+            isLoadingSummaryHistory: store.isLoadingSummaryHistory,
+            onLoadOlderSummaryHistory: {
+                Task { await store.loadOlderSummaryHistory() }
+            },
+            onVisibleDayChange: { dayMs in
+                Task { await store.loadDaySummary(dayMs: dayMs) }
+            },
+            searchSession: control.searchSession,
+            thumbnailLoader: { momentID in
+                try await images.thumbnail(momentID: momentID).bytes
+            },
+            ocrLoader: { momentID in
+                try await images.ocrEvidence(momentID: momentID)
+            },
+            onSelectSearchFrame: selectSearchFrame
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .opacity(permissions.allGranted ? 1 : 0)
@@ -917,43 +946,22 @@ private struct AfterRayRootView: View {
         )
         .overlay(alignment: .top) {
             VStack(spacing: 8) {
-                ImmersiveControlBar(
+                ImmersiveQueryBar(
                     model: control,
-                    onToggleRecording: toggleRecording,
-                    onSearch: { Task { await control.search() } },
+                    mode: $queryMode,
+                    onSubmit: submitQuery,
+                    onOpenChat: { openChat() },
+                    onStepResult: { delta in
+                        guard let session = control.searchSession else { return }
+                        selectSearchFrame(session.steppedIndex(by: delta))
+                    },
                     onClose: { RecallOverlayController.shared.hide(returnFocus: true) }
-                )
-                ImmersiveAskBar(
-                    model: control,
-                    onAsk: submitAsk,
-                    onOpenSettings: { AfterRaySettingsController.shared.show() },
-                    onSelectCitation: openAskCitation
                 )
                 if let message = control.message, !control.isRecording {
                     CaptureFailureBanner(message: message, onRetry: toggleRecording)
                 }
             }
             .padding(.top, controlBarTopPadding)
-        }
-        .overlay(alignment: .topTrailing) {
-            if isLive {
-                OverlaySettingsButton(action: { AfterRaySettingsController.shared.show() })
-                    .padding(.top, controlBarTopPadding)
-                    .padding(.trailing, RecallGeometry.overlayChromeMargin)
-            }
-        }
-        .overlay(alignment: .topTrailing) {
-            if !control.searchHits.isEmpty {
-                SearchResultsPanel(
-                    hits: control.searchHits,
-                    onSelect: openSearchHit,
-                    onDismiss: control.dismissSearch
-                )
-                .frame(width: 390)
-                .padding(.top, RecallGeometry.detailsMenuTopPadding(chromeTopPadding: controlBarTopPadding))
-                .padding(.trailing, RecallGeometry.overlayChromeMargin)
-                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
-            }
         }
         .overlay {
             if !permissions.allGranted {
@@ -971,8 +979,23 @@ private struct AfterRayRootView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
         }
+        .overlay {
+            if isChatPresented {
+                AfterRayChatOverlay(
+                    model: chat,
+                    onClose: { isChatPresented = false },
+                    onOpenMoment: openChatMoment
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            }
+        }
         .animation(.easeOut(duration: 0.16), value: settings.isPresented)
+        .animation(.easeOut(duration: 0.16), value: isChatPresented)
         .onExitCommand {
+            if isChatPresented {
+                isChatPresented = false
+                return
+            }
             audioPlayer.stop()
             RecallOverlayController.shared.hide(returnFocus: true)
         }
@@ -1001,7 +1024,7 @@ private struct AfterRayRootView: View {
                 }
             }
         }
-        .animation(.easeOut(duration: 0.14), value: control.searchHits.isEmpty)
+        .animation(.easeOut(duration: 0.14), value: control.searchSession == nil)
         .animation(.easeOut(duration: 0.14), value: control.isAsking)
         .animation(.easeOut(duration: 0.14), value: control.askAnswer == nil)
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
@@ -1040,6 +1063,8 @@ private struct AfterRayRootView: View {
             audioPlayer.stop()
             store.clearSensitiveState()
             control.clearSensitiveState()
+            chat.clearSensitiveState()
+            isChatPresented = false
             clearRecallDecodedImageCache()
             Task { await images.clearSensitiveData() }
         }
@@ -1120,21 +1145,78 @@ private struct AfterRayRootView: View {
 
     private func openSearchHit(_ hit: RecallSearchHit) {
         control.dismissSearch()
+        enterHistory()
+        Task { await store.openSearchHit(hit) }
+    }
+
+    /// Runs the query and lands on the newest match without a second click.
+    /// Recall almost always means "the thing I just had open".
+    private func submitSearch() {
+        Task {
+            guard let frame = await control.search() else { return }
+            enterHistory()
+            await store.openMoment(id: frame.momentId)
+        }
+    }
+
+    private func selectSearchFrame(_ index: Int) {
+        guard let frame = control.selectFrame(at: index) else { return }
+        enterHistory()
+        // Stepping through results stays cheap: only fall back to a full
+        // timeline reload when the frame is not already in memory.
+        if !store.selectLoaded(momentID: frame.momentId) {
+            Task { await store.openMoment(id: frame.momentId) }
+        }
+    }
+
+    private func enterHistory() {
+        guard isLive else { return }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             isLive = false
         }
-        Task { await store.openSearchHit(hit) }
     }
 
-    private func submitAsk() {
+    /// One input, two destinations. Search stays inline; a question hands the
+    /// text to the chat model and opens the full panel, because an answer needs
+    /// room the single line does not have.
+    private func submitQuery() {
+        switch queryMode {
+        case .search:
+            submitSearch()
+        case .ask:
+            let question = control.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !question.isEmpty else { return }
+            control.searchQuery = ""
+            openChat(draft: question, send: true)
+        }
+    }
+
+    private func openChat(draft: String = "", send: Bool = false) {
         control.dismissSearch()
-        Task { await control.ask() }
+        isChatPresented = true
+        if !draft.isEmpty {
+            chat.draft = draft
+        }
+        Task {
+            await chat.refresh()
+            if send { chat.send() }
+        }
     }
 
-    private func openAskCitation(_ citation: AskCitation) {
-        openSearchHit(citation.asSearchHit())
+    private func openChatMoment(_ momentID: String) {
+        isChatPresented = false
+        openSearchHit(
+            RecallSearchHit(
+                momentId: momentID,
+                sessionId: "",
+                capturedAtMs: 0,
+                source: "chat",
+                text: "",
+                score: 1
+            )
+        )
     }
 }
 
@@ -1269,69 +1351,79 @@ private struct AfterRaySettingsOverlay: View {
     }
 }
 
-private struct OverlaySettingsButton: View {
-    let action: () -> Void
 
-    var body: some View {
-        RecallChromeIconButton(
-            symbol: "gearshape",
-            help: "Settings",
-            action: action
-        )
-    }
-}
-
-private struct ImmersiveControlBar: View {
+/// One line for both ways of asking the vault a question. It stays one line in
+/// either mode — the chat panel is where an answer goes, and it opens on send
+/// or on the chat button, never merely because you pressed Tab.
+private struct ImmersiveQueryBar: View {
     @ObservedObject var model: AfterRayControlModel
-    let onToggleRecording: () -> Void
-    let onSearch: () -> Void
+    @Binding var mode: ImmersiveQueryMode
+    let onSubmit: () -> Void
+    let onOpenChat: () -> Void
+    let onStepResult: (Int) -> Void
     let onClose: () -> Void
-    @FocusState private var isSearchFocused: Bool
+    @FocusState private var isInputFocused: Bool
 
     var body: some View {
         HStack(spacing: 10) {
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(statusDotColor)
-                    .frame(width: 6, height: 6)
-                    .shadow(color: model.isRecording ? .red.opacity(0.8) : .clear, radius: 5)
-                Text(statusLabel)
+            Button(action: toggleMode) {
+                Label(mode.title, systemImage: mode.symbol)
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.72))
-            }
-
-            Button(action: onToggleRecording) {
-                Image(systemName: model.isCaptureSessionActive ? "pause.fill" : "record.circle")
-                    .frame(width: 26, height: 26)
+                    .foregroundStyle(mode == .ask ? RecallPalette.ray : .white.opacity(0.76))
+                    .padding(.horizontal, 9)
+                    .frame(height: 26)
+                    .background(.white.opacity(0.08), in: Capsule())
+                    .contentShape(Capsule())
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.white.opacity(0.82))
-            .disabled(!model.canToggleRecording)
-            .help(model.isCaptureSessionActive ? "Pause capture" : "Resume capture")
+            .help("\(mode.toggleHelp) (Tab)")
+            .accessibilityLabel("Input mode")
+            .accessibilityValue(mode.title)
+            .accessibilityHint(mode.toggleHelp)
 
             Rectangle()
                 .fill(.white.opacity(0.12))
                 .frame(width: 1, height: 18)
 
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.56))
-                TextField("Search your day", text: $model.searchQuery)
+                TextField(mode.placeholder, text: $model.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .focused($isSearchFocused)
-                    .onSubmit(onSearch)
+                    .focused($isInputFocused)
+                    .onSubmit(onSubmit)
+                    .onKeyPress(keys: [.tab], phases: .down) { _ in
+                        toggleMode()
+                        return .handled
+                    }
                 if model.isSearching {
                     ProgressView().controlSize(.small)
                 } else if !model.searchQuery.isEmpty {
-                    Button(action: model.dismissSearch) {
+                    Button(action: clearInput) {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
+                    .help("Clear")
                 }
             }
-            .frame(width: 224)
+            .frame(width: 268)
+
+            if let session = model.searchSession {
+                searchTally(session)
+            }
+
+            Rectangle()
+                .fill(.white.opacity(0.12))
+                .frame(width: 1, height: 18)
+
+            Button(action: onOpenChat) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("Open chat")
+            .accessibilityLabel("Open chat")
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -1347,219 +1439,55 @@ private struct ImmersiveControlBar: View {
         .recallGlass(in: .capsule)
     }
 
-    private var statusDotColor: Color {
-        if model.isRecording { return .red }
-        if model.isWaitingToRecord || model.isChangingRecording { return .orange }
-        return Color.secondary.opacity(0.55)
+    private func toggleMode() {
+        mode.toggle()
+        isInputFocused = true
     }
 
-    private var statusLabel: String {
-        if let message = model.message, !model.isCaptureSessionActive {
-            return "Capture failed"
-        }
-        if model.isChangingRecording, model.status?.recordingState == .idle || model.status == nil {
-            return "Waiting"
-        }
-        guard let status = model.status else { return "Daemon offline" }
-        switch status.recordingState {
-        case .idle: return "Ready"
-        case .waiting: return "Waiting"
-        case .recording: return "Recording"
-        case .stopping: return "Stopping"
-        case .failed: return "Capture failed"
-        }
+    private func clearInput() {
+        model.searchQuery = ""
+        model.dismissSearch()
     }
-}
 
-private struct ImmersiveAskBar: View {
-    @ObservedObject var model: AfterRayControlModel
-    let onAsk: () -> Void
-    let onOpenSettings: () -> Void
-    let onSelectCitation: (AskCitation) -> Void
-    @FocusState private var isAskFocused: Bool
+    /// Where you are in the result set, and how big it is. Two numbers because
+    /// hits and frames differ — one frame can match several times over.
+    private func searchTally(_ session: RecallSearchSession) -> some View {
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(.white.opacity(0.12))
+                .frame(width: 1, height: 18)
 
-    var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "sparkle")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(RecallPalette.ray.opacity(0.92))
-                TextField("Ask about your day", text: $model.askQuestion)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .focused($isAskFocused)
-                    .onSubmit(onAsk)
-                if model.isAsking {
-                    ProgressView().controlSize(.small)
-                } else if !model.askQuestion.isEmpty {
-                    Button(action: model.dismissAsk) {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear question")
-                }
+            VStack(alignment: .leading, spacing: 0) {
+                Text(session.positionLabel)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.92))
+                Text(session.tallyLabel)
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.55))
             }
-            .padding(.horizontal, 14)
-            .frame(width: 420, height: 36)
-            .recallGlass(in: .capsule)
+            .fixedSize()
 
-            if model.isAsking || model.askAnswer != nil || model.askMessage != nil {
-                AskAnswerPanel(
-                    isAsking: model.isAsking,
-                    answer: model.askAnswer,
-                    error: model.askMessage,
-                    onOpenSettings: onOpenSettings,
-                    onSelectCitation: onSelectCitation,
-                    onDismiss: model.dismissAsk
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+            HStack(spacing: 2) {
+                stepButton(symbol: "chevron.left", help: "Newer match", delta: -1)
+                    .disabled(session.selectedIndex == 0)
+                stepButton(symbol: "chevron.right", help: "Older match", delta: 1)
+                    .disabled(session.selectedIndex >= session.frames.count - 1)
             }
         }
     }
-}
 
-private struct AskAnswerPanel: View {
-    let isAsking: Bool
-    let answer: AskAnswer?
-    let error: String?
-    let onOpenSettings: () -> Void
-    let onSelectCitation: (AskCitation) -> Void
-    let onDismiss: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(panelTitle)
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .tracking(1.4)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button(action: onDismiss) { Image(systemName: "xmark") }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-            }
-
-            if isAsking {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Reading today's memory…")
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.78))
-                }
-            } else if let error {
-                Text(error)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.88))
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if let answer {
-                AskAnswerText(text: answer.answer) { momentID in
-                    if let citation = answer.citations.first(where: { $0.momentId == momentID }) {
-                        onSelectCitation(citation)
-                    } else {
-                        onSelectCitation(
-                            AskCitation(
-                                momentId: momentID,
-                                capturedAtMs: 0,
-                                label: "",
-                                excerpt: ""
-                            )
-                        )
-                    }
-                }
-                if !answer.citations.isEmpty {
-                    HStack(spacing: 6) {
-                        ForEach(Array(answer.citations.prefix(3))) { citation in
-                            Button {
-                                onSelectCitation(citation)
-                            } label: {
-                                Text(citationChipTitle(citation))
-                                    .lineLimit(1)
-                            }
-                            .buttonStyle(AskCitationChipStyle())
-                            .help(citation.excerpt)
-                        }
-                    }
-                }
-                if answer.modelMissing {
-                    Button("Open Settings", action: onOpenSettings)
-                        .buttonStyle(.plain)
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(RecallPalette.ray)
-                }
-            }
+    private func stepButton(symbol: String, help: String, delta: Int) -> some View {
+        Button { onStepResult(delta) } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .frame(width: 20, height: 20)
         }
-        .padding(14)
-        .frame(width: 420, alignment: .leading)
-        .recallGlass(in: .rounded(10))
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.78))
+        .help(help)
     }
 
-    private var panelTitle: String {
-        if isAsking { return "ASKING" }
-        if answer?.modelMissing == true { return "MODEL MISSING" }
-        if error != nil { return "ASK FAILED" }
-        return "ANSWER"
-    }
-
-    private func citationChipTitle(_ citation: AskCitation) -> String {
-        let time = Date(timeIntervalSince1970: TimeInterval(citation.capturedAtMs) / 1_000)
-            .formatted(date: .omitted, time: .shortened)
-        if citation.label.isEmpty {
-            return time
-        }
-        return "\(time) · \(citation.label)"
-    }
-}
-
-private struct AskAnswerText: View {
-    let text: String
-    let onOpenMoment: (String) -> Void
-
-    var body: some View {
-        Text(attributed)
-            .font(.system(size: 13, weight: .medium, design: .rounded))
-            .foregroundStyle(.white.opacity(0.92))
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
-            .environment(\.openURL, OpenURLAction { url in
-                if url.scheme == "afterray", url.host == "moment" {
-                    let momentID = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                    if !momentID.isEmpty {
-                        onOpenMoment(momentID)
-                        return .handled
-                    }
-                }
-                return .systemAction
-            })
-    }
-
-    private var attributed: AttributedString {
-        var markdown = text
-        if !markdown.contains("](afterray://moment/") {
-            markdown = markdown.replacingOccurrences(
-                of: #"afterray://moment/([A-Za-z0-9\-]+)"#,
-                with: "[moment](afterray://moment/$1)",
-                options: .regularExpression
-            )
-        }
-        if let parsed = try? AttributedString(
-            markdown: markdown,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            return parsed
-        }
-        return AttributedString(text)
-    }
-}
-
-private struct AskCitationChipStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 10, weight: .semibold, design: .rounded))
-            .foregroundStyle(.white.opacity(0.88))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(.white.opacity(configuration.isPressed ? 0.08 : 0.12), in: Capsule())
-    }
 }
 
 private struct CaptureFailureBanner: View {
@@ -1589,69 +1517,6 @@ private struct CaptureFailureBanner: View {
     }
 }
 
-private struct SearchResultsPanel: View {
-    let hits: [RecallSearchHit]
-    let onSelect: (RecallSearchHit) -> Void
-    let onDismiss: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("SEARCH RESULTS")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .tracking(1.4)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button(action: onDismiss) { Image(systemName: "xmark") }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(14)
-
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(hits) { hit in
-                        Button { onSelect(hit) } label: {
-                            VStack(alignment: .leading, spacing: 7) {
-                                HStack {
-                                    Label(hit.source.uppercased(), systemImage: sourceIcon(hit.source))
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(.red)
-                                    Spacer()
-                                    Text(formatTimestamp(hit.capturedAtMs))
-                                        .font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text(hit.text)
-                                    .font(.callout)
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(3)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 11)
-                        }
-                        .buttonStyle(SearchResultButtonStyle())
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 8)
-            }
-            .frame(maxHeight: 390)
-        }
-        .recallGlass(in: .rounded(10))
-    }
-
-    private func sourceIcon(_ source: String) -> String {
-        source.lowercased().contains("transcript") ? "waveform" : "text.viewfinder"
-    }
-
-    private func formatTimestamp(_ milliseconds: Int64) -> String {
-        Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
-            .formatted(date: .abbreviated, time: .shortened)
-    }
-}
-
 private struct RecordingButtonStyle: ButtonStyle {
     let isRecording: Bool
 
@@ -1662,15 +1527,6 @@ private struct RecordingButtonStyle: ButtonStyle {
             .frame(height: 30)
             .foregroundStyle(.white)
             .background(isRecording ? Color.red.opacity(0.72) : Color.white.opacity(0.09), in: Capsule())
-            .scaleEffect(configuration.isPressed ? 0.96 : 1)
-            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
-    }
-}
-
-private struct SearchResultButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(configuration.isPressed ? 0.72 : 1)
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }

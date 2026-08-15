@@ -1,0 +1,564 @@
+{
+  "evidence": {
+    "entry_points": [
+      {
+        "at_ms": 1786693330551,
+        "moment_id": "019fff38-a682-71e0-af53-28620c4e26f7",
+        "ocr_chars": 2190,
+        "target": "Google Chrome · github.com/loro-dev/lody-oss/pull/55"
+      },
+      {
+        "at_ms": 1786693564498,
+        "moment_id": "019fff3c-3861-7381-bde0-6657debb649c",
+        "ocr_chars": 1853,
+        "target": "Feishu · en-US.html"
+      },
+      {
+        "at_ms": 1786693574485,
+        "moment_id": "019fff3c-5f61-7851-b1e3-45d36802c2b3",
+        "ocr_chars": 2047,
+        "target": "Lody · 有的时候会遇到说这个文件打不开，但是实际是存在的，而且在工作区内，不知道是路径引用的问题还是什么，就 …"
+      },
+      {
+        "at_ms": 1786693584492,
+        "moment_id": "019fff3c-867f-7e53-b620-7166f0c2ebf2",
+        "ocr_chars": 3619,
+        "target": "Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 …"
+      },
+      {
+        "at_ms": 1786693624617,
+        "moment_id": "019fff3d-2335-7722-9e85-e04e325eb3c9",
+        "ocr_chars": 2078,
+        "target": "Zed · afterray-accessibility.json"
+      },
+      {
+        "at_ms": 1786693634633,
+        "moment_id": "019fff3d-4a54-7d12-8f72-bba15750ef6e",
+        "ocr_chars": 3003,
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody"
+      },
+      {
+        "at_ms": 1786694156888,
+        "moment_id": "019fff45-b9e4-7672-846b-34d4d3049f97",
+        "ocr_chars": 1849,
+        "target": "Lody · github.com/loro-dev/lody-oss/pull/56"
+      },
+      {
+        "at_ms": 1786694191388,
+        "moment_id": "019fff45-c928-7eb1-b29f-379eaddde405",
+        "ocr_chars": 1939,
+        "target": "Google Chrome · github.com/loro-dev/lody-oss/pull/56"
+      }
+    ],
+    "moment_ids": [
+      "019fff2d-88ba-7320-b339-fd4e29c54bbf",
+      "019fff2d-afb5-7180-a9cc-9aa800a0ef75",
+      "019fff2d-d6d8-7130-92f5-4233d3759924",
+      "019fff2d-fdde-7b82-a016-3bbb37bf1046",
+      "019fff2e-24e4-7fd3-98b9-6e14cb5f007d",
+      "019fff2e-4bee-76f2-8c78-f3431c0a6137",
+      "019fff2e-730c-71e3-8773-9aae4e6a5b49",
+      "019fff2e-9a23-7dc2-8438-aa45e6ed0cf2",
+      "019fff2e-c114-7601-a372-ab13d47d725f",
+      "019fff2e-e861-7f61-b385-4a978406acbc",
+      "019fff2f-0f66-7112-baf1-3c26a3e8c8c7",
+      "019fff2f-366c-7c12-b55d-3dddd3dc5583",
+      "019fff2f-5d91-75a2-92c3-ac2b54ff2563",
+      "019fff2f-84a0-7bc3-b09f-d1684bfccc7a",
+      "019fff2f-da20-7621-ac0d-e1081a9c7c67",
+      "019fff2f-da3d-7cf0-8cd5-69f59c58851a",
+      "019fff2f-f9c2-7ec2-8ae7-e66cb5733957",
+      "019fff30-20d0-7902-96f2-8c39d4c72f58",
+      "019fff30-47f1-7353-beba-0286dfe53db3",
+      "019fff30-6ee7-7941-a3ef-15a261530083",
+      "019fff30-95d9-75a3-acc6-860c158465d7",
+      "019fff30-bcf8-79a3-aeaf-eb26b92d7024",
+      "019fff30-e41b-7760-afc4-77ff45dcd2ed",
+      "019fff31-0b3b-7442-bf3c-9e3cea46ad4f",
+      "019fff31-3249-7673-8099-15ca7075ad72",
+      "019fff31-5957-7333-9e0c-aac0cdd8a101",
+      "019fff31-8060-7e80-854c-52e8c27a5973",
+      "019fff31-a7b0-7221-b14c-abe1a8f9db00",
+      "019fff31-ce64-7e32-8ff5-a6a01f59f94e",
+      "019fff31-f59d-72f3-a920-5f7a2a401f6d",
+      "019fff32-1c91-7493-aed7-2e00718b0305",
+      "019fff32-43b9-7591-bc70-3e64fcb4a658",
+      "019fff32-6acb-74d1-9ad5-8dd95fcf0567",
+      "019fff32-91db-7153-98be-147ccf11665c",
+      "019fff32-b8f9-72e1-9eb0-cbc72cc5bd93",
+      "019fff32-e007-7181-bd9a-25ba07999a6d",
+      "019fff33-071e-7b30-82b8-409bfda86267",
+      "019fff33-2e0f-7411-8732-fd8f657f0b80",
+      "019fff33-552b-7062-9efb-cc30843fda95",
+      "019fff33-7c30-7831-a220-57bf1bb7fe2d",
+      "019fff33-a343-74c3-8a83-ea117569ec76",
+      "019fff33-ca46-77b2-acf9-189d9e2d0c41",
+      "019fff33-f152-72b1-af74-957090c5b962",
+      "019fff34-1861-7421-9e45-f2aae4d08202",
+      "019fff35-4b0e-7723-a58a-c139271fc476",
+      "019fff35-7237-7800-8fe3-da04b390d95d",
+      "019fff35-9965-74f3-8437-16b23720bf2e",
+      "019fff35-c046-76c0-b097-b00882118799",
+      "019fff35-e77e-7cb1-bc6d-b8fda32acb40",
+      "019fff36-0e6e-7163-8b3f-60472f1afb79",
+      "019fff36-35a4-7b21-8fff-ca7c612d9ead",
+      "019fff36-5ca1-77d0-93fc-9cc553d56f84",
+      "019fff36-8399-7551-8ba6-0c20c0446f8c",
+      "019fff36-aaaf-70b3-83e3-865820d72215",
+      "019fff36-d1c4-7772-91e7-dfe01e818e3c",
+      "019fff36-f8c5-7292-b223-5f8c35ba9997",
+      "019fff37-1ffa-7e23-8de2-0f01c0eb30b4",
+      "019fff37-a374-7793-a3ac-03918c72cba2",
+      "019fff37-a391-75b2-833b-a5c6657dbb2a",
+      "019fff37-a3a9-7442-af5b-9b8551453609",
+      "019fff37-bc06-72d0-9135-47fce6edc6a2",
+      "019fff37-e32a-7c03-a867-4798a9879342",
+      "019fff38-0a65-7652-b820-b901db7da102",
+      "019fff38-3146-7213-8f2d-f8e84edf5c3b",
+      "019fff38-586c-7d60-9728-46b3e1662b27",
+      "019fff38-7f82-7673-947d-152fc9930496",
+      "019fff38-a682-71e0-af53-28620c4e26f7",
+      "019fff38-cdaa-7002-ba29-e43974714384",
+      "019fff38-f4a9-7680-92da-2f6620efe366",
+      "019fff39-2bc0-7410-ab61-bc39077dde8e",
+      "019fff39-52c0-77b0-9a35-bf1885a18b6e",
+      "019fff39-a076-7853-b35b-cf47725db727",
+      "019fff39-f2eb-79b3-a0ce-a5c689c92220",
+      "019fff3a-1a17-7293-9dd1-ac8880636eb8",
+      "019fff3a-6391-7631-92e5-5725e4741dd7",
+      "019fff3a-8ab1-77e3-891c-83024fbd6bad",
+      "019fff3a-b1b4-7803-9d2a-bd2196fc53e5",
+      "019fff3a-d8bd-7b90-8992-c237735b36e0",
+      "019fff3a-ffe6-70a3-b6cd-13703b37ca5e",
+      "019fff3b-26e6-73e0-ba4b-cc92f11ec2ee",
+      "019fff3b-4df5-77e1-abd9-2ebb334aa33d",
+      "019fff3b-7500-7cc1-a99a-5a8605eb38ae",
+      "019fff3b-9c0a-7f03-968a-54aec17ca688",
+      "019fff3b-c31f-7501-b02b-24e6962403b7",
+      "019fff3b-ea24-7300-ab91-c953e7bb89f3",
+      "019fff3c-1141-7ef0-b32f-bfec57497bbd",
+      "019fff3c-3861-7381-bde0-6657debb649c",
+      "019fff3c-5f61-7851-b1e3-45d36802c2b3",
+      "019fff3c-867f-7e53-b620-7166f0c2ebf2",
+      "019fff3c-ad92-7181-8e93-da9f095dd0bb",
+      "019fff3c-fc00-7d42-8827-66e4e0d27237",
+      "019fff3d-2335-7722-9e85-e04e325eb3c9",
+      "019fff3d-4a54-7d12-8f72-bba15750ef6e",
+      "019fff3d-7164-7b31-9269-3e5e3aee23fa",
+      "019fff3d-9880-7313-ae84-51c0b58f9242",
+      "019fff3e-00e8-7272-81cc-db29bc5c7a9a",
+      "019fff3e-280c-70e1-ab57-10f714106c64",
+      "019fff3e-4f1f-7db3-b386-bbec2c56c1df",
+      "019fff3e-762b-7a60-9e81-0fa2c43c199d",
+      "019fff3e-9d40-7b82-a107-00ce9ed2be57",
+      "019fff3e-c450-7471-8602-fa0325a4a4ed",
+      "019fff3e-eb5a-7362-9e6b-4270f6d84468",
+      "019fff3f-126b-72e0-a4ba-8aa3ff88bc16",
+      "019fff3f-3981-7fd2-a550-2bccaa9ee89e",
+      "019fff3f-6091-7651-aa86-fad0234de891",
+      "019fff3f-87a8-7741-ba5e-de46b305a4de",
+      "019fff3f-aeb9-7ee1-99b4-ccd0a03a9c53",
+      "019fff3f-d5c0-7463-bc1f-a9121ec5304e",
+      "019fff3f-fcd2-7593-bcb6-f6a0afe59748",
+      "019fff40-23e7-7362-a451-aada0d90a3ea",
+      "019fff40-4aeb-7a71-8e0a-6f8644c7b4f1",
+      "019fff40-71fc-7882-9ff4-bc97f4a9e743",
+      "019fff40-990f-71e1-9cc0-c7e9c45f0eab",
+      "019fff40-c029-7f02-977d-81a86e6fff63",
+      "019fff40-e72f-74e2-b52b-4f7f675c6edc",
+      "019fff41-0e3d-7d20-8d33-a7b02a421346",
+      "019fff41-354f-7b92-a01a-c3fbaea5c2f9",
+      "019fff41-5c5f-79e2-b867-ea3464b942fe",
+      "019fff41-836d-7e82-b477-052d1d9d63cc",
+      "019fff41-aa7d-7743-9e18-675ace3096c9",
+      "019fff41-d199-7900-af4d-fad98c699c82",
+      "019fff41-f8a2-75d0-ac65-b6e35ccfe26d",
+      "019fff42-1fb2-7543-985b-c046700a6242",
+      "019fff42-46bf-7803-8b8f-9dc129a7fc82",
+      "019fff42-6dd7-7510-a577-a9d14e2019ad",
+      "019fff42-d30d-7b82-b050-93e0bd1c39e1",
+      "019fff43-3846-7f32-aa6e-0a6aff904701",
+      "019fff43-9d75-72b3-82df-014f7f85baba",
+      "019fff44-02d9-71d1-81df-575a5b4324d5",
+      "019fff44-685e-73a2-9d65-6a8b591c569c",
+      "019fff44-cdd9-7f50-b11c-d76fb5fb5610",
+      "019fff45-3321-7832-872e-1da62e5dece4",
+      "019fff45-3493-72b0-9edb-0121aaba3705",
+      "019fff45-3603-7cc2-be86-376285aaa9be",
+      "019fff45-3758-76c0-b246-0837ad2d291d",
+      "019fff45-38bf-7750-86d0-dc8bf13f721b",
+      "019fff45-3a2c-7081-b7e5-807277d1a6f9",
+      "019fff45-3bad-7ff2-8366-c20c7036e1b4",
+      "019fff45-b9a1-7ac1-b751-30cd45f5c03f",
+      "019fff45-b9c2-7a12-95be-159e6f34de74",
+      "019fff45-b9e4-7672-846b-34d4d3049f97",
+      "019fff45-ba00-70e2-93ed-2ad5a6c22135",
+      "019fff45-ba1b-7253-a66e-b619184b9241",
+      "019fff45-ba35-74b3-9b0c-13afa195cdee",
+      "019fff45-ba4f-7470-bb53-cf2b2264069e",
+      "019fff45-ba6b-7fa2-8b4d-0c71fb52167b",
+      "019fff45-c928-7eb1-b29f-379eaddde405",
+      "019fff45-f057-7592-93c5-10f1647318fd",
+      "019fff46-1759-7222-a00a-bfc8c2a3ae10",
+      "019fff46-3e76-7fd2-b4d5-4790d9cfb112",
+      "019fff46-6578-7212-8a5e-4f93b03be450",
+      "019fff46-8c91-7b42-9d10-0ff18e6a9d42",
+      "019fff46-b39b-7a90-bcc5-9fa185699e09",
+      "019fff46-dab4-7121-b116-7a1269ab44bd",
+      "019fff47-01c3-7820-8ef4-1caf055b742b",
+      "019fff47-28bb-7af0-a823-3b2ecc1e94ec",
+      "019fff47-4fe0-7771-bda5-8fb2ebbabd21",
+      "019fff47-76f1-7171-aea5-14389e61f18e",
+      "019fff47-9e0b-7880-b057-82969f95adbc",
+      "019fff47-c518-7a21-9d7a-7b67fa56d768",
+      "019fff47-ec2a-7510-98f0-c3cf3da0e666",
+      "019fff48-1333-7ed1-a797-0eb6f4ae22cb",
+      "019fff48-3a42-7ff3-9bcb-82ba004ae770",
+      "019fff48-6159-7681-b8bc-98e84f9a6ad1",
+      "019fff48-8863-70a1-b4ac-2bbe47c1bd9e",
+      "019fff48-af7c-7072-b7f4-8848d568855d",
+      "019fff48-d683-7a81-862a-79fd84e76307"
+    ]
+  },
+  "facts": {
+    "apps": [
+      {
+        "bundle_identifier": "ai.lody.desktop",
+        "ms": 1582796,
+        "name": "Lody"
+      },
+      {
+        "bundle_identifier": "com.apple.ActivityMonitor",
+        "ms": 71054,
+        "name": "Activity Monitor"
+      },
+      {
+        "bundle_identifier": "com.mitchellh.ghostty",
+        "ms": 64056,
+        "name": "Ghostty"
+      },
+      {
+        "bundle_identifier": "com.google.Chrome",
+        "ms": 50026,
+        "name": "Google Chrome"
+      },
+      {
+        "bundle_identifier": "dev.zed.Zed",
+        "ms": 20053,
+        "name": "Zed"
+      },
+      {
+        "bundle_identifier": "com.electron.lark",
+        "ms": 9987,
+        "name": "Feishu"
+      }
+    ],
+    "ax_moment_count": 167,
+    "has_audio": true,
+    "idle_ratio": 0.055926110595464706,
+    "longest_focus_ms": 474374,
+    "moment_count": 167,
+    "ocr_moment_count": 167,
+    "switch_count": 20,
+    "top_documents": [
+      "chat",
+      "lody",
+      "afterray-accessibility.json",
+      "en-US.html"
+    ],
+    "top_urls": [
+      "github.com/loro-dev/lody-oss/pull/56",
+      "github.com/loro-dev/lody-oss/pull/55",
+      "Google%20Chrome%20(6122)",
+      "Google%20Chrome%20(11309)"
+    ],
+    "top_windows": [
+      "请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody",
+      "Lody",
+      "AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody",
+      "有的时候会遇到说这个文件打不开，但是实际是存在的，而且在工作区内，不知道是路径引用的问题还是什么，就 - Lody",
+      "mactop",
+      "Activity Monitor – All Processes"
+    ]
+  },
+  "index": {
+    "coverage": [
+      {
+        "end_ms": 1786692852043,
+        "kind": "dense",
+        "mean_ocr_chars": 1710,
+        "moment_count": 25,
+        "start_ms": 1786692602028
+      },
+      {
+        "end_ms": 1786692862041,
+        "kind": "sparse",
+        "mean_ocr_chars": 167,
+        "moment_count": 1,
+        "start_ms": 1786692852041
+      },
+      {
+        "end_ms": 1786693042019,
+        "kind": "dense",
+        "mean_ocr_chars": 1578,
+        "moment_count": 18,
+        "start_ms": 1786692862028
+      },
+      {
+        "end_ms": 1786693110531,
+        "kind": "gap",
+        "mean_ocr_chars": 0,
+        "moment_count": 0,
+        "start_ms": 1786693042019
+      },
+      {
+        "end_ms": 1786693931395,
+        "kind": "dense",
+        "mean_ocr_chars": 1410,
+        "moment_count": 76,
+        "start_ms": 1786693110531
+      },
+      {
+        "end_ms": 1786693941405,
+        "kind": "unchanged",
+        "mean_ocr_chars": 896,
+        "moment_count": 1,
+        "start_ms": 1786693931405
+      },
+      {
+        "end_ms": 1786694391423,
+        "kind": "dense",
+        "mean_ocr_chars": 1526,
+        "moment_count": 45,
+        "start_ms": 1786693941398
+      },
+      {
+        "end_ms": 1786694400000,
+        "kind": "unchanged",
+        "mean_ocr_chars": 1797,
+        "moment_count": 1,
+        "start_ms": 1786694391414
+      }
+    ],
+    "dwells": [
+      {
+        "end_ms": 1786693032019,
+        "start_ms": 1786692882008,
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody",
+        "unchanged": false
+      },
+      {
+        "end_ms": 1786694155747,
+        "start_ms": 1786693681373,
+        "target": "Lody · chat",
+        "unchanged": false
+      },
+      {
+        "end_ms": 1786694400000,
+        "start_ms": 1786694211404,
+        "target": "Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 …",
+        "unchanged": false
+      }
+    ],
+    "revisits": [
+      {
+        "at_ms": [
+          1786692602028,
+          1786693032019,
+          1786693230572,
+          1786693290582,
+          1786693320565,
+          1786693425653,
+          1786693554486,
+          1786693594501,
+          1786694211404
+        ],
+        "target": "Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 …",
+        "total_ms": 546038,
+        "visits": 9
+      },
+      {
+        "at_ms": [
+          1786692772036,
+          1786692882008,
+          1786693150575,
+          1786693310560
+        ],
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody",
+        "total_ms": 279988,
+        "visits": 4
+      },
+      {
+        "at_ms": [
+          1786693300537,
+          1786693340573,
+          1786693415647,
+          1786693454502,
+          1786693534484,
+          1786693584492,
+          1786693634633
+        ],
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody",
+        "total_ms": 99992,
+        "visits": 7
+      },
+      {
+        "at_ms": [
+          1786693260558,
+          1786693350555,
+          1786693494490
+        ],
+        "target": "Ghostty · lody",
+        "total_ms": 64056,
+        "visits": 3
+      },
+      {
+        "at_ms": [
+          1786692732047,
+          1786692852041,
+          1786693330551
+        ],
+        "target": "Google Chrome · github.com/loro-dev/lody-oss/pull/55",
+        "total_ms": 39997,
+        "visits": 3
+      },
+      {
+        "at_ms": [
+          1786693270516,
+          1786693364659
+        ],
+        "target": "Activity Monitor · Google%20Chrome%20(6122)",
+        "total_ms": 39905,
+        "visits": 2
+      }
+    ],
+    "switches": [
+      {
+        "at_ms": 1786692732047,
+        "from": "Lody",
+        "held_ms": 130019,
+        "to": "Google Chrome"
+      },
+      {
+        "at_ms": 1786692752035,
+        "from": "Google Chrome",
+        "held_ms": 19988,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786692852041,
+        "from": "Lody",
+        "held_ms": 19996,
+        "to": "Google Chrome"
+      },
+      {
+        "at_ms": 1786692862028,
+        "from": "Google Chrome",
+        "held_ms": 9987,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786693260558,
+        "from": "Lody",
+        "held_ms": 29986,
+        "to": "Ghostty"
+      },
+      {
+        "at_ms": 1786693270516,
+        "from": "Ghostty",
+        "held_ms": 9958,
+        "to": "Activity Monitor"
+      },
+      {
+        "at_ms": 1786693290582,
+        "from": "Activity Monitor",
+        "held_ms": 10040,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786693330551,
+        "from": "Lody",
+        "held_ms": 9986,
+        "to": "Google Chrome"
+      },
+      {
+        "at_ms": 1786693340573,
+        "from": "Google Chrome",
+        "held_ms": 10022,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786693350555,
+        "from": "Lody",
+        "held_ms": 9982,
+        "to": "Ghostty"
+      },
+      {
+        "at_ms": 1786693364659,
+        "from": "Ghostty",
+        "held_ms": 14104,
+        "to": "Activity Monitor"
+      },
+      {
+        "at_ms": 1786693415647,
+        "from": "Activity Monitor",
+        "held_ms": 21109,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786693494490,
+        "from": "Lody",
+        "held_ms": 39988,
+        "to": "Ghostty"
+      },
+      {
+        "at_ms": 1786693534484,
+        "from": "Ghostty",
+        "held_ms": 39994,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786693564498,
+        "from": "Lody",
+        "held_ms": 10012,
+        "to": "Feishu"
+      },
+      {
+        "at_ms": 1786693574485,
+        "from": "Feishu",
+        "held_ms": 9987,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786693614580,
+        "from": "Lody",
+        "held_ms": 20079,
+        "to": "Zed"
+      },
+      {
+        "at_ms": 1786693634633,
+        "from": "Zed",
+        "held_ms": 20053,
+        "to": "Lody"
+      },
+      {
+        "at_ms": 1786694191388,
+        "from": "Lody",
+        "held_ms": 9974,
+        "to": "Google Chrome"
+      },
+      {
+        "at_ms": 1786694201417,
+        "from": "Google Chrome",
+        "held_ms": 10029,
+        "to": "Lody"
+      }
+    ],
+    "threads": []
+  },
+  "local_day": "2026-08-14",
+  "slot_end_ms": 1786694400000,
+  "slot_start_ms": 1786692600000,
+  "state": "ready",
+  "theme_key": "ai.lody.desktop|file:///Applications/Lody.app/Contents/Resources/app.asar/out/renderer/index.html#/zxc/chat"
+}

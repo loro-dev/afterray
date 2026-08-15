@@ -1,8 +1,8 @@
 //! Background cold-GOP packer. Hot stills stay JPEG; packed frames drop unpinned JPEGs.
 
 use afterray_codec::{
-    Av1Encoder, CONTENT_TYPE_IVF_AV01, DEFAULT_KEYINT, EncodedGop, GopFrameInput, Rav1eEncoder,
-    jpeg_to_i420, parse_ivf, slice_ivf,
+    Av1Encoder, CONTENT_TYPE_IVF_AV01, DEFAULT_KEYINT, DEFAULT_THUMBNAIL_MAX_EDGE, EncodedGop,
+    GopFrameInput, Rav1eEncoder, jpeg_to_i420, parse_ivf, slice_ivf, still_thumbnail,
 };
 use afterray_protocol::{ArtifactPayload, GopReadMode};
 use afterray_store::{
@@ -226,6 +226,12 @@ fn encode_run(vault: &Vault, run: &[PackCandidate]) -> Result<EncodedGop, anyhow
     let mut inputs = Vec::with_capacity(run.len());
     for frame in run {
         let still = vault.read_artifact(&frame.image_artifact_id)?;
+        // Thumbnail now, while the JPEG is decrypted and in hand. Once this run
+        // commits, `drop_unpinned_stills` deletes it — and nothing on this side
+        // can decode AV1 to get the pixels back.
+        if let Err(error) = ensure_thumbnail(vault, &frame.id, &still.bytes) {
+            eprintln!("gop packer: thumbnail failed for moment {}: {error}", frame.id);
+        }
         let (width, height, yuv) = jpeg_to_i420(&still.bytes)?;
         let even_width = frame.width & !1;
         let even_height = frame.height & !1;
@@ -260,6 +266,15 @@ fn encode_run(vault: &Vault, run: &[PackCandidate]) -> Result<EncodedGop, anyhow
         started.elapsed().as_secs_f32() * 1000.0 / encoded.frames.len() as f32
     );
     Ok(encoded)
+}
+
+fn ensure_thumbnail(vault: &Vault, moment_id: &str, jpeg: &[u8]) -> Result<(), anyhow::Error> {
+    if vault.thumbnail_artifact_id(moment_id)?.is_some() {
+        return Ok(());
+    }
+    let bytes = still_thumbnail(jpeg, DEFAULT_THUMBNAIL_MAX_EDGE)?;
+    vault.set_thumbnail(moment_id, &bytes)?;
+    Ok(())
 }
 
 fn verify_gop(vault: &Vault, segment_id: &str, encoded: &EncodedGop) -> Result<(), anyhow::Error> {

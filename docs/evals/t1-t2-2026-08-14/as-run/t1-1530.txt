@@ -1,0 +1,69 @@
+<slot day="2026-08-14" from="15:30" to="16:00">
+
+[facts] apps and time
+  Lody                     26m
+  Activity Monitor         1m
+  Ghostty                  1m
+  Google Chrome            50s
+  Zed                      20s
+  Feishu                   9s
+  20 switches · longest unbroken 7m · idle 6%
+
+[seen] what was open
+  file  chat
+  file  lody
+  file  about:blank
+  file  afterray-accessibility.json
+  file  en-US.html
+  web   blob:file:///449f5d02-77b3-4358-8e32-a8e9037ccbb1
+  web   github.com/loro-dev/lody-oss/pull/56
+  web   github.com/loro-dev/lody-oss/pull/55
+  web   Google%20Chrome%20(6122)
+  web   Google%20Chrome%20(11309)
+  web   native-resource://sdk/avatar?key=default-avatar_v2_cc35cdce-8382-4c69-8ac2-9803…
+
+[seen] already-written fragment notes
+  15:29 The user is reviewing a list of analysis requests and design tasks in the Lody application.
+  15:39 Reviewing a development plan in Lody that discusses automated periodic summaries and collaborative text checkout performance.
+  15:48 Defined a plan to optimize AfterRay's search presentation, focusing on capturing app titles, highlighting OCR text, and restructuring the timeline layout in Lody.
+  15:56 The user drafted technical design plans for the AfterRay project, specifically outlining strategies for automated thirty-minute summaries and analyzing checkout performance issues.
+
+[map] returned to
+  Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody — 9 visits, 9m total (15:30 15:37 15:40 15:41 15:42 15:43 15:45 15:46 15:56)
+  Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody — 4 visits, 4m total (15:32 15:34 15:39 15:41)
+  Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody — 7 visits, 1m total (15:41 15:42 15:43 15:44 15:45 15:46 15:47)
+  Ghostty · lody — 3 visits, 1m total (15:41 15:42 15:44)
+  Google Chrome · github.com/loro-dev/lody-oss/pull/55 — 3 visits, 39s total (15:32 15:34 15:42)
+  Activity Monitor · Google%20Chrome%20(6122) — 2 visits, 39s total (15:41 15:42)
+
+[map] sustained on one thing
+  15:34–15:37 Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+  15:48–15:55 Lody · chat
+  15:56–16:00 Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody
+
+[map] where the text is
+  15:30–15:34  text, dense (~1710 chars/frame)
+  15:34–15:37  text, dense (~1578 chars/frame)
+  15:37–15:38  no capture
+  15:38–15:52  text, dense (~1410 chars/frame)
+  15:52–15:59  text, dense (~1526 chars/frame)
+
+[map] entry-point moment ids (one per stretch)
+  019fff2d-88ba-7320-b339-fd4e29c54bbf
+  019fff2f-84a0-7bc3-b09f-d1684bfccc7a
+  019fff2f-f9c2-7ec2-8ae7-e66cb5733957
+  019fff30-95d9-75a3-acc6-860c158465d7
+  019fff30-bcf8-79a3-aeaf-eb26b92d7024
+  019fff30-e41b-7760-afc4-77ff45dcd2ed
+  019fff31-3249-7673-8099-15ca7075ad72
+  019fff31-5957-7333-9e0c-aac0cdd8a101
+  019fff31-8060-7e80-854c-52e8c27a5973
+  019fff31-a7b0-7221-b14c-abe1a8f9db00
+  019fff31-ce64-7e32-8ff5-a6a01f59f94e
+  019fff34-1861-7421-9e45-f2aae4d08202
+
+[avoid] wording already used on nearby cards
+  14:45 They were reviewing technical documentation in Lody concerning the development plan for AfterRay's screen and audio logging system, including sections on Agent CLI and tool agents.
+  15:29 The user is reviewing a list of analysis requests and design tasks in the Lody application.
+</slot>
+

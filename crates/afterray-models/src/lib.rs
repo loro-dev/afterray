@@ -6,27 +6,40 @@
 
 mod catalog;
 mod download;
+mod persistent_mlx;
 mod process;
 mod queue;
 mod remote;
 
 pub use catalog::{
-    FALLBACK_LLM_FILE, FALLBACK_LLM_REPOSITORY, PackSource, PackSpec, QWEN36_27B_Q4_EXPECTED_BYTES,
-    QWEN38_27B_Q4_EXPECTED_BYTES,
-    catalog_in, default_catalog, inspect_model_path, library, library_in, llm_pack_from,
-    model_directory, spec_by_id, specs_for_download, specs_for_download_in,
+    FALLBACK_LLM_FILE, FALLBACK_LLM_REPOSITORY, ManifestFile, PackSource, PackSpec,
+    QWEN35_4B_MLX_EXPECTED_BYTES, QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REPOSITORY,
+    QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_EXPECTED_BYTES, QWEN35_9B_MLX_PACK_ID,
+    QWEN35_9B_MLX_REPOSITORY, QWEN35_9B_MLX_REVISION,
+    QWEN36_27B_Q4_EXPECTED_BYTES, QWEN38_27B_Q4_EXPECTED_BYTES, READY_MARKER, catalog_in,
+    default_catalog, inspect_model_path, library, library_in, llm_pack_from, model_directory,
+    qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack,
+    spec_by_id, specs_for_download, specs_for_download_in,
 };
-pub use download::{DownloadError, DownloadProgress, download_pack, download_packs};
+pub use download::{
+    DownloadError, DownloadProgress, download_pack, download_packs, remove_pack, verify_files,
+};
+pub use persistent_mlx::{
+    MLX_WORKER_PROTOCOL_VERSION, MlxWorkerHealth, PersistentMlxAdapter, PersistentMlxConfig,
+    normalize_model_output,
+};
 pub use process::{
     ProcessAdapter, ProcessAdapterConfig, WORKER_PROTOCOL_VERSION, WorkerRequest, WorkerResponse,
 };
-pub use remote::{
-    DEFAULT_OLLAMA_BASE_URL, LlmRouterAdapter, LlmRuntimeConfig, chat_completions_url,
-    models_from_ollama_tags, models_from_openai_list, normalize_origin, ollama_tags_url,
-    openai_models_url, probe_llm, recommend_model,
-};
 pub use queue::{
-    CapabilityConcurrency, JobId, JobSnapshot, JobState, ModelQueue, QueueConfig, QueueError,
+    CapabilityConcurrency, JobId, JobPriority, JobSnapshot, JobState, LlmLeaseHold, ModelQueue,
+    QueueConfig, QueueError,
+};
+pub use remote::{
+    DEFAULT_OLLAMA_BASE_URL, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink, LlmTokenSinkGuard,
+    chat_completions_url, models_from_ollama_tags, models_from_openai_list, normalize_origin,
+    ollama_chat_delta, ollama_chat_url, ollama_tags_url, openai_models_url, openai_sse_delta,
+    probe_llm, recommend_model,
 };
 
 use async_trait::async_trait;

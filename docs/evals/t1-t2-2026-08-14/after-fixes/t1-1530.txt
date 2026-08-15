@@ -1,0 +1,67 @@
+<slot day="2026-08-14" from="15:30" to="16:00">
+
+[facts] apps and time
+  Lody                     26m
+  Activity Monitor         1m
+  Ghostty                  1m
+  Google Chrome            50s
+  Zed                      20s
+  Feishu                   9s
+  20 switches · longest unbroken 7m · idle 6%
+
+[seen] what was open
+  window  请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody
+  window  Lody
+  window  AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+  window  有的时候会遇到说这个文件打不开，但是实际是存在的，而且在工作区内，不知道是路径引用的问题还是什么，就 - Lody
+  window  mactop
+  window  Activity Monitor – All Processes
+  file    chat
+  file    lody
+  file    afterray-accessibility.json
+  file    en-US.html
+  web     github.com/loro-dev/lody-oss/pull/56
+  web     github.com/loro-dev/lody-oss/pull/55
+  web     Google%20Chrome%20(6122)
+  web     Google%20Chrome%20(11309)
+
+[seen] already-written fragment notes
+  15:29 The user is reviewing a list of analysis requests and design tasks in the Lody application.
+  15:39 Reviewing a development plan in Lody that discusses automated periodic summaries and collaborative text checkout performance.
+  15:48 Defined a plan to optimize AfterRay's search presentation, focusing on capturing app titles, highlighting OCR text, and restructuring the timeline layout in Lody.
+  15:56 The user drafted technical design plans for the AfterRay project, specifically outlining strategies for automated thirty-minute summaries and analyzing checkout performance issues.
+
+[map] returned to
+  Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 … — 9 visits, 9m total (15:30 15:37 15:40 15:41 15:42 15:43 15:45 15:46 15:56)
+  Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody — 4 visits, 4m total (15:32 15:34 15:39 15:41)
+  Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody — 7 visits, 1m total (15:41 15:42 15:43 15:44 15:45 15:46 15:47)
+  Ghostty · lody — 3 visits, 1m total (15:41 15:42 15:44)
+  Google Chrome · github.com/loro-dev/lody-oss/pull/55 — 3 visits, 39s total (15:32 15:34 15:42)
+  Activity Monitor · Google%20Chrome%20(6122) — 2 visits, 39s total (15:41 15:42)
+
+[map] sustained on one thing
+  15:34–15:37 Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+  15:48–15:55 Lody · chat
+  15:56–16:00 Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 …
+
+[map] where the text is
+  15:30–15:34  text, dense (~1710 chars/frame)
+  15:34–15:37  text, dense (~1578 chars/frame)
+  15:37–15:38  no capture
+  15:38–15:52  text, dense (~1410 chars/frame)
+  15:52–15:59  text, dense (~1526 chars/frame)
+
+[map] probe here (one frame per stretch, all carry text)
+  15:42  2190 chars  019fff38-a682-71e0-af53-28620c4e26f7  Google Chrome · github.com/loro-dev/lody-oss/pull/55
+  15:46  1853 chars  019fff3c-3861-7381-bde0-6657debb649c  Feishu · en-US.html
+  15:46  2047 chars  019fff3c-5f61-7851-b1e3-45d36802c2b3  Lody · 有的时候会遇到说这个文件打不开，但是实际是存在的，而且在工作区内，不知道是路径引用的问题还是什么，就 …
+  15:46  3619 chars  019fff3c-867f-7e53-b620-7166f0c2ebf2  Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 …
+  15:47  2078 chars  019fff3d-2335-7722-9e85-e04e325eb3c9  Zed · afterray-accessibility.json
+  15:47  3003 chars  019fff3d-4a54-7d12-8f72-bba15750ef6e  Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+  15:55  1849 chars  019fff45-b9e4-7672-846b-34d4d3049f97  Lody · github.com/loro-dev/lody-oss/pull/56
+  15:56  1939 chars  019fff45-c928-7eb1-b29f-379eaddde405  Google Chrome · github.com/loro-dev/lody-oss/pull/56
+
+[avoid] wording already used on nearby cards
+  14:45 They were reviewing technical documentation in Lody concerning the development plan for AfterRay's screen and audio logging system, including sections on Agent CLI and tool agents.
+  15:29 The user is reviewing a list of analysis requests and design tasks in the Lody application.
+</slot>

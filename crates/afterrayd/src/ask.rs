@@ -21,6 +21,11 @@ When you mention a specific activity, cite it as a markdown link using afterray:
 for example [2:14 Safari](afterray://moment/MOMENT_ID). Be concise. Never invent missing evidence. \
 Prefer list_memories and list_activity first; use search_evidence for keywords; use get_ocr or get_ax_digest when you need detail for a moment_id.";
 
+const QWEN35_TOOL_PROTOCOL_SUFFIX: &str = "\
+For tools, output exactly two lines: TOOL <allowlisted tool name> followed by \
+ARGS <one JSON object>. Do not put analysis, thinking markers, or prose before \
+those lines. For a user-facing response, output FINAL followed by the answer.";
+
 const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
 #[must_use]
@@ -32,8 +37,18 @@ pub(crate) fn llm_pack_present(library: &ModelLibrary) -> bool {
 }
 
 #[must_use]
+pub(crate) fn mlx_pack_present(library: &ModelLibrary, config: &LlmRuntimeConfig) -> bool {
+    config.mlx_pack_id().is_some_and(|pack_id| {
+        library
+            .packs
+            .iter()
+            .any(|pack| pack.id == pack_id && pack.present)
+    })
+}
+
+#[must_use]
 pub(crate) fn llm_ready(library: &ModelLibrary, config: &LlmRuntimeConfig) -> bool {
-    config.is_ready(llm_pack_present(library))
+    config.is_ready_with_mlx(llm_pack_present(library), mlx_pack_present(library, config))
 }
 
 pub(crate) fn resolve_ask_range(
@@ -401,8 +416,13 @@ pub(crate) async fn handle_ask(
     let user = format!(
         "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
     );
-    let host = ToolHost { store, models };
-    match agent::run_readonly_agent(models, &host, ASK_SYSTEM_PROMPT, &user).await {
+    let host = ToolHost {
+        store,
+        models,
+        now_ms,
+    };
+    let system = format!("{ASK_SYSTEM_PROMPT}\n\n{QWEN35_TOOL_PROTOCOL_SUFFIX}");
+    match agent::run_readonly_agent(models, &host, &system, &user).await {
         Ok(answer) => Response::success(AskAnswer {
             answer: answer.trim().to_owned(),
             citations,
@@ -437,7 +457,7 @@ mod tests {
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 100,
+                ..VaultConfig::default()
             },
             [9_u8; 32],
         )
@@ -459,10 +479,13 @@ mod tests {
                 capability: "llm".into(),
                 path: "/tmp/missing.gguf".into(),
                 present: false,
+                state: afterray_protocol::ModelPackState::NotDownloaded,
                 bytes: 0,
                 required: false,
                 note: None,
                 expected_bytes: None,
+                revision: None,
+                error: None,
             }],
             download: None,
         };
@@ -482,10 +505,13 @@ mod tests {
                 capability: "llm".into(),
                 path: "/tmp/missing.gguf".into(),
                 present: false,
+                state: afterray_protocol::ModelPackState::NotDownloaded,
                 bytes: 0,
                 required: false,
                 note: None,
                 expected_bytes: None,
+                revision: None,
+                error: None,
             }],
             download: None,
         };
@@ -497,6 +523,41 @@ mod tests {
         };
         assert!(llm_ready(&missing, &remote));
         assert!(!llm_ready(&missing, &LlmRuntimeConfig::default()));
+    }
+
+    #[test]
+    fn llm_ready_uses_the_selected_mlx_pack() {
+        let library = ModelLibrary {
+            directory: "/tmp".into(),
+            packs: vec![ModelPack {
+                id: "llm_qwen35_4b_mlx4".into(),
+                name: "Qwen3.5 4B · MLX 4-bit".into(),
+                capability: "llm_vlm".into(),
+                path: "/tmp/Qwen3.5-4B-MLX-4bit".into(),
+                present: true,
+                state: afterray_protocol::ModelPackState::Ready,
+                bytes: 3_061_129_077,
+                required: false,
+                note: None,
+                expected_bytes: Some(3_061_129_077),
+                revision: Some("32f3e8ecf65426fc3306969496342d504bfa13f3".into()),
+                error: None,
+            }],
+            download: None,
+        };
+        let config = LlmRuntimeConfig {
+            provider: afterray_protocol::LlmProvider::MlxLocal,
+            ..LlmRuntimeConfig::default()
+        };
+        assert!(mlx_pack_present(&library, &config));
+        assert!(llm_ready(&library, &config));
+
+        let config = LlmRuntimeConfig {
+            model: "llm_qwen35_9b_mlx4".into(),
+            ..config
+        };
+        assert!(!mlx_pack_present(&library, &config));
+        assert!(!llm_ready(&library, &config));
     }
 
     #[test]

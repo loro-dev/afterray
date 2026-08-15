@@ -19,6 +19,25 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["since_ms"] as? Int, 42)
     }
 
+    func testDaySummaryRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "day_summary", dayMs: 1_786_698_000_000))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["type"] as? String, "day_summary")
+        XCTAssertEqual((json["day_ms"] as? NSNumber)?.int64Value, 1_786_698_000_000)
+    }
+
+    func testSummaryHistoryRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "summary_history", limit: 7, beforeMs: 1_786_698_000_000)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["type"] as? String, "summary_history")
+        XCTAssertEqual((json["before_ms"] as? NSNumber)?.int64Value, 1_786_698_000_000)
+        XCTAssertEqual(json["limit"] as? Int, 7)
+    }
+
     func testRecallWindowRequestMatchesRustShape() throws {
         let request = WireRequest(type: "recall_window", sessionID: "session-1", centerMs: 42, limit: 120)
         let data = try JSONEncoder().encode(request)
@@ -141,7 +160,84 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.modelDir, "/tmp/models")
         XCTAssertFalse(settings.recordAudio)
         XCTAssertEqual(settings.captureIntervalSeconds, 10)
+        XCTAssertEqual(settings.storageLimitBytes, AppSettings.defaultStorageLimitBytes)
         XCTAssertTrue(settings.excludedBundleIds.isEmpty)
+        XCTAssertEqual(settings.uiLanguage, AppSettings.defaultLanguage)
+        XCTAssertEqual(settings.summaryLanguage, AppSettings.defaultLanguage)
+        XCTAssertTrue(settings.languageOptions.isEmpty)
+    }
+
+    func testAppSettingsDefaultsLanguageWhenOldDaemonOmitsFields() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.uiLanguage, "auto")
+        XCTAssertEqual(settings.summaryLanguage, "auto")
+        XCTAssertTrue(settings.languageOptions.isEmpty)
+
+        let picker = settings.languagePickerOptions(selected: settings.uiLanguage)
+        XCTAssertEqual(picker.map(\.code), ["auto"])
+        XCTAssertEqual(picker.first?.menuTitle, "跟随系统")
+        XCTAssertEqual(picker.first?.englishName, "Follow system")
+    }
+
+    func testAppSettingsDecodesLanguageCatalogueFromDaemon() throws {
+        let json = """
+        {"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"ui_language":"en","summary_language":"ja","language_options":[{"code":"auto","native_name":"跟随系统 / System","english_name":"Follow system"},{"code":"en","native_name":"English","english_name":"English"},{"code":"ja","native_name":"日本語","english_name":"Japanese"}]}
+        """
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.uiLanguage, "en")
+        XCTAssertEqual(settings.summaryLanguage, "ja")
+        XCTAssertEqual(settings.languageOptions.count, 3)
+        XCTAssertEqual(settings.languageOptions[2].nativeName, "日本語")
+        XCTAssertEqual(settings.languageOptions[2].englishName, "Japanese")
+        XCTAssertEqual(settings.languageOptions[0].menuTitle, "跟随系统")
+        XCTAssertEqual(settings.languageOptions[2].menuTitle, "日本語")
+        XCTAssertEqual(
+            settings.languagePickerOptions(selected: settings.summaryLanguage).map(\.code),
+            ["auto", "en", "ja"]
+        )
+    }
+
+    func testLanguagePickerOptionsKeepsDaemonCatalogueAndUnknownSelection() throws {
+        let settings = AppSettings(
+            dataDir: "/tmp/data",
+            modelDir: "/tmp/models",
+            recordAudio: true,
+            captureIntervalSeconds: 10,
+            languageOptions: [
+                LanguageOption(code: "en", nativeName: "English", englishName: "English"),
+            ]
+        )
+        XCTAssertEqual(settings.languagePickerOptions(selected: "en").map(\.code), ["en"])
+        XCTAssertEqual(settings.languagePickerOptions(selected: "xx").map(\.code), ["en", "xx"])
+    }
+
+    func testUpdateSettingsRequestIncludesLanguageFields() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(
+                type: "update_settings",
+                uiLanguage: "zh-Hans",
+                summaryLanguage: "ja"
+            )
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["ui_language"] as? String, "zh-Hans")
+        XCTAssertEqual(json["summary_language"] as? String, "ja")
+    }
+
+    func testUpdateSettingsRequestIncludesStorageLimit() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", storageLimitBytes: 250_000_000_000)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["storage_limit_bytes"] as? UInt64, 250_000_000_000)
+    }
+
+    func testAppSettingsDecodesStorageLimit() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"storage_limit_bytes":250000000000}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.storageLimitBytes, 250_000_000_000)
     }
 
     func testAppSettingsDecodesExcludedApps() throws {
@@ -150,6 +246,39 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.excludedBundleIds, ["com.apple.Safari"])
         XCTAssertEqual(settings.llmProvider, .builtin)
         XCTAssertTrue(settings.llmModel.isEmpty)
+    }
+
+    func testAppSettingsDecodesExcludedWebsites() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"excluded_domains":["bank.example","mail.example.com"]}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.excludedDomains, ["bank.example", "mail.example.com"])
+    }
+
+    /// A daemon that predates website exclusion omits the key entirely. Decoding
+    /// must not fail there, or upgrading the app strands the old daemon.
+    func testAppSettingsTreatsMissingExcludedWebsitesAsNone() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertTrue(settings.excludedDomains.isEmpty)
+    }
+
+    /// The daemon distinguishes "leave this list alone" from "make it empty",
+    /// so an update that only touches apps must not carry a domains key at all.
+    func testUpdateSettingsOmitsWebsitesWhenUntouched() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", excludedBundleIds: ["com.apple.Safari"])
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["excluded_bundle_ids"] as? [String], ["com.apple.Safari"])
+        XCTAssertNil(json["excluded_domains"])
+    }
+
+    func testUpdateSettingsRequestCarriesExcludedWebsites() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", excludedDomains: ["example.com"])
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["excluded_domains"] as? [String], ["example.com"])
     }
 
     func testAppSettingsDecodesLlmFields() throws {
@@ -222,6 +351,13 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["pack_id"] as? String, "asr")
     }
 
+    func testRemoveModelRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "remove_model", packID: "llm_qwen35_4b_mlx4"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "remove_model")
+        XCTAssertEqual(json["pack_id"] as? String, "llm_qwen35_4b_mlx4")
+    }
+
     func testShutdownRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "shutdown"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -284,6 +420,64 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["type"] as? String, "search")
         XCTAssertEqual(json["query"] as? String, "design review")
         XCTAssertEqual(json["limit"] as? Int, 30)
+    }
+
+    func testThumbnailRequestMatchesRustShape() throws {
+        let request = WireRequest(type: "read_thumbnail", momentID: "m1", maxEdge: 360)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(json["type"] as? String, "read_thumbnail")
+        XCTAssertEqual(json["moment_id"] as? String, "m1")
+        XCTAssertEqual(json["max_edge"] as? Int, 360)
+    }
+
+    func testThumbnailRequestOmitsMaxEdgeWhenUnset() throws {
+        // Rust defaults `max_edge` to None; sending null would not deserialize.
+        let request = WireRequest(type: "read_thumbnail", momentID: "m1")
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(request)) as? [String: Any]
+        )
+        XCTAssertNil(json["max_edge"])
+    }
+
+    func testEvidenceOcrRequestMatchesRustShape() throws {
+        let request = WireRequest(type: "evidence_ocr", momentID: "m1")
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(json["type"] as? String, "evidence_ocr")
+        XCTAssertEqual(json["moment_id"] as? String, "m1")
+    }
+
+    func testOcrEvidenceDecodesVisionBoxes() throws {
+        let json = """
+        {"moment_id":"m1","text":"Roadmap","regions":[
+          {"text":"Roadmap","confidence":0.94,"x":0.1,"y":0.8,"width":0.3,"height":0.05}
+        ]}
+        """
+        let evidence = try JSONDecoder().decode(OcrEvidence.self, from: Data(json.utf8))
+
+        XCTAssertEqual(evidence.momentId, "m1")
+        XCTAssertEqual(evidence.regions.count, 1)
+        XCTAssertEqual(evidence.regions[0].text, "Roadmap")
+        XCTAssertEqual(evidence.regions[0].y, 0.8, accuracy: 0.0001)
+    }
+
+    func testOcrEvidenceToleratesOmittedRegions() throws {
+        // The daemon skips `regions` entirely when a frame produced no boxes.
+        let evidence = try JSONDecoder().decode(
+            OcrEvidence.self,
+            from: Data(#"{"moment_id":"m1","text":"nothing"}"#.utf8)
+        )
+        XCTAssertTrue(evidence.regions.isEmpty)
+    }
+
+    func testClientSpeaksTheCurrentProtocolVersion() throws {
+        // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 7)
     }
 
     func testRecordResultsDecodeBothDaemonBranches() throws {

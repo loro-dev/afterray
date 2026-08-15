@@ -30,8 +30,18 @@ final class OnboardingController: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         isFinished = defaults.bool(forKey: Self.completedKey)
+        let exclusions = OnboardingExclusions()
         model = AfterRayOnboardingModel(
             hotKeys: .shared,
+            privacyActions: AfterRayOnboardingPrivacyActions(
+                excludedApps: { exclusions.bundleIds },
+                excludedDomains: { exclusions.domains },
+                addApp: { await exclusions.pickApp() },
+                removeApp: { bundleID in await exclusions.removeApp(bundleID) },
+                addDomain: { typed in await exclusions.addDomain(typed) },
+                removeDomain: { domain in await exclusions.removeDomain(domain) },
+                displayName: { OnboardingExclusions.displayName(for: $0) }
+            ),
             cliActions: AfterRayOnboardingCliActions(
                 status: { AfterRayCliInstall.statusSummary },
                 isInstalled: { AfterRayCliInstall.isInstalled },
@@ -39,6 +49,20 @@ final class OnboardingController: ObservableObject {
                     _ = try AfterRayCliInstall.install()
                 },
                 pathExportLine: { AfterRayCliInstall.pathExportLine() }
+            ),
+            modelActions: AfterRayOnboardingModelActions(
+                status: {
+                    _ = try await DaemonSupervisor.shared.startIfNeeded()
+                    return try await UnixSocketDaemonClient(
+                        socketPath: DaemonSupervisor.shared.socketPath
+                    ).modelLibrary()
+                },
+                download: { packID in
+                    _ = try await DaemonSupervisor.shared.startIfNeeded()
+                    return try await UnixSocketDaemonClient(
+                        socketPath: DaemonSupervisor.shared.socketPath
+                    ).downloadModels(packID: packID)
+                }
             )
         )
     }

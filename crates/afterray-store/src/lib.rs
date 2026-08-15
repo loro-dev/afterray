@@ -8,7 +8,8 @@
 
 use afterray_core::{CoreError, Store};
 use afterray_protocol::{
-    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Memory, Moment, SearchHit, Session,
+    ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Conversation, ConversationMessage,
+    DEFAULT_STORAGE_LIMIT_BYTES, Memory, Moment, SearchHit, Session,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -37,15 +38,20 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 mod activity;
 mod gop;
+pub mod infoscore;
 mod jpeg;
 mod memory;
+mod slot;
 
 pub use gop::{
     GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, PackCandidate,
@@ -53,16 +59,46 @@ pub use gop::{
 };
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
-    AccessibilityDigest, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
+    AccessibilityDigest, accessibility_text_lines, digest_fingerprint, is_idle_digest,
+    parse_accessibility_digest,
+};
+/// One stretch of transcribed speech: when it started, which track it came
+/// from, and what was said.
+pub type TranscriptLine = (i64, String, String);
+
+/// A capture id paired with the instant it was taken.
+pub type MomentAt = (String, i64);
+
+pub use slot::{
+    AppFact, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow, SLOT_DURATION_MS,
+    SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotFacts, SlotMomentRow, SlotState,
+    SlotSummaryState, StoredSlotOverlay, T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport,
+    T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, TimelineEntry, assemble_day_summary,
+    attach_entity_candidates, build_slot_card, dedup_key_of, extract_json_object,
+    local_day_bounds, local_day_for, parse_t2_card, parse_t2_card_v2, render_t2_prompt,
+    shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
 };
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 16;
+
+/// `text_evidence.source` for the synthetic rows that put window titles in FTS.
+pub const WINDOW_EVIDENCE_SOURCE: &str = "window";
+/// A window usually stays put for minutes while capture fires every ~10s.
+/// Re-indexing a title only after this long keeps the index from filling with
+/// thousands of identical rows, and collapses A↔B window flapping too.
+const WINDOW_TITLE_DEDUPE_MS: i64 = 600_000;
+
+/// Thumbnails are always JPEG, whatever the still they were derived from.
+pub const THUMBNAIL_CONTENT_TYPE: &str = "image/jpeg";
+
 const LEGACY_ARTIFACT_MAGIC: &[u8; 4] = b"ARV0";
 const ARTIFACT_MAGIC: &[u8; 4] = b"ARV1";
 const ARTIFACT_FORMAT_VERSION: i64 = 1;
 const NONCE_LENGTH: usize = 24;
 const WRAPPED_DEK_LENGTH: usize = 32 + 16;
 const ARTIFACT_HEADER_LENGTH: usize = 4 + NONCE_LENGTH;
+const ARTIFACT_FILE_OVERHEAD_BYTES: i64 = (ARTIFACT_HEADER_LENGTH + 16) as i64;
+const RETENTION_BATCH_SIZE: i64 = 256;
 const DATABASE_KEY_CONTEXT: &str = "dev.afterray.vault.database-key.v1";
 const ARTIFACT_WRAP_KEY_CONTEXT: &str = "dev.afterray.vault.artifact-wrap-key.v1";
 const KEYCHAIN_SERVICE: &str = "dev.afterray.v0.vault";
@@ -91,6 +127,8 @@ pub enum StoreError {
     GopNotFound(String),
     #[error("gop commit raced with retention")]
     GopStale,
+    #[error("moment not found: {0}")]
+    MomentNotFound(String),
 }
 
 pub trait KeyProvider: Send + Sync {
@@ -310,25 +348,75 @@ fn decode_key(value: &[u8]) -> Result<VaultKey, StoreError> {
 #[derive(Debug, Clone)]
 pub struct VaultConfig {
     pub data_dir: PathBuf,
-    pub max_unstarred_moments: usize,
+    pub max_storage_bytes: u64,
 }
 
 impl Default for VaultConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
-            max_unstarred_moments: 10_000,
+            max_storage_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
         }
     }
 }
 
 pub struct Vault {
+    /// The single writer. SQLite in WAL mode supports many readers beside
+    /// one writer; funnelling reads through this same mutex — the original
+    /// design — serialised the whole store behind whichever caller was
+    /// building a day of slot cards.
     connection: Mutex<Connection>,
+    readers: ReadPool,
+    /// Slot cards for settled half-hours, keyed by slot start. See
+    /// [`Vault::slot_card`] for the eligibility rule.
+    card_cache: Mutex<HashMap<i64, slot::SlotCard>>,
     artifacts_dir: PathBuf,
     artifact_wrap_key: Zeroizing<[u8; 32]>,
     legacy_artifact_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     artifact_io: Mutex<()>,
-    max_unstarred_moments: usize,
+    max_storage_bytes: AtomicU64,
+}
+
+/// A handful of `PRAGMA query_only` connections, handed out round-robin.
+/// `query_only` makes a misclassified write a loud error instead of a data
+/// race — the pool must never be able to corrupt anything.
+struct ReadPool {
+    connections: Vec<Mutex<Connection>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadPool {
+    const SIZE: usize = 3;
+
+    fn open(path: &Path, key: &Zeroizing<[u8; 32]>) -> Result<Self, StoreError> {
+        let mut connections = Vec::with_capacity(Self::SIZE);
+        for _ in 0..Self::SIZE {
+            let connection = open_keyed_database(path, key)?;
+            connection.execute_batch(
+                "PRAGMA query_only = ON;
+                 PRAGMA busy_timeout = 5000;",
+            )?;
+            connections.push(Mutex::new(connection));
+        }
+        Ok(Self {
+            connections,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Prefers an idle connection; blocks on one only when all are busy.
+    fn get(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.connections.len() {
+            let index = (start + offset) % self.connections.len();
+            if let Ok(guard) = self.connections[index].try_lock() {
+                return guard;
+            }
+        }
+        self.connections[start % self.connections.len()]
+            .lock()
+            .unwrap()
+    }
 }
 
 impl Vault {
@@ -355,9 +443,14 @@ impl Vault {
         let connection =
             open_database_with_legacy_migration(&database_path, &database_key, &master_key)?;
         migrate(&connection)?;
+        connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
         set_database_file_permissions(&database_path)?;
+        // Readers open only after migration has settled the schema.
+        let readers = ReadPool::open(&database_path, &database_key)?;
         let vault = Self {
             connection: Mutex::new(connection),
+            readers,
+            card_cache: Mutex::new(HashMap::new()),
             artifacts_dir,
             artifact_wrap_key: Zeroizing::new(blake3::derive_key(
                 ARTIFACT_WRAP_KEY_CONTEXT,
@@ -365,12 +458,36 @@ impl Vault {
             )),
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: Mutex::new(()),
-            max_unstarred_moments: config.max_unstarred_moments,
+            max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
         };
         let _ = vault.rollback_orphan_gops();
         let _ = vault.reconcile_packed_stills();
         let _ = vault.cleanup_unreferenced_gop_artifacts();
+        vault.enforce_retention()?;
         Ok(vault)
+    }
+
+    #[must_use]
+    pub fn storage_limit_bytes(&self) -> u64 {
+        self.max_storage_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_storage_limit_bytes(&self, bytes: u64) -> Result<(), StoreError> {
+        let previous = self.max_storage_bytes.swap(bytes, Ordering::Relaxed);
+        if let Err(error) = self.enforce_retention() {
+            self.max_storage_bytes.store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn storage_usage_bytes(&self) -> Result<u64, StoreError> {
+        let bytes = self.connection.lock().unwrap().query_row(
+            "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+            [ARTIFACT_FILE_OVERHEAD_BYTES],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
     }
 
     pub fn create_session_sync(&self, started_at_ms: i64) -> Result<Session, StoreError> {
@@ -415,7 +532,7 @@ impl Vault {
     }
 
     pub fn sessions_sync(&self) -> Result<Vec<Session>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, started_at_ms, ended_at_ms FROM sessions ORDER BY started_at_ms DESC",
         )?;
@@ -430,7 +547,7 @@ impl Vault {
     }
 
     pub fn moments_sync(&self, session_id: &str) -> Result<Vec<Moment>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
                     (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
@@ -728,7 +845,68 @@ impl Vault {
             self.delete_moment_and_artifacts(&moment_id)?;
             return Ok(None);
         }
+        self.index_window_title(session_id, &moment_id, moment_time, &context)?;
         Ok(Some(artifact_id))
+    }
+
+    /// Makes a moment findable by what its window was *called*.
+    ///
+    /// Titles land in `moments.window_title`, but `evidence_fts` only indexes
+    /// `text_evidence`, so search could never reach them. Mirroring the title
+    /// into a synthetic evidence row puts it through the same FTS, ranking, and
+    /// hit-opening path that OCR and transcripts already use.
+    fn index_window_title(
+        &self,
+        session_id: &str,
+        moment_id: &str,
+        captured_at_ms: i64,
+        context: &activity::ActivityContext,
+    ) -> Result<(), StoreError> {
+        let Some(title) = trimmed(context.window_title.as_deref()) else {
+            return Ok(());
+        };
+        // The URL is the stronger recall handle for a browser window, and it is
+        // never on screen as OCR text when the address bar is hidden.
+        let text = match trimmed(context.url.as_deref()) {
+            Some(url) => format!("{title}\n{url}"),
+            None => title.to_owned(),
+        };
+
+        let seen_recently = {
+            let connection = self.connection.lock().unwrap();
+            connection
+                .query_row(
+                    "SELECT 1 FROM text_evidence
+                      WHERE session_id = ?1 AND source = ?2 AND text = ?3
+                        AND started_at_ms > ?4
+                      LIMIT 1",
+                    params![
+                        session_id,
+                        WINDOW_EVIDENCE_SOURCE,
+                        text,
+                        captured_at_ms - WINDOW_TITLE_DEDUPE_MS
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+        };
+        if seen_recently {
+            return Ok(());
+        }
+
+        self.insert_text_evidence(
+            session_id,
+            Some(moment_id),
+            None,
+            WINDOW_EVIDENCE_SOURCE,
+            &text,
+            captured_at_ms,
+            None,
+            "activity",
+            None,
+        )?;
+        Ok(())
     }
 
     pub fn activity_spans(
@@ -740,7 +918,7 @@ impl Vault {
         if limit == 0 || from_ms > to_ms {
             return Ok(Vec::new());
         }
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, captured_at_ms, application_name, bundle_identifier,
                     window_title, url, document
@@ -763,6 +941,856 @@ impl Vault {
         drop(statement);
         drop(connection);
         Ok(activity::fold_activity_spans(&moments, limit))
+    }
+
+    /// Builds the deterministic T1 card for the slot containing `at_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    /// How long after a slot ends before its card may be cached. OCR and
+    /// transcripts land minutes after their frames; caching too early would
+    /// freeze a card that is still gaining text.
+    const CARD_CACHE_SETTLE_MS: i64 = 2 * 60 * 60 * 1000;
+    /// Bounded so a long-running daemon cannot grow the cache without limit;
+    /// on overflow the whole map is dropped and simply rebuilds on demand.
+    const CARD_CACHE_CAP: usize = 96;
+
+    pub fn slot_card(
+        &self,
+        at_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<slot::SlotCard, StoreError> {
+        let slot_start_ms = slot::slot_start_for(at_ms);
+        let slot_end_ms = slot_start_ms + slot::SLOT_DURATION_MS;
+
+        // A settled half hour is immutable except for deletion, and every
+        // deletion path flushes this cache. The same card used to be rebuilt
+        // — per-frame AX decryption included — by the day panel, the T2
+        // prompt, and the sweeper, each within minutes of the others.
+        let wall_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default(),
+        )
+        .unwrap_or(i64::MAX);
+        let settled = slot_end_ms.saturating_add(Self::CARD_CACHE_SETTLE_MS) <= wall_ms;
+        if settled
+            && let Some(card) = self.card_cache.lock().unwrap().get(&slot_start_ms)
+        {
+            return Ok(card.clone());
+        }
+
+        let mut rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
+        // The AX artifact is decrypted once per frame at T1 build time
+        // (once per half hour). It yields the two strongest intent signals
+        // (selection, composition) and, when the tree is rich enough, the
+        // frame's text itself: AX text is exact where OCR guesses, and is
+        // scoped to the frontmost app — the thing the user was operating,
+        // not everything on screen. Measured on a real slot, the two
+        // sources barely merge (60KB + 73KB ≈ 132KB combined), so this is
+        // a per-frame either/or, never a blend.
+        for row in &mut rows {
+            if !row.ax_present {
+                continue;
+            }
+            if let Ok(Some(bytes)) = self.accessibility_bytes_for_moment(&row.id) {
+                let digest = parse_accessibility_digest(&bytes);
+                row.selected_text = digest.selected_text;
+                row.focused_value = digest.focused_value;
+                let lines = accessibility_text_lines(&bytes);
+                let chars: usize = lines.iter().map(|line| line.chars().count()).sum();
+                if chars >= slot::AX_TEXT_MIN_CHARS {
+                    row.ocr_text = Some(lines.join("\n"));
+                    row.text_from_ax = true;
+                }
+            }
+        }
+        let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
+        let card = slot::build_slot_card(slot_start_ms, &rows, idle_ms, capture_interval_ms);
+        if settled {
+            let mut cache = self.card_cache.lock().unwrap();
+            if cache.len() >= Self::CARD_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(slot_start_ms, card.clone());
+        }
+        Ok(card)
+    }
+
+    /// Every path that removes moments must call this: a cached card for a
+    /// half hour whose frames were deleted would resurrect them.
+    fn flush_card_cache(&self) {
+        self.card_cache.lock().unwrap().clear();
+    }
+
+    /// Folds up to `max_slots` closed-but-uncounted slots into the text DF
+    /// corpus, oldest first, and returns how many were processed. Called
+    /// repeatedly from a background task until it returns 0; each call is one
+    /// short transaction, so a cold-start backfill never blocks a reader.
+    ///
+    /// A slot enters the corpus once, decided by the watermark. Only closed
+    /// slots count — the half hour still being written must not see itself
+    /// in its own background.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be read or written.
+    pub fn advance_text_df(
+        &self,
+        now_ms: i64,
+        capture_interval_ms: i64,
+        max_slots: usize,
+    ) -> Result<usize, StoreError> {
+        const BACKFILL_REACH_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+        let current_slot = slot::slot_start_for(now_ms);
+        let floor = now_ms.saturating_sub(BACKFILL_REACH_MS);
+        let mut watermark = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement =
+                connection.prepare("SELECT watermark_ms FROM text_df_meta WHERE id = 1")?;
+            let mut rows = statement.query([])?;
+            match rows.next()? {
+                Some(row) => row.get::<_, i64>(0)?,
+                None => slot::slot_start_for(floor),
+            }
+        }
+        .max(slot::slot_start_for(floor));
+
+        let mut processed = 0_usize;
+        while processed < max_slots {
+            if watermark + slot::SLOT_DURATION_MS > current_slot.min(now_ms) {
+                break; // only slots that have fully closed
+            }
+            let slot_start = watermark;
+            watermark += slot::SLOT_DURATION_MS;
+            let rows = self.slot_moment_rows(slot_start, slot_start + slot::SLOT_DURATION_MS)?;
+            let (line_keys, tokens) = slot::df_contribution(&rows);
+            let connection = self.connection.lock().unwrap();
+            let tx = connection.unchecked_transaction()?;
+            {
+                let mut upsert = tx.prepare_cached(
+                    "INSERT INTO text_df (kind, key, df, last_seen_ms) VALUES (?1, ?2, 1, ?3)
+                     ON CONFLICT(kind, key) DO UPDATE SET
+                       df = df + 1, last_seen_ms = excluded.last_seen_ms",
+                )?;
+                for key in &line_keys {
+                    upsert.execute(params![0_i64, key, slot_start])?;
+                }
+                for token in &tokens {
+                    upsert.execute(params![1_i64, token, slot_start])?;
+                }
+            }
+            let occupied = i64::from(!line_keys.is_empty() || !tokens.is_empty());
+            tx.execute(
+                "INSERT INTO text_df_meta (id, watermark_ms, slot_count)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                   watermark_ms = excluded.watermark_ms,
+                   slot_count = text_df_meta.slot_count + ?2",
+                params![watermark, occupied],
+            )?;
+            tx.commit()?;
+            processed += 1;
+        }
+        let _ = capture_interval_ms; // rows query is interval-independent
+        Ok(processed)
+    }
+
+    /// Batch DF lookup for exactly the keys and tokens one card needs.
+    /// Loading the whole corpus would be megabytes; a card asks after a few
+    /// thousand strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn background_stats(
+        &self,
+        card: &slot::SlotCard,
+    ) -> Result<infoscore::BackgroundStats, StoreError> {
+        let (line_keys, tokens) = slot::card_df_queries(card);
+        let connection = self.readers.get();
+        let (slots, watermark_ms) = {
+            let mut statement = connection
+                .prepare("SELECT slot_count, watermark_ms FROM text_df_meta WHERE id = 1")?;
+            let mut rows = statement.query([])?;
+            match rows.next()? {
+                Some(row) => (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                None => (0, i64::MIN),
+            }
+        };
+        let mut stats = infoscore::BackgroundStats {
+            slots: u32::try_from(slots.max(0)).unwrap_or(u32::MAX),
+            corpus_includes_slot: card.slot_end_ms <= watermark_ms,
+            line_df: HashMap::new(),
+            token_df: HashMap::new(),
+        };
+        let mut lookup = connection
+            .prepare_cached("SELECT df FROM text_df WHERE kind = ?1 AND key = ?2")?;
+        for key in line_keys {
+            if let Some(df) = lookup
+                .query_row(params![0_i64, &key], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                stats
+                    .line_df
+                    .insert(key, u32::try_from(df.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        for token in tokens {
+            if let Some(df) = lookup
+                .query_row(params![1_i64, &token], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                stats
+                    .token_df
+                    .insert(token, u32::try_from(df.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Persists a successful T2 card. Re-running the same slot increments
+    /// `generation` so a later model swap can tell the row is stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn put_t2_summary(
+        &self,
+        card: &slot::SlotCard,
+        t2: &slot::T2Card,
+        producer: &str,
+        produced_at_ms: i64,
+        latency_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let facts_json = serde_json::to_string(&card.facts).unwrap_or_else(|_| "{}".to_owned());
+        let artifacts_json = serde_json::to_string(&t2.artifacts).ok();
+        let bullets_json = serde_json::to_string(&t2.bullets).ok();
+        let evidence_json =
+            serde_json::to_string(&card.evidence).unwrap_or_else(|_| "{}".to_owned());
+        let id = Uuid::now_v7().to_string();
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO slot_summaries (
+                id, slot_start_ms, slot_end_ms, local_day, state, generation, schema_version,
+                facts_json, theme_key, artifacts_json, title, bullets_json, category, confidence,
+                evidence_json, producer, produced_at_ms, latency_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, 'done', 1, ?5,
+                ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16
+             )
+             ON CONFLICT(slot_start_ms) DO UPDATE SET
+                slot_end_ms = excluded.slot_end_ms,
+                local_day = excluded.local_day,
+                state = excluded.state,
+                generation = slot_summaries.generation + 1,
+                schema_version = excluded.schema_version,
+                facts_json = excluded.facts_json,
+                theme_key = excluded.theme_key,
+                artifacts_json = excluded.artifacts_json,
+                title = excluded.title,
+                bullets_json = excluded.bullets_json,
+                category = excluded.category,
+                confidence = excluded.confidence,
+                evidence_json = excluded.evidence_json,
+                producer = excluded.producer,
+                produced_at_ms = excluded.produced_at_ms,
+                latency_ms = excluded.latency_ms",
+            params![
+                id,
+                card.slot_start_ms,
+                card.slot_end_ms,
+                card.local_day,
+                SLOT_SUMMARY_SCHEMA_VERSION,
+                facts_json,
+                card.theme_key,
+                artifacts_json,
+                t2.title.trim(),
+                bullets_json,
+                t2.category.as_deref(),
+                t2.confidence,
+                evidence_json,
+                producer,
+                produced_at_ms,
+                latency_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persists a v2 card. Bullets are derived from threads so every v1
+    /// reader — the day panel, old CLI output — keeps working unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn put_t2_summary_v2(
+        &self,
+        card: &slot::SlotCard,
+        t2: &slot::T2CardV2,
+        producer: &str,
+        produced_at_ms: i64,
+        latency_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let compat = slot::T2Card {
+            artifacts: Vec::new(),
+            title: t2.title.clone(),
+            bullets: t2.derived_bullets(),
+            category: t2.category.clone(),
+            confidence: t2.confidence,
+        };
+        self.put_t2_summary(card, &compat, producer, produced_at_ms, latency_ms)?;
+        self.connection.lock().unwrap().execute(
+            "UPDATE slot_summaries SET
+                description = ?2,
+                threads_json = ?3,
+                entities_json = ?4,
+                decisions_json = ?5,
+                not_captured_json = ?6
+              WHERE slot_start_ms = ?1",
+            params![
+                card.slot_start_ms,
+                t2.description.trim(),
+                serde_json::to_string(&t2.threads).ok(),
+                serde_json::to_string(&t2.entities).ok(),
+                serde_json::to_string(&t2.decisions).ok(),
+                serde_json::to_string(&t2.not_captured).ok(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Neighbouring T2 titles, oldest first. Fed to the next T2 pass as a
+    /// negative constraint so adjacent cards do not copy each other's wording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn previous_slot_titles(
+        &self,
+        before_start_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<slot::PrevCard>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, title FROM slot_summaries
+              WHERE title IS NOT NULL AND TRIM(title) != '' AND slot_start_ms < ?1
+              ORDER BY slot_start_ms DESC
+              LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![before_start_ms, limit], |row| {
+            let start_ms: i64 = row.get(0)?;
+            let title: String = row.get(1)?;
+            Ok(slot::PrevCard {
+                from_label: slot::slot_clock_label(start_ms),
+                title,
+            })
+        })?;
+        let mut cards = rows.collect::<Result<Vec<_>, _>>()?;
+        cards.reverse();
+        Ok(cards)
+    }
+
+    /// The day panel payload: every occupied slot that day, with T2 titles
+    /// when they exist and T1 facts otherwise.
+    ///
+    /// AX is not decrypted here. Facts only need app names and durations;
+    /// walking every tree on a 48-slot day would stall the overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn day_summary(
+        &self,
+        day_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<slot::DaySummary, StoreError> {
+        let day = slot::local_day_for(day_ms);
+        let (day_start_ms, day_end_ms) = slot::local_day_bounds(day_ms);
+        let rows = self.slot_moment_rows(day_start_ms, day_end_ms)?;
+        let mut grouped: HashMap<i64, Vec<slot::SlotMomentRow>> = HashMap::new();
+        for row in rows {
+            grouped
+                .entry(slot::slot_start_for(row.captured_at_ms))
+                .or_default()
+                .push(row);
+        }
+        // Slots are independent — one card's build reads nothing from
+        // another's — and a day holds up to 48 of them. Building serially
+        // made opening the day panel cost the sum of every slot; scoped
+        // threads bound the cost by the slowest slot per lane, with the
+        // reader pool serving `idle_overlap_ms` lookups concurrently.
+        let mut starts: Vec<i64> = grouped.keys().copied().collect();
+        starts.sort_unstable();
+        let lanes = starts.len().clamp(1, 4);
+        let work: Vec<(i64, Vec<slot::SlotMomentRow>)> = starts
+            .iter()
+            .map(|start| (*start, grouped.remove(start).unwrap_or_default()))
+            .collect();
+        let mut cards: Vec<(i64, slot::SlotCard)> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(lanes);
+            for chunk in work.chunks(work.len().div_ceil(lanes).max(1)) {
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(start, slot_rows)| {
+                            let idle_ms = self
+                                .idle_overlap_ms(*start, *start + slot::SLOT_DURATION_MS)?;
+                            Ok((
+                                *start,
+                                slot::build_slot_card(
+                                    *start,
+                                    slot_rows,
+                                    idle_ms,
+                                    capture_interval_ms,
+                                ),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, StoreError>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("card build thread panicked"))
+                .collect::<Result<Vec<_>, StoreError>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect();
+        cards.sort_unstable_by_key(|(start, _)| *start);
+        let cards: Vec<slot::SlotCard> = cards.into_iter().map(|(_, card)| card).collect();
+        let overlays = self.slot_overlays_for_day(&day)?;
+        Ok(slot::assemble_day_summary(
+            day,
+            day_start_ms,
+            day_end_ms,
+            &cards,
+            &overlays,
+        ))
+    }
+
+    /// A small, cursor-paginated slice of occupied local days for the history
+    /// summary panel. The query only keeps one page in memory; clients pass
+    /// `next_before_ms` back unchanged to continue toward older history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vault cannot be queried.
+    pub fn summary_history(
+        &self,
+        before_ms: Option<i64>,
+        limit: usize,
+        capture_interval_ms: i64,
+    ) -> Result<slot::SummaryHistoryPage, StoreError> {
+        let mut cursor = before_ms.unwrap_or(i64::MAX);
+        let mut days = Vec::with_capacity(limit.clamp(1, 31));
+
+        for _ in 0..limit.clamp(1, 31) {
+            let Some(latest_ms) = self.latest_moment_before(cursor)? else {
+                break;
+            };
+            let summary = self.day_summary(latest_ms, capture_interval_ms)?;
+            // The cursor is the local midnight, rather than a fixed 24-hour
+            // subtraction, so it remains correct over DST changes too.
+            cursor = summary.day_start_ms;
+            if !summary.slots.is_empty() {
+                days.push(summary);
+            }
+        }
+
+        let has_more = self.latest_moment_before(cursor)?.is_some();
+        Ok(slot::SummaryHistoryPage {
+            days,
+            next_before_ms: has_more.then_some(cursor),
+            has_more,
+        })
+    }
+
+    fn latest_moment_before(&self, before_ms: i64) -> Result<Option<i64>, StoreError> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT captured_at_ms
+                   FROM moments
+                  WHERE captured_at_ms < ?1
+                  ORDER BY captured_at_ms DESC, id DESC
+                  LIMIT 1",
+                params![before_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn slot_overlays_for_day(
+        &self,
+        local_day: &str,
+    ) -> Result<HashMap<i64, slot::StoredSlotOverlay>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, state, title, bullets_json, category,
+                    description, threads_json, entities_json, decisions_json,
+                    not_captured_json
+               FROM slot_summaries
+              WHERE local_day = ?1
+              ORDER BY slot_start_ms",
+        )?;
+        let rows = statement.query_map(params![local_day], |row| {
+            let start: i64 = row.get(0)?;
+            let state_raw: String = row.get(1)?;
+            let title: Option<String> = row.get(2)?;
+            let bullets_json: Option<String> = row.get(3)?;
+            let category: Option<String> = row.get(4)?;
+            let description: Option<String> = row.get(5)?;
+            let threads_json: Option<String> = row.get(6)?;
+            let entities_json: Option<String> = row.get(7)?;
+            let decisions_json: Option<String> = row.get(8)?;
+            let not_captured_json: Option<String> = row.get(9)?;
+            let parse_list = |json: Option<String>| {
+                json.and_then(|raw| serde_json::from_str(&raw).ok())
+            };
+            let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
+            Ok((
+                start,
+                slot::StoredSlotOverlay {
+                    state: slot::SlotSummaryState::parse(&state_raw),
+                    title,
+                    bullets,
+                    category,
+                    description: description.filter(|text| !text.is_empty()),
+                    threads: threads_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                    entities: entities_json
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                    decisions: parse_list(decisions_json),
+                    not_captured: parse_list(not_captured_json),
+                },
+            ))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Moments in `[from_ms, to_ms)` joined with their OCR text and evidence flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn slot_moment_rows(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<slot::SlotMomentRow>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT m.id, m.captured_at_ms, m.application_name, m.bundle_identifier,
+                    m.window_title, m.url, m.document,
+                    (SELECT group_concat(te.text, '\n') FROM text_evidence te
+                      WHERE te.moment_id = m.id AND te.source = 'ocr'),
+                    m.accessibility_artifact_id IS NOT NULL,
+                    EXISTS (SELECT 1 FROM audio_segments a
+                             WHERE m.captured_at_ms BETWEEN a.started_at_ms AND a.ended_at_ms)
+               FROM moments m
+              WHERE m.captured_at_ms >= ?1 AND m.captured_at_ms < ?2
+              ORDER BY m.captured_at_ms, m.id",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(slot::SlotMomentRow {
+                id: row.get(0)?,
+                captured_at_ms: row.get(1)?,
+                application_name: row.get(2)?,
+                bundle_identifier: row.get(3)?,
+                window_title: row.get(4)?,
+                url: row.get(5)?,
+                document: row.get(6)?,
+                ocr_text: row.get(7)?,
+                selected_text: None,
+                focused_value: None,
+                text_from_ax: false,
+                ax_present: row.get(8)?,
+                has_audio: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Milliseconds of `[from_ms, to_ms)` covered by recorded idle spans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn idle_overlap_ms(&self, from_ms: i64, to_ms: i64) -> Result<i64, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT started_at_ms, ended_at_ms FROM idle_spans
+              WHERE started_at_ms < ?2 AND (ended_at_ms IS NULL OR ended_at_ms > ?1)",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            let started: i64 = row.get(0)?;
+            let ended: Option<i64> = row.get(1)?;
+            Ok((started, ended.unwrap_or(to_ms)))
+        })?;
+        let mut total = 0_i64;
+        for span in rows {
+            let (started, ended) = span?;
+            let overlap = ended.min(to_ms).saturating_sub(started.max(from_ms));
+            total += overlap.max(0);
+        }
+        Ok(total.min(to_ms.saturating_sub(from_ms)))
+    }
+
+    /// Speech transcribed in a window, oldest first.
+    ///
+    /// Meetings are otherwise unreachable to an agent: transcripts hang off
+    /// audio segments, not moments, so asking about "the call at three" has
+    /// no moment id to start from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn transcripts_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<TranscriptLine>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT te.started_at_ms, COALESCE(a.track, 'unknown'), te.text
+               FROM text_evidence te
+               LEFT JOIN audio_segments a ON a.id = te.audio_segment_id
+              WHERE te.source = 'transcript'
+                AND te.started_at_ms >= ?1 AND te.started_at_ms <= ?2
+              ORDER BY te.started_at_ms
+              LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Moments captured in a window, oldest first. Entry points for an agent
+    /// that knows a time but no ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_ids_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MomentAt>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, captured_at_ms FROM moments
+              WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2
+              ORDER BY captured_at_ms
+              LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![from_ms, to_ms, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Oldest and newest capture held by the vault, or `None` when nothing has
+    /// been recorded. An agent needs this to tell a window that is genuinely
+    /// quiet from one that falls outside the recording altogether.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_time_bounds(&self) -> Result<Option<(i64, i64)>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement =
+            connection.prepare("SELECT MIN(captured_at_ms), MAX(captured_at_ms) FROM moments")?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let first: Option<i64> = row.get(0)?;
+        let last: Option<i64> = row.get(1)?;
+        Ok(first.zip(last))
+    }
+
+    /// Nearest moment to `at_ms`, in either direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn moment_nearest(&self, at_ms: i64) -> Result<Option<String>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id FROM moments
+              ORDER BY ABS(captured_at_ms - ?1), captured_at_ms
+              LIMIT 1",
+        )?;
+        let mut rows = statement.query(params![at_ms])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
+    /// Creates a conversation and returns its id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn create_conversation(&self, title: &str, now_ms: i64) -> Result<String, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO conversations (id, title, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![id, title, now_ms],
+        )?;
+        Ok(id)
+    }
+
+    /// Conversations, most recently touched first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversations(&self, limit: usize) -> Result<Vec<Conversation>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
+                    (SELECT COUNT(*) FROM conversation_messages m
+                      WHERE m.conversation_id = c.id)
+               FROM conversations c
+              ORDER BY c.updated_at_ms DESC
+              LIMIT ?1",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![limit], |row| {
+            Ok(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                message_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// One conversation by id, if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation(&self, id: &str) -> Result<Option<Conversation>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.title, c.created_at_ms, c.updated_at_ms,
+                    (SELECT COUNT(*) FROM conversation_messages m
+                      WHERE m.conversation_id = c.id)
+               FROM conversations c
+              WHERE c.id = ?1",
+        )?;
+        let mut rows = statement.query(params![id])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                message_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+            }),
+            None => None,
+        })
+    }
+
+    /// Appends a message and bumps the conversation's updated timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either write fails.
+    pub fn append_message(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+        tool_log: Option<&str>,
+        now_ms: i64,
+    ) -> Result<String, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "INSERT INTO conversation_messages
+               (id, conversation_id, role, content, tool_log, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, conversation_id, role, content, tool_log, now_ms],
+        )?;
+        connection.execute(
+            "UPDATE conversations SET updated_at_ms = ?2 WHERE id = ?1",
+            params![conversation_id, now_ms],
+        )?;
+        Ok(id)
+    }
+
+    /// Messages of one conversation in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationMessage>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, conversation_id, role, content, tool_log, created_at_ms
+               FROM conversation_messages
+              WHERE conversation_id = ?1
+              ORDER BY created_at_ms, id",
+        )?;
+        let rows = statement.query_map(params![conversation_id], |row| {
+            Ok(ConversationMessage {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tool_log: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Renames a conversation — used to replace the placeholder title with
+    /// one derived from the opening question.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<(), StoreError> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE conversations SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a conversation and, by cascade, its messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub fn delete_conversation(&self, id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub fn begin_idle_span(&self, started_at_ms: i64, reason: &str) -> Result<String, StoreError> {
@@ -805,11 +1833,13 @@ impl Vault {
     }
 
     pub fn delete_moment_and_artifacts(&self, moment_id: &str) -> Result<(), StoreError> {
+        self.flush_card_cache();
         let connection = self.connection.lock().unwrap();
-        let artifacts: (Option<String>, Option<String>) = connection.query_row(
-            "SELECT image_artifact_id, accessibility_artifact_id FROM moments WHERE id = ?1",
+        let artifacts: Vec<Option<String>> = connection.query_row(
+            "SELECT image_artifact_id, accessibility_artifact_id, thumbnail_artifact_id
+               FROM moments WHERE id = ?1",
             [moment_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok(vec![row.get(0)?, row.get(1)?, row.get(2)?]),
         )?;
         connection.execute(
             "DELETE FROM evidence_fts WHERE evidence_id IN
@@ -818,11 +1848,8 @@ impl Vault {
         )?;
         connection.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
         drop(connection);
-        if let Some(image) = artifacts.0 {
-            self.delete_artifact_record_and_file(&image)?;
-        }
-        if let Some(accessibility) = artifacts.1 {
-            self.delete_artifact_record_and_file(&accessibility)?;
+        for artifact_id in artifacts.into_iter().flatten() {
+            self.delete_artifact_record_and_file(&artifact_id)?;
         }
         Ok(())
     }
@@ -860,7 +1887,7 @@ impl Vault {
         if limit == 0 || from_ms > to_ms {
             return Ok(Vec::new());
         }
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id, start_ms, end_ms, moment_id, application_name, bundle_identifier,
                     window_title, url, document, summary, fingerprint
@@ -877,7 +1904,7 @@ impl Vault {
     }
 
     pub fn latest_memory(&self) -> Result<Option<Memory>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT id, start_ms, end_ms, moment_id, application_name, bundle_identifier,
@@ -891,6 +1918,7 @@ impl Vault {
     }
 
     pub fn delete_history(&self, from_ms: i64, to_ms: i64) -> Result<usize, StoreError> {
+        self.flush_card_cache();
         if from_ms > to_ms {
             return Ok(0);
         }
@@ -908,6 +1936,13 @@ impl Vault {
         }
         self.connection.lock().unwrap().execute(
             "DELETE FROM memories WHERE start_ms <= ?2 AND end_ms >= ?1",
+            params![from_ms, to_ms],
+        )?;
+        // A leftover card after the evidence is gone is both a privacy leak
+        // and a hallucination source for the next T2 pass.
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM slot_summaries
+              WHERE slot_start_ms <= ?2 AND slot_end_ms > ?1",
             params![from_ms, to_ms],
         )?;
         Ok(count)
@@ -988,6 +2023,51 @@ impl Vault {
         Ok(id)
     }
 
+    /// Artifact holding this moment's filmstrip thumbnail, if one was built.
+    pub fn thumbnail_artifact_id(&self, moment_id: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT thumbnail_artifact_id FROM moments WHERE id = ?1",
+                [moment_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into)
+    }
+
+    /// Stores (or replaces) a moment's thumbnail and returns the artifact id.
+    ///
+    /// Thumbnails outlive the still they came from: `drop_unpinned_stills`
+    /// deletes the full-resolution JPEG once a moment is packed into a cold
+    /// GOP, and nothing on the Rust side can decode AV1 to rebuild one.
+    pub fn set_thumbnail(&self, moment_id: &str, bytes: &[u8]) -> Result<String, StoreError> {
+        let previous = self.thumbnail_artifact_id(moment_id)?;
+        let artifact_id = self.put_artifact(THUMBNAIL_CONTENT_TYPE, bytes)?;
+        let updated = self.connection.lock().unwrap().execute(
+            "UPDATE moments SET thumbnail_artifact_id = ?2 WHERE id = ?1",
+            params![moment_id, artifact_id],
+        );
+        match updated {
+            Ok(0) => {
+                // The moment was evicted while the thumbnail was encoding.
+                let _ = self.delete_artifact_record_and_file(&artifact_id);
+                return Err(StoreError::MomentNotFound(moment_id.to_owned()));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = self.delete_artifact_record_and_file(&artifact_id);
+                return Err(error.into());
+            }
+        }
+        if let Some(previous) = previous {
+            self.delete_artifact_record_and_file(&previous)?;
+        }
+        Ok(artifact_id)
+    }
+
     /// Returns OCR layout JSON for a moment, if an OCR evidence row stored boxes.
     pub fn ocr_layout_for_moment(&self, moment_id: &str) -> Result<Option<String>, StoreError> {
         let connection = self.connection.lock().unwrap();
@@ -1009,7 +2089,7 @@ impl Vault {
         &self,
         moment_id: &str,
     ) -> Result<Option<(String, Option<String>)>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT text, layout_json FROM text_evidence
@@ -1024,7 +2104,7 @@ impl Vault {
     }
 
     pub fn moment_by_id(&self, moment_id: &str) -> Result<Option<Moment>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
                     (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
@@ -1084,7 +2164,7 @@ impl Vault {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT COALESCE(
                        te.moment_id,
@@ -1460,111 +2540,182 @@ impl Vault {
 
     #[allow(clippy::too_many_lines)]
     fn enforce_retention(&self) -> Result<(), StoreError> {
-        let max = i64::try_from(self.max_unstarred_moments).unwrap_or(i64::MAX);
-        let mut connection = self.connection.lock().unwrap();
-        let count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM moments", [], |row| row.get(0))?;
-        let excess = count.saturating_sub(max).max(0);
-        if excess == 0 {
-            return Ok(());
-        }
-        let transaction = connection.transaction()?;
-        let candidates = {
-            let mut statement = transaction.prepare(
-                "SELECT id, image_artifact_id, accessibility_artifact_id
-                   FROM moments
-                 ORDER BY captured_at_ms ASC LIMIT ?1",
+        self.flush_card_cache();
+        loop {
+            let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
+            let mut connection = self.connection.lock().unwrap();
+            let used: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+                [ARTIFACT_FILE_OVERHEAD_BYTES],
+                |row| row.get(0),
             )?;
-            statement
-                .query_map([excess], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut gop_artifact_ids = Vec::new();
-        for (moment_id, artifact_id, accessibility_artifact_id) in &candidates {
-            transaction.execute(
-                "DELETE FROM evidence_fts WHERE evidence_id IN
-                 (SELECT id FROM text_evidence WHERE moment_id = ?1)",
-                [moment_id],
-            )?;
-            transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
-            transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
-            if let Some(artifact_id) = artifact_id {
-                transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+            let excess = used.saturating_sub(max).max(0);
+            if excess == 0 {
+                return Ok(());
             }
-            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
-                transaction.execute(
-                    "DELETE FROM artifacts WHERE id = ?1",
-                    [accessibility_artifact_id],
+
+            let transaction = connection.transaction()?;
+            let candidate_pool = {
+                let mut statement = transaction.prepare(
+                    "SELECT m.id, m.image_artifact_id, m.accessibility_artifact_id,
+                            m.thumbnail_artifact_id,
+                            COALESCE(image.byte_length + ?1, 0)
+                              + COALESCE(accessibility.byte_length + ?1, 0)
+                              + COALESCE(thumbnail.byte_length + ?1, 0)
+                              + CASE
+                                  WHEN m.gop_segment_id IS NOT NULL
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM moments favorite
+                                      WHERE favorite.gop_segment_id = m.gop_segment_id
+                                        AND favorite.is_favorite = 1
+                                   )
+                                  THEN COALESCE(gop_artifact.byte_length + ?1, 0)
+                                    / MAX((
+                                        SELECT COUNT(*) FROM moments sibling
+                                         WHERE sibling.gop_segment_id = m.gop_segment_id
+                                           AND sibling.is_favorite = 0
+                                      ), 1)
+                                  ELSE 0
+                                END
+                       FROM moments m
+                       LEFT JOIN artifacts image ON image.id = m.image_artifact_id
+                       LEFT JOIN artifacts accessibility
+                         ON accessibility.id = m.accessibility_artifact_id
+                       LEFT JOIN artifacts thumbnail
+                         ON thumbnail.id = m.thumbnail_artifact_id
+                       LEFT JOIN gop_segments gop ON gop.id = m.gop_segment_id
+                       LEFT JOIN artifacts gop_artifact ON gop_artifact.id = gop.artifact_id
+                      WHERE m.is_favorite = 0
+                        AND (
+                          image.id IS NOT NULL
+                          OR accessibility.id IS NOT NULL
+                          OR m.gop_segment_id IS NULL
+                          OR NOT EXISTS (
+                            SELECT 1 FROM moments favorite
+                             WHERE favorite.gop_segment_id = m.gop_segment_id
+                               AND favorite.is_favorite = 1
+                          )
+                        )
+                      ORDER BY m.captured_at_ms ASC, m.id ASC
+                      LIMIT ?2",
                 )?;
+                statement
+                    .query_map(
+                        params![ARTIFACT_FILE_OVERHEAD_BYTES, RETENTION_BATCH_SIZE],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, i64>(4)?,
+                            ))
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut estimated_reclaim = 0_i64;
+            let mut candidates = Vec::new();
+            for (moment_id, artifact_id, accessibility_artifact_id, thumbnail_artifact_id, bytes) in
+                candidate_pool
+            {
+                candidates.push((
+                    moment_id,
+                    artifact_id,
+                    accessibility_artifact_id,
+                    thumbnail_artifact_id,
+                ));
+                estimated_reclaim = estimated_reclaim.saturating_add(bytes.max(0));
+                if bytes <= 0 || estimated_reclaim >= excess {
+                    break;
+                }
             }
-        }
-        let empty_segments: Vec<(String, Option<String>)> = {
-            let mut statement = transaction.prepare(
-                "SELECT id, artifact_id FROM gop_segments
-                  WHERE id NOT IN (
-                    SELECT DISTINCT gop_segment_id FROM moments WHERE gop_segment_id IS NOT NULL
-                  )
-                  AND id NOT IN (SELECT DISTINCT segment_id FROM gop_frames)",
-            )?;
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (segment_id, artifact_id) in &empty_segments {
-            transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
-            if let Some(artifact_id) = artifact_id {
+
+            let mut gop_artifact_ids = Vec::new();
+            for (moment_id, artifact_id, accessibility_artifact_id, thumbnail_artifact_id) in
+                &candidates
+            {
+                transaction.execute(
+                    "DELETE FROM evidence_fts WHERE evidence_id IN
+                     (SELECT id FROM text_evidence WHERE moment_id = ?1)",
+                    [moment_id],
+                )?;
+                transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
+                transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
+                for artifact_id in [artifact_id, accessibility_artifact_id, thumbnail_artifact_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+                }
+            }
+            let empty_segments: Vec<(String, Option<String>)> = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, artifact_id FROM gop_segments
+                      WHERE id NOT IN (
+                        SELECT DISTINCT gop_segment_id FROM moments WHERE gop_segment_id IS NOT NULL
+                      )
+                      AND id NOT IN (SELECT DISTINCT segment_id FROM gop_frames)",
+                )?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (segment_id, artifact_id) in &empty_segments {
+                transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
+                if let Some(artifact_id) = artifact_id {
+                    transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+                    gop_artifact_ids.push(artifact_id.clone());
+                }
+            }
+            let audio_candidates = {
+                let mut statement = transaction.prepare(
+                    "SELECT audio.id, audio.audio_artifact_id
+                       FROM audio_segments audio
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM moments m
+                         WHERE m.session_id = audio.session_id
+                           AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
+                      )",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (segment_id, artifact_id) in &audio_candidates {
+                transaction.execute(
+                    "DELETE FROM evidence_fts WHERE evidence_id IN
+                     (SELECT id FROM text_evidence WHERE audio_segment_id = ?1)",
+                    [segment_id],
+                )?;
+                transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
                 transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-                gop_artifact_ids.push(artifact_id.clone());
             }
-        }
-        let audio_candidates = {
-            let mut statement = transaction.prepare(
-                "SELECT audio.id, audio.audio_artifact_id
-                   FROM audio_segments audio
-                  WHERE NOT EXISTS (
-                    SELECT 1 FROM moments m
-                     WHERE m.session_id = audio.session_id
-                       AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                  )",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (segment_id, artifact_id) in &audio_candidates {
-            transaction.execute(
-                "DELETE FROM evidence_fts WHERE evidence_id IN
-                 (SELECT id FROM text_evidence WHERE audio_segment_id = ?1)",
-                [segment_id],
-            )?;
-            transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
-            transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-        }
-        transaction.commit()?;
-        drop(connection);
-        for (_, artifact_id, accessibility_artifact_id) in candidates {
-            if let Some(artifact_id) = artifact_id {
+            let removed_anything = !candidates.is_empty()
+                || !gop_artifact_ids.is_empty()
+                || !audio_candidates.is_empty();
+            transaction.commit()?;
+            drop(connection);
+            for (_, artifact_id, accessibility_artifact_id, thumbnail_artifact_id) in candidates {
+                for artifact_id in [artifact_id, accessibility_artifact_id, thumbnail_artifact_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = fs::remove_file(self.artifact_path(&artifact_id));
+                }
+            }
+            for artifact_id in gop_artifact_ids {
                 let _ = fs::remove_file(self.artifact_path(&artifact_id));
             }
-            if let Some(accessibility_artifact_id) = accessibility_artifact_id {
-                let _ = fs::remove_file(self.artifact_path(&accessibility_artifact_id));
+            for (_, artifact_id) in audio_candidates {
+                let _ = fs::remove_file(self.artifact_path(&artifact_id));
+            }
+            if !removed_anything {
+                return Ok(());
             }
         }
-        for artifact_id in gop_artifact_ids {
-            let _ = fs::remove_file(self.artifact_path(&artifact_id));
-        }
-        for (_, artifact_id) in audio_candidates {
-            let _ = fs::remove_file(self.artifact_path(&artifact_id));
-        }
-        Ok(())
     }
 
     fn artifact_path(&self, id: &str) -> PathBuf {
@@ -1780,6 +2931,12 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_8(connection)?;
     migrate_schema_9(connection)?;
     migrate_schema_10(connection)?;
+    migrate_schema_11(connection)?;
+    migrate_schema_12(connection)?;
+    migrate_schema_13(connection)?;
+    migrate_schema_14(connection)?;
+    migrate_schema_15(connection)?;
+    migrate_schema_16(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -2085,6 +3242,146 @@ fn migrate_schema_10(connection: &Connection) -> Result<(), StoreError> {
     if !columns.iter().any(|name| name == "layout_json") {
         connection.execute("ALTER TABLE text_evidence ADD COLUMN layout_json TEXT", [])?;
     }
+    Ok(())
+}
+
+fn trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn migrate_schema_11(connection: &Connection) -> Result<(), StoreError> {
+    // Window-title indexing looks up "have I already recorded this title in
+    // this session recently?" on every capture. Without this index that is a
+    // full scan of every OCR and transcript row in the vault.
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS text_evidence_session_source
+           ON text_evidence(session_id, source, started_at_ms);",
+    )?;
+    Ok(())
+}
+
+/// Chat lives in the vault like every other capture: encrypted at rest and
+/// removed by the same retention and clear-history paths. A conversation
+/// about what you did all day is as revealing as the recording it is about.
+fn migrate_schema_13(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversations (
+           id TEXT PRIMARY KEY,
+           title TEXT NOT NULL,
+           created_at_ms INTEGER NOT NULL,
+           updated_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS conversations_updated
+           ON conversations(updated_at_ms DESC);
+         CREATE TABLE IF NOT EXISTS conversation_messages (
+           id TEXT PRIMARY KEY,
+           conversation_id TEXT NOT NULL
+             REFERENCES conversations(id) ON DELETE CASCADE,
+           role TEXT NOT NULL,
+           content TEXT NOT NULL,
+           tool_log TEXT,
+           created_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS conversation_messages_thread
+           ON conversation_messages(conversation_id, created_at_ms);",
+    )?;
+    Ok(())
+}
+
+fn migrate_schema_12(connection: &Connection) -> Result<(), StoreError> {
+    let moment_columns = moment_column_names(connection)?;
+    if !moment_columns
+        .iter()
+        .any(|name| name == "thumbnail_artifact_id")
+    {
+        connection.execute(
+            "ALTER TABLE moments ADD COLUMN thumbnail_artifact_id TEXT REFERENCES artifacts(id)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Slot cards persist independently of the live T1 compute path. T2 output
+/// used to vanish when the process exited; the day panel needs it to survive.
+fn migrate_schema_14(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS slot_summaries (
+           id              TEXT PRIMARY KEY,
+           slot_start_ms   INTEGER NOT NULL,
+           slot_end_ms     INTEGER NOT NULL,
+           local_day       TEXT NOT NULL,
+           state           TEXT NOT NULL,
+           generation      INTEGER NOT NULL DEFAULT 1,
+           schema_version  INTEGER NOT NULL,
+           facts_json      TEXT NOT NULL,
+           theme_key       TEXT,
+           artifacts_json  TEXT,
+           title           TEXT,
+           bullets_json    TEXT,
+           category        TEXT,
+           confidence      REAL,
+           evidence_json   TEXT NOT NULL,
+           producer        TEXT,
+           produced_at_ms  INTEGER,
+           input_tokens    INTEGER,
+           output_tokens   INTEGER,
+           latency_ms      INTEGER
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS slot_summaries_slot
+           ON slot_summaries(slot_start_ms);
+         CREATE INDEX IF NOT EXISTS slot_summaries_day
+           ON slot_summaries(local_day, slot_start_ms);",
+    )?;
+    Ok(())
+}
+
+/// The v2 card columns: description, per-thread prose with frame citations,
+/// verbatim entities, decisions, and honest gaps. Additive so v1 rows keep
+/// reading; `bullets_json` stays derived for old readers.
+fn migrate_schema_16(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(slot_summaries)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for column in [
+        "description TEXT",
+        "threads_json TEXT",
+        "entities_json TEXT",
+        "decisions_json TEXT",
+        "not_captured_json TEXT",
+    ] {
+        let name = column.split(' ').next().unwrap_or_default();
+        if !existing.iter().any(|held| held == name) {
+            connection.execute(
+                &format!("ALTER TABLE slot_summaries ADD COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Document frequencies of screen-text lines and tokens over the user's own
+/// slot history — the background corpus for `infoscore`. `kind` 0 is a line
+/// dedup key, 1 is a token. `text_df_meta` remembers how far the corpus has
+/// been built so maintenance is incremental.
+fn migrate_schema_15(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS text_df (
+           kind          INTEGER NOT NULL,
+           key           TEXT NOT NULL,
+           df            INTEGER NOT NULL,
+           last_seen_ms  INTEGER NOT NULL,
+           PRIMARY KEY (kind, key)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS text_df_meta (
+           id            INTEGER PRIMARY KEY CHECK (id = 1),
+           watermark_ms  INTEGER NOT NULL,
+           slot_count    INTEGER NOT NULL
+         );",
+    )?;
     Ok(())
 }
 
@@ -2452,12 +3749,16 @@ mod pipeline_bench;
 mod tests {
     use super::*;
 
-    fn test_vault(max: usize) -> (tempfile::TempDir, Vault) {
+    fn test_vault(max_storage_gigabytes: u64) -> (tempfile::TempDir, Vault) {
+        test_vault_with_storage_limit(max_storage_gigabytes.saturating_mul(1_000_000_000))
+    }
+
+    fn test_vault_with_storage_limit(max_storage_bytes: u64) -> (tempfile::TempDir, Vault) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: max,
+                max_storage_bytes,
             },
             [7_u8; 32],
         )
@@ -2502,7 +3803,7 @@ mod tests {
         let result = Vault::open(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 10,
+                ..VaultConfig::default()
             },
             &provider,
         );
@@ -2606,7 +3907,7 @@ mod tests {
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 10,
+                ..VaultConfig::default()
             },
             master_key,
         )
@@ -2630,7 +3931,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
-            max_unstarred_moments: 10,
+            ..VaultConfig::default()
         };
         let master_key = [23_u8; 32];
         let vault = Vault::open_with_key(config.clone(), master_key).unwrap();
@@ -2783,9 +4084,78 @@ mod tests {
         assert!(too_late.is_none());
     }
 
+    /// The point of the reader pool: a long write transaction must not stall
+    /// reads. Before the pool, one mutex serialised the entire store.
     #[test]
-    fn retention_evicts_oldest_moments() {
-        let (_directory, vault) = test_vault(2);
+    fn reads_proceed_while_a_write_transaction_is_open() {
+        let (_directory, vault) = test_vault(100);
+        let session = vault.create_session_sync(1_000).unwrap();
+        vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"one")
+            .unwrap();
+
+        // Hold the writer open on this thread…
+        let writer = vault.connection.lock().unwrap();
+        let tx = writer.unchecked_transaction().unwrap();
+        tx.execute(
+            "INSERT INTO text_df (kind, key, df, last_seen_ms) VALUES (9, 'held', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        // …and read from another. With reads behind the same mutex this
+        // deadlocks (single-threaded) — the read must come from the pool.
+        let sessions = vault.sessions_sync().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let rows = vault.slot_moment_rows(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 1);
+        drop(tx);
+        drop(writer);
+    }
+
+    /// `query_only` turns a misclassified write into an error, never silent
+    /// WAL corruption. This is the guard that makes the pool safe to extend.
+    #[test]
+    fn reader_connections_refuse_writes() {
+        let (_directory, vault) = test_vault(100);
+        let reader = vault.readers.get();
+        let result = reader.execute("CREATE TABLE should_fail (id INTEGER)", []);
+        assert!(result.is_err(), "a pool reader accepted a write");
+    }
+
+    #[test]
+    fn settled_slot_cards_are_cached_until_a_deletion() {
+        let (_directory, vault) = test_vault(100);
+        // Timestamps far in the past: settled by any wall clock.
+        let start = slot_start_for(1_600_000_000_000);
+        let session = vault.create_session_sync(start).unwrap();
+        vault
+            .insert_moment(&session.id, start + 1_000, "image/jpeg", b"one")
+            .unwrap();
+
+        let first = vault.slot_card(start, 10_000).unwrap();
+        assert_eq!(first.facts.moment_count, 1);
+        assert!(
+            vault.card_cache.lock().unwrap().contains_key(&start),
+            "settled card must enter the cache"
+        );
+
+        // A deletion must flush; the rebuilt card reflects the new truth.
+        let deleted = vault
+            .delete_history(start, start + SLOT_DURATION_MS)
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(
+            vault.card_cache.lock().unwrap().is_empty(),
+            "deletion left a stale card behind"
+        );
+        let rebuilt = vault.slot_card(start, 10_000).unwrap();
+        assert_eq!(rebuilt.facts.moment_count, 0);
+    }
+
+    #[test]
+    fn storage_retention_evicts_oldest_moments() {
+        let (_directory, vault) = test_vault_with_storage_limit(100);
         let session = vault.create_session_sync(1).unwrap();
         let first = vault
             .insert_moment(&session.id, 1, "image/jpeg", b"one")
@@ -2808,6 +4178,156 @@ mod tests {
         assert!(!ids.contains(&second.id.as_str()));
         assert!(ids.contains(&third.id.as_str()));
         assert!(ids.contains(&fourth.id.as_str()));
+        assert!(vault.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn lowering_storage_limit_prunes_immediately() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        let third = vault
+            .insert_moment(&session.id, 3, "image/jpeg", b"three")
+            .unwrap();
+
+        vault.set_storage_limit_bytes(100).unwrap();
+
+        let ids = vault
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&first.id));
+        assert!(ids.contains(&second.id));
+        assert!(ids.contains(&third.id));
+        assert_eq!(vault.storage_limit_bytes(), 100);
+        assert!(vault.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn opening_vault_applies_persisted_storage_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: data_dir.clone(),
+                max_storage_bytes: 10_000,
+            },
+            [7_u8; 32],
+        )
+        .unwrap();
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 3, "image/jpeg", b"three")
+            .unwrap();
+        drop(vault);
+
+        let reopened = Vault::open_with_key(
+            VaultConfig {
+                data_dir,
+                max_storage_bytes: 100,
+            },
+            [7_u8; 32],
+        )
+        .unwrap();
+        let ids = reopened
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&first.id));
+        assert!(reopened.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
+    fn storage_retention_keeps_favorites() {
+        let (_directory, vault) = test_vault_with_storage_limit(100);
+        let session = vault.create_session_sync(1).unwrap();
+        let favorite = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"favorite")
+            .unwrap();
+        vault.set_favorite(&favorite.id, true).unwrap();
+        let removable = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"temporary")
+            .unwrap();
+
+        let ids = vault
+            .moments_sync(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|moment| moment.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&favorite.id));
+        assert!(!ids.contains(&removable.id));
+    }
+
+    #[test]
+    fn retention_keeps_unstarred_moments_when_their_shared_gop_is_pinned() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        let ids = vec![first.id.clone(), second.id.clone()];
+        let frames = vec![
+            GopCommitFrame {
+                index: 0,
+                is_keyframe: true,
+                byte_offset: 0,
+                byte_length: 8,
+                content_hash: [1; 32],
+            },
+            GopCommitFrame {
+                index: 1,
+                is_keyframe: false,
+                byte_offset: 8,
+                byte_length: 8,
+                content_hash: [2; 32],
+            },
+        ];
+        let segment = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &ids,
+                ivf: b"DKIF-fake",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                started_at_ms: 1,
+                ended_at_ms: 2,
+                content_hash: "shared",
+                frames: &frames,
+            })
+            .unwrap();
+        vault.mark_gop_ready(&segment).unwrap();
+        assert_eq!(vault.drop_unpinned_stills(&segment).unwrap(), 2);
+        vault.set_favorite(&first.id, true).unwrap();
+        let usage = vault.storage_usage_bytes().unwrap();
+
+        vault.set_storage_limit_bytes(usage - 1).unwrap();
+
+        let remaining = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|moment| moment.id == second.id));
+        assert!(vault.storage_usage_bytes().unwrap() > vault.storage_limit_bytes());
     }
 
     #[test]
@@ -2872,7 +4392,17 @@ mod tests {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
         let evidence = vault
-            .insert_text_evidence(&session.id, None, None, "ocr", "test", 1, None, "ocr-model", None)
+            .insert_text_evidence(
+                &session.id,
+                None,
+                None,
+                "ocr",
+                "test",
+                1,
+                None,
+                "ocr-model",
+                None,
+            )
             .unwrap();
         assert!(matches!(
             vault.insert_embedding(&evidence, &[], "embedding-model"),
@@ -3017,8 +4547,8 @@ mod tests {
                     10_000 * i64::from(index),
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
             ids.push(moment.id);
         }
@@ -3050,6 +4580,10 @@ mod tests {
             .unwrap();
         let live = vault.live_gop_frames(&segment).unwrap();
         assert_eq!(live.len(), 6);
+        let storage_before_new_moment = vault.storage_usage_bytes().unwrap();
+        vault
+            .set_storage_limit_bytes(storage_before_new_moment)
+            .unwrap();
         vault
             .insert_moment(&session.id, 80_000, "image/jpeg", &jpeg)
             .unwrap();
@@ -3257,8 +4791,8 @@ mod tests {
                     moment.captured_at_ms,
                     None,
                     "ocr",
-                None,
-            )
+                    None,
+                )
                 .unwrap();
         }
         let policy = PackPolicy {
@@ -3622,7 +5156,8 @@ mod tests {
         let moment = vault
             .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
             .unwrap();
-        let layout = r#"[{"text":"Hello","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.05}]"#;
+        let layout =
+            r#"[{"text":"Hello","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.05}]"#;
         vault
             .insert_text_evidence(
                 &session.id,
@@ -3639,6 +5174,467 @@ mod tests {
         let stored = vault.ocr_layout_for_moment(&moment.id).unwrap();
         assert_eq!(stored.as_deref(), Some(layout));
         assert!(vault.ocr_layout_for_moment("missing").unwrap().is_none());
+    }
+
+    /// Builds an AX snapshot payload carrying just the activity header fields.
+    fn ax_snapshot(window_title: &str, url: Option<&str>) -> Vec<u8> {
+        let mut header = serde_json::json!({ "window_title": window_title });
+        if let Some(url) = url {
+            header["url"] = serde_json::Value::String(url.to_owned());
+        }
+        serde_json::to_vec(&header).unwrap()
+    }
+
+    fn window_evidence_texts(vault: &Vault, session_id: &str) -> Vec<String> {
+        let connection = vault.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT text FROM text_evidence
+                  WHERE session_id = ?1 AND source = 'window'
+                  ORDER BY started_at_ms ASC",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+
+    #[test]
+    fn window_titles_are_indexed_and_searchable() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("Quarterly roadmap.key", Some("https://example.com/deck")),
+                Some("Keynote"),
+                Some("com.apple.iWork.Keynote"),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            window_evidence_texts(&vault, &session.id),
+            vec!["Quarterly roadmap.key\nhttps://example.com/deck".to_owned()]
+        );
+
+        // The whole point: a title that never appeared as OCR text is findable.
+        let hits = vault.search("roadmap", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].moment_id, moment.id);
+        assert_eq!(hits[0].source, WINDOW_EVIDENCE_SOURCE);
+    }
+
+    #[test]
+    fn repeated_window_titles_are_indexed_once_per_dedupe_window() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        // Capture fires every ~10s; the same window title must not produce a
+        // row per frame.
+        for step in 0..4_i64 {
+            let at = 1_000 + step * 10_000;
+            vault
+                .insert_moment(&session.id, at, "image/jpeg", b"screen")
+                .unwrap();
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &ax_snapshot("Inbox", None),
+                    Some("Mail"),
+                    Some("com.apple.mail"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(window_evidence_texts(&vault, &session.id).len(), 1);
+
+        // Past the dedupe window the same title is a genuinely new visit.
+        let later = 1_000 + WINDOW_TITLE_DEDUPE_MS + 10_000;
+        vault
+            .insert_moment(&session.id, later, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                later,
+                "application/json",
+                &ax_snapshot("Inbox", None),
+                Some("Mail"),
+                Some("com.apple.mail"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(window_evidence_texts(&vault, &session.id).len(), 2);
+    }
+
+    #[test]
+    fn moments_without_a_window_title_index_nothing() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("   ", None),
+                Some("Finder"),
+                Some("com.apple.finder"),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(window_evidence_texts(&vault, &session.id).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_moment_drops_its_window_evidence_from_fts() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("Secret project plan", None),
+                Some("Notes"),
+                Some("com.apple.Notes"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(vault.search("Secret", 10).unwrap().len(), 1);
+
+        vault.delete_moment_and_artifacts(&moment.id).unwrap();
+        assert!(vault.search("Secret", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn thumbnails_round_trip_and_replace_cleanly() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        assert!(vault.thumbnail_artifact_id(&moment.id).unwrap().is_none());
+
+        let first = vault.set_thumbnail(&moment.id, b"thumb-one").unwrap();
+        assert_eq!(
+            vault.thumbnail_artifact_id(&moment.id).unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(vault.read_artifact(&first).unwrap().bytes, b"thumb-one");
+
+        let second = vault.set_thumbnail(&moment.id, b"thumb-two").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(vault.read_artifact(&second).unwrap().bytes, b"thumb-two");
+        // The superseded thumbnail must not linger as an orphan artifact.
+        assert!(vault.read_artifact(&first).is_err());
+        assert!(!vault.artifact_path(&first).exists());
+    }
+
+    #[test]
+    fn thumbnails_survive_packing_but_not_deletion() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"screen")
+            .unwrap();
+        let thumbnail = vault.set_thumbnail(&moment.id, b"thumb").unwrap();
+
+        vault.delete_moment_and_artifacts(&moment.id).unwrap();
+        assert!(vault.read_artifact(&thumbnail).is_err());
+        assert!(!vault.artifact_path(&thumbnail).exists());
+    }
+
+    #[test]
+    fn retention_reclaims_thumbnail_artifacts() {
+        // The limit is a byte budget, so it has to be small enough that one
+        // moment plus its thumbnail already exceeds it; a count would not
+        // evict anything here.
+        let (_directory, vault) = test_vault_with_storage_limit(u64::try_from(ARTIFACT_FILE_OVERHEAD_BYTES).unwrap_or(0) + 64);
+        let session = vault.create_session_sync(1).unwrap();
+        let evicted = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"old")
+            .unwrap();
+        let thumbnail = vault.set_thumbnail(&evicted.id, b"thumb").unwrap();
+        vault
+            .insert_moment(&session.id, 2_000, "image/jpeg", b"new")
+            .unwrap();
+
+        vault.enforce_retention().unwrap();
+        assert!(vault.read_artifact(&thumbnail).is_err());
+        assert!(!vault.artifact_path(&thumbnail).exists());
+    }
+
+    /// Upgrading must not cost a user their history.
+    ///
+    /// Every other migration test starts from an empty vault, which cannot
+    /// catch a migration that silently drops or rebuilds rows. This one fills a
+    /// vault the way a real one fills up — stills, OCR boxes, transcripts,
+    /// audio, favorites, memories, and a moment already packed into a cold GOP
+    /// — winds the schema back to 10, and reopens.
+    struct SeededVault {
+        session_id: String,
+        hot_moment: String,
+        packed_moment: String,
+        still_artifact: String,
+    }
+
+    /// Fills a vault the way a real one fills up, then winds the schema back to
+    /// 10 so reopening it exercises the upgrade path.
+    fn seed_then_downgrade_to_schema_10(config: &VaultConfig, key: [u8; 32]) -> SeededVault {
+        let vault = Vault::open_with_key(config.clone(), key).unwrap();
+        let session = vault.create_session_sync(1_000).unwrap();
+
+        let hot = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"hot-still-bytes")
+            .unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                &ax_snapshot("Quarterly roadmap.key", Some("https://example.com/deck")),
+                Some("Keynote"),
+                Some("com.apple.iWork.Keynote"),
+            )
+            .unwrap()
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&hot.id),
+                None,
+                "ocr",
+                "revenue projection",
+                1_000,
+                None,
+                "vision-ocr",
+                Some(r#"[{"text":"revenue","confidence":0.9,"x":0.1,"y":0.2,"width":0.3,"height":0.05}]"#),
+            )
+            .unwrap();
+        vault.set_favorite(&hot.id, true).unwrap();
+
+        // A moment that already lives in a cold GOP: its still is gone, so
+        // the new delete/retention paths must tolerate the NULL.
+        let packed = vault
+            .insert_moment(&session.id, 2_000, "image/jpeg", b"packed-still")
+            .unwrap();
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE moments
+                    SET image_artifact_id = NULL, gop_segment_id = 'seg-1', gop_index = 3
+                  WHERE id = ?1",
+                [&packed.id],
+            )
+            .unwrap();
+
+        vault
+            .insert_memory(&Memory {
+                id: "mem-upgrade".into(),
+                start_ms: 1_000,
+                end_ms: 2_000,
+                moment_id: Some(hot.id.clone()),
+                application_name: Some("Keynote".into()),
+                bundle_identifier: Some("com.apple.iWork.Keynote".into()),
+                window_title: Some("Quarterly roadmap.key".into()),
+                url: None,
+                document: None,
+                summary: "Reviewed the deck".into(),
+                fingerprint: "fp-1".into(),
+            })
+            .unwrap();
+
+        // Wind the schema back to what a pre-upgrade vault looks like.
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE moments DROP COLUMN thumbnail_artifact_id;
+                 DROP INDEX IF EXISTS text_evidence_session_source;
+                 UPDATE schema_meta SET version = 10;",
+            )
+            .unwrap();
+
+        SeededVault {
+            session_id: session.id,
+            hot_moment: hot.id,
+            packed_moment: packed.id,
+            still_artifact: hot.image_artifact_id.clone().unwrap(),
+        }
+    }
+
+    /// Upgrading must not cost a user their history. Every other migration test
+    /// starts from an empty vault, which cannot catch a migration that silently
+    /// drops or rebuilds rows.
+    #[test]
+    fn schema_12_upgrade_preserves_a_populated_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [11_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let seeded = seed_then_downgrade_to_schema_10(&config, key);
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+
+        let version: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+
+        // The two things schema 11 and 12 add.
+        let columns = moment_column_names(&vault.connection.lock().unwrap()).unwrap();
+        assert!(columns.iter().any(|name| name == "thumbnail_artifact_id"));
+        let has_index: bool = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'index' AND name = 'text_evidence_session_source'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        assert!(has_index, "schema 11 index missing after upgrade");
+
+        // Nothing was lost.
+        let moments = vault.moments_sync(&seeded.session_id).unwrap();
+        assert_eq!(moments.len(), 2, "a moment went missing across the upgrade");
+
+        let hot = moments
+            .iter()
+            .find(|moment| moment.id == seeded.hot_moment)
+            .expect("hot moment survived");
+        assert_eq!(hot.window_title.as_deref(), Some("Quarterly roadmap.key"));
+        assert_eq!(hot.url.as_deref(), Some("https://example.com/deck"));
+        assert_eq!(hot.application_name.as_deref(), Some("Keynote"));
+        assert!(hot.is_favorite, "favorite flag survived");
+        assert_eq!(hot.ocr_text.as_deref(), Some("revenue projection"));
+
+        let packed = moments
+            .iter()
+            .find(|moment| moment.id == seeded.packed_moment)
+            .expect("packed moment survived");
+        assert!(packed.image_artifact_id.is_none());
+        // Read the raw columns: the segment row itself is not part of this
+        // fixture, so `moments_sync` cannot materialise a `GopRef`. What the
+        // migration owes us is that the claim on the segment survived.
+        let claim: (Option<String>, Option<i64>) = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT gop_segment_id, gop_index FROM moments WHERE id = ?1",
+                [&seeded.packed_moment],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, (Some("seg-1".to_owned()), Some(3)));
+
+        // Artifacts still decrypt: the key hierarchy was not disturbed.
+        assert_eq!(
+            vault.read_artifact(&seeded.still_artifact).unwrap().bytes,
+            b"hot-still-bytes"
+        );
+
+        // FTS and OCR layout came through intact.
+        let hits = vault.search("revenue", 10).unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.moment_id == seeded.hot_moment),
+            "OCR evidence is no longer searchable after the upgrade"
+        );
+        assert!(
+            vault
+                .ocr_layout_for_moment(&seeded.hot_moment)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            vault
+                .search("roadmap", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.source == WINDOW_EVIDENCE_SOURCE),
+            "window-title evidence written before the upgrade is still indexed"
+        );
+
+        assert_eq!(vault.memories(0, 10_000, 10).unwrap().len(), 1);
+
+        // And the new column is usable on the migrated vault, including for a
+        // moment whose still is already gone.
+        let thumbnail = vault
+            .set_thumbnail(&seeded.packed_moment, b"thumb")
+            .unwrap();
+        assert_eq!(vault.read_artifact(&thumbnail).unwrap().bytes, b"thumb");
+        vault
+            .delete_moment_and_artifacts(&seeded.packed_moment)
+            .unwrap();
+        assert!(
+            !vault.artifact_path(&thumbnail).exists(),
+            "thumbnail leaked when a packed moment was deleted"
+        );
+    }
+
+    #[test]
+    fn conversations_round_trip_and_cascade_on_delete() {
+        let (_directory, vault) = test_vault(10);
+        let id = vault.create_conversation("Untitled", 1_000).unwrap();
+        vault
+            .append_message(&id, "user", "昨天下午我在干嘛？", None, 1_100)
+            .unwrap();
+        vault
+            .append_message(
+                &id,
+                "assistant",
+                "你在调 GOP 打包。",
+                Some(r#"[{"tool":"list_activity"}]"#),
+                1_200,
+            )
+            .unwrap();
+        vault.rename_conversation(&id, "昨天下午").unwrap();
+
+        let listed = vault.conversations(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "昨天下午");
+        assert_eq!(listed[0].message_count, 2);
+        assert_eq!(listed[0].updated_at_ms, 1_200, "append bumps updated_at");
+        assert_eq!(vault.conversation(&id).unwrap().unwrap().title, "昨天下午");
+        assert!(vault.conversation("missing").unwrap().is_none());
+
+        let messages = vault.conversation_messages(&id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[1].tool_log.is_some(), "tool log survives");
+
+        vault.delete_conversation(&id).unwrap();
+        assert!(vault.conversations(10).unwrap().is_empty());
+        assert!(
+            vault.conversation_messages(&id).unwrap().is_empty(),
+            "messages cascade with the conversation"
+        );
     }
 
     #[test]
@@ -3677,7 +5673,7 @@ mod tests {
         let key = [7_u8; 32];
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
-            max_unstarred_moments: 10,
+            ..VaultConfig::default()
         };
         let session_id = {
             let vault = Vault::open_with_key(config.clone(), key).unwrap();
@@ -3711,6 +5707,264 @@ mod tests {
         assert!(columns.iter().any(|column| column == "window_title"));
         assert!(columns.iter().any(|column| column == "url"));
         assert!(columns.iter().any(|column| column == "document"));
+        let version: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+    }
+
+    fn stamp_app(vault: &Vault, moment_id: &str, app: &str, bundle: &str, title: &str) {
+        vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE moments
+                    SET application_name = ?2,
+                        bundle_identifier = ?3,
+                        window_title = ?4
+                  WHERE id = ?1",
+                params![moment_id, app, bundle, title],
+            )
+            .unwrap();
+    }
+
+    fn insert_named_moment(
+        vault: &Vault,
+        session_id: &str,
+        at_ms: i64,
+        app: &str,
+        bundle: &str,
+        title: &str,
+    ) -> Moment {
+        let moment = vault
+            .insert_moment(session_id, at_ms, "image/jpeg", b"screen")
+            .unwrap();
+        stamp_app(vault, &moment.id, app, bundle, title);
+        moment
+    }
+
+    #[test]
+    fn slot_summaries_round_trip_and_day_summary_keeps_t1_only_slots() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (day_start, _) = local_day_bounds(1_786_698_000_000);
+        let first_slot = slot_start_for(day_start + 10 * 3_600_000);
+        let second_slot = first_slot + SLOT_DURATION_MS;
+        for (offset, title) in [(0_i64, "gop.rs"), (20_000, "encoder.rs"), (40_000, "ivf.rs")] {
+            insert_named_moment(
+                &vault,
+                &session.id,
+                first_slot + offset,
+                "Xcode",
+                "com.apple.dt.Xcode",
+                title,
+            );
+        }
+        for offset in [0_i64, 20_000, 40_000] {
+            insert_named_moment(
+                &vault,
+                &session.id,
+                second_slot + offset,
+                "Safari",
+                "com.apple.Safari",
+                "docs.rs",
+            );
+        }
+
+        let second_card = vault.slot_card(second_slot + 1_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &second_card,
+                &T2Card {
+                    artifacts: vec!["docs.rs".into()],
+                    title: "Reading rav1e Config".into(),
+                    bullets: vec!["docs.rs for the IVF header".into()],
+                    category: Some("reading".into()),
+                    confidence: Some(0.7),
+                },
+                "ollama:qwen",
+                second_slot,
+                Some(1_200),
+            )
+            .unwrap();
+
+        let summary = vault.day_summary(first_slot + 1_000, 10_000).unwrap();
+        assert_eq!(summary.slots.len(), 2);
+        let t1 = summary
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == first_slot)
+            .unwrap();
+        assert!(t1.title.is_none(), "T2 never ran on this slot");
+        assert!(!t1.facts.apps.is_empty());
+        assert_eq!(t1.state, SlotSummaryState::Degraded);
+        let t2 = summary
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == second_slot)
+            .unwrap();
+        assert_eq!(t2.title.as_deref(), Some("Reading rav1e Config"));
+        assert_eq!(t2.state, SlotSummaryState::Done);
+        assert_eq!(t2.category.as_deref(), Some("reading"));
+
+        vault
+            .put_t2_summary(
+                &second_card,
+                &T2Card {
+                    artifacts: vec!["docs.rs".into()],
+                    title: "Second pass".into(),
+                    bullets: vec![],
+                    category: Some("reading".into()),
+                    confidence: Some(0.8),
+                },
+                "ollama:qwen",
+                second_slot + 1,
+                Some(800),
+            )
+            .unwrap();
+        let generation: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT generation FROM slot_summaries WHERE slot_start_ms = ?1",
+                [second_slot],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+
+        let prev = vault.previous_slot_titles(second_slot + 1, 4).unwrap();
+        assert_eq!(prev.last().map(|card| card.title.as_str()), Some("Second pass"));
+    }
+
+    #[test]
+    fn summary_history_pages_unique_days_with_an_exclusive_cursor() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (first_day_start, first_day_end) = local_day_bounds(1_786_698_000_000);
+        let (second_day_start, second_day_end) = local_day_bounds(first_day_end + 12 * 3_600_000);
+        assert!(second_day_start > first_day_start);
+
+        insert_named_moment(
+            &vault,
+            &session.id,
+            first_day_start + 10 * 3_600_000,
+            "Xcode",
+            "com.apple.dt.Xcode",
+            "first.rs",
+        );
+        insert_named_moment(
+            &vault,
+            &session.id,
+            second_day_start + 10 * 3_600_000,
+            "Safari",
+            "com.apple.Safari",
+            "second.dev",
+        );
+
+        let newest = vault
+            .summary_history(Some(second_day_end), 1, 10_000)
+            .unwrap();
+        assert_eq!(newest.days.len(), 1);
+        assert_eq!(newest.days[0].day_start_ms, second_day_start);
+        assert!(newest.has_more);
+        assert_eq!(newest.next_before_ms, Some(second_day_start));
+
+        let older = vault
+            .summary_history(newest.next_before_ms, 7, 10_000)
+            .unwrap();
+        assert_eq!(older.days.len(), 1);
+        assert_eq!(older.days[0].day_start_ms, first_day_start);
+        assert!(!older.has_more);
+        assert_eq!(older.next_before_ms, None);
+    }
+
+    #[test]
+    fn delete_history_removes_slot_summaries_with_the_evidence() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let at = 1_786_698_000_000;
+        let slot = slot_start_for(at);
+        insert_named_moment(
+            &vault,
+            &session.id,
+            slot + 5_000,
+            "Xcode",
+            "com.apple.dt.Xcode",
+            "gop.rs",
+        );
+        let card = vault.slot_card(slot + 5_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &T2Card {
+                    artifacts: vec![],
+                    title: "Should vanish".into(),
+                    bullets: vec![],
+                    category: None,
+                    confidence: None,
+                },
+                "test",
+                slot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap(), 1);
+        let remaining: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM slot_summaries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(vault.day_summary(slot, 10_000).unwrap().slots.is_empty());
+    }
+
+    #[test]
+    fn schema_12_adds_slot_summaries_without_resetting_the_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [7_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP TABLE slot_summaries;
+                     DROP INDEX IF EXISTS slot_summaries_slot;
+                     DROP INDEX IF EXISTS slot_summaries_day;
+                     UPDATE schema_meta SET version = 11;",
+                )
+                .unwrap();
+            session.id
+        };
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let has_table: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'slot_summaries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_table, 1);
         let version: i64 = vault
             .connection
             .lock()

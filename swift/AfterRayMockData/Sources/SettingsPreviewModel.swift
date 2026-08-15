@@ -24,10 +24,13 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var downloadProgress: Double?
     @Published public var downloadStatus: String?
     @Published public var isUpdatingAudio = false
+    @Published public var isUpdatingStorageLimit = false
+    @Published public var isUpdatingLanguage = false
     @Published public var isUpdatingExclusions = false
     @Published public var isClearingHistory = false
     @Published public var recordAudio = true
     @Published public var excludedBundleIds: [String] = []
+    @Published public var excludedDomains: [String] = []
     @Published public var llmProbe: LlmEndpointStatus? = LlmEndpointStatus(
         reachable: true,
         models: [
@@ -69,6 +72,32 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         library = ModelLibrary(
             directory: modelDirectoryPath,
             packs: [
+                ModelPack(
+                    id: "llm_qwen35_4b_mlx4",
+                    name: "Qwen3.5-4B MLX 4-bit",
+                    capability: "llm_vlm",
+                    path: "\(modelDirectoryPath)/Qwen3.5-4B-MLX-4bit",
+                    present: false,
+                    bytes: 0,
+                    required: false,
+                    note: "Recommended local model · mlx-community · Apache 2.0",
+                    expectedBytes: 3_061_129_077,
+                    state: .notDownloaded,
+                    revision: "32f3e8ecf65426fc3306969496342d504bfa13f3"
+                ),
+                ModelPack(
+                    id: "llm_qwen35_9b_mlx4",
+                    name: "Qwen3.5-9B MLX 4-bit",
+                    capability: "llm_vlm",
+                    path: "\(modelDirectoryPath)/Qwen3.5-9B-MLX-4bit",
+                    present: false,
+                    bytes: 0,
+                    required: false,
+                    note: "Higher-quality local assistant · approximately 5.97 GB",
+                    expectedBytes: 5_977_071_067,
+                    state: .notDownloaded,
+                    revision: "938d8919941c6e7efd3c7150eff7fe9d12afa631"
+                ),
                 ModelPack(
                     id: "asr",
                     name: "Qwen3 ASR",
@@ -118,6 +147,30 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         message = enabled ? "Audio recording is on." : "Audio recording is off."
     }
 
+    public func setStorageLimitBytes(_ bytes: UInt64) async {
+        guard let current = settings else { return }
+        isUpdatingStorageLimit = true
+        settings = replacing(current, storageLimitBytes: bytes)
+        isUpdatingStorageLimit = false
+        message = "Preview memory limit updated."
+    }
+
+    public func setUiLanguage(_ code: String) async {
+        guard let current = settings else { return }
+        isUpdatingLanguage = true
+        settings = replacing(current, uiLanguage: code)
+        isUpdatingLanguage = false
+        message = "Preview interface language updated."
+    }
+
+    public func setSummaryLanguage(_ code: String) async {
+        guard let current = settings else { return }
+        isUpdatingLanguage = true
+        settings = replacing(current, summaryLanguage: code)
+        isUpdatingLanguage = false
+        message = "Preview summary language updated."
+    }
+
     public func excludeBundle(_ bundleID: String) async {
         if !excludedBundleIds.contains(bundleID) {
             excludedBundleIds.append(bundleID)
@@ -130,6 +183,40 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
 
     public func excludeFrontmostApp() async {
         await excludeBundle("com.apple.Safari")
+    }
+
+    /// No file picker in a preview — the lab stands in with the next app that
+    /// is not already on the list, so the button still visibly does something.
+    public func excludeChosenApp() async {
+        let samples = ["com.tinyspeck.slackmacgap", "com.apple.mail", "com.figma.Desktop"]
+        guard let next = samples.first(where: { !excludedBundleIds.contains($0) }) else { return }
+        await excludeBundle(next)
+    }
+
+    /// The preview stands in for the daemon's normaliser, so a pasted URL in
+    /// the lab lands as the same host it would in production.
+    public func excludeDomain(_ input: String) async {
+        guard let host = SettingsPreviewModel.previewHost(input),
+              !excludedDomains.contains(host)
+        else { return }
+        excludedDomains.append(host)
+        excludedDomains.sort()
+    }
+
+    public func includeDomain(_ domain: String) async {
+        excludedDomains.removeAll { $0 == domain }
+    }
+
+    private static func previewHost(_ input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let withoutScheme = trimmed.components(separatedBy: "://").last ?? trimmed
+        let host = withoutScheme
+            .components(separatedBy: CharacterSet(charactersIn: "/?#"))
+            .first?
+            .components(separatedBy: ":").first?
+            .lowercased()
+        guard let host, host.contains("."), !host.isEmpty else { return nil }
+        return host
     }
 
     public func clearHistory(_: HistoryScope) async {
@@ -173,6 +260,30 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         message = "Preview marked \(packID ?? "models") as installed."
     }
 
+    public func remove(packID: String) async {
+        guard let current = library else { return }
+        library = ModelLibrary(
+            directory: current.directory,
+            packs: current.packs.map { pack in
+                guard pack.id == packID else { return pack }
+                return ModelPack(
+                    id: pack.id,
+                    name: pack.name,
+                    capability: pack.capability,
+                    path: pack.path,
+                    present: false,
+                    bytes: 0,
+                    required: pack.required,
+                    note: pack.note,
+                    expectedBytes: pack.expectedBytes,
+                    state: .notDownloaded,
+                    revision: pack.revision
+                )
+            }
+        )
+        message = "Preview removed \(packID)."
+    }
+
     public func revealLogs() {
         message = "Would reveal \(logDirectoryPath)"
     }
@@ -182,16 +293,46 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     }
 
     public func setLlmProvider(_ provider: LlmProvider) async {
+        let current = settings
         settings = AppSettings(
-            dataDir: settings?.dataDir ?? dataDirectoryPath,
-            modelDir: settings?.modelDir ?? modelDirectoryPath,
+            dataDir: current?.dataDir ?? dataDirectoryPath,
+            modelDir: current?.modelDir ?? modelDirectoryPath,
             recordAudio: recordAudio,
             captureIntervalSeconds: 10,
+            storageLimitBytes: current?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
+            excludedBundleIds: current?.excludedBundleIds ?? excludedBundleIds,
             llmProvider: provider,
             llmBaseUrl: draftLlmBaseUrl,
-            llmModel: draftLlmModel
+            llmModel: draftLlmModel,
+            llmApiKeySet: current?.llmApiKeySet ?? false,
+            uiLanguage: current?.uiLanguage ?? AppSettings.defaultLanguage,
+            summaryLanguage: current?.summaryLanguage ?? AppSettings.defaultLanguage,
+            languageOptions: current?.languageOptions ?? []
         )
         message = "Preview switched assistant source to \(provider.title)."
+    }
+
+    private func replacing(
+        _ current: AppSettings,
+        storageLimitBytes: UInt64? = nil,
+        uiLanguage: String? = nil,
+        summaryLanguage: String? = nil
+    ) -> AppSettings {
+        AppSettings(
+            dataDir: current.dataDir,
+            modelDir: current.modelDir,
+            recordAudio: current.recordAudio,
+            captureIntervalSeconds: current.captureIntervalSeconds,
+            storageLimitBytes: storageLimitBytes ?? current.storageLimitBytes,
+            excludedBundleIds: current.excludedBundleIds,
+            llmProvider: current.llmProvider,
+            llmBaseUrl: current.llmBaseUrl,
+            llmModel: current.llmModel,
+            llmApiKeySet: current.llmApiKeySet,
+            uiLanguage: uiLanguage ?? current.uiLanguage,
+            summaryLanguage: summaryLanguage ?? current.summaryLanguage,
+            languageOptions: current.languageOptions
+        )
     }
 
     public func saveLlmConnection() async {

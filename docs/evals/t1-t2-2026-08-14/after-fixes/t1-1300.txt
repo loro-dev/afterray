@@ -1,0 +1,39 @@
+<slot day="2026-08-14" from="13:00" to="13:30">
+
+[facts] apps and time
+  Lody                     25m
+  UserNotificationCenter   30s
+  1 switches · longest unbroken 19m · idle 17%
+
+[seen] what was open
+  window  AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+
+[seen] already-written fragment notes
+  12:59 The user was viewing a technical planning document in Lody, reviewing model prompts, exposed tools, and various design specifications. They were reading through sections detailing system architecture alongside checkout performance and UI optimization notes.
+  13:00 The user reviewed development planning notes and feature tracking entries within the Lody application. They scrolled through lists covering system architecture steps, configuration guidelines, and various troubleshooting items.
+  13:05 The user was reviewing technical documentation in Lody outlining development planning for a localized screen and audio logging system. They were examining structured notes regarding CLI configuration, agent architecture, and installation procedures within the page.
+  13:24 The user was viewing a task titled 'AfterRay 本地化屏幕与音频日志系统的开发规划' in the lody application. The interface displayed a list of other development issues, such as checkout performance analysis and design reviews.
+
+[map] returned to
+  Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody — 2 visits, 19m total (13:00 13:05)
+
+[map] sustained on one thing
+  13:00–13:05 Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+  13:05–13:25 Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+
+[map] where the text is
+  13:00–13:01  text, dense (~1612 chars/frame)
+  13:01–13:10  text, dense (~1566 chars/frame)
+  13:11–13:16  text, dense (~1643 chars/frame)
+  13:17–13:21  text, dense (~1596 chars/frame)
+  13:21–13:26  text, dense (~1541 chars/frame)
+  13:26–13:30  no capture
+
+[map] probe here (one frame per stretch, all carry text)
+  13:00  1928 chars  019ffea4-5ff9-7eb0-a3a1-fee0fc043531  Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody
+  13:25  1539 chars  019ffebd-6087-7193-9ccc-7e38dd250815  UserNotificationCenter
+
+[avoid] wording already used on nearby cards
+  12:55 They were typing in a message field within the Lody app to draft planning notes for a local screen and audio logging system. Their outline focused on system prompts, exposed tools, and integration checks.
+  12:59 The user was viewing a technical planning document in Lody, reviewing model prompts, exposed tools, and various design specifications. They were reading through sections detailing system architecture alongside checkout performance and UI optimization notes.
+</slot>

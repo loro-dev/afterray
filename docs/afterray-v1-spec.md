@@ -51,7 +51,7 @@ v1 的主入口不是搜索框，而是一个具有“视觉奇观”感的可�
 
 1. **完整版优先**：v1 只通过官网发布 Developer ID 签名、Hardened Runtime 和 Notarization 的完整版；Mac App Store 不进入 v1 范围。
 2. **Accessibility 不可降级**：完整跨 App AX 是真实捕获的 required permission。缺失或被撤销时，用户可体验 mock Timeline 和管理已有数据，但新的真实捕获暂停，不以纯 OCR 版偷偷降级。
-3. **私有源码**：v1 不开源，不接受外部代码贡献。可公开 threat model、benchmark、格式文档和开发过程，但不把源码公开当作 v1 的信任前提。
+3. **完整源码公开**：v1 默认使用 FSL-1.1-ALv2，允许审查和自己编译，每个版本两年后转 Apache-2.0；Protocol / SDK 使用 Apache-2.0，官方 Agent Skills 使用 MIT。Developer Preview 暂不接受外部代码贡献。
 4. **音频按会议自动开启**：麦克风权限与“自动记录检测到的会议”的产品同意在 onboarding 中分开展示。默认不占用麦克风；确认已进入会议时自动开始并明确告知，始终允许一键停止。
 
 ---
@@ -1234,7 +1234,7 @@ v1 不承诺防护：
 | 首发渠道 | 只发布 Developer ID + Hardened Runtime + Notarization 的官网完整版；MAS 不进入 v1 |
 | 最低系统 | macOS 26 |
 | Accessibility | 真实捕获的 Required 能力，不提供 OCR-only 降级版 |
-| 源码与贡献 | v1 私有源码，不接受外部代码贡献 |
+| 源码与贡献 | v1 完整源码公开，默认 FSL-1.1-ALv2；Developer Preview 暂不接受外部贡献 |
 | 免费/付费主边界 | Free Timeline 滚动保留 30 天；Paid Timeline 不按年龄自动删除 |
 | 原始音频 | mic/system 双轨默认保留 30 天，Transcript 按 Timeline 权益保留 |
 | 默认音频范围 | 用户在 onboarding 同意后，自动记录稳定检测到的会议；平时不录音 |
@@ -1283,7 +1283,10 @@ v1 不承诺防护：
 
 ## 20. 商业、源码与分发约束
 
-**已决定**：v1 是私有源码的商业产品，不建立公共源码仓库，不接受外部代码贡献，不使用 AGPL 作为首发许可证。这个决定不阻止未来开源某个边界清晰的协议、SDK 或 Rust library，但不在 v1 承诺中。
+**已决定（2026-08-14）**：v1 公开完整产品源码。除目录或文件另有声明外，使用
+FSL-1.1-ALv2：允许审查、自己编译、内部使用、修改和许可范围内的再分发；限制把当前源码作为面向他人的商业竞争产品或服务提供。每个公开版本在首次提供满两年后自动获得 Apache-2.0 许可。当前阶段应准确称为 **source-available / Fair Source**，不能称为 OSI Open Source。
+
+协议与公共 SDK 使用 Apache-2.0；官方 Agent Skills 使用 MIT，并在各自目录放置独立许可证。AfterRay 名称、Logo 和官方构建身份不随源码许可授权。开发者预览阶段暂不接受外部贡献；开放 contribution 前需先确定贡献者协议和商业授权所需的再许可边界。
 
 更可持续的付费理由应是：
 
@@ -1296,7 +1299,9 @@ v1 不承诺防护：
 
 创始人 IP 很适合做分发引擎：公开构建过程、真实能耗/隐私取舍、视觉 demo 和模型 benchmark 会建立信任。但创始人 IP 不是产品护城河，也不能替代一个值得每天打开的复盘闭环。
 
-信任不再主要由“可自行审核全部源码”提供，而由可验证的产品边界提供：默认无网络数据外发、公开 threat model、签名模型 catalog、可审计的 Agent scope、可验证删除、真实 benchmark 和明确的隐私指示。
+公开源码是信任证据之一，但不能替代可验证的产品边界：默认无网络数据外发、公开 threat model、签名模型 catalog、可审计的 Agent scope、可验证删除、真实 benchmark、明确的隐私指示，以及官方二进制到源码 commit 的构建来源证明。
+
+用户自己编译和运行源码是许可允许的正常路径，不按盗版处理。商业模式不能依赖阻止本地自编译，而应主要依赖官方签名构建、安全更新、可选服务、支持、企业能力和商业/OEM 授权。FSL 只限制面向他人的商业竞争使用；它不应被描述成能够阻止所有免费 fork。
 
 ### 20.1 v1 直发渠道
 
@@ -1308,7 +1313,9 @@ v1 不承诺防护：
 | 模型权重 | 有再分发权时使用自有 CDN；否则上游直下/签名导入 |
 | Accessibility | Required；在 notarized build 中做完整权限与恢复测试 |
 | CLI/MCP | stdio CLI、Unix socket 或受控 localhost，所有 scope 可撤销 |
-| 源码 | 私有；没有外部 contribution/CLA 流程 |
+| 源码 | 公开；默认 FSL-1.1-ALv2，每个版本两年后转 Apache-2.0 |
+| 开放接口 | Protocol / SDK 为 Apache-2.0；官方 Agent Skills 为 MIT |
+| 外部贡献 | Developer Preview 暂不接受；开放前确定 contribution/CLA 规则 |
 
 每次 release 至少检查：
 
@@ -1329,7 +1336,7 @@ v1 不承诺防护：
 ```
 
 - 社媒首发资产：Month→Moment 连续缩放、一次会议的 Screen/Transcript/AX 三层展开、10GB 仍可用的实时容量预测。
-- GitHub 若用于分发，只发布非源码的 threat model、模型/编码 benchmark、可复现能耗结果和公开 roadmap；不开放产品代码或 contribution 入口。
+- GitHub 发布完整源码、threat model、模型/编码 benchmark、可复现能耗结果、公开 roadmap 和与 commit 对应的官方构建。Developer Preview 可以暂不开放 contribution 入口，但 issue、构建说明和许可证边界必须清楚。
 - 创始人内容：持续解释真实技术取舍和 dogfood 结果，不把隐私承诺做成抽象口号。
 - 每个公开视觉 demo 都要能在实际产品中复现，避免只做无法交付的概念视频。
 

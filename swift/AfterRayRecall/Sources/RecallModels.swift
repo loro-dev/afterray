@@ -302,23 +302,29 @@ public struct ModelJob: Codable, Equatable, Identifiable, Sendable {
 
 public struct ModelDownloadProgress: Codable, Equatable, Sendable {
     public let packId: String
+    public let state: ModelPackState
     public let bytes: UInt64
     public let expectedBytes: UInt64?
     public let completedFiles: UInt64
     public let totalFiles: UInt64
+    public let error: String?
 
     public init(
         packId: String,
+        state: ModelPackState = .downloading,
         bytes: UInt64,
         expectedBytes: UInt64? = nil,
         completedFiles: UInt64 = 0,
-        totalFiles: UInt64 = 0
+        totalFiles: UInt64 = 0,
+        error: String? = nil
     ) {
         self.packId = packId
+        self.state = state
         self.bytes = bytes
         self.expectedBytes = expectedBytes
         self.completedFiles = completedFiles
         self.totalFiles = totalFiles
+        self.error = error
     }
 
     public var fraction: Double? {
@@ -332,11 +338,34 @@ public struct ModelDownloadProgress: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case packId = "pack_id"
+        case state
         case bytes
         case expectedBytes = "expected_bytes"
         case completedFiles = "completed_files"
         case totalFiles = "total_files"
+        case error
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        packId = try container.decode(String.self, forKey: .packId)
+        state = try container.decodeIfPresent(ModelPackState.self, forKey: .state) ?? .downloading
+        bytes = try container.decode(UInt64.self, forKey: .bytes)
+        expectedBytes = try container.decodeIfPresent(UInt64.self, forKey: .expectedBytes)
+        completedFiles = try container.decodeIfPresent(UInt64.self, forKey: .completedFiles) ?? 0
+        totalFiles = try container.decodeIfPresent(UInt64.self, forKey: .totalFiles) ?? 0
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+public enum ModelPackState: String, Codable, Equatable, Sendable {
+    case notDownloaded = "not_downloaded"
+    case downloading
+    case verifying
+    case ready
+    case inUse = "in_use"
+    case failed
+    case incompatible
 }
 
 public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
@@ -349,6 +378,9 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
     public let required: Bool
     public let note: String?
     public let expectedBytes: UInt64?
+    public let state: ModelPackState
+    public let revision: String?
+    public let error: String?
 
     public init(
         id: String,
@@ -359,7 +391,10 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
         bytes: UInt64,
         required: Bool,
         note: String? = nil,
-        expectedBytes: UInt64? = nil
+        expectedBytes: UInt64? = nil,
+        state: ModelPackState? = nil,
+        revision: String? = nil,
+        error: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -370,6 +405,9 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
         self.required = required
         self.note = note
         self.expectedBytes = expectedBytes
+        self.state = state ?? (present ? .ready : .notDownloaded)
+        self.revision = revision
+        self.error = error
     }
 
     enum CodingKeys: String, CodingKey {
@@ -382,11 +420,32 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
         case required
         case note
         case expectedBytes = "expected_bytes"
+        case state
+        case revision
+        case error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        capability = try container.decode(String.self, forKey: .capability)
+        path = try container.decode(String.self, forKey: .path)
+        present = try container.decode(Bool.self, forKey: .present)
+        bytes = try container.decode(UInt64.self, forKey: .bytes)
+        required = try container.decode(Bool.self, forKey: .required)
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+        expectedBytes = try container.decodeIfPresent(UInt64.self, forKey: .expectedBytes)
+        state = try container.decodeIfPresent(ModelPackState.self, forKey: .state)
+            ?? (present ? .ready : .notDownloaded)
+        revision = try container.decodeIfPresent(String.self, forKey: .revision)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
     }
 }
 
 public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
     case builtin
+    case mlxLocal = "mlx_local"
     case ollama
     case openaiCompatible = "openai_compatible"
 
@@ -395,6 +454,7 @@ public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
     public var title: String {
         switch self {
         case .builtin: "Built-in"
+        case .mlxLocal: "AfterRay Local (MLX)"
         case .ollama: "Ollama"
         case .openaiCompatible: "OpenAI compatible"
         }
@@ -441,37 +501,96 @@ public struct LlmEndpointStatus: Codable, Equatable, Sendable {
     }
 }
 
+/// One language the daemon is willing to store. The catalogue lives in
+/// afterray-protocol; Swift only renders what Settings already returned.
+public struct LanguageOption: Codable, Equatable, Identifiable, Sendable {
+    public let code: String
+    public let nativeName: String
+    public let englishName: String
+
+    public var id: String { code }
+
+    public init(code: String, nativeName: String, englishName: String) {
+        self.code = code
+        self.nativeName = nativeName
+        self.englishName = englishName
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case nativeName = "native_name"
+        case englishName = "english_name"
+    }
+
+    public static let autoCode = "auto"
+
+    /// Last-resort row when an old daemon omits `language_options`.
+    public static let followSystem = LanguageOption(
+        code: autoCode,
+        nativeName: "跟随系统",
+        englishName: "Follow system"
+    )
+
+    public var isAuto: Bool {
+        code.compare(Self.autoCode, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+    }
+
+    /// Menu label: `auto` is always 「跟随系统」, everything else uses the native name.
+    public var menuTitle: String {
+        isAuto ? "跟随系统" : nativeName
+    }
+}
+
 public struct AppSettings: Codable, Equatable, Sendable {
+    public static let defaultStorageLimitBytes: UInt64 = 100_000_000_000
+    public static let defaultLanguage = LanguageOption.autoCode
+
     public let dataDir: String
     public let modelDir: String
     public let recordAudio: Bool
     public let captureIntervalSeconds: UInt64
+    public let storageLimitBytes: UInt64
     public let excludedBundleIds: [String]
+    /// Hosts never recorded. Subdomains are covered by the daemon.
+    public let excludedDomains: [String]
     public let llmProvider: LlmProvider
     public let llmBaseUrl: String
     public let llmModel: String
     public let llmApiKeySet: Bool
+    public let uiLanguage: String
+    public let summaryLanguage: String
+    public let languageOptions: [LanguageOption]
 
     public init(
         dataDir: String,
         modelDir: String,
         recordAudio: Bool,
         captureIntervalSeconds: UInt64,
+        storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
         excludedBundleIds: [String] = [],
+        excludedDomains: [String] = [],
         llmProvider: LlmProvider = .builtin,
         llmBaseUrl: String = "",
         llmModel: String = "",
-        llmApiKeySet: Bool = false
+        llmApiKeySet: Bool = false,
+        uiLanguage: String = defaultLanguage,
+        summaryLanguage: String = defaultLanguage,
+        languageOptions: [LanguageOption] = []
     ) {
         self.dataDir = dataDir
         self.modelDir = modelDir
         self.recordAudio = recordAudio
         self.captureIntervalSeconds = captureIntervalSeconds
+        self.storageLimitBytes = storageLimitBytes
         self.excludedBundleIds = excludedBundleIds
+        self.excludedDomains = excludedDomains
         self.llmProvider = llmProvider
         self.llmBaseUrl = llmBaseUrl
         self.llmModel = llmModel
         self.llmApiKeySet = llmApiKeySet
+        self.uiLanguage = uiLanguage
+        self.summaryLanguage = summaryLanguage
+        self.languageOptions = languageOptions
     }
 
     enum CodingKeys: String, CodingKey {
@@ -479,11 +598,16 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case modelDir = "model_dir"
         case recordAudio = "record_audio"
         case captureIntervalSeconds = "capture_interval_seconds"
+        case storageLimitBytes = "storage_limit_bytes"
         case excludedBundleIds = "excluded_bundle_ids"
+        case excludedDomains = "excluded_domains"
         case llmProvider = "llm_provider"
         case llmBaseUrl = "llm_base_url"
         case llmModel = "llm_model"
         case llmApiKeySet = "llm_api_key_set"
+        case uiLanguage = "ui_language"
+        case summaryLanguage = "summary_language"
+        case languageOptions = "language_options"
     }
 
     public init(from decoder: Decoder) throws {
@@ -492,11 +616,28 @@ public struct AppSettings: Codable, Equatable, Sendable {
         modelDir = try container.decode(String.self, forKey: .modelDir)
         recordAudio = try container.decode(Bool.self, forKey: .recordAudio)
         captureIntervalSeconds = try container.decode(UInt64.self, forKey: .captureIntervalSeconds)
+        storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
+            ?? Self.defaultStorageLimitBytes
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
+        excludedDomains = try container.decodeIfPresent([String].self, forKey: .excludedDomains) ?? []
         llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .builtin
         llmBaseUrl = try container.decodeIfPresent(String.self, forKey: .llmBaseUrl) ?? ""
         llmModel = try container.decodeIfPresent(String.self, forKey: .llmModel) ?? ""
         llmApiKeySet = try container.decodeIfPresent(Bool.self, forKey: .llmApiKeySet) ?? false
+        uiLanguage = try container.decodeIfPresent(String.self, forKey: .uiLanguage) ?? Self.defaultLanguage
+        summaryLanguage = try container.decodeIfPresent(String.self, forKey: .summaryLanguage)
+            ?? Self.defaultLanguage
+        languageOptions = try container.decodeIfPresent([LanguageOption].self, forKey: .languageOptions) ?? []
+    }
+
+    /// Rows for a language picker. The catalogue itself is never hardcoded here;
+    /// an empty list (old daemon) falls back to `auto` so the control still works.
+    public func languagePickerOptions(selected: String) -> [LanguageOption] {
+        var options = languageOptions.isEmpty ? [LanguageOption.followSystem] : languageOptions
+        if !selected.isEmpty, !options.contains(where: { $0.code == selected }) {
+            options.append(LanguageOption(code: selected, nativeName: selected, englishName: selected))
+        }
+        return options
     }
 }
 
@@ -631,6 +772,61 @@ public struct RecallSearchHit: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// One recognized text box on a captured frame.
+///
+/// Coordinates are Apple Vision's: a unit square with the origin at the
+/// **bottom left**, not SwiftUI's top left. `OcrHighlight` does the flip.
+public struct OcrRegion: Codable, Equatable, Sendable {
+    public let text: String
+    public let confidence: Double
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(
+        text: String,
+        confidence: Double,
+        x: Double,
+        y: Double,
+        width: Double,
+        height: Double
+    ) {
+        self.text = text
+        self.confidence = confidence
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+public struct OcrEvidence: Codable, Equatable, Sendable {
+    public let momentId: String
+    public let text: String
+    public let regions: [OcrRegion]
+
+    public init(momentId: String, text: String, regions: [OcrRegion] = []) {
+        self.momentId = momentId
+        self.text = text
+        self.regions = regions
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case momentId = "moment_id"
+        case text
+        case regions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        momentId = try container.decode(String.self, forKey: .momentId)
+        text = try container.decode(String.self, forKey: .text)
+        // The daemon omits `regions` entirely when a frame produced no boxes.
+        regions = try container.decodeIfPresent([OcrRegion].self, forKey: .regions) ?? []
+    }
+}
+
 public enum RecallLoadState: Equatable, Sendable {
     case loading
     case ready
@@ -648,7 +844,7 @@ public struct RecallVisualTuning: Equatable, Sendable {
 
     public init(
         topScrimOpacity: Double = 0.29,
-        bottomScrimOpacity: Double = 0.46,
+        bottomScrimOpacity: Double = 0.5,
         timelineDensity: Double = 0.12,
         timelineSegmentHeight: Double = 48,
         timelineSegmentGap: Double = 2,
@@ -670,6 +866,16 @@ public enum RecallGeometry {
     public static let overlayChromeMargin: CGFloat = 26
     /// Space between sibling buttons inside one chrome cluster.
     public static let overlayChromeItemGap: CGFloat = 10
+    /// Sized for a whole slot card — title plus its bullets — rather than a
+    /// one-line index. Narrower than this and every summary wraps into a
+    /// column of fragments.
+    public static let daySummaryPanelWidth: CGFloat = 392
+    public static let daySummaryMaxHeight: CGFloat = 520
+    public static let daySummaryListMaxHeight: CGFloat = 460
+    public static let daySummaryCornerRadius: CGFloat = 16
+    /// Window titles run long. Cap the identity capsule so one verbose title
+    /// cannot push the rest of the chrome row off screen.
+    public static let appIdentityTitleMaxWidth: CGFloat = 320
 
     public static func controlBarTopPadding(
         safeAreaTop: CGFloat,

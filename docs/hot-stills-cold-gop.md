@@ -17,7 +17,7 @@
 1. **热窗口（最近 2 小时）**：继续用独立 JPEG。拖拽走现有 `RecallJPEGDecoder`。
 2. **冷数据**：后台把已关闭、已 OCR 的 still 打成 **closed-GOP AV1**（PoC 编码器 rav1e，schema 写 `av01`）。**GOP = Group of Pictures**：一段自包含的短视频，先有一张完整关键帧（I / keyframe），后面几张只存相对前一帧的差值（P 帧）。默认 6 张 / 约 1 分钟。k12 实测为 JPEG 的 7.0%，k6 为 9.2%。
 
-**容量承诺要降级：** PR 0–7 默认 `KEEP_STILLS=1`（Dual：JPEG + GOP 并存），磁盘只增不减。用户能感到的「1 GiB → ~280 MiB」只在 PR 8 删未收藏 still 之后，且无 compaction 时会被按条数 retention 挖空。Dual 是安全观察态，不是容量态。
+**容量承诺要降级：** PR 0–7 默认 `KEEP_STILLS=1`（Dual：JPEG + GOP 并存）。用户能感到的「1 GiB → ~280 MiB」只在 PR 8 删未收藏 still 之后；达到用户配置的存储预算时，retention 会从最旧的未收藏 Moment 开始回收。Dual 是安全观察态，不是容量态。
 
 编码策略、加密、删除、迁移全部归 Rust `afterrayd` / `afterray-store`。Swift Recall 只拿编码后的 still 或 GOP 字节，用 VideoToolbox 解成 NV12。Capture shim 继续薄：`SCScreenshotManager` → JPEG → staging。**rav1e 不进 10s 捕获热路径。**
 
@@ -51,7 +51,7 @@ Recall
 - Vault：`crates/afterray-store/src/lib.rs`，`SCHEMA_VERSION = 5`。`moments.image_artifact_id` **NOT NULL**，一对一指向 `artifacts`。`read_artifact` / `put_artifact` / `delete_artifact_record_and_file` 都按独立对象工作。`cleanup_orphaned_artifact_files` **已经**识别 `.arv1` / `.arv0` / `.*.tmp`。
 - 协议：`crates/afterray-protocol/src/lib.rs`，`PROTOCOL_VERSION = 2`。`Request::ReadArtifact`；`ArtifactPayload::header_line()` 先写 JSON header，再跟 `byte_length` 原始字节。树内 **没有** v1 `bytes_base64` daemon；该形状只残留在 `scripts/bench-recall-pipeline.swift`。当前 `UnixSocketDaemonClient` 已经是 framed v2，且要求 `protocol_version == 2` 精确匹配。**不要重新引入 `bytes_base64`。**
 - Recall：`RecallYUVDisplay.swift` 的 `RecallJPEGDecoder`；`RecallView.swift` 的 `RecallDecodedImageCache`（48 / 1.5GB，prefetch ±20，6 并发）；`RecallStore.swift` 的 `RecallImageRepository`（128 / 512MB 编码字节）。`RecallMoment.imageArtifactId: String` 非可选。
-- Retention：`VaultConfig.max_unstarred_moments`（默认 10_000，env `AFTERRAY_MAX_UNSTARRED_MOMENTS`）。按条数，不按磁盘、不按时间。`PRAGMA foreign_keys = ON`。
+- Retention：`VaultConfig.max_storage_bytes`（默认 100 GB，从 `settings.json` 的 `storage_limit_bytes` 读取）。按加密采集 artifact 的字节数计算；超限时优先删除最旧的未收藏 Moment，收藏内容保留。`PRAGMA foreign_keys = ON`。
 - `jobs` 表已建（5 列：`id, capability, source_id, state, attempts, error`）但从未写入；`JobsList` / `JobRetry` 走内存 `afterray-models::ModelQueue`。Packer **不得**复用这张表。
 
 ### 实测（2026-08-13，本机 `.afterray/v0-data`）
@@ -129,7 +129,7 @@ M3：有 AV1 **解码** 硬件，**没有** AV1 编码硬件。质量 caveat：�
 - 不把 HEVC 作为冷归档主路径。
 - 热路径不上 HEIC / AVIF，除非先有 VT NV12 解码器。
 - 不做 AX JSON 压缩（可另开 RFC）。
-- 不把 retention 从 `maxUnstarredMoments` 改成按磁盘 / 按天。
+- 本 GOP 阶段不设计按天 retention；按存储预算回收由 Vault 的通用容量设置负责。
 - 不在 V0 默认打开 GOP（V0 计划明确「不做 pack」）。
 - 不把原始 `CVPixelBuffer` 长期留在磁盘；第一版 packer 从已解码 JPEG 像素再编码。
 - 不做跨 GOP 的全局视频文件、不重写整个 Vault 成单一 ciphertext。
@@ -200,7 +200,7 @@ stateDiagram-v2
 | Cold（PR 8 之后） | NULL | 有 | GOP poster KF | GOP exact |
 | 冷事后收藏 | `gop_extract` JPEG | 有 | 抽帧 JPEG | 抽帧 JPEG |
 
-`KEEP_STILLS=1`（默认）时生命周期停在 Dual：磁盘上 JPEG + GOP 并存，**体积大于今天**。更重要的是 Dual 叠在现有 `insert_moment` → `enforce_retention()` 上——每次捕获都会按条数删最旧未收藏 Moment。PR 5 必须先让 retention 认识 `gop_frames` / GOP artifact，否则 Dual 观察期就会 FK 炸掉 10s 热路径。Recall 继续只读 `image_artifact_id`，**不走 GOP 解码**。Cold / NULL 要等 PR 8。PR 7 的 GOP poster 在 Dual 真数据上不可验，必须用 fixture / 无 still 测试行；因此 **PR 6 不得在 PR 7 的 fixture 播放器通过前对 dogfood Vault 默认开 `ARCHIVE=1`**。
+`KEEP_STILLS=1`（默认）时生命周期停在 Dual：磁盘上 JPEG + GOP 并存，**体积大于今天**。更重要的是 Dual 叠在现有 `insert_moment` → `enforce_retention()` 上——达到存储预算后，每次捕获都可能回收最旧的未收藏 Moment。PR 5 必须先让 retention 认识 `gop_frames` / GOP artifact，否则 Dual 观察期就会 FK 炸掉 10s 热路径。Recall 继续只读 `image_artifact_id`，**不走 GOP 解码**。Cold / NULL 要等 PR 8。PR 7 的 GOP poster 在 Dual 真数据上不可验，必须用 fixture / 无 still 测试行；因此 **PR 6 不得在 PR 7 的 fixture 播放器通过前对 dogfood Vault 默认开 `ARCHIVE=1`**。
 
 ### 热窗口定义
 

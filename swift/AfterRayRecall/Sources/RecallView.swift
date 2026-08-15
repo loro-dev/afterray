@@ -4,6 +4,7 @@ import SwiftUI
 
 public typealias RecallImageLoader = (String) async throws -> Data
 public typealias RecallArtifactLoader = (String) async throws -> Data
+public typealias RecallOcrLoader = @Sendable (String) async throws -> OcrEvidence
 
 public struct RecallView: View {
     public let moments: [RecallMoment]
@@ -20,16 +21,44 @@ public struct RecallView: View {
     public var playingAudioArtifactID: String?
     public var onReload: (() -> Void)?
     public var onOpenSettings: (() -> Void)?
+    /// Capture state shown as a word next to the gear. Nil `onToggleRecording`
+    /// hides the control entirely — the Visual Lab drives scenes without a daemon.
+    public var recordingState: DaemonRecordingState?
+    public var isChangingRecording: Bool
+    public var onToggleRecording: (() -> Void)?
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
+    public var daySummary: DaySummary
+    /// Newest first; SwiftUI's LazyVStack only instantiates visible summary
+    /// sections while the store pages older days from the daemon.
+    public var summaryHistory: [DaySummary]
+    public var summaryHistoryHasMore: Bool
+    public var isLoadingSummaryHistory: Bool
+    public var onLoadOlderSummaryHistory: (() -> Void)?
+    public var onVisibleDayChange: ((Int64) -> Void)?
+    /// Non-nil puts the view in search mode: the bottom bar becomes a filmstrip
+    /// of matched frames and travel snaps between them instead of wall clock.
+    public var searchSession: RecallSearchSession?
+    public var thumbnailLoader: RecallThumbnailLoader?
+    public var ocrLoader: RecallOcrLoader?
+    public var onSelectSearchFrame: ((Int) -> Void)?
 
     @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
+    @State private var searchDragOrigin: Int?
     @State private var movementDirection = -1
     @State private var showsDetails = false
     @State private var detailsPage = RecallDetailsPage.root
     @State private var timelineViewportWidth: CGFloat = 720
     @State private var timelineZoom: CGFloat = 1
     @State private var isZoomingTimeline = false
+    @State private var layoutCache = TimelineLayoutCache()
+    @AppStorage(DaySummaryLayout.expandedStorageKey) private var daySummaryExpanded = true
+    @State private var settledStill: SettledStill?
+    @State private var searchScrollAccumulator: CGFloat = 0
+    /// Trackpad travel needed to advance one filmstrip cell.
+    private static let searchScrollPointsPerCell: CGFloat = 46
+    @State private var highlightRegions: [OcrRegion] = []
+    @State private var highlightMomentID: String?
 
     public init(
         moments: [RecallMoment],
@@ -46,8 +75,21 @@ public struct RecallView: View {
         playingAudioArtifactID: String? = nil,
         onReload: (() -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil,
+        recordingState: DaemonRecordingState? = nil,
+        isChangingRecording: Bool = false,
+        onToggleRecording: (() -> Void)? = nil,
         chromeTopPadding: CGFloat = 22,
-        trailingChromeInset: CGFloat = 0
+        trailingChromeInset: CGFloat = 0,
+        daySummary: DaySummary = .empty,
+        summaryHistory: [DaySummary] = [],
+        summaryHistoryHasMore: Bool = false,
+        isLoadingSummaryHistory: Bool = false,
+        onLoadOlderSummaryHistory: (() -> Void)? = nil,
+        onVisibleDayChange: ((Int64) -> Void)? = nil,
+        searchSession: RecallSearchSession? = nil,
+        thumbnailLoader: RecallThumbnailLoader? = nil,
+        ocrLoader: RecallOcrLoader? = nil,
+        onSelectSearchFrame: ((Int) -> Void)? = nil
     ) {
         self.moments = moments
         self._playheadMs = playheadMs
@@ -63,8 +105,21 @@ public struct RecallView: View {
         self.playingAudioArtifactID = playingAudioArtifactID
         self.onReload = onReload
         self.onOpenSettings = onOpenSettings
+        self.recordingState = recordingState
+        self.isChangingRecording = isChangingRecording
+        self.onToggleRecording = onToggleRecording
         self.chromeTopPadding = chromeTopPadding
         self.trailingChromeInset = trailingChromeInset
+        self.daySummary = daySummary
+        self.summaryHistory = summaryHistory
+        self.summaryHistoryHasMore = summaryHistoryHasMore
+        self.isLoadingSummaryHistory = isLoadingSummaryHistory
+        self.onLoadOlderSummaryHistory = onLoadOlderSummaryHistory
+        self.onVisibleDayChange = onVisibleDayChange
+        self.searchSession = searchSession
+        self.thumbnailLoader = thumbnailLoader
+        self.ocrLoader = ocrLoader
+        self.onSelectSearchFrame = onSelectSearchFrame
     }
 
     private var selectedAudioIsActive: Bool {
@@ -76,8 +131,11 @@ public struct RecallView: View {
         RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
     }
 
+    /// Read on every scroll tick from three places — the drag handler, the
+    /// playhead setter, and `body`. Building it there meant sorting and
+    /// scanning every capture of the day three times a frame.
     private var timelineLayout: TimelineLayout {
-        TimelineLayout(
+        layoutCache.layout(
             moments: moments,
             viewportWidth: max(timelineViewportWidth, 1),
             density: tuning.timelineDensity * Double(timelineZoom)
@@ -112,21 +170,27 @@ public struct RecallView: View {
             if !isLive, let moment = selectedMoment {
                 ImmersiveArtifactImage(
                     artifactID: moment.displayCacheKey,
-                    loader: imageLoader
+                    loader: imageLoader,
+                    onSettled: { settledStill = $0 }
                 )
             }
 
-            if !isLive {
-                chromeGradients
+            chromeGradients
+
+            // Above the scrims: a dimmed highlight defeats the purpose.
+            if !isLive, let still = settledStill, still.id == selectedMoment?.displayCacheKey {
+                OcrHighlightOverlay(
+                    regions: highlightRegions,
+                    pixelSize: still.pixelSize,
+                    blinkToken: still.id
+                )
             }
 
             VStack(spacing: 0) {
-                if !isLive {
-                    momentHeader
-                        .frame(height: RecallGeometry.overlayChromeButtonSize, alignment: .center)
-                        .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-                        .padding(.top, chromeTopPadding)
-                }
+                momentHeader
+                    .frame(minHeight: RecallGeometry.overlayChromeButtonSize, alignment: .top)
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .padding(.top, chromeTopPadding)
 
                 Spacer(minLength: 100)
 
@@ -147,18 +211,51 @@ public struct RecallView: View {
                     .padding(.bottom, 12)
                 }
 
-                AppUsageTimeline(
-                    layout: timelineLayout,
-                    playheadMs: playheadMs,
-                    isLive: isLive,
-                    selectedMoment: selectedMoment,
-                    tuning: tuning,
-                    zoom: $timelineZoom,
-                    isZooming: $isZoomingTimeline,
-                    onSelectMs: { selectPlayhead(playheadMs: $0) },
-                    onViewportWidthChange: { timelineViewportWidth = $0 }
-                )
-                .padding(.bottom, 18)
+                if daySummaryExpanded {
+                    HStack(alignment: .bottom, spacing: 0) {
+                        DaySummaryPanel(
+                            summaries: summaryHistory.isEmpty ? [daySummary] : summaryHistory,
+                            playheadMs: playheadMs,
+                            nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                            hasMore: summaryHistoryHasMore,
+                            isLoadingMore: isLoadingSummaryHistory,
+                            onSelectSlot: { selectPlayhead(playheadMs: $0) },
+                            onLoadMore: { onLoadOlderSummaryHistory?() }
+                        )
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .padding(.bottom, 10)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+
+                timelineChromeRow
+                    .padding(.bottom, 9)
+
+                if let searchSession, let thumbnailLoader {
+                    SearchFilmstrip(
+                        session: searchSession,
+                        tuning: tuning,
+                        selectedDate: selectedDate,
+                        thumbnailLoader: thumbnailLoader,
+                        onSelectIndex: { onSelectSearchFrame?($0) },
+                        onViewportWidthChange: { timelineViewportWidth = $0 }
+                    )
+                    .padding(.bottom, 18)
+                } else {
+                    AppUsageTimeline(
+                        layout: timelineLayout,
+                        playheadMs: playheadMs,
+                        isLive: isLive,
+                        selectedMoment: selectedMoment,
+                        tuning: tuning,
+                        zoom: $timelineZoom,
+                        isZooming: $isZoomingTimeline,
+                        onSelectMs: { selectPlayhead(playheadMs: $0) },
+                        onViewportWidthChange: { timelineViewportWidth = $0 }
+                    )
+                    .padding(.bottom, 18)
+                }
             }
 
             if showsDetails, !isLive, let moment = selectedMoment {
@@ -200,18 +297,87 @@ public struct RecallView: View {
             return .handled
         }
         .animation(.easeOut(duration: 0.18), value: showsDetails)
+        .animation(.easeOut(duration: 0.18), value: daySummaryExpanded)
         .task(id: "\(selectedMoment?.id ?? "-"):\(movementDirection)") {
             prefetchAroundSelection()
         }
+        .onAppear { onVisibleDayChange?(playheadMs) }
+        .onChange(of: playheadDayKey) { _, _ in
+            onVisibleDayChange?(playheadMs)
+        }
+        .task(id: highlightKey) {
+            await loadHighlightRegions()
+        }
+        .task(id: searchSession?.selectedIndex ?? -1) {
+            prefetchFilmstripThumbnails()
+        }
     }
 
+    private var playheadDayKey: String {
+        DaySummaryLayout.localDayKey(ms: playheadMs)
+    }
+
+    /// Reloading is only worth it when the frame or the query actually changed.
+    private var highlightKey: String {
+        "\(selectedMoment?.id ?? "-")|\(searchSession?.query ?? "")"
+    }
+
+    private var selectedDate: Date {
+        let ms = selectedMoment?.capturedAtMs ?? playheadMs
+        return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
+    }
+
+    /// Fetches OCR boxes for the selected frame and keeps only those the query
+    /// actually hit. Cleared eagerly so a stale highlight never sits over a new
+    /// frame while the fetch is in flight.
+    private func loadHighlightRegions() async {
+        highlightRegions = []
+        guard
+            let ocrLoader,
+            let moment = selectedMoment,
+            let query = searchSession?.query,
+            !query.isEmpty
+        else {
+            highlightMomentID = nil
+            return
+        }
+        highlightMomentID = moment.id
+        guard let evidence = try? await ocrLoader(moment.id) else { return }
+        // The selection may have moved on while this was in flight.
+        guard highlightMomentID == moment.id else { return }
+        highlightRegions = OcrHighlight.matching(regions: evidence.regions, query: query)
+    }
+
+    private func prefetchFilmstripThumbnails() {
+        guard let searchSession, let thumbnailLoader else { return }
+        let center = searchSession.selectedIndex
+        let ids = (-8...8).compactMap { offset -> String? in
+            let index = center + offset
+            guard searchSession.frames.indices.contains(index) else { return nil }
+            return searchSession.frames[index].momentId
+        }
+        RecallThumbnailCache.shared.prefetch(momentIDs: ids, loader: thumbnailLoader)
+    }
+
+    /// The bottom scrim is unconditional: live or not, the timeline and the
+    /// controls beside it sit over whatever is on screen, and a busy desktop
+    /// leaves them unreadable without it. The top and side washes are for the
+    /// recalled still only — in live view they would dim the real desktop.
     private var chromeGradients: some View {
         ZStack {
-            LinearGradient(
-                colors: [.black.opacity(tuning.topScrimOpacity), .clear],
-                startPoint: .top,
-                endPoint: UnitPoint(x: 0.5, y: 0.23)
-            )
+            if !isLive {
+                LinearGradient(
+                    colors: [.black.opacity(tuning.topScrimOpacity), .clear],
+                    startPoint: .top,
+                    endPoint: UnitPoint(x: 0.5, y: 0.23)
+                )
+                LinearGradient(
+                    colors: [.black.opacity(0.17), .clear, .black.opacity(0.11)],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            }
+
             LinearGradient(
                 stops: [
                     .init(color: .clear, location: 0.52),
@@ -221,23 +387,27 @@ public struct RecallView: View {
                 startPoint: .top,
                 endPoint: .bottom
             )
-            LinearGradient(
-                colors: [.black.opacity(0.17), .clear, .black.opacity(0.11)],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
         }
         .allowsHitTesting(false)
         .ignoresSafeArea()
     }
 
+    /// The top-right cluster. Settings lives here rather than beside the
+    /// timeline: down there it sat in the busiest corner of the overlay and
+    /// read as another playback control. The identity capsule and the context
+    /// button belong to a recalled frame, so they drop away in live view —
+    /// the gear does not, and stays reachable either way.
     private var momentHeader: some View {
-        HStack(alignment: .center, spacing: RecallGeometry.overlayChromeItemGap) {
-            AppIdentity(moment: selectedMoment)
+        // Top-aligned: the identity capsule grows downward when it carries a
+        // window title, and the chrome cluster must not grow with it.
+        HStack(alignment: .top, spacing: RecallGeometry.overlayChromeItemGap) {
+            if !isLive {
+                AppIdentity(moment: selectedMoment)
+            }
 
             Spacer(minLength: 24)
 
-            if isProcessing {
+            if isProcessing, !isLive {
                 Label("Understanding", systemImage: "sparkles")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.86))
@@ -248,18 +418,20 @@ public struct RecallView: View {
 
             RecallGlassCluster {
                 HStack(spacing: RecallGeometry.overlayChromeItemGap) {
-                    RecallChromeIconButton(
-                        symbol: showsDetails ? "sidebar.right" : "info.circle",
-                        help: showsDetails ? "Hide captured context" : "Show captured context",
-                        action: {
-                            if showsDetails {
-                                showsDetails = false
-                            } else {
-                                detailsPage = .root
-                                showsDetails = true
+                    if !isLive {
+                        RecallChromeIconButton(
+                            symbol: showsDetails ? "sidebar.right" : "info.circle",
+                            help: showsDetails ? "Hide captured context" : "Show captured context",
+                            action: {
+                                if showsDetails {
+                                    showsDetails = false
+                                } else {
+                                    detailsPage = .root
+                                    showsDetails = true
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
 
                     if let onOpenSettings {
                         RecallChromeIconButton(
@@ -273,11 +445,73 @@ public struct RecallView: View {
         }
     }
 
+    /// The day-summary toggle sits directly under the panel it opens and
+    /// directly above the timeline it belongs to — the control is within
+    /// reach of what it reveals. Settings used to share this cluster; it is
+    /// a whole-app control, not a playback one, so it moved to the top right.
+    private var daySummaryChrome: some View {
+        RecallGlassCluster {
+            RecallChromeIconButton(
+                symbol: daySummaryExpanded
+                    ? "rectangle.bottomhalf.inset.filled"
+                    : "list.bullet.rectangle",
+                help: daySummaryExpanded ? "Hide today's summary" : "Show today's summary",
+                tint: daySummaryExpanded ? RecallPalette.ray : .white,
+                action: {
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        daySummaryExpanded.toggle()
+                    }
+                }
+            )
+        }
+    }
+
+    /// One row directly above the timeline: capture state, then the controls,
+    /// then zoom — all left-aligned over the bottom scrim, which is the only
+    /// part of the frame guaranteed to be dark enough to read them against.
+    /// The playhead clock rides the same row but stays centred on screen.
+    private var timelineChromeRow: some View {
+        ZStack {
+            HStack(spacing: RecallGeometry.overlayChromeItemGap) {
+                if let onToggleRecording {
+                    TimelineRecordingStatusButton(
+                        state: recordingState,
+                        isChanging: isChangingRecording,
+                        action: onToggleRecording
+                    )
+                }
+
+                daySummaryChrome
+
+                TimelineZoomStrip(zoom: $timelineZoom, isDragging: $isZoomingTimeline)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+
+            PlayheadTimestamp(date: selectedDate, isLive: isLive)
+        }
+    }
+
     private var recallDrag: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
                 if isZoomingTimeline {
                     dragOrigin = nil
+                    searchDragOrigin = nil
+                    return
+                }
+                if let searchSession {
+                    // Search results are discrete, so a drag walks whole cells
+                    // rather than scrubbing continuously through time.
+                    let origin = searchDragOrigin ?? searchSession.selectedIndex
+                    searchDragOrigin = origin
+                    let layout = SearchFilmstripLayout(
+                        count: searchSession.frames.count,
+                        viewportWidth: timelineViewportWidth
+                    )
+                    let steps = layout.steps(forDragTranslation: value.translation.width)
+                    selectSearchIndex(origin + steps)
                     return
                 }
                 if dragOrigin == nil {
@@ -293,11 +527,40 @@ public struct RecallView: View {
                 )
                 selectPlayhead(playheadMs: moved.playheadMs, isLive: moved.isLive)
             }
-            .onEnded { _ in dragOrigin = nil }
+            .onEnded { _ in
+                dragOrigin = nil
+                searchDragOrigin = nil
+            }
+    }
+
+    /// Clamps and forwards; the owner decides what selecting a frame means.
+    private func selectSearchIndex(_ index: Int) {
+        guard let searchSession, !searchSession.frames.isEmpty else { return }
+        let clamped = min(max(index, 0), searchSession.frames.count - 1)
+        guard clamped != searchSession.selectedIndex else { return }
+        onSelectSearchFrame?(clamped)
     }
 
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
-        if ended { return }
+        if ended {
+            searchScrollAccumulator = 0
+            return
+        }
+        if let searchSession {
+            guard delta != 0 else { return }
+            if !isPrecise {
+                selectSearchIndex(searchSession.selectedIndex + (delta > 0 ? -1 : 1))
+                return
+            }
+            // A trackpad emits dozens of small deltas per flick. Accumulating
+            // to a whole cell keeps one swipe from blowing through the results.
+            searchScrollAccumulator += delta
+            let steps = Int(searchScrollAccumulator / Self.searchScrollPointsPerCell)
+            guard steps != 0 else { return }
+            searchScrollAccumulator -= CGFloat(steps) * Self.searchScrollPointsPerCell
+            selectSearchIndex(searchSession.selectedIndex - steps)
+            return
+        }
         guard delta != 0, !moments.isEmpty else { return }
         if !isPrecise {
             let stepped = RecallPlayhead.stepMoment(
@@ -328,6 +591,10 @@ public struct RecallView: View {
     }
 
     private func moveSelection(by delta: Int) {
+        if let searchSession {
+            selectSearchIndex(searchSession.selectedIndex + delta)
+            return
+        }
         let stepped = RecallPlayhead.stepMoment(
             playheadMs: playheadMs,
             isLive: isLive,
@@ -375,9 +642,16 @@ public struct RecallView: View {
     }
 }
 
+/// A still that has finished fading in and now owns the screen at full opacity.
+struct SettledStill: Equatable {
+    let id: String
+    let pixelSize: CGSize
+}
+
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
     let loader: RecallImageLoader
+    var onSettled: ((SettledStill) -> Void)?
     @StateObject private var player = RecallStillPlayer()
 
     var body: some View {
@@ -409,6 +683,9 @@ private struct ImmersiveArtifactImage: View {
         .onChange(of: artifactID) { _, newID in
             player.request(newID)
         }
+        .onChange(of: player.settled) { _, settled in
+            if let settled { onSettled?(settled) }
+        }
         .onDisappear {
             player.invalidate()
         }
@@ -435,6 +712,9 @@ private final class RecallStillPlayer: ObservableObject {
     /// Incoming slot is always drawn above the base so a ping-pong fade
     /// is never hidden under the previous still.
     @Published private(set) var overlaySlotIsA = false
+    /// The still currently at full opacity. Publishing this is what lets the
+    /// OCR highlight wait for the fade instead of flashing mid-crossfade.
+    @Published private(set) var settled: SettledStill?
 
     private enum Slot {
         case a, b
@@ -517,6 +797,11 @@ private final class RecallStillPlayer: ObservableObject {
         }
     }
 
+    /// Called once the incoming slot has reached full opacity.
+    private func markSettled(_ still: PresentedStill) {
+        settled = SettledStill(id: still.id, pixelSize: still.frame.pixelSize)
+    }
+
     private func waitForViews() async {
         for _ in 0..<40 {
             if slotA.view != nil, slotB.view != nil { return }
@@ -535,6 +820,7 @@ private final class RecallStillPlayer: ObservableObject {
         base?.display(still.frame)
         base?.setContentOpacity(1)
         hasVisibleStill = true
+        settled = SettledStill(id: still.id, pixelSize: still.frame.pixelSize)
     }
 
     private func startIncomingFade(_ still: PresentedStill) {
@@ -557,6 +843,7 @@ private final class RecallStillPlayer: ObservableObject {
             guard self.isCurrentFade(generation) else { return }
             self.promoteIncomingToBase()
             self.isAnimating = false
+            self.markSettled(still)
             self.handle(self.gate.transitionFinished())
         }
     }
@@ -701,17 +988,38 @@ public func clearRecallDecodedImageCache() {
 private struct AppIdentity: View {
     let moment: RecallMoment?
 
+    /// The app name alone rarely identifies a frame — a day in one editor is a
+    /// dozen different files. The window title is what tells them apart.
+    private var windowTitle: String? {
+        guard
+            let title = moment?.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !title.isEmpty
+        else { return nil }
+        return title
+    }
+
     var body: some View {
         HStack(spacing: 9) {
             ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 24)
-            Text(moment?.applicationName ?? "Idle")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.92))
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(moment?.applicationName ?? "Idle")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .lineLimit(1)
+                if let windowTitle {
+                    Text(windowTitle)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: RecallGeometry.appIdentityTitleMaxWidth, alignment: .leading)
+                }
+            }
         }
         .padding(.leading, 7)
         .padding(.trailing, 12)
-        .frame(height: RecallGeometry.overlayChromeButtonSize)
+        .padding(.vertical, windowTitle == nil ? 0 : 6)
+        .frame(minHeight: RecallGeometry.overlayChromeButtonSize)
         .recallGlass(in: .capsule)
     }
 }
@@ -729,21 +1037,13 @@ private struct AppUsageTimeline: View {
 
     var body: some View {
         VStack(spacing: 9) {
-            timestamp
-
-            HStack(spacing: 0) {
-                TimelineZoomStrip(zoom: $zoom, isDragging: $isZooming)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-
             GeometryReader { geometry in
                 let width = geometry.size.width
                 let selectedX = layout.playheadX(playheadMs: playheadMs, isLive: isLive)
 
                 ZStack(alignment: .leading) {
                     Color.black.opacity(0.001)
-                    timelineTrack
+                    timelineTrack(visible: Self.visibleRange(centeredOn: selectedX, width: width))
                         .offset(x: width / 2 - selectedX)
 
                     Rectangle()
@@ -775,18 +1075,160 @@ private struct AppUsageTimeline: View {
         .contentShape(Rectangle())
     }
 
-    private var timestamp: some View {
+    private var selectedDate: Date {
+        let ms = selectedMoment?.capturedAtMs ?? playheadMs
+        return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
+    }
+
+    /// The track is as wide as the whole archive — tens of thousands of points
+    /// — while the viewport shows one screen of it. Everything outside
+    /// `visible` used to be built, laid out, gradient-filled and given a
+    /// tooltip on every frame, only to be clipped away.
+    ///
+    /// Runs are placed by their own `startX` rather than stacked, so skipping
+    /// one costs nothing: an `HStack` would have to lay out the segments it
+    /// never draws just to know where the next one goes.
+    private func timelineTrack(visible: ClosedRange<CGFloat>) -> some View {
+        let visibleRuns = layout.runs(intersecting: visible)
+        let lastIndex = layout.runs.count - 1
+        return ZStack(alignment: .leading) {
+            Color.black.opacity(0.001)
+                .frame(width: layout.contentWidth, height: tuning.timelineSegmentHeight)
+                .contentShape(Rectangle())
+                .gesture(
+                    SpatialTapGesture().onEnded { value in
+                        onSelectMs(layout.snapToRecordedMs(layout.ms(x: value.location.x)))
+                    }
+                )
+
+            ForEach(Array(visibleRuns.indices), id: \.self) { index in
+                let run = layout.runs[index]
+                let drawnWidth = max(
+                    run.width - (index == lastIndex ? 0 : tuning.timelineSegmentGap),
+                    1
+                )
+                let height = run.isIdle ? 7 : tuning.timelineSegmentHeight
+                AppUsageSegmentView(run: run, width: drawnWidth, height: height)
+                    .frame(width: drawnWidth, height: height)
+                    .position(x: run.startX + run.width / 2, y: 28)
+                    .help(
+                        run.isIdle
+                            ? "这段时间没有录制 · \(DurationFormatter.short(milliseconds: run.durationMs))"
+                            : "\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))"
+                    )
+            }
+
+            ForEach(layout.favorites.filter { visible.contains($0.x) }) { favorite in
+                Image(systemName: "star.fill")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.white)
+                    .position(x: favorite.x, y: 2)
+            }
+        }
+        .frame(width: layout.contentWidth, height: 56)
+        .padding(.vertical, 6)
+    }
+
+    /// One viewport either side of the playhead, plus a margin so a segment
+    /// straddling an edge is drawn whole rather than appearing mid-scroll.
+    private static func visibleRange(centeredOn x: CGFloat, width: CGFloat) -> ClosedRange<CGFloat> {
+        let reach = width / 2 + 96
+        return (x - reach)...(x + reach)
+    }
+}
+
+/// Draws the matched OCR boxes over the still, pulses them, then leaves them up.
+///
+/// Mounted only once the crossfade has settled — a box drawn over a
+/// half-faded frame points at the wrong pixels.
+private struct OcrHighlightOverlay: View {
+    let regions: [OcrRegion]
+    let pixelSize: CGSize
+    /// Changing this restarts the pulse: a new frame deserves a new flash.
+    let blinkToken: String
+
+    private static let pulses = 3
+    private static let pulseDuration = 0.22
+    /// After the pulses the boxes stay up. They are the answer to the query,
+    /// not a transient notification.
+    private static let restingOpacity: Double = 0.9
+
+    @State private var opacity: Double = 0
+
+    var body: some View {
+        GeometryReader { geometry in
+            let content = OcrHighlight.contentRect(
+                pixelSize: pixelSize,
+                viewSize: geometry.size
+            )
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(regions.enumerated()), id: \.offset) { _, region in
+                    let box = OcrHighlight.rect(for: region, in: content)
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(RecallPalette.ray.opacity(0.16))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .strokeBorder(RecallPalette.ray, lineWidth: 1.5)
+                        }
+                        .shadow(color: RecallPalette.ray.opacity(0.7), radius: 6)
+                        .frame(width: box.width, height: box.height)
+                        .offset(x: box.minX, y: box.minY)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .opacity(opacity)
+        .allowsHitTesting(false)
+        .ignoresSafeArea()
+        .task(id: blinkToken) { await pulse() }
+    }
+
+    private func pulse() async {
+        guard !regions.isEmpty else {
+            opacity = 0
+            return
+        }
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            opacity = Self.restingOpacity
+            return
+        }
+        for _ in 0..<Self.pulses {
+            withAnimation(.easeOut(duration: Self.pulseDuration)) { opacity = 1 }
+            try? await Task.sleep(for: .seconds(Self.pulseDuration))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: Self.pulseDuration)) { opacity = 0.25 }
+            try? await Task.sleep(for: .seconds(Self.pulseDuration))
+            guard !Task.isCancelled else { return }
+        }
+        withAnimation(.easeOut(duration: Self.pulseDuration)) {
+            opacity = Self.restingOpacity
+        }
+    }
+}
+
+/// The absolute time under the playhead. Shared by the app timeline and the
+/// search filmstrip: whatever the strip below is showing, this stays the one
+/// place that spells out *when*.
+struct PlayheadTimestamp: View {
+    let date: Date
+    let isLive: Bool
+
+    var body: some View {
         VStack(spacing: 2) {
-            Text(isLive ? "NOW" : selectedDate.formatted(date: .omitted, time: .standard))
+            Text(isLive ? "NOW" : date.formatted(date: .omitted, time: .standard))
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .monospacedDigit()
+                // Explicit, not `.primary`: this always sits on dark chrome, and
+                // relying on the inherited scheme renders it black-on-black in
+                // any host that does not carry the dark appearance through.
+                .foregroundStyle(RecallPalette.textPrimary)
             Text(
                 isLive
                     ? "Swipe right to enter history"
-                    : selectedDate.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
+                    : date.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
             )
-                .font(.system(size: 10, weight: .medium, design: .rounded))
-                .foregroundStyle(.white.opacity(0.58))
+            .font(.system(size: 10, weight: .medium, design: .rounded))
+            .foregroundStyle(.white.opacity(0.58))
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
@@ -799,55 +1241,78 @@ private struct AppUsageTimeline: View {
                 .shadow(color: RecallPalette.ray, radius: 6)
         }
     }
+}
 
-    private var selectedDate: Date {
-        let ms = selectedMoment?.capturedAtMs ?? playheadMs
-        return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
+/// Capture state as a word, not a symbol. "Recording" / "Waiting" / "Paused"
+/// is wordier than a dot, but a dot alone cannot say which of the three it is,
+/// and the row has room to spare. Tapping toggles capture.
+private struct TimelineRecordingStatusButton: View {
+    let state: DaemonRecordingState?
+    let isChanging: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(indicatorColor)
+                    .frame(width: 6, height: 6)
+                    .shadow(
+                        color: effectiveState == .recording ? indicatorColor.opacity(0.8) : .clear,
+                        radius: 5
+                    )
+                Text(statusLabel)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.78))
+            }
+            .padding(.horizontal, 12)
+            .frame(height: RecallGeometry.overlayChromeButtonSize)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(RecallGlassPressStyle())
+        .recallGlass(in: .capsule)
+        .disabled(effectiveState == .stopping || isChanging)
+        .help(toggleHelp)
+        .accessibilityLabel("Capture status")
+        .accessibilityValue(statusLabel)
+        .accessibilityHint(toggleHelp)
     }
 
-    private var timelineTrack: some View {
-        ZStack(alignment: .leading) {
-            HStack(spacing: 0) {
-                ForEach(Array(layout.runs.enumerated()), id: \.element.id) { index, run in
-                    let drawnWidth = max(
-                        run.width - (index == layout.runs.count - 1 ? 0 : tuning.timelineSegmentGap),
-                        1
-                    )
-                    AppUsageSegmentView(
-                        run: run,
-                        width: drawnWidth,
-                        height: run.isIdle ? 7 : tuning.timelineSegmentHeight
-                    )
-                    .frame(width: drawnWidth, height: run.isIdle ? 7 : tuning.timelineSegmentHeight)
-                    .frame(
-                        width: run.width,
-                        height: tuning.timelineSegmentHeight,
-                        alignment: .center
-                    )
-                    .help(
-                        run.isIdle
-                            ? "这段时间没有录制 · \(DurationFormatter.short(milliseconds: run.durationMs))"
-                            : "\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))"
-                    )
-                }
-            }
-            .frame(width: layout.contentWidth, alignment: .leading)
-            .contentShape(Rectangle())
-            .gesture(
-                SpatialTapGesture().onEnded { value in
-                    onSelectMs(layout.snapToRecordedMs(layout.ms(x: value.location.x)))
-                }
-            )
-
-            ForEach(layout.moments.filter(\.isFavorite), id: \.id) { moment in
-                Image(systemName: "star.fill")
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(.white)
-                    .position(x: layout.x(ms: moment.capturedAtMs), y: 2)
-            }
+    /// A toggle in flight reads as "Waiting" rather than briefly flashing back
+    /// to the state it is leaving.
+    private var effectiveState: DaemonRecordingState? {
+        if isChanging, state == nil || state == .idle {
+            return .waiting
         }
-        .frame(width: layout.contentWidth, height: 56)
-        .padding(.vertical, 6)
+        return state
+    }
+
+    private var statusLabel: String {
+        switch effectiveState {
+        case .idle: "Paused"
+        case .waiting: "Waiting"
+        case .recording: "Recording"
+        case .stopping: "Pausing"
+        case .failed: "Failed"
+        case nil: "Offline"
+        }
+    }
+
+    private var indicatorColor: Color {
+        switch effectiveState {
+        case .recording: .red
+        case .waiting, .stopping: .orange
+        case .failed: .red.opacity(0.8)
+        case .idle: .white.opacity(0.48)
+        case nil: .secondary.opacity(0.55)
+        }
+    }
+
+    private var toggleHelp: String {
+        switch effectiveState {
+        case .waiting, .recording, .stopping: "Pause capture"
+        case .idle, .failed, nil: "Resume capture"
+        }
     }
 }
 
@@ -1010,11 +1475,34 @@ private struct ApplicationIcon: View {
     }
 
     private var icon: NSImage? {
-        guard
-            let bundleIdentifier,
-            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
-        else { return nil }
-        return NSWorkspace.shared.icon(forFile: url.path)
+        AppIconCache.icon(bundleIdentifier: bundleIdentifier)
+    }
+}
+
+/// Both halves of an app icon lookup — resolving the bundle id to a URL and
+/// reading the icon — go through Launch Services and the disk. This used to
+/// be a computed property on the view, so every drawn timeline segment
+/// repeated both on every frame of a scroll.
+private enum AppIconCache {
+    private static let cache = NSCache<NSString, NSImage>()
+    /// Marks "looked it up, there is no icon", so a missing app does not
+    /// re-query Launch Services forever.
+    private static let absent = NSImage(size: .zero)
+
+    static func icon(bundleIdentifier: String?) -> NSImage? {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return nil }
+        let key = bundleIdentifier as NSString
+        if let cached = cache.object(forKey: key) {
+            return cached === absent ? nil : cached
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+        else {
+            cache.setObject(absent, forKey: key)
+            return nil
+        }
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        cache.setObject(icon, forKey: key)
+        return icon
     }
 }
 

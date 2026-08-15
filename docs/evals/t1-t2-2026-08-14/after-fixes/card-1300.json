@@ -1,0 +1,308 @@
+{
+  "evidence": {
+    "entry_points": [
+      {
+        "at_ms": 1786683613155,
+        "moment_id": "019ffea4-5ff9-7eb0-a3a1-fee0fc043531",
+        "ocr_chars": 1928,
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody"
+      },
+      {
+        "at_ms": 1786685141870,
+        "moment_id": "019ffebd-6087-7193-9ccc-7e38dd250815",
+        "ocr_chars": 1539,
+        "target": "UserNotificationCenter"
+      }
+    ],
+    "moment_ids": [
+      "019ffea4-38f5-7c43-83f7-460bfdb424d2",
+      "019ffea4-5ff9-7eb0-a3a1-fee0fc043531",
+      "019ffea4-b937-7d92-89f5-1565f8e757cb",
+      "019ffea4-b955-7d61-b72e-138fd62d7eab",
+      "019ffea4-d533-7a52-8d34-454a06682c30",
+      "019ffea4-fc3f-7230-bf38-50685d9e418b",
+      "019ffea5-2347-7252-a0a0-13b4e92d190a",
+      "019ffea5-4a6a-7f81-983b-c0f4b015f2b6",
+      "019ffea5-7180-7da2-92af-845165db22ab",
+      "019ffea5-988e-7121-8aeb-a302130d0ca7",
+      "019ffea5-bf9c-7911-82a1-70ccda30af46",
+      "019ffea5-e6aa-7f13-884e-995b99f9bdbd",
+      "019ffea6-0dbd-7602-a2b8-8a25478c3d88",
+      "019ffea6-349a-7fe3-bdab-2877ce50c166",
+      "019ffea6-5be1-7432-a86e-0ec891d61582",
+      "019ffea6-82df-7902-816b-a878b78e5773",
+      "019ffea6-a9e0-7613-8a64-929a0a3acf06",
+      "019ffea6-d104-7c32-af4b-426d80c9dceb",
+      "019ffea6-f80e-7511-a0d5-c6c571be2289",
+      "019ffea7-1f30-7f73-a8a9-60d814ea5320",
+      "019ffea7-463b-78e3-b302-f337261c5c08",
+      "019ffea7-6d4c-78c2-b499-7526d51d45cc",
+      "019ffea7-944b-7361-a00d-2417baf03f25",
+      "019ffea7-bb62-7be2-a213-751c02a9aa05",
+      "019ffea7-e25e-7d22-af7e-c6f57751ba9f",
+      "019ffea8-0991-71c0-a5b9-0ac250ed7acc",
+      "019ffea8-308e-71a1-b07b-9ad2844af713",
+      "019ffea8-57b0-71c3-b40e-19cbc693979e",
+      "019ffea8-7ecb-7bc1-8a09-9dc74becbf32",
+      "019ffea8-a595-74b2-8962-2eacfb78e7c3",
+      "019ffea8-ccdc-7c13-b8e0-a0d3a7a9bc7d",
+      "019ffea8-f3ed-7003-ac84-c27d9a20a02c",
+      "019ffea9-1af1-7323-89fa-355fa842850f",
+      "019ffea9-4212-75d2-84b7-5d532b45b76e",
+      "019ffea9-6907-7840-88a9-d75316e0da42",
+      "019ffea9-8ff9-7222-a6cb-1ba975933276",
+      "019ffeaa-1d4e-7932-9496-5525c59685a8",
+      "019ffeaa-1d6e-7970-b779-20c97087d8fb",
+      "019ffeaa-1d8a-7680-a9c1-4a180967f311",
+      "019ffeaa-2c64-7480-aed3-d3b4b49a5779",
+      "019ffeaa-5369-7301-8784-c546f85082be",
+      "019ffeaa-7a82-7513-9023-87b82cb2bcdc",
+      "019ffeaa-a16c-7581-83e9-aa455d3062de",
+      "019ffeaa-c875-7e21-914c-7777dcc60140",
+      "019ffeaa-effc-7a32-a519-5f964fa212a2",
+      "019ffeab-16bc-79d1-9beb-d50385687c14",
+      "019ffeab-3dd0-7531-8f41-a5f30cea6643",
+      "019ffeab-64e5-7c40-b8d4-94650e293a95",
+      "019ffeab-8be3-7300-981b-691e74287f94",
+      "019ffeab-b2f3-7c40-b23b-48bd2fb5a75c",
+      "019ffeab-da1d-79d3-b970-a011e3cd4902",
+      "019ffeac-012a-7ff1-8d62-43ce3a5469ef",
+      "019ffeac-2818-7e02-84af-8870d1ae6729",
+      "019ffeac-4f4c-78a2-a8b3-a7b2e3b2ad02",
+      "019ffeac-7657-7c13-adab-782f8e9a7cce",
+      "019ffeac-9d62-7212-a215-11a02ab55c56",
+      "019ffeac-c465-7420-b711-d5eac8d3706c",
+      "019ffeac-eb74-7182-80e6-92aa64aeeb80",
+      "019ffead-129a-7c32-bd77-b43c4a3c8087",
+      "019ffead-3995-7911-8577-a7128020ecd5",
+      "019ffead-60b7-7721-b015-64e167e90512",
+      "019ffead-8843-7b63-a243-2cf49ce61772",
+      "019ffead-aee1-72f2-aac6-ec7222122213",
+      "019ffead-d5cf-75a1-9d7e-0f9f69e52736",
+      "019ffeae-a427-7c32-9703-4c4b86d7c736",
+      "019ffeae-caff-7cd2-bb1e-872ab6be5ae7",
+      "019ffeae-f215-76d3-82cb-521f35947ed2",
+      "019ffeaf-1923-7dc3-ab15-e0decd32616d",
+      "019ffeaf-402c-7d30-8583-6cc4dbff6b31",
+      "019ffeaf-6782-79a0-ba03-f1ca62cf96a4",
+      "019ffeaf-8e50-7e43-92bf-596945e80447",
+      "019ffeaf-b55c-7f50-acae-4e6c0a9af063",
+      "019ffeaf-dc82-7eb1-b161-1ace752d6470",
+      "019ffeb0-1240-7490-8d1f-7a05553cb61b",
+      "019ffeb0-395f-7ed0-b0a5-a0026ab0f4b4",
+      "019ffeb0-607b-7702-834b-266ed7059f94",
+      "019ffeb0-8778-7280-bb98-701edfcabda9",
+      "019ffeb0-ae87-7a61-96e6-ab0664e39f49",
+      "019ffeb0-d5a9-77a3-8317-ef68d7ec3a51",
+      "019ffeb0-fc9b-7790-a221-f394ac79c89d",
+      "019ffeb1-23d3-7350-b046-a4527b765b57",
+      "019ffeb1-4aca-71b1-92d9-e94f4d57c296",
+      "019ffeb1-71dc-7303-a9bb-14af60141b50",
+      "019ffeb1-98eb-70a3-8e06-9aba08f1eedc",
+      "019ffeb1-c005-70c1-9348-a8341510883f",
+      "019ffeb1-e712-7442-8a7a-302eabaa5d4f",
+      "019ffeb2-0e22-7a33-be11-ecaec6510098",
+      "019ffeb2-3537-7552-bcac-dfe87dea6f47",
+      "019ffeb2-5c3c-7271-a1fe-9ba6951a3769",
+      "019ffeb2-834b-7e12-ae35-5aa0b855fb3b",
+      "019ffeb2-aa5f-7ec2-a658-b13f7a0cef6f",
+      "019ffeb2-d18e-7dd0-a8f3-be65760d0dca",
+      "019ffeb2-f885-70c0-917e-c1a4f22ccd02",
+      "019ffeb3-1f8d-7ee0-8599-7c4640eb1645",
+      "019ffeb3-46a0-7160-98f5-6a707d93b87a",
+      "019ffeb3-6db6-79e0-a5d1-6aa23bdb3ef1",
+      "019ffeb3-94c7-7230-8147-5309aeeeda6c",
+      "019ffeb3-ec32-74c0-93ab-0398d0e517a0",
+      "019ffeb4-1368-7923-b2bb-b40a4641205e",
+      "019ffeb4-3a61-7421-b191-f9defa48726d",
+      "019ffeb4-616e-70d0-b422-cf88625d9271",
+      "019ffeb4-9861-7523-b5a2-5aa02ea91067",
+      "019ffeb4-bf96-7142-9cea-d68aaa649735",
+      "019ffeb4-e6a8-74e3-9e9e-0452386d68cd",
+      "019ffeb5-0d91-7413-968f-cf333fb26dde",
+      "019ffeb5-4a9a-7362-8eb2-9dc077adf275",
+      "019ffeb5-71a8-7500-9326-3b029ca5b64e",
+      "019ffeb5-98de-7540-b4f0-ee16505e3c9e",
+      "019ffeb5-c008-78a1-8797-fe287f182642",
+      "019ffeb5-e6fc-7080-b0c1-16592d2cad76",
+      "019ffeb6-0e17-7f10-85c3-253454460374",
+      "019ffeb6-352b-7751-bae3-852fa9c35a89",
+      "019ffeb6-5c38-7180-88c3-ce2b7869df1e",
+      "019ffeb6-833d-78c0-8e47-23e4fb5e822e",
+      "019ffeb6-aa4f-7281-b33f-98ebea4555fc",
+      "019ffeb6-d16f-76a2-bdd7-90e19d0f012a",
+      "019ffeb6-f879-7db1-9212-0207ab5ce6ce",
+      "019ffeb7-1f84-7501-add5-b4ba5ca9f57e",
+      "019ffeb7-46af-7e10-a560-8895f647cebe",
+      "019ffeb7-6da0-7f40-bf07-db8e2bcb8c0b",
+      "019ffeb7-94bd-7751-9705-cf58029c77e8",
+      "019ffeb7-bbc5-7003-becf-cbe19b1d8dd9",
+      "019ffeb7-e2c6-7770-b0bc-4af8bdd3717a",
+      "019ffeb8-09e8-7b62-912e-e5bf71a25222",
+      "019ffeb8-30dd-77d0-b006-f4b074519e6e",
+      "019ffeb8-5813-7a41-bcc1-98a6c1d89014",
+      "019ffeb8-7f12-79b0-b722-19ea3aeaeb25",
+      "019ffeb8-a616-7012-81c0-4d0e3aa8cc4c",
+      "019ffeb8-cd3f-77b3-9db7-dc2f9618d63c",
+      "019ffeb8-f44b-7422-be75-428484338ce4",
+      "019ffeb9-1b46-7cb2-8063-a3155607a5f9",
+      "019ffeb9-425d-7200-9fac-361cc234c325",
+      "019ffeb9-6980-7920-bdcf-220c09d68508",
+      "019ffeb9-9087-7d21-83b1-914ae95a6aba",
+      "019ffeb9-b78d-7e13-aec3-e5e4bbd4eac1",
+      "019ffeb9-de7a-7b63-8420-e1d53c0647e2",
+      "019ffeba-05be-7240-940a-bfcdaa5f4836",
+      "019ffeba-2cbe-7f12-ab00-da3cfb2b3ca6",
+      "019ffeba-53d6-7a03-a067-48d6c8001e1e",
+      "019ffeba-7ae6-7be2-a248-0d1946a3c266",
+      "019ffeba-a1f9-7c03-bbeb-a882ad2beee4",
+      "019ffeba-c90b-7791-bfbf-83c130f3c1a5",
+      "019ffeba-f001-7623-b606-c203d666b051",
+      "019ffebb-172b-7b22-9c8a-8f08d68b6f14",
+      "019ffebb-3e29-7111-8b24-5c13d27273ea",
+      "019ffebb-6547-7771-a0a1-c7fa3f6a0b1c",
+      "019ffebb-8c4f-7390-8115-e9ef16e095ff",
+      "019ffebd-6087-7193-9ccc-7e38dd250815",
+      "019ffebd-60a2-7151-89c0-d3a14937215b"
+    ]
+  },
+  "facts": {
+    "apps": [
+      {
+        "bundle_identifier": "ai.lody.desktop",
+        "ms": 1528663,
+        "name": "Lody"
+      },
+      {
+        "bundle_identifier": "com.apple.UserNotificationCenter",
+        "ms": 30024,
+        "name": "UserNotificationCenter"
+      }
+    ],
+    "ax_moment_count": 149,
+    "has_audio": true,
+    "idle_ratio": 0.16734056174755096,
+    "longest_focus_ms": 1178704,
+    "moment_count": 149,
+    "ocr_moment_count": 149,
+    "switch_count": 1,
+    "top_documents": [],
+    "top_urls": [],
+    "top_windows": [
+      "AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody"
+    ]
+  },
+  "index": {
+    "coverage": [
+      {
+        "end_ms": 1786683673162,
+        "kind": "dense",
+        "mean_ocr_chars": 1612,
+        "moment_count": 7,
+        "start_ms": 1786683603176
+      },
+      {
+        "end_ms": 1786683693185,
+        "kind": "unchanged",
+        "mean_ocr_chars": 1558,
+        "moment_count": 2,
+        "start_ms": 1786683673180
+      },
+      {
+        "end_ms": 1786684243154,
+        "kind": "dense",
+        "mean_ocr_chars": 1566,
+        "moment_count": 55,
+        "start_ms": 1786683693182
+      },
+      {
+        "end_ms": 1786684285975,
+        "kind": "gap",
+        "mean_ocr_chars": 0,
+        "moment_count": 0,
+        "start_ms": 1786684243154
+      },
+      {
+        "end_ms": 1786684609721,
+        "kind": "dense",
+        "mean_ocr_chars": 1643,
+        "moment_count": 32,
+        "start_ms": 1786684285975
+      },
+      {
+        "end_ms": 1786684619724,
+        "kind": "unchanged",
+        "mean_ocr_chars": 1707,
+        "moment_count": 1,
+        "start_ms": 1786684609724
+      },
+      {
+        "end_ms": 1786684901834,
+        "kind": "dense",
+        "mean_ocr_chars": 1596,
+        "moment_count": 26,
+        "start_ms": 1786684632101
+      },
+      {
+        "end_ms": 1786684911852,
+        "kind": "unchanged",
+        "mean_ocr_chars": 1559,
+        "moment_count": 1,
+        "start_ms": 1786684901852
+      },
+      {
+        "end_ms": 1786685161863,
+        "kind": "dense",
+        "mean_ocr_chars": 1541,
+        "moment_count": 25,
+        "start_ms": 1786684911826
+      },
+      {
+        "end_ms": 1786685400000,
+        "kind": "gap",
+        "mean_ocr_chars": 0,
+        "moment_count": 0,
+        "start_ms": 1786685161863
+      }
+    ],
+    "dwells": [
+      {
+        "end_ms": 1786683953135,
+        "start_ms": 1786683613155,
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody",
+        "unchanged": false
+      },
+      {
+        "end_ms": 1786685131839,
+        "start_ms": 1786683953135,
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody",
+        "unchanged": false
+      }
+    ],
+    "revisits": [
+      {
+        "at_ms": [
+          1786683603176,
+          1786683953135
+        ],
+        "target": "Lody · AfterRay 本地化屏幕与音频日志系统的开发规划 - Lody",
+        "total_ms": 1188683,
+        "visits": 2
+      }
+    ],
+    "switches": [
+      {
+        "at_ms": 1786685131839,
+        "from": "Lody",
+        "held_ms": 1178704,
+        "to": "UserNotificationCenter"
+      }
+    ],
+    "threads": []
+  },
+  "local_day": "2026-08-14",
+  "slot_end_ms": 1786685400000,
+  "slot_start_ms": 1786683600000,
+  "state": "ready",
+  "theme_key": "ai.lody.desktop|blob:file:///449f5d02-77b3-4358-8e32-a8e9037ccbb1"
+}

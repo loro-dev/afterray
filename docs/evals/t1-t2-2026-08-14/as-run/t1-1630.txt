@@ -1,0 +1,80 @@
+<slot day="2026-08-14" from="16:30" to="17:00">
+
+[facts] apps and time
+  Lody                     21m
+  Google Chrome            4m
+  SecurityAgent            59s
+  unknown                  31s
+  WeChat                   30s
+  Ghostty                  30s
+  23 switches · longest unbroken 7m · idle 6%
+
+[seen] what was open
+  file  about:blank
+  file  chat
+  file  lody
+  file  %E8%82%96%E4%BD%B3%E6%85%A7_%E4%BD%93%E6%A3%80%E6%8A%A5%E5%91%8A_2026-08-09_0311212608093004.pdf
+  web   blob:file:///449f5d02-77b3-4358-8e32-a8e9037ccbb1
+  web   127.0.0.1:5175
+  web   main.lody.pages.dev/temp-lody/chat
+  web   main.lody.pages.dev/temp-lody/sessions/2786e718-435a-46b8-9e12-53ddf87697f4?pr=…
+  web   main.lody.pages.dev/temp-lody/sessions/2786e718-435a-46b8-9e12-53ddf87697f4
+  web   127.0.0.1:5173
+
+[seen] already-written fragment notes
+  16:30 The user drafted instructions for a local activity logging system, proposing that an AI agent track clipboard copy events over thirty-minute intervals to generate automatic work summaries. They discussed how to provide meta-descriptions to help the model infer specific user activities based on available OCR data.
+  16:33 AfterRay requested access to stored confidential information, prompting the user to enter their login keychain password.
+  16:37 The user typed a question into Lody about whether OpenAI performs input monitoring while browsing design reviews and issues for the Loro library. They also appeared to be outlining plans for an automatic, periodic work summary system for their project.
+  16:51 Inquiring why enabling a local project worktree triggers an ENOENT agent startup error on Electron, while pasting the relevant log into the chat.
+  16:53 The user reviewed a design document in Lody outlining how to implement automatic work summaries with 30-minute intervals. They examined technical specifications such as state machines, slot boundaries, and catch-up logic.
+  16:56 The person is viewing a session in the Lody app that lists development tasks including "Loro Issue 888 Design" and website iteration, while reviewing an entry about analyzing automatic work summaries.
+
+[map] returned to
+  Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody — 5 visits, 15m total (16:30 16:37 16:37 16:41 16:56)
+  Lody · blob:file:///449f5d02-77b3-4358-8e32-a8e9037ccbb1 — 5 visits, 3m total (16:35 16:37 16:49 16:50 16:53)
+  Google Chrome · 127.0.0.1:5175 — 2 visits, 1m total (16:54 16:56)
+  Lody · Lody — 4 visits, 1m total (16:50 16:54 16:55 16:56)
+  Google Chrome · main.lody.pages.dev/temp-lody/sessions/2786e718-435a-46b8-9e12-53ddf87697f4?pr=… — 4 visits, 1m total (16:40 16:41 16:50 16:50)
+  Lody · 有的时候会遇到说这个文件打不开，但是实际是存在的，而且在工作区内，不知道是路径引用的问题还是什么，就 - Lody — 3 visits, 52s total (16:36 16:39 16:41)
+
+[map] sustained on one thing
+  16:30–16:33 Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody
+  16:41–16:48 Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody
+  16:56–16:59 Lody · 请分析这个项目如何为它设计自动的工作总结，每三十分钟一轮，每一轮有它那一次的总结（如果30分钟内有操 - Lody
+
+[map] recurring errors (candidate work threads)
+  5 × at 16:54 16:55 16:56 16:56 16:56 — "app.tsx:426 Uncaught TypeError: Cannot read properties of"
+  4 × at 16:51 16:52 16:52 16:52 — "Error: Agent 启动前失败"
+  1 × at 16:52 — "Error: Agemt /以」刖天火"
+  1 × at 16:52 — "Error:Agent启动前失败"
+
+[map] where the text is
+  16:30–16:31  text, dense (~1763 chars/frame)
+  16:31–16:33  no capture
+  16:33–16:42  text, dense (~1527 chars/frame)
+  16:42–16:48  no capture
+  16:48–16:50  text, dense (~1116 chars/frame)
+  16:51–16:52  text, dense (~1248 chars/frame)
+  16:53–16:59  text, dense (~1838 chars/frame)
+
+[map] entry-point moment ids (one per stretch)
+  019fff65-59fd-74e0-a114-ebd6b76dbc7c
+  019fff67-e87e-7050-bbb5-5ac74956b1e7
+  019fff68-b8bb-75a0-82fb-984cae872315
+  019fff68-f9e4-7fd2-bddf-6f72105cd242
+  019fff69-20ed-7d41-9e1b-789e2e97908c
+  019fff69-4804-79f2-a088-66b6869b90e8
+  019fff69-6f09-7f81-be4b-5db67bea7f95
+  019fff69-b42a-7120-80d7-d81ccbea8eea
+  019fff6a-9e84-77b1-99ab-55fd39bbc147
+  019fff6a-f5d3-7522-96b7-3e9ec5408a8a
+  019fff6b-6b00-7c92-a970-d2bdc1a84157
+  019fff6c-f1a7-7520-b841-bdd45330bbf2
+
+[avoid] wording already used on nearby cards
+  15:56 The user drafted technical design plans for the AfterRay project, specifically outlining strategies for automated thirty-minute summaries and analyzing checkout performance issues.
+  16:01 The user reviewed code modifications regarding Loro's checkout performance and collaboration logic. They were analyzing requirements for local search enhancements and debugging file path issues within the development environment.
+  16:07 Viewing Pull Request 56 for the loro-dev/lody-oss repository inside the Lody client application. The display presents the request details, file statistics, and relevant links regarding checkout performance.
+  16:08 The user was reviewing a Pull Request in the Lody application and examining development plans for AfterRay's localized screen and audio logging system.
+</slot>
+

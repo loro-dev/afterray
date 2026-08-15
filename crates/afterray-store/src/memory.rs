@@ -120,6 +120,57 @@ pub fn is_idle_digest(digest: &AccessibilityDigest) -> bool {
         && digest.visible_text.is_empty()
 }
 
+/// Roles whose text is document content rather than app chrome. Buttons,
+/// menus and toolbars are deliberately absent: their labels repeat on every
+/// frame of every app and carry no narrative.
+const TEXT_ROLES: &[&str] = &[
+    "AXStaticText",
+    "AXTextArea",
+    "AXTextField",
+    "AXHeading",
+    "AXLink",
+];
+
+/// Extracts content text lines from the full accessibility tree, in tree
+/// order. Values are split on newlines so a multi-paragraph `AXTextArea` does
+/// not arrive as one enormous line. Exact where OCR is noisy; scoped to the
+/// frontmost application by construction of the snapshot.
+#[must_use]
+pub fn accessibility_text_lines(snapshot: &[u8]) -> Vec<String> {
+    const LINE_CLIP_CHARS: usize = 500;
+    let Ok(header) = serde_json::from_slice::<SnapshotHeader>(snapshot) else {
+        return Vec::new();
+    };
+    let Some(root) = header.root else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    collect_text_lines(&root, &mut lines, LINE_CLIP_CHARS);
+    lines
+}
+
+fn collect_text_lines(node: &SnapshotNode, lines: &mut Vec<String>, clip_chars: usize) {
+    let role = node.role.as_deref().unwrap_or("");
+    if TEXT_ROLES.contains(&role) {
+        let text = node
+            .value
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or(node.title.as_deref());
+        if let Some(text) = text {
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.chars().count() >= 2 {
+                    lines.push(clip(trimmed, clip_chars));
+                }
+            }
+        }
+    }
+    for child in &node.children {
+        collect_text_lines(child, lines, clip_chars);
+    }
+}
+
 #[must_use]
 pub fn parse_accessibility_digest(snapshot: &[u8]) -> AccessibilityDigest {
     let Ok(header) = serde_json::from_slice::<SnapshotHeader>(snapshot) else {
@@ -336,6 +387,28 @@ mod tests {
                 .any(|text| text == "Package.swift")
         );
         assert_eq!(digest_fingerprint(&digest), digest_fingerprint(&digest));
+    }
+
+    #[test]
+    fn text_lines_take_content_roles_and_split_multiline_values() {
+        let snapshot = br#"{
+            "application_name":"Lody",
+            "root":{
+                "role":"AXApplication",
+                "children":[
+                    {"role":"AXButton","title":"Send"},
+                    {"role":"AXTextArea","value":"first paragraph\nsecond paragraph"},
+                    {"role":"AXStaticText","value":"a visible sentence"},
+                    {"role":"AXMenuItem","title":"Preferences"}
+                ]
+            }
+        }"#;
+        let lines = accessibility_text_lines(snapshot);
+        assert_eq!(
+            lines,
+            ["first paragraph", "second paragraph", "a visible sentence"],
+            "buttons and menus are chrome, not content"
+        );
     }
 
     #[test]

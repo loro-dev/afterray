@@ -1,4 +1,11 @@
-use afterray_models::ModelQueue;
+//! Episode segmentation from accessibility snapshots.
+//!
+//! Episodes are cut in real time — an identity-key change closes one — but
+//! deliberately never summarised by a model here. The live capture path stays
+//! deterministic and free; all model spend belongs to the deferred T2 pass,
+//! which reconstructs the story from richer evidence anyway. The stored
+//! summary is the digest's deterministic fallback line.
+
 use afterray_protocol::Memory;
 use afterray_store::{
     AccessibilityDigest, Vault, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
@@ -6,18 +13,7 @@ use afterray_store::{
 use std::sync::Mutex;
 use uuid::Uuid;
 
-use crate::agent;
-use crate::tools::{self, ToolHost};
-
 const MIN_MEMORY_MS: i64 = 45_000;
-
-const MEMORY_SYSTEM_PROMPT: &str = "You write a local activity memory for AfterRay. \
-Produce one or two short sentences about what the person was doing. \
-Use tools to inspect accessibility first (get_ax_digest). If the digest is weak \
-(sufficient=false, empty visible text, or generic window titles like WeChat/Weixin), \
-call get_ocr on the same moment_id. Do not invent files, URLs, or tasks. \
-Do not mention idle time, the desktop, or AfterRay itself. \
-When done, answer with FINAL followed by only the memory sentences.";
 
 #[derive(Debug, Clone)]
 struct OpenEpisode {
@@ -50,14 +46,14 @@ impl MemoryRuntime {
         {
             if let Some(open) = &mut self.open {
                 open.last_ms = captured_at_ms.max(open.last_ms);
-                open.moment_id = moment_id.to_owned();
+                moment_id.clone_into(&mut open.moment_id);
             }
             return None;
         }
         match self.open.take() {
             Some(mut open) if open.digest.identity_key() == digest.identity_key() => {
                 open.last_ms = captured_at_ms.max(open.last_ms);
-                open.moment_id = moment_id.to_owned();
+                moment_id.clone_into(&mut open.moment_id);
                 open.digest = digest;
                 open.fingerprint = fingerprint;
                 self.open = Some(open);
@@ -91,46 +87,34 @@ impl MemoryRuntime {
     }
 }
 
-pub(crate) async fn observe_and_maybe_commit(
+pub(crate) fn observe_and_maybe_commit(
     store: &Vault,
-    models: &ModelQueue,
     runtime: &Mutex<MemoryRuntime>,
     captured_at_ms: i64,
     moment_id: &str,
     snapshot: &[u8],
-    llm_present: bool,
 ) {
     let digest = parse_accessibility_digest(snapshot);
     let closed = runtime
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .observe(store, captured_at_ms, moment_id, digest);
     if let Some(episode) = closed {
-        commit_episode(store, models, episode, llm_present).await;
+        commit_episode(store, episode);
     }
 }
 
-pub(crate) async fn flush(
-    store: &Vault,
-    models: &ModelQueue,
-    runtime: &Mutex<MemoryRuntime>,
-    llm_present: bool,
-) {
+pub(crate) fn flush(store: &Vault, runtime: &Mutex<MemoryRuntime>) {
     let closed = runtime
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .close();
     if let Some(episode) = closed {
-        commit_episode(store, models, episode, llm_present).await;
+        commit_episode(store, episode);
     }
 }
 
-async fn commit_episode(
-    store: &Vault,
-    models: &ModelQueue,
-    episode: OpenEpisode,
-    llm_present: bool,
-) {
+fn commit_episode(store: &Vault, episode: OpenEpisode) {
     if episode.last_ms.saturating_sub(episode.start_ms) < MIN_MEMORY_MS {
         return;
     }
@@ -139,59 +123,21 @@ async fn commit_episode(
     {
         return;
     }
-    let summary = if llm_present {
-        summarize_episode(store, models, &episode)
-            .await
-            .unwrap_or_else(|| episode.digest.fallback_summary())
-    } else {
-        episode.digest.fallback_summary()
-    };
     let memory = Memory {
         id: Uuid::now_v7().to_string(),
         start_ms: episode.start_ms,
         end_ms: episode.last_ms.max(episode.start_ms + MIN_MEMORY_MS),
         moment_id: Some(episode.moment_id),
-        application_name: episode.digest.application_name,
-        bundle_identifier: episode.digest.bundle_identifier,
-        window_title: episode.digest.window_title,
-        url: episode.digest.url,
-        document: episode.digest.document,
-        summary,
+        application_name: episode.digest.application_name.clone(),
+        bundle_identifier: episode.digest.bundle_identifier.clone(),
+        window_title: episode.digest.window_title.clone(),
+        url: episode.digest.url.clone(),
+        document: episode.digest.document.clone(),
+        summary: episode.digest.fallback_summary(),
         fingerprint: episode.fingerprint,
     };
     if let Err(error) = store.insert_memory(&memory) {
         eprintln!("could not store memory: {error}");
-    }
-}
-
-async fn summarize_episode(store: &Vault, models: &ModelQueue, episode: &OpenEpisode) -> Option<String> {
-    let minutes = ((episode.last_ms - episode.start_ms).max(1) + 30_000) / 60_000;
-    let sufficient = tools::digest_looks_sufficient(&episode.digest);
-    let user = format!(
-        "Write a memory for this episode.\n\
-moment_id: {}\n\
-duration_minutes: {minutes}\n\
-start_ms: {}\n\
-end_ms: {}\n\
-seed_digest_sufficient: {sufficient}\n\
-seed_digest:\n{}\n\
-Start by calling get_ax_digest for this moment_id. If evidence is thin, call get_ocr. Then FINAL.",
-        episode.moment_id,
-        episode.start_ms,
-        episode.last_ms,
-        episode.digest.compact_text()
-    );
-    let host = ToolHost { store, models };
-    match agent::run_readonly_agent(models, &host, MEMORY_SYSTEM_PROMPT, &user).await {
-        Ok(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            }
-        }
-        Err(_) => None,
     }
 }
 
@@ -205,7 +151,7 @@ mod tests {
         let vault = Vault::open_with_key(
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
-                max_unstarred_moments: 100,
+                ..VaultConfig::default()
             },
             [9_u8; 32],
         )

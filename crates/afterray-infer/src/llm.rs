@@ -11,7 +11,7 @@ use std::{num::NonZeroU32, path::Path, sync::OnceLock};
 
 pub(crate) const QWEN_IM_START: &str = "<|im_start|>";
 pub(crate) const QWEN_IM_END: &str = "<|im_end|>";
-const DEFAULT_N_CTX: u32 = 8_192;
+const DEFAULT_N_CTX: u32 = 16_384;
 const DEFAULT_N_BATCH: u32 = 2_048;
 const DEFAULT_MAX_TOKENS: u32 = 512;
 
@@ -225,11 +225,11 @@ mod tests {
     }
 
     #[test]
-    fn n_ctx_defaults_to_8k_and_is_overridable() {
-        assert_eq!(llm_n_ctx(None).get(), 8_192);
+    fn n_ctx_defaults_to_16k_and_is_overridable() {
+        assert_eq!(llm_n_ctx(None).get(), 16_384);
         assert_eq!(llm_n_ctx(Some("4096")).get(), 4_096);
-        assert_eq!(llm_n_ctx(Some("0")).get(), 8_192);
-        assert_eq!(llm_n_ctx(Some("nope")).get(), 8_192);
+        assert_eq!(llm_n_ctx(Some("0")).get(), 16_384);
+        assert_eq!(llm_n_ctx(Some("nope")).get(), 16_384);
     }
 
     #[test]
