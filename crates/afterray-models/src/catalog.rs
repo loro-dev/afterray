@@ -12,6 +12,20 @@ pub const QWEN35_9B_MLX_REVISION: &str = "938d8919941c6e7efd3c7150eff7fe9d12afa6
 pub const QWEN35_9B_MLX_EXPECTED_BYTES: u64 = 5_977_071_067;
 pub const QWEN35_9B_MLX_PACK_ID: &str = "llm_qwen35_9b_mlx4";
 
+/// The architectural context window of a managed MLX pack, in tokens.
+///
+/// Both packs are Qwen3.5, which declares 262 144 at 4B and at 9B. It lives
+/// beside the revisions and the byte counts because it is the same kind of
+/// fact: a property of this pinned checkpoint, not of the machine running it.
+/// What the machine can hold is a separate limit, applied on top.
+#[must_use]
+pub fn mlx_pack_context_tokens(pack_id: &str) -> Option<usize> {
+    match pack_id {
+        QWEN35_4B_MLX_PACK_ID | QWEN35_9B_MLX_PACK_ID => Some(262_144),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestFile {
     pub path: String,

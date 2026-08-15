@@ -5,6 +5,7 @@
 //! `afterray-model-worker` binary; OCR stays on the native Swift helper.
 
 mod catalog;
+mod context;
 mod delta;
 mod download;
 mod persistent_mlx;
@@ -16,9 +17,15 @@ pub use catalog::{
     ManifestFile, PackSource, PackSpec, QWEN35_4B_MLX_EXPECTED_BYTES, QWEN35_4B_MLX_PACK_ID,
     QWEN35_4B_MLX_REPOSITORY, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_EXPECTED_BYTES,
     QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REPOSITORY, QWEN35_9B_MLX_REVISION, READY_MARKER,
-    catalog_in, default_catalog, inspect_model_path, library, library_in, model_directory,
+    catalog_in, default_catalog, inspect_model_path, library, library_in,
+    mlx_pack_context_tokens, model_directory,
     qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
     specs_for_download, specs_for_download_in,
+};
+pub use context::{
+    CONTEXT_ENV_VARS, ContextProbe, MINIMUM_CONTEXT_TOKENS, REMOTE_DEFAULT_CONTEXT_TOKENS,
+    architecture_context_length, pinned_context_tokens, probe_context_tokens,
+    resolve_context_tokens, running_context_length,
 };
 pub use delta::{LlmDelta, LlmDeltaKind};
 pub use download::{

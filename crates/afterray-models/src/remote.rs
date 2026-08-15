@@ -26,6 +26,15 @@ pub struct LlmRuntimeConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// The context window this turn is planned against, once it has been worked
+    /// out ([`crate::probe_context_tokens`]). `None` means nobody has asked yet.
+    ///
+    /// It lives here because two places need the same number and they must not
+    /// disagree: the harness budgets the transcript against it, and the Ollama
+    /// request declares it as `num_ctx`. Budgeting for more than we declare
+    /// gets the prompt cut; declaring more than we budget for allocates a KV
+    /// cache nobody uses.
+    pub context_tokens: Option<usize>,
 }
 
 impl Default for LlmRuntimeConfig {
@@ -35,6 +44,7 @@ impl Default for LlmRuntimeConfig {
             base_url: String::new(),
             model: String::new(),
             api_key: None,
+            context_tokens: None,
         }
     }
 }

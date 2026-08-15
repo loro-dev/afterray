@@ -56,11 +56,19 @@ async fn generate_ollama_stream(
     let model = require_model(config)?;
     let origin = require_origin(config)?;
     let url = ollama_chat_url(&origin);
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": chat_messages(prompt, system),
         "stream": true,
     });
+    // Declaring the window makes the server's own default stop mattering: left
+    // alone it picks from installed RAM and cuts anything longer without a
+    // word. The value has to be the one the harness budgeted against — it sizes
+    // a KV cache in the same memory the rest of the machine is using, so this
+    // is not a place to ask for the maximum and hope.
+    if let Some(num_ctx) = config.context_tokens {
+        body["options"] = json!({ "num_ctx": num_ctx });
+    }
     let response = send_chat(client, &url, None, &body, &cancellation).await?;
     let status = response.status();
     if !status.is_success() {
@@ -617,12 +625,27 @@ mod tests {
             return;
         };
         eprintln!("live ollama /api/chat stream test using model `{model}`");
-        let config = LlmRuntimeConfig {
+        let mut config = LlmRuntimeConfig {
             provider: LlmProvider::Ollama,
             base_url: String::new(),
             model,
             api_key: None,
+            context_tokens: None,
         };
+        // The probe against a real server, and the value that then goes out as
+        // `num_ctx`. Printed because the interesting part is the disagreement
+        // between the four inputs, which no fixture can reproduce.
+        let context = crate::probe_context_tokens(&config, 262_144).await;
+        eprintln!(
+            "live ollama {} -> declaring num_ctx={}",
+            context.summary(),
+            context.resolved
+        );
+        assert!(
+            context.resolved >= crate::MINIMUM_CONTEXT_TOKENS,
+            "a live probe should not resolve below the floor: {context:?}"
+        );
+        config.context_tokens = Some(context.resolved);
         let (tx, mut rx) = mpsc::channel(32);
         // Drained concurrently, not afterwards. `push_delta` awaits on this
         // bounded channel, so a model that emits more than 32 deltas would
@@ -676,6 +699,7 @@ mod tests {
             base_url: origin.to_owned(),
             model: "mock".into(),
             api_key: None,
+            context_tokens: None,
         };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -688,6 +712,74 @@ mod tests {
             tokens.push(token);
         }
         Ok((text, tokens))
+    }
+
+    /// The declaration has to actually leave the process. Without `num_ctx` on
+    /// the wire the server falls back to its own memory-derived default and
+    /// cuts anything longer, which is precisely the case this exists to stop —
+    /// and nothing downstream would report it.
+    #[tokio::test]
+    async fn the_window_we_budgeted_for_is_declared_on_the_wire() {
+        let (origin, requests) = serve_capturing(
+            concat!(r#"{"message":{"content":"ok"},"done":true}"#, "\n"),
+            "application/x-ndjson",
+        )
+        .await;
+        let config = LlmRuntimeConfig {
+            provider: LlmProvider::Ollama,
+            base_url: origin,
+            model: "mock".into(),
+            api_key: None,
+            context_tokens: Some(32_768),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        generate_streaming(
+            &client,
+            &config,
+            "prompt",
+            None,
+            tx,
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        collector.await.unwrap();
+
+        let request = requests.lock().unwrap().clone();
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let parsed: Value = serde_json::from_str(body).expect(body);
+        assert_eq!(parsed["options"]["num_ctx"], 32_768, "{body}");
+    }
+
+    /// Like `serve_http`, but hands back what the client sent.
+    async fn serve_capturing(
+        body: &str,
+        content_type: &str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_owned();
+        let content_type = content_type.to_owned();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 8192];
+            let read = socket.read(&mut buf).await.unwrap_or(0);
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buf[..read]).into_owned();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
     }
 
     async fn serve_http(body: &str, content_type: &str) -> String {
