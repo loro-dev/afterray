@@ -181,6 +181,7 @@ fi
 mkdir -p "$app_bundle/Contents/Frameworks"
 ditto "$sparkle_framework" "$app_bundle/Contents/Frameworks/Sparkle.framework"
 codesign_identity="$(resolve_codesign_identity)"
+automation_entitlements="$repo_root/apps/AfterRay/Resources/Automation.entitlements"
 if [[ "$codesign_identity" == '-' ]]; then
   printf '%s\n' \
     'WARNING: No Apple Development or Developer ID signing identity was found.' \
@@ -196,7 +197,11 @@ xcrun swift-stdlib-tool \
 rm -f "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib.original"
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterrayd" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray" >/dev/null
-codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
+codesign \
+  --force \
+  --entitlements "$automation_entitlements" \
+  --sign "$codesign_identity" \
+  "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib" >/dev/null
@@ -204,6 +209,7 @@ codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/after
 if [[ "$codesign_identity" == '-' ]]; then
   codesign \
     --force \
+    --entitlements "$automation_entitlements" \
     --sign - \
     --identifier dev.afterray.app \
     --requirements '=designated => identifier "dev.afterray.app"' \
@@ -214,6 +220,7 @@ else
   # team identifier, and bundle identifier.
   codesign \
     --force \
+    --entitlements "$automation_entitlements" \
     --sign "$codesign_identity" \
     "$app_bundle" >/dev/null
 fi

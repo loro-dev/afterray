@@ -180,8 +180,12 @@ public final class RecallStore: ObservableObject {
             guard sensitiveGeneration == requestGeneration else { return }
             daySummary = loaded
             loadedDayKey = key
+
+            let initializesHistory = summaryHistory.isEmpty
+            upsertSummaryHistory(loaded)
+            guard initializesHistory else { return }
+
             summaryHistoryGeneration &+= 1
-            summaryHistory = [loaded]
             summaryHistoryCursorMs = loaded.dayStartMs
             summaryHistoryHasMore = true
             isLoadingSummaryHistory = false
@@ -211,6 +215,10 @@ public final class RecallStore: ObservableObject {
             else { return }
             let knownDays = Set(summaryHistory.map(\.dayStartMs))
             summaryHistory.append(contentsOf: page.days.filter { !knownDays.contains($0.dayStartMs) })
+            // A direct playhead jump can insert a day older than this cursor
+            // before pagination fills the gap. Keep display order independent
+            // of the order in which those two request paths finish.
+            summaryHistory.sort { $0.dayStartMs > $1.dayStartMs }
             summaryHistoryCursorMs = page.nextBeforeMs
             summaryHistoryHasMore = page.hasMore && page.nextBeforeMs != nil
         } catch {
@@ -223,6 +231,17 @@ public final class RecallStore: ObservableObject {
         }
         if summaryHistoryGeneration == requestGeneration {
             isLoadingSummaryHistory = false
+        }
+    }
+
+    /// Refresh the selected day without replacing the history around it.
+    /// Pagination owns the cursor; moving the playhead must not rewind it.
+    private func upsertSummaryHistory(_ loaded: DaySummary) {
+        if let index = summaryHistory.firstIndex(where: { $0.dayStartMs == loaded.dayStartMs }) {
+            summaryHistory[index] = loaded
+        } else {
+            summaryHistory.append(loaded)
+            summaryHistory.sort { $0.dayStartMs > $1.dayStartMs }
         }
     }
 

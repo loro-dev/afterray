@@ -141,15 +141,21 @@ pub fn accessibility_text_lines(snapshot: &[u8]) -> Vec<String> {
     let Ok(header) = serde_json::from_slice::<SnapshotHeader>(snapshot) else {
         return Vec::new();
     };
+    let private_browsing = header.private_browsing;
     let Some(root) = header.root else {
         return Vec::new();
     };
     let mut lines = Vec::new();
-    collect_text_lines(&root, &mut lines, LINE_CLIP_CHARS);
+    collect_text_lines(&root, &mut lines, LINE_CLIP_CHARS, private_browsing);
     lines
 }
 
-fn collect_text_lines(node: &SnapshotNode, lines: &mut Vec<String>, clip_chars: usize) {
+fn collect_text_lines(
+    node: &SnapshotNode,
+    lines: &mut Vec<String>,
+    clip_chars: usize,
+    private_browsing: bool,
+) {
     let role = node.role.as_deref().unwrap_or("");
     if TEXT_ROLES.contains(&role) {
         let text = node
@@ -157,7 +163,9 @@ fn collect_text_lines(node: &SnapshotNode, lines: &mut Vec<String>, clip_chars: 
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .or(node.title.as_deref());
-        if let Some(text) = text {
+        if let Some(text) = text
+            && !(private_browsing && is_location_field(role) && looks_like_web_location(text))
+        {
             for line in text.lines() {
                 let trimmed = line.trim();
                 if trimmed.chars().count() >= 2 {
@@ -167,7 +175,7 @@ fn collect_text_lines(node: &SnapshotNode, lines: &mut Vec<String>, clip_chars: 
         }
     }
     for child in &node.children {
-        collect_text_lines(child, lines, clip_chars);
+        collect_text_lines(child, lines, clip_chars, private_browsing);
     }
 }
 
@@ -176,8 +184,9 @@ pub fn parse_accessibility_digest(snapshot: &[u8]) -> AccessibilityDigest {
     let Ok(header) = serde_json::from_slice::<SnapshotHeader>(snapshot) else {
         return AccessibilityDigest::default();
     };
+    let private_browsing = header.private_browsing;
     if let Some(digest) = header.digest {
-        return AccessibilityDigest {
+        let mut parsed = AccessibilityDigest {
             application_name: nonempty(header.application_name).or(digest.application_name),
             bundle_identifier: nonempty(header.bundle_identifier).or(digest.bundle_identifier),
             window_title: nonempty(header.window_title).or(digest.window_title),
@@ -192,6 +201,10 @@ pub fn parse_accessibility_digest(snapshot: &[u8]) -> AccessibilityDigest {
             headings: digest.headings,
             visible_text: digest.visible_text,
         };
+        if private_browsing {
+            redact_private_digest_locations(&mut parsed);
+        }
+        return parsed;
     }
     let mut digest = AccessibilityDigest {
         application_name: nonempty(header.application_name),
@@ -204,11 +217,16 @@ pub fn parse_accessibility_digest(snapshot: &[u8]) -> AccessibilityDigest {
     if let Some(root) = header.root {
         fill_digest(&mut digest, &root);
     }
+    if private_browsing {
+        redact_private_digest_locations(&mut digest);
+    }
     digest
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct SnapshotHeader {
+    #[serde(default)]
+    private_browsing: bool,
     #[serde(default)]
     application_name: Option<String>,
     #[serde(default)]
@@ -303,6 +321,40 @@ fn fill_digest(digest: &mut AccessibilityDigest, node: &SnapshotNode) {
 
 fn first_text(node: &SnapshotNode) -> Option<String> {
     nonempty(node.title.clone()).or_else(|| nonempty(node.value.clone()))
+}
+
+fn is_location_field(role: &str) -> bool {
+    matches!(role, "AXTextField" | "AXSearchField" | "AXComboBox")
+}
+
+fn looks_like_web_location(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with("file://")
+        || (value.starts_with('/') && !value.starts_with("//"))
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("www.")
+        || (!value.chars().any(char::is_whitespace) && value.contains('.'))
+}
+
+fn redact_private_digest_locations(digest: &mut AccessibilityDigest) {
+    digest.url = None;
+    if is_location_field(digest.focused_role.as_deref().unwrap_or(""))
+        && digest
+            .focused_value
+            .as_deref()
+            .is_some_and(looks_like_web_location)
+    {
+        digest.focused_value = None;
+    }
+    digest
+        .visible_text
+        .retain(|value| !looks_like_web_location(value));
 }
 
 fn push_unique(items: &mut Vec<String>, value: String, limit: usize) {
@@ -409,6 +461,45 @@ mod tests {
             ["first paragraph", "second paragraph", "a visible sentence"],
             "buttons and menus are chrome, not content"
         );
+    }
+
+    #[test]
+    fn private_browsing_digest_and_text_lines_drop_web_locations() {
+        let snapshot = br#"{
+            "application_name":"Google Chrome",
+            "private_browsing":true,
+            "url":"https://private.example/account",
+            "digest":{
+                "url":"https://private.example/account",
+                "focused_role":"AXTextField",
+                "focused_value":"private.example/account",
+                "visible_text":["private.example/account", "Account settings"]
+            },
+            "root":{
+                "role":"AXApplication",
+                "children":[
+                    {"role":"AXTextField","value":"private.example/account"},
+                    {"role":"AXStaticText","value":"Account settings"}
+                ]
+            }
+        }"#;
+
+        let digest = parse_accessibility_digest(snapshot);
+
+        assert!(digest.url.is_none());
+        assert!(digest.focused_value.is_none());
+        assert_eq!(digest.visible_text, ["Account settings"]);
+        assert_eq!(accessibility_text_lines(snapshot), ["Account settings"]);
+
+        let fallback = br#"{
+            "private_browsing":true,
+            "url":"https://private.example/account",
+            "root":{"role":"AXTextField","focused":true,"value":"private.example/account"}
+        }"#;
+        let fallback_digest = parse_accessibility_digest(fallback);
+        assert!(fallback_digest.url.is_none());
+        assert!(fallback_digest.focused_value.is_none());
+        assert!(fallback_digest.visible_text.is_empty());
     }
 
     #[test]

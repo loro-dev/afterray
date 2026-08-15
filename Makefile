@@ -6,6 +6,7 @@ check:
 test:
 	cargo test --workspace
 	swift test
+	swift test --package-path apps/AfterRayCaptureShim
 
 build: capture-shim
 	cargo build --workspace

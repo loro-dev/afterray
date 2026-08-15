@@ -170,7 +170,10 @@ public struct DaySummaryPanel: View {
                 if topDayHeading != heading { topDayHeading = heading }
             }
         )
-        .frame(maxHeight: style == .overlay ? RecallGeometry.daySummaryListMaxHeight : .infinity)
+        .frame(
+            maxHeight: style == .overlay ? RecallGeometry.daySummaryListMaxHeight : .infinity,
+            alignment: .top
+        )
         .padding(.horizontal, 6)
         .padding(.bottom, 8)
     }
@@ -203,4 +206,3 @@ private struct DaySummaryPanelChrome: ViewModifier {
         }
     }
 }
-

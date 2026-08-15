@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import AfterRayCapturePolicy
 import ApplicationServices
 import AppKit
 import CoreGraphics
@@ -234,6 +235,7 @@ private struct AccessibilityNode: Encodable {
         try container.encodeIfPresent(frame, forKey: .frame)
         try container.encode(children, forKey: .children)
     }
+
 }
 
 private struct AccessibilitySnapshot: Encodable {
@@ -244,6 +246,7 @@ private struct AccessibilitySnapshot: Encodable {
     let windowTitle: String?
     let url: String?
     let document: String?
+    let privateBrowsing: Bool
     let truncated: Bool
     let digest: AccessibilityDigest
     let root: AccessibilityNode
@@ -255,6 +258,7 @@ private struct AccessibilitySnapshot: Encodable {
         case applicationName = "application_name"
         case windowTitle = "window_title"
         case url, document, truncated, digest, root
+        case privateBrowsing = "private_browsing"
     }
 }
 
@@ -324,6 +328,9 @@ private final class AccessibilityTreeEncoder {
         let subrole = string(element, kAXSubroleAttribute)
         let secure = subrole == "AXSecureTextField"
         let title = string(element, kAXTitleAttribute)
+        let nodeDescription = string(element, kAXDescriptionAttribute)
+        let identifier = string(element, kAXIdentifierAttribute)
+        let value = secure ? nil : scalarString(attribute(element, kAXValueAttribute))
         let nodeURL = secure ? nil : firstLocation(element, Self.urlAttributeNames)
         let nodeDocument = secure ? nil : normalizedDocument(firstLocation(element, Self.documentAttributeNames))
         considerActivityContext(role: role, title: title, url: nodeURL, document: nodeDocument)
@@ -332,7 +339,7 @@ private final class AccessibilityTreeEncoder {
             role: role,
             subrole: subrole,
             title: title,
-            value: secure ? nil : scalarString(attribute(element, kAXValueAttribute)),
+            value: value,
             focused: boolValue(element, kAXFocusedAttribute)
         )
         let children = (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? [])
@@ -341,9 +348,9 @@ private final class AccessibilityTreeEncoder {
             role: role,
             subrole: subrole,
             title: title,
-            nodeDescription: string(element, kAXDescriptionAttribute),
-            identifier: string(element, kAXIdentifierAttribute),
-            value: secure ? nil : scalarString(attribute(element, kAXValueAttribute)),
+            nodeDescription: nodeDescription,
+            identifier: identifier,
+            value: value,
             valueRedacted: secure,
             url: nodeURL.flatMap(classifiedURL),
             document: nodeDocument,
@@ -385,20 +392,28 @@ private final class AccessibilityTreeEncoder {
     func digest(
         applicationName: String?,
         bundleIdentifier: String?,
-        windowTitle: String?
+        windowTitle: String?,
+        privateBrowsing: Bool
     ) -> AccessibilityDigest {
         AccessibilityDigest(
             applicationName: applicationName,
             bundleIdentifier: bundleIdentifier,
             windowTitle: windowTitle ?? self.windowTitle,
-            url: url,
+            url: BrowserPrivacyDetector.redactedURL(url, privateBrowsing: privateBrowsing),
             document: document,
             focusedRole: focusedRole,
             focusedTitle: focusedTitle,
-            focusedValue: focusedValue,
+            focusedValue: BrowserPrivacyDetector.redactedBrowserChromeValue(
+                focusedValue,
+                role: focusedRole,
+                insideWebContent: false,
+                privateBrowsing: privateBrowsing
+            ),
             selectedText: selectedText,
             headings: headings,
-            visibleText: visibleTexts
+            visibleText: privateBrowsing
+                ? visibleTexts.filter { !BrowserPrivacyDetector.looksLikeWebLocation($0) }
+                : visibleTexts
         )
     }
 
@@ -543,55 +558,222 @@ private func appendUnique(_ items: inout [String], _ value: String, limit: Int) 
     items.append(value)
 }
 
+private enum AccessibilityCapture {
+    case artifact(URL, context: ForegroundCaptureContext)
+    case privateBrowsing(BrowserPrivacyEvidence)
+    case foregroundChanged
+}
+
+private struct ForegroundCaptureContext {
+    let processId: pid_t
+    let browserWindowId: CGWindowID?
+}
+
+private enum BrowserAutomationProbe {
+    private static let timeout: TimeInterval = 1.0
+
+    static func query(bundleIdentifier: String?) async -> BrowserPrivacyState {
+        guard let query = BrowserPrivacyAutomationQuery.make(bundleIdentifier: bundleIdentifier) else {
+            return .unknown
+        }
+        return await Task.detached(priority: .utility) {
+            guard requestPermission(bundleIdentifier: query.bundleIdentifier) else {
+                return .unknown
+            }
+            return run(query)
+        }.value
+    }
+
+    private static func requestPermission(bundleIdentifier: String) -> Bool {
+        let target = NSAppleEventDescriptor(bundleIdentifier: bundleIdentifier)
+        guard let address = target.aeDesc else { return false }
+        return AEDeterminePermissionToAutomateTarget(
+            address,
+            typeWildCard,
+            typeWildCard,
+            true
+        ) == noErr
+    }
+
+    private static func run(_ query: BrowserPrivacyAutomationQuery) -> BrowserPrivacyState {
+        let process = Process()
+        let standardOutput = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", query.script]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = standardOutput
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return .unknown
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+            return .unknown
+        }
+        guard process.terminationStatus == 0 else { return .unknown }
+
+        let data = standardOutput.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return .unknown }
+        return query.parse(output: output)
+    }
+}
+
+/// Reads only browser-owned Accessibility chrome. Document-like subtrees are
+/// never entered, so a private page's URL and content cannot be materialized
+/// while looking for a positive fallback marker.
+private func browserChromePrivacyState(
+    browserWindow: AXUIElement,
+    bundleIdentifier: String?,
+    automationState: BrowserPrivacyState,
+    windowTitle: String?
+) -> BrowserPrivacyState {
+    var detector = BrowserPrivacyDetector(bundleIdentifier: bundleIdentifier)
+    guard detector.isKnownBrowser else {
+        return detector.resolve(
+            automationState: automationState,
+            windowTitle: windowTitle
+        )
+    }
+
+    var nodeCount = 0
+    var visited = Set<CFHashCode>()
+    let maximumNodes = 20_000
+
+    func walk(_ element: AXUIElement, insideBrowserWindow: Bool) {
+        guard nodeCount < maximumNodes, visited.insert(CFHash(element)).inserted else { return }
+        nodeCount += 1
+
+        let role = axString(element, kAXRoleAttribute)
+        if isDocumentLikeRole(role) { return }
+        let nodeIsInsideBrowserWindow = insideBrowserWindow || isWindowRole(role)
+        detector.observe(
+            role: role,
+            title: axString(element, kAXTitleAttribute),
+            nodeDescription: axString(element, kAXDescriptionAttribute),
+            identifier: axString(element, kAXIdentifierAttribute),
+            insideBrowserWindow: nodeIsInsideBrowserWindow,
+            insideWebContent: false
+        )
+        let children = axAttribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
+        for child in children {
+            walk(child, insideBrowserWindow: nodeIsInsideBrowserWindow)
+        }
+    }
+
+    walk(browserWindow, insideBrowserWindow: true)
+    return detector.resolve(
+        automationState: automationState,
+        windowTitle: windowTitle
+    )
+}
+
 private func captureAccessibilityTree(
-    requestId: String,
     capturedAtMs: Int64,
     outputDirectory: URL,
     events: EventWriter
-) throws {
+) async throws -> AccessibilityCapture? {
     guard let application = capturedForegroundApplication() else {
         events.send(.warning(code: "ax_no_frontmost_app", message: "No foreground application was available"))
-        return
+        return nil
     }
     let appElement = AXUIElementCreateApplication(application.processIdentifier)
+    let preflightDetector = BrowserPrivacyDetector(bundleIdentifier: application.bundleIdentifier)
+    let browserWindow = preflightDetector.isKnownBrowser ? frontWindowElement(appElement) : nil
+    let context: ForegroundCaptureContext
+    let captureRoot: AXUIElement
+    if preflightDetector.isKnownBrowser {
+        guard
+            let browserWindow,
+            let browserWindowId = cgFrontWindowId(for: application.processIdentifier)
+        else { return .foregroundChanged }
+        context = ForegroundCaptureContext(
+            processId: application.processIdentifier,
+            browserWindowId: browserWindowId
+        )
+        captureRoot = browserWindow
+    } else {
+        context = ForegroundCaptureContext(
+            processId: application.processIdentifier,
+            browserWindowId: nil
+        )
+        captureRoot = appElement
+    }
+    let windowTitle = frontWindowTitle(
+        appElement: appElement,
+        processId: application.processIdentifier,
+        treeTitle: nil
+    )
+    var privacyState = preflightDetector.resolve(windowTitle: windowTitle)
+    if case let .privateBrowsing(evidence) = privacyState {
+        log("skipping private browser capture evidence=\(evidence.rawValue)")
+        return .privateBrowsing(evidence)
+    }
+
+    let automationState = await BrowserAutomationProbe.query(
+        bundleIdentifier: application.bundleIdentifier
+    )
+    guard foregroundCaptureContextIsCurrent(context) else {
+        return .foregroundChanged
+    }
+    privacyState = preflightDetector.resolve(
+        automationState: automationState,
+        windowTitle: windowTitle
+    )
+    if case let .privateBrowsing(evidence) = privacyState {
+        log("skipping private browser capture evidence=\(evidence.rawValue)")
+        return .privateBrowsing(evidence)
+    }
+
+    privacyState = browserChromePrivacyState(
+        browserWindow: captureRoot,
+        bundleIdentifier: application.bundleIdentifier,
+        automationState: automationState,
+        windowTitle: windowTitle
+    )
+    if case let .privateBrowsing(evidence) = privacyState {
+        log("skipping private browser capture evidence=\(evidence.rawValue)")
+        return .privateBrowsing(evidence)
+    }
+
     let encoder = AccessibilityTreeEncoder()
-    let root = encoder.encode(appElement)
+    let encodedRoot = encoder.encode(captureRoot)
+    let privateBrowsing = false
     let snapshot = AccessibilitySnapshot(
         capturedAtMs: capturedAtMs,
         processId: application.processIdentifier,
         bundleIdentifier: application.bundleIdentifier,
         applicationName: application.localizedName,
-        windowTitle: frontWindowTitle(
-            appElement: appElement,
-            processId: application.processIdentifier,
-            treeTitle: encoder.windowTitle
-        ),
-        url: encoder.url,
+        windowTitle: windowTitle ?? encoder.windowTitle,
+        url: BrowserPrivacyDetector.redactedURL(encoder.url, privateBrowsing: privateBrowsing),
         document: encoder.document,
+        privateBrowsing: privateBrowsing,
         truncated: encoder.truncated,
         digest: encoder.digest(
             applicationName: application.localizedName,
             bundleIdentifier: application.bundleIdentifier,
-            windowTitle: frontWindowTitle(
-                appElement: appElement,
-                processId: application.processIdentifier,
-                treeTitle: encoder.windowTitle
-            )
+            windowTitle: windowTitle ?? encoder.windowTitle,
+            privateBrowsing: privateBrowsing
         ),
-        root: root
+        root: encodedRoot
     )
+    guard foregroundCaptureContextIsCurrent(context) else {
+        return .foregroundChanged
+    }
     let url = outputDirectory
         .appendingPathComponent("accessibility-\(UUID().uuidString)")
         .appendingPathExtension("json")
     try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
     try hardenPrivateFile(url)
-    events.send(.artifact(
-        kind: .accessibility,
-        url: url,
-        startedAtMs: capturedAtMs,
-        endedAtMs: capturedAtMs,
-        requestId: requestId
-    ))
+    return .artifact(url, context: context)
 }
 
 private func capturedForegroundApplication() -> NSRunningApplication? {
@@ -620,18 +802,18 @@ private func capturedForegroundApplication() -> NSRunningApplication? {
 }
 
 private func frontWindowTitle(appElement: AXUIElement, processId: pid_t, treeTitle: String?) -> String? {
-    if let focused = axElement(appElement, kAXFocusedWindowAttribute),
-       let title = nonempty(axString(focused, kAXTitleAttribute))
-    {
-        return title
-    }
-    if let main = axElement(appElement, kAXMainWindowAttribute),
-       let title = nonempty(axString(main, kAXTitleAttribute))
+    if let frontWindow = frontWindowElement(appElement),
+       let title = nonempty(axString(frontWindow, kAXTitleAttribute))
     {
         return title
     }
     if let treeTitle { return treeTitle }
     return cgWindowName(for: processId)
+}
+
+private func frontWindowElement(_ appElement: AXUIElement) -> AXUIElement? {
+    axElement(appElement, kAXFocusedWindowAttribute)
+        ?? axElement(appElement, kAXMainWindowAttribute)
 }
 
 private func axAttribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
@@ -650,7 +832,7 @@ private func axElement(_ element: AXUIElement, _ name: String) -> AXUIElement? {
     axAttribute(element, name).map { $0 as! AXUIElement }
 }
 
-private func cgWindowName(for processId: pid_t) -> String? {
+private func cgFrontWindowInfo(for processId: pid_t) -> [String: Any]? {
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
         return nil
@@ -658,12 +840,25 @@ private func cgWindowName(for processId: pid_t) -> String? {
     for window in windows {
         guard
             (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processId,
-            (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
-            let name = nonempty(window[kCGWindowName as String] as? String)
+            (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
         else { continue }
-        return name
+        return window
     }
     return nil
+}
+
+private func cgFrontWindowId(for processId: pid_t) -> CGWindowID? {
+    (cgFrontWindowInfo(for: processId)?[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+}
+
+private func cgWindowName(for processId: pid_t) -> String? {
+    nonempty(cgFrontWindowInfo(for: processId)?[kCGWindowName as String] as? String)
+}
+
+private func foregroundCaptureContextIsCurrent(_ context: ForegroundCaptureContext) -> Bool {
+    guard capturedForegroundApplication()?.processIdentifier == context.processId else { return false }
+    guard let browserWindowId = context.browserWindowId else { return true }
+    return cgFrontWindowId(for: context.processId) == browserWindowId
 }
 
 private final class EventWriter: @unchecked Sendable {
@@ -860,33 +1055,65 @@ private func captureScreen(
 ) async throws {
     // Screenshots are pull-based: Rust decides when a Moment is needed. The
     // native boundary does not introduce another hidden frame scheduler.
-    let image = try await SCScreenshotManager.captureImage(
-        contentFilter: filter,
-        configuration: configuration
-    )
-    guard let data = NSBitmapImageRep(cgImage: image).representation(
-        using: .jpeg,
-        properties: [.compressionFactor: options.jpegQuality]
-    ) else { throw ShimError.imageEncoding }
-    let url = options.outputDirectory
-        .appendingPathComponent("screen-\(UUID().uuidString)")
-        .appendingPathExtension("jpg")
-    try data.write(to: url, options: Data.WritingOptions.atomic)
-    try hardenPrivateFile(url)
     let now = Int64((Date().timeIntervalSince1970 * 1_000).rounded())
-    events.send(.artifact(
-        kind: .screen,
-        url: url,
-        startedAtMs: now,
-        endedAtMs: now,
-        requestId: requestId
-    ))
-    try captureAccessibilityTree(
-        requestId: requestId,
+    let accessibility = try await captureAccessibilityTree(
         capturedAtMs: now,
         outputDirectory: options.outputDirectory,
         events: events
     )
+    if case .privateBrowsing? = accessibility { return }
+    if case .foregroundChanged? = accessibility {
+        return
+    }
+    if case let .artifact(accessibilityURL, context)? = accessibility,
+       !foregroundCaptureContextIsCurrent(context)
+    {
+        try? FileManager.default.removeItem(at: accessibilityURL)
+        return
+    }
+    let screenURL = options.outputDirectory
+        .appendingPathComponent("screen-\(UUID().uuidString)")
+        .appendingPathExtension("jpg")
+    do {
+        let image = try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: configuration
+        )
+        if case let .artifact(accessibilityURL, context)? = accessibility,
+           !foregroundCaptureContextIsCurrent(context)
+        {
+            try? FileManager.default.removeItem(at: accessibilityURL)
+            return
+        }
+        guard let data = NSBitmapImageRep(cgImage: image).representation(
+            using: .jpeg,
+            properties: [.compressionFactor: options.jpegQuality]
+        ) else { throw ShimError.imageEncoding }
+        try data.write(to: screenURL, options: Data.WritingOptions.atomic)
+        try hardenPrivateFile(screenURL)
+        events.send(.artifact(
+            kind: .screen,
+            url: screenURL,
+            startedAtMs: now,
+            endedAtMs: now,
+            requestId: requestId
+        ))
+        if case let .artifact(accessibilityURL, _)? = accessibility {
+            events.send(.artifact(
+                kind: .accessibility,
+                url: accessibilityURL,
+                startedAtMs: now,
+                endedAtMs: now,
+                requestId: requestId
+            ))
+        }
+    } catch {
+        try? FileManager.default.removeItem(at: screenURL)
+        if case let .artifact(accessibilityURL, _)? = accessibility {
+            try? FileManager.default.removeItem(at: accessibilityURL)
+        }
+        throw error
+    }
 }
 
 private struct InputCommand: Decodable {

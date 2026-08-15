@@ -70,6 +70,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
 release_dir="$repo_root/dist"
 source_plist="$repo_root/apps/AfterRay/Resources/Info.plist"
+automation_entitlements="$repo_root/apps/AfterRay/Resources/Automation.entitlements"
 plist_buddy='/usr/libexec/PlistBuddy'
 temp_root=''
 
@@ -363,16 +364,17 @@ done
 
 sign_executable() {
   local executable="$1"
-  if [[ "$mode" == 'local' ]]; then
-    codesign --force --options runtime --sign - "$executable" >/dev/null
-  else
-    codesign \
-      --force \
-      --options runtime \
-      --timestamp \
-      --sign "$codesign_identity" \
-      "$executable" >/dev/null
+  local entitlements="${2:-}"
+  local signing_args=(--force --options runtime)
+  if [[ -n "$entitlements" ]]; then
+    signing_args+=(--entitlements "$entitlements")
   fi
+  if [[ "$mode" == 'local' ]]; then
+    signing_args+=(--sign -)
+  else
+    signing_args+=(--timestamp --sign "$codesign_identity")
+  fi
+  codesign "${signing_args[@]}" "$executable" >/dev/null
 }
 
 step "Signing nested executables (${codesign_identity})"
@@ -386,9 +388,13 @@ for library in "${runtime_libraries[@]}"; do
   sign_executable "$library"
 done
 for binary in "${bundle_binaries[@]:1}"; do
-  sign_executable "$binary"
+  if [[ "$binary" == "$app_bundle/Contents/Helpers/AfterRayCaptureShim" ]]; then
+    sign_executable "$binary" "$automation_entitlements"
+  else
+    sign_executable "$binary"
+  fi
 done
-sign_executable "$app_bundle"
+sign_executable "$app_bundle" "$automation_entitlements"
 
 step 'Verifying code signatures and Hardened Runtime'
 for binary in "${bundle_binaries[@]}"; do

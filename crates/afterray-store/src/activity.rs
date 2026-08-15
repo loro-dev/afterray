@@ -28,6 +28,8 @@ pub struct ActivityMomentRow {
 #[derive(Debug, Default, Deserialize)]
 struct SnapshotHeader {
     #[serde(default)]
+    private_browsing: bool,
+    #[serde(default)]
     application_name: Option<String>,
     #[serde(default)]
     bundle_identifier: Option<String>,
@@ -60,6 +62,7 @@ pub fn parse_accessibility_context(snapshot: &[u8]) -> ActivityContext {
     let Ok(header) = serde_json::from_slice::<SnapshotHeader>(snapshot) else {
         return ActivityContext::default();
     };
+    let private_browsing = header.private_browsing;
     let mut context = ActivityContext {
         application_name: nonempty(header.application_name),
         bundle_identifier: nonempty(header.bundle_identifier),
@@ -70,6 +73,9 @@ pub fn parse_accessibility_context(snapshot: &[u8]) -> ActivityContext {
     if let Some(root) = header.root {
         let mut found_web_url = context.url.is_some();
         fill_context_from_tree(&mut context, &root, &mut found_web_url);
+    }
+    if private_browsing {
+        context.url = None;
     }
     context
 }
@@ -355,6 +361,29 @@ mod tests {
         let context = parse_accessibility_context(snapshot);
         assert_eq!(context.url.as_deref(), Some("https://example.com/"));
         assert_eq!(context.window_title.as_deref(), Some("Example Domain"));
+    }
+
+    #[test]
+    fn private_browsing_fixture_never_exposes_header_or_tree_url() {
+        let snapshot = br#"{
+            "application_name": "Google Chrome",
+            "bundle_identifier": "com.google.Chrome",
+            "private_browsing": true,
+            "window_title": "Private account",
+            "url": "https://private.example/account",
+            "root": {
+                "role": "AXWindow",
+                "children": [{
+                    "role": "AXWebArea",
+                    "url": "https://private.example/account"
+                }]
+            }
+        }"#;
+
+        let context = parse_accessibility_context(snapshot);
+
+        assert_eq!(context.window_title.as_deref(), Some("Private account"));
+        assert!(context.url.is_none());
     }
 
     #[test]
