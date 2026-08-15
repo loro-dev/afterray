@@ -55,6 +55,11 @@ impl Budgeted {
 /// result back over budget.
 const MARKER_RESERVE_TOKENS: usize = 32;
 
+/// Room that has to be left over before it is worth cutting into the next line.
+/// Below this the fragment is too short to say anything, and a clean stop reads
+/// better than a word and a half.
+const PARTIAL_LINE_MIN_TOKENS: usize = 64;
+
 /// Keeps whole lines from the start of `text` until `max_tokens` is reached.
 ///
 /// Head-first because our tool results are ordered most-useful-first: a JSON
@@ -108,6 +113,32 @@ pub fn truncate_head(text: &str, max_tokens: usize) -> Budgeted {
         };
     }
 
+    // The line that broke the loop may be the only one that carried anything.
+    // A tool result is JSON, and `serde_json` puts a whole OCR page on the one
+    // line that holds `"text"`; stopping cleanly before it keeps the envelope
+    // and drops every word of the evidence, while most of the allowance goes
+    // unspent. Cutting into that line spends the room on something.
+    let mut partial_line = false;
+    let leftover = body_budget.saturating_sub(used);
+    if leftover >= PARTIAL_LINE_MIN_TOKENS {
+        if let Some(next) = lines.get(kept.len()) {
+            let head = take_tokens(next, leftover.saturating_sub(1));
+            if !head.is_empty() {
+                partial_line = true;
+                let body = format!("{}\n{head}", kept.join("\n"));
+                let dropped_lines = lines.len() - kept.len();
+                let dropped_tokens = total.saturating_sub(estimate_tokens(&body));
+                return Budgeted {
+                    text: format!("{body}\n{}", marker(dropped_lines, dropped_tokens)),
+                    truncated: true,
+                    dropped_lines,
+                    dropped_tokens,
+                    partial_line,
+                };
+            }
+        }
+    }
+
     let dropped_lines = lines.len() - kept.len();
     let body = kept.join("\n");
     let dropped_tokens = total.saturating_sub(estimate_tokens(&body));
@@ -117,7 +148,7 @@ pub fn truncate_head(text: &str, max_tokens: usize) -> Budgeted {
         truncated: true,
         dropped_lines,
         dropped_tokens,
-        partial_line: false,
+        partial_line,
     }
 }
 
@@ -205,6 +236,43 @@ mod tests {
             .map(|index| format!("  {{\"moment_id\": \"01J2X{index:04}\", \"at_ms\": 17867299370{index:02}}},"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The shape every JSON tool result has: a short envelope and one line
+    /// holding all the evidence. Stopping cleanly at the line boundary keeps
+    /// the envelope, drops every word of the payload, and leaves most of the
+    /// allowance unspent — the model is handed a receipt for evidence it never
+    /// sees.
+    #[test]
+    fn a_payload_on_one_line_is_cut_into_rather_than_dropped_whole() {
+        let payload = "the quick brown fox jumped over the lazy dog. ".repeat(1_200);
+        let body = format!("{{\n  \"moment_id\": \"01J2X\",\n  \"text\": \"{payload}\"\n}}");
+        let out = truncate_head(&body, 512);
+
+        assert!(out.truncated);
+        assert!(out.partial_line, "the payload line had to be cut into");
+        assert!(
+            out.text.contains("the quick brown fox"),
+            "kept no evidence at all: {}",
+            &out.text[..out.text.len().min(200)]
+        );
+        assert!(estimate_tokens(&out.text) <= 512, "over its own budget");
+        // Most of the allowance is now spent on evidence rather than wasted:
+        // stopping at the boundary kept about a fifth of it.
+        assert!(
+            estimate_tokens(&out.text) > 512 / 2,
+            "only {} of 512 tokens used",
+            estimate_tokens(&out.text)
+        );
+    }
+
+    /// The preference is still whole lines: a body that fits line by line is
+    /// never cut mid-line just because there is room left over.
+    #[test]
+    fn whole_lines_are_still_preferred_when_they_fit() {
+        let out = truncate_head(&json_rows(400), 512);
+        assert!(out.truncated);
+        assert!(!out.partial_line, "no line should have been cut: {}", out.text);
     }
 
     #[test]
