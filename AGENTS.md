@@ -6,6 +6,7 @@ AfterRay is a local-first macOS computer-history app: a Rust daemon (`afterrayd`
 
 - `make dev` — watch-mode signed dev app; `make dev-ui` — mock-data UI loop, no permissions or real data
 - `make test` — `cargo test --workspace` + `swift test`
+- `make test-repeat N=10 [TEST=name]` — new concurrency/IO tests need ≥5 consecutive green runs before commit; judge a build by its exit code, never a filtered warning count ([why](docs/development.md#tests-and-lint))
 - `cargo clippy --workspace --all-targets -- -D warnings` — lint gate; the workspace denies `unsafe_code`
 - `make v0` / `make v0-daemon` — one-shot signed app / daemon only; dev data lives in gitignored `.afterray/` and `.afterray-dev/`
 

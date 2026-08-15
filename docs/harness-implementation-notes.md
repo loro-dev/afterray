@@ -304,6 +304,53 @@ all of it. And `PROTOCOL_VERSION` went to 8: `ChatAbort` was added while the
 version still read 7, so an app that knows stop and a daemon that does not both
 claimed 7, the handshake passed, and the user's stop did nothing.
 
+## The conversation is a list of messages
+
+Every turn used to be one `system` message and one `user` message. The whole
+conversation was folded into that user message as text — first round kept,
+middle dropped, recent six kept — so the same past rendered differently every
+turn. Four things followed from that, and all four are now gone.
+
+**The prefix moved every turn.** Turn 8 dropped round 2; turn 9 dropped rounds
+2 and 3. Every provider caches on the longest identical prefix and every local
+runtime re-prefills from the first byte that changed, so a conversation that
+re-slices itself matches nothing and pays full price for text it has already
+read. History is now `Vec<Message>`, appended and never rewritten; the invariant
+is asserted directly (`is_prefix_of`) in the harness, in the daemon's renderer,
+and end to end through the real chat path.
+
+**The clock was in front of it.** `build_seed` opens with `now_ms`, and the
+opening was built seed-first, so byte one of every prompt differed. Volatile
+content now rides at the end with the question. The guarantee is exact:
+everything except the final user message is append-only — that last message is
+supposed to change, which is why it is last. Once answered and stored, the
+question re-enters the array as its own message and never moves again.
+
+**Tool calls were invisible across turns.** `tool_log` was written to the vault
+and never read back, so a follow-up could not see what the previous turn had
+looked up and simply looked it up again. A past turn now replays as the
+assistant's `TOOL`/`ARGS` message plus a note naming what ran. Result bodies are
+not replayed — they are not stored, and re-running the calls to fill them in
+would be a silent vault read on every turn — so the model sees what was checked
+and can check again if it needs the detail.
+
+**Two kinds of "out of room" behaved differently.** In-turn pressure announced
+itself, wrote a row and showed in the UI; cross-turn pressure silently deleted
+the middle of the conversation. `CompactionStrategy` now has a second method for
+the conversation, `PruneToolResults` implements both, and the cross-turn pass
+emits the same `CompactionNotice` — so it writes the same row, renders the same
+separator, and leaves an `[AfterRay]` marker where the dropped messages were.
+After a fold the prefix settles again and stays settled, which is the most a
+non-model policy can offer; `SummarizeOldest` remains phase 5.
+
+Tool calls stay in the text protocol rather than moving to provider-native
+function calling. Native calling would make the *stored* conversation
+provider-shaped: Ollama drops `thinking` from context, DeepSeek requires
+`reasoning_content` echoed back, and the tool-call message differs between them.
+Under the text protocol the array is one canonical thing, switching providers
+mid-conversation changes nothing about what the model sees of its own past, and
+the existing fence is already the right wrapper for a replayed result.
+
 ## Not started
 
 Phase 4 (steering) and phase 5 (`SummarizeOldest`), plus the plan's note about
@@ -315,11 +362,6 @@ Four more, named in review and genuinely outstanding:
   by a map in `AppState` rather than by a type that owns the session, its tool
   registry, its policy hooks and its event log. `afterray-agent` remains a
   queue binding plus error classification; the name is ahead of the contents.
-- **Long-term history is still trimmed by character count.** `fold_history`
-  keeps the first message and drops from the middle until it fits, with no
-  summary, no tombstone and no recoverable log. Compaction covers the in-turn
-  transcript only. Until that changes, the `compaction` event and the context
-  meter describe a narrower guarantee than a reader might assume.
 - **Tools hold `&ModelQueue`** where an embedding port would do.
 
 Phase 5 also needs the seam widened first: `CompactionStrategy::compact` is
