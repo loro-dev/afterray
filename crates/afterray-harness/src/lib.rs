@@ -17,6 +17,7 @@ pub mod budget;
 pub mod cancel;
 pub mod compaction;
 pub mod fence;
+pub mod progress;
 pub mod tokens;
 pub mod transcript;
 pub mod truncate;
@@ -27,9 +28,10 @@ mod run;
 pub use budget::ContextBudget;
 pub use cancel::CancelToken;
 pub use compaction::{CompactionNotice, CompactionStrategy, PruneToolResults};
+pub use progress::{Phase, ProgressReport};
 pub use run::{
-    Discard, EventSink, GenerateRequest, HarnessEvent, LoopConfig, LoopError, ModelError,
-    ModelSurface, ToolCallRecord, ToolSurface, Turn, TurnUsage, run_turn,
+    DeltaKind, Discard, EventSink, GenerateRequest, HarnessEvent, LoopConfig, LoopError,
+    ModelError, ModelSurface, StreamDelta, ToolCallRecord, ToolSurface, Turn, TurnUsage, run_turn,
 };
 pub use transcript::{Pruned, Transcript};
 pub use truncate::{Budgeted, truncate_head};

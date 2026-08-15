@@ -23,6 +23,9 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Only for the live-Ollama probe in `stream.rs`, which asks /api/tags
+# which model this machine actually has before running against it.
+reqwest.workspace = true
 tempfile = "3.27"
 
 [lints]

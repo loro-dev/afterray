@@ -5,6 +5,7 @@
 //! `afterray-model-worker` binary; OCR stays on the native Swift helper.
 
 mod catalog;
+mod delta;
 mod download;
 mod persistent_mlx;
 mod process;
@@ -19,6 +20,7 @@ pub use catalog::{
     qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
     specs_for_download, specs_for_download_in,
 };
+pub use delta::{LlmDelta, LlmDeltaKind};
 pub use download::{
     DownloadError, DownloadProgress, download_pack, download_packs, remove_pack, verify_files,
 };

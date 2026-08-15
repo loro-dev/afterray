@@ -282,6 +282,62 @@ public struct ChatContextUsage: Equatable, Sendable {
     }
 }
 
+/// Proof that a turn is alive while it has nothing to show.
+///
+/// Three separate stretches leave the window empty and only one is about
+/// thinking models: a model streaming reasoning, a cold load before the first
+/// byte, and the generation of a tool call the answer gate hides. They look
+/// identical from here, and the user's question in all three is the same one.
+public struct ChatProgress: Equatable, Sendable {
+    public enum Phase: Equatable, Sendable {
+        case generating
+        case thinking
+
+        /// Unknown phases fall back to `generating` rather than being dropped:
+        /// a newer daemon inventing one must not blank the indicator.
+        public init(parsing raw: String) {
+            self = raw == "thinking" ? .thinking : .generating
+        }
+    }
+
+    public var phase: Phase
+    public var reasoningDeltas: Int
+    public var elapsedMs: Int
+    public var round: Int
+
+    public init(phase: Phase, reasoningDeltas: Int, elapsedMs: Int, round: Int) {
+        self.phase = phase
+        self.reasoningDeltas = reasoningDeltas
+        self.elapsedMs = elapsedMs
+        self.round = round
+    }
+
+    public var title: String {
+        phase == .thinking ? "Thinking" : "Working"
+    }
+
+    /// A number the user can watch change. An animation alone cannot answer
+    /// "is it stuck" — a spinner spins just as happily over a dead socket —
+    /// so the readout is the part that carries the proof.
+    ///
+    /// Reasoning deltas when the model is producing them, because they show the
+    /// model working rather than the connection merely being open; elapsed time
+    /// otherwise, because it is the only thing moving.
+    public var detail: String {
+        if reasoningDeltas > 0 {
+            return "\(reasoningDeltas) steps · \(seconds)"
+        }
+        return seconds
+    }
+
+    private var seconds: String {
+        let value = Double(elapsedMs) / 1_000
+        return value < 10
+            ? String(format: "%.1fs", value)
+            : "\(Int(value.rounded()))s"
+    }
+}
+
 /// One pass where the daemon dropped earlier evidence to make room.
 public struct ChatCompactionNotice: Equatable, Identifiable, Sendable {
     public var id: String
@@ -328,6 +384,7 @@ public enum ChatStreamEvent: Equatable, Sendable {
     case toolResult(name: String, chars: Int, truncated: Bool = false, dropped: Int = 0)
     case token(text: String)
     case usage(ChatContextUsage)
+    case progress(ChatProgress)
     case compaction(ChatCompactionNotice)
     case done(messageId: String, conversationId: String)
     case error(message: String)
@@ -400,6 +457,15 @@ public enum ChatStreamEventDecoder {
                     round: intValue(object["round"]) ?? 0
                 )
             )
+        case "progress":
+            return .progress(
+                ChatProgress(
+                    phase: ChatProgress.Phase(parsing: object["phase"] as? String ?? ""),
+                    reasoningDeltas: intValue(object["reasoning_deltas"]) ?? 0,
+                    elapsedMs: intValue(object["elapsed_ms"]) ?? 0,
+                    round: intValue(object["round"]) ?? 0
+                )
+            )
         case "compaction":
             let from = intValue(object["from_round"]) ?? 0
             let to = intValue(object["to_round"]) ?? from
@@ -436,6 +502,9 @@ public struct ChatStreamState: Equatable, Sendable {
     /// an older daemon simply shows no meter rather than showing a wrong one.
     public var usage: ChatContextUsage?
     public var compactions: [ChatCompactionNotice]
+    /// Set while the turn is alive with nothing to show, cleared the moment
+    /// there is something. Nil is the normal state, not an error.
+    public var progress: ChatProgress?
 
     public init(
         text: String = "",
@@ -445,7 +514,8 @@ public struct ChatStreamState: Equatable, Sendable {
         error: String? = nil,
         isFinished: Bool = false,
         usage: ChatContextUsage? = nil,
-        compactions: [ChatCompactionNotice] = []
+        compactions: [ChatCompactionNotice] = [],
+        progress: ChatProgress? = nil
     ) {
         self.text = text
         self.tools = tools
@@ -455,6 +525,7 @@ public struct ChatStreamState: Equatable, Sendable {
         self.isFinished = isFinished
         self.usage = usage
         self.compactions = compactions
+        self.progress = progress
     }
 
     public var receivedWork: Bool {
@@ -470,6 +541,8 @@ public enum ChatStreamReducer {
     public static func apply(_ event: ChatStreamEvent, to state: inout ChatStreamState) {
         switch event {
         case .toolCall(let name, let argsJSON):
+            // The tool row takes over as the visible sign of work.
+            state.progress = nil
             state.tools.append(
                 ChatToolCall(
                     id: "tool-\(state.tools.count)-\(name)",
@@ -496,6 +569,8 @@ public enum ChatStreamReducer {
             }
         case .usage(let usage):
             state.usage = usage
+        case .progress(let progress):
+            state.progress = progress
         case .compaction(let notice):
             // A pass can be reported more than once across rounds; the range is
             // the identity, so a repeat replaces rather than stacks.
@@ -506,7 +581,11 @@ public enum ChatStreamReducer {
             }
         case .token(let text):
             state.text += text
+            // The answer is now its own proof of life. Leaving the indicator up
+            // beside it would put two "it is working" signals on screen.
+            state.progress = nil
         case .done(let messageId, let conversationId):
+            state.progress = nil
             if !messageId.isEmpty { state.messageId = messageId }
             if !conversationId.isEmpty { state.conversationId = conversationId }
             state.isFinished = true
@@ -668,6 +747,8 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
     public let tools: [ChatToolCall]
     public let isStreaming: Bool
     public let createdAtMs: Int64
+    /// Set on the streaming bubble while the turn has nothing to show yet.
+    public let progress: ChatProgress?
 
     public init(
         id: String,
@@ -675,7 +756,8 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         text: String,
         tools: [ChatToolCall] = [],
         isStreaming: Bool = false,
-        createdAtMs: Int64
+        createdAtMs: Int64,
+        progress: ChatProgress? = nil
     ) {
         self.id = id
         self.role = role
@@ -683,6 +765,7 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         self.tools = tools
         self.isStreaming = isStreaming
         self.createdAtMs = createdAtMs
+        self.progress = progress
     }
 
     public var markdownBlocks: [MarkdownBlock] {
@@ -706,7 +789,8 @@ public enum ChatTranscript {
         streamingTools: [ChatToolCall] = [],
         isSending: Bool = false,
         nowMs: Int64 = 0,
-        liveCompactions: [ChatCompactionNotice] = []
+        liveCompactions: [ChatCompactionNotice] = [],
+        progress: ChatProgress? = nil
     ) -> [ChatBubble] {
         var items = messages.map { message in
             ChatBubble(
@@ -738,7 +822,8 @@ public enum ChatTranscript {
                     text: streamingText,
                     tools: streamingTools,
                     isStreaming: true,
-                    createdAtMs: nowMs
+                    createdAtMs: nowMs,
+                    progress: progress
                 )
             )
         }

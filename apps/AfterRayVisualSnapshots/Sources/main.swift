@@ -611,6 +611,11 @@ private var chatScenes: [SnapshotScene] {
     [
         chatScene(name: "16-chat-context-pressure", scenario: .pressure),
         chatScene(name: "17-chat-tools", scenario: .tools),
+        // The two dead-air states. A thinking model spends most of a turn here
+        // and a cold load spends its first ten seconds here, so this is what
+        // the chat window looks like most of the time it is working.
+        chatScene(name: "18-chat-thinking", scenario: .thinking),
+        chatScene(name: "19-chat-waiting", scenario: .waiting),
     ]
 }
 

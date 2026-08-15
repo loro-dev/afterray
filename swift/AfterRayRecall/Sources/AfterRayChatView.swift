@@ -508,9 +508,16 @@ private struct ChatBubbleView: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                ChatMarkdownView(blocks: bubble.markdownBlocks)
-                if bubble.isStreaming {
-                    ChatStreamCaret()
+                // The indicator replaces the caret rather than joining it. A
+                // blinking caret in front of no text reads as "waiting for you";
+                // this reads as "waiting for me".
+                if let progress = bubble.progress, bubble.text.isEmpty {
+                    ChatWorkingIndicator(progress: progress)
+                } else {
+                    ChatMarkdownView(blocks: bubble.markdownBlocks)
+                    if bubble.isStreaming {
+                        ChatStreamCaret()
+                    }
                 }
             }
         }
@@ -646,6 +653,50 @@ private struct ChatCodeBlock: View {
                 .frame(width: 2)
         }
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// Shown while a turn is alive with nothing to show yet.
+///
+/// Two signals, deliberately. The dots carry motion, which is what makes a live
+/// window feel live. The readout carries proof: a spinner spins just as happily
+/// over a dead socket, so the number beside it is the part that actually
+/// answers "is it stuck". It is also the only half that survives into a
+/// screenshot or a snapshot test.
+private struct ChatWorkingIndicator: View {
+    let progress: ChatProgress
+    @State private var phase = 0.0
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 3) {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .fill(ChatPalette.accent)
+                        .frame(width: 4, height: 4)
+                        .opacity(opacity(index))
+                }
+            }
+            Text(progress.title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(ChatPalette.secondary)
+            Text(progress.detail)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(ChatPalette.tertiary)
+                .monospacedDigit()
+        }
+        .onAppear {
+            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
+                phase = 3
+            }
+        }
+    }
+
+    /// A travelling pulse rather than three synchronised blinks: three dots
+    /// fading together is hard to tell from a rendering stall.
+    private func opacity(_ index: Int) -> Double {
+        let distance = abs(phase - Double(index))
+        return 0.25 + 0.75 * max(0, 1 - min(distance, 1))
     }
 }
 

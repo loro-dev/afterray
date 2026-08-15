@@ -14,7 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 # Only the pieces the loop needs: a channel for token deltas and `select!` to
 # drain it while a round is still generating. No runtime, no I/O.
-tokio = { version = "1.49", default-features = false, features = ["macros", "sync"] }
+tokio = { version = "1.49", default-features = false, features = ["macros", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["macros", "rt", "sync", "time"] }

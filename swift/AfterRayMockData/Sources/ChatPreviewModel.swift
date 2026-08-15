@@ -8,6 +8,11 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
     case markdown
     case tools
     case pressure
+    /// A thinking model mid-turn: reasoning is streaming, nothing is visible.
+    case thinking
+    /// The general case the thinking one is a special case of — a turn that has
+    /// produced nothing at all yet, as during a cold model load.
+    case waiting
 
     public var id: String { rawValue }
 
@@ -19,6 +24,8 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
         case .markdown: "Markdown"
         case .tools: "Tool calls"
         case .pressure: "Context pressure"
+        case .thinking: "Thinking"
+        case .waiting: "Waiting"
         }
     }
 }
@@ -38,6 +45,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
     @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
+    @Published public private(set) var streamProgress: ChatProgress?
 
     public private(set) var scenario: ChatScenario = .markdown
     private var store: [String: [ChatMessage]] = [:]
@@ -60,6 +68,10 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         statusMessage = nil
         let fixture = ChatFixtures.load(scenario)
         contextUsage = ChatFixtures.usage(scenario)
+        streamProgress = ChatFixtures.progress(scenario)
+        // The indicator only exists mid-turn, so these scenarios must look like
+        // one is running.
+        isSending = streamProgress != nil
         conversations = fixture.conversations
         store = fixture.histories
         selectedID = fixture.conversations.first?.id
@@ -152,6 +164,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
             streamTools = state.tools
             if let usage = state.usage { contextUsage = usage }
             if !state.compactions.isEmpty { compactionNotices = state.compactions }
+            streamProgress = state.progress
             try? await Task.sleep(for: .milliseconds(28))
         }
         if Task.isCancelled {
@@ -251,6 +264,19 @@ public enum ChatFixtures {
                 [conversation("c-short", "What did I ship?", count: 4, updated: nowMs - 3_600_000)],
                 ["c-short": shortMessages]
             )
+        case .thinking, .waiting:
+            return (
+                [conversation("c-think", "Yesterday's reading", count: 1, updated: nowMs)],
+                ["c-think": [
+                    ChatMessage(
+                        id: "u-think",
+                        conversationId: "c-think",
+                        role: .user,
+                        content: "昨天下午我在读什么",
+                        createdAtMs: nowMs - 3_000
+                    )
+                ]]
+            )
         case .streaming:
             return (
                 [conversation("c-stream", "Afternoon errors", count: 1, updated: nowMs)],
@@ -311,6 +337,23 @@ public enum ChatFixtures {
         case .markdown: ChatContextUsage(promptTokens: 3_180, windowTokens: 16_384, round: 2)
         case .streaming, .tools: ChatContextUsage(promptTokens: 6_420, windowTokens: 16_384, round: 3)
         case .pressure: ChatContextUsage(promptTokens: 13_910, windowTokens: 16_384, round: 5)
+        case .thinking, .waiting:
+            ChatContextUsage(promptTokens: 2_240, windowTokens: 16_384, round: 1)
+        }
+    }
+
+    /// The two dead-air states, frozen mid-turn.
+    ///
+    /// The numbers are the ones actually measured against `qwen3.6:35b-mlx`
+    /// answering a two-character question: 131 reasoning deltas over ~2.4 s,
+    /// and a 12.7 s cold load of the 22 GB model before its first byte.
+    public static func progress(_ scenario: ChatScenario) -> ChatProgress? {
+        switch scenario {
+        case .thinking:
+            ChatProgress(phase: .thinking, reasoningDeltas: 131, elapsedMs: 2_400, round: 1)
+        case .waiting:
+            ChatProgress(phase: .generating, reasoningDeltas: 0, elapsedMs: 12_700, round: 1)
+        default: nil
         }
     }
 

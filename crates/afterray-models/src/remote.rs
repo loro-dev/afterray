@@ -1,7 +1,7 @@
 mod stream;
 
 use crate::{
-    AdapterError, Cancellation, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
+    AdapterError, Cancellation, LlmDelta, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
     PersistentMlxAdapter, QWEN35_4B_MLX_PACK_ID, QWEN35_9B_MLX_PACK_ID,
 };
 use afterray_protocol::{LlmEndpointStatus, LlmProvider, LlmRemoteModel};
@@ -83,25 +83,25 @@ impl LlmRuntimeConfig {
 /// sender so a queued T2 job cannot keep the outlet after chat arms it.
 #[derive(Clone, Default)]
 pub struct LlmTokenSink {
-    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<LlmDelta>>>>,
 }
 
 impl LlmTokenSink {
     /// Installs a sender until the guard drops. Chat holds the guard around
     /// `submit`/`wait` so tokens from that generation can leak out.
     #[must_use = "dropping the guard clears the token outlet"]
-    pub fn install(&self, tx: mpsc::Sender<String>) -> LlmTokenSinkGuard {
+    pub fn install(&self, tx: mpsc::Sender<LlmDelta>) -> LlmTokenSinkGuard {
         *self.lock() = Some(tx);
         LlmTokenSinkGuard {
             inner: Arc::clone(&self.inner),
         }
     }
 
-    fn take(&self) -> Option<mpsc::Sender<String>> {
+    fn take(&self) -> Option<mpsc::Sender<LlmDelta>> {
         self.lock().take()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<String>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<LlmDelta>>> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -110,7 +110,7 @@ impl LlmTokenSink {
 
 /// Clears the outlet even if the chat task is cancelled mid-wait.
 pub struct LlmTokenSinkGuard {
-    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    inner: Arc<std::sync::Mutex<Option<mpsc::Sender<LlmDelta>>>>,
 }
 
 impl Drop for LlmTokenSinkGuard {
@@ -365,7 +365,7 @@ async fn generate_remote(
     config: &LlmRuntimeConfig,
     prompt: &str,
     system: Option<&str>,
-    token_tx: Option<mpsc::Sender<String>>,
+    token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
     if let Some(token_tx) = token_tx {

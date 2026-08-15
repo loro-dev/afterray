@@ -165,6 +165,7 @@ dependencies = [
  "blake3",
  "chrono",
  "dirs",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

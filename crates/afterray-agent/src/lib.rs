@@ -7,9 +7,10 @@
 //!
 //! Tools stay in the daemon, where the vault is.
 
-use afterray_harness::{GenerateRequest, ModelError, ModelSurface};
+use afterray_harness::{GenerateRequest, ModelError, ModelSurface, StreamDelta};
 use afterray_models::{
-    JobPriority, JobState, LlmTokenSink, ModelInput, ModelOutput, ModelQueue, QueueError,
+    JobPriority, JobState, LlmDelta, LlmDeltaKind, LlmTokenSink, ModelInput, ModelOutput,
+    ModelQueue, QueueError,
 };
 use tokio::sync::mpsc;
 
@@ -39,17 +40,40 @@ impl ModelSurface for QueueModel<'_> {
     async fn generate(
         &self,
         request: GenerateRequest<'_>,
-        tokens: mpsc::Sender<String>,
+        tokens: mpsc::Sender<StreamDelta>,
     ) -> Result<String, ModelError> {
-        let guard = self.token_sink.map(|sink| sink.install(tokens));
-        let result = self.run_round(request).await;
+        let Some(sink) = self.token_sink else {
+            return self.run_round(request, None).await;
+        };
+        // The harness and the model layer each define their own delta type,
+        // because neither may depend on the other. This is the seam, and the
+        // conversion below is the whole of it.
+        let (adapter_tx, adapter_rx) = mpsc::channel::<LlmDelta>(64);
+        let guard = sink.install(adapter_tx);
+        let result = self.run_round(request, Some((adapter_rx, tokens))).await;
         drop(guard);
         result
     }
 }
 
+fn convert(delta: LlmDelta) -> StreamDelta {
+    match delta.kind {
+        LlmDeltaKind::Content => StreamDelta::content(delta.text),
+        LlmDeltaKind::Reasoning => StreamDelta::reasoning(delta.text),
+    }
+}
+
 impl QueueModel<'_> {
-    async fn run_round(&self, request: GenerateRequest<'_>) -> Result<String, ModelError> {
+    /// Runs one job, forwarding adapter deltas to the harness as they arrive.
+    ///
+    /// The forwarding lives inside the same `select!` as the wait rather than in
+    /// a spawned task: the adapter's channel is bounded, so a producer that
+    /// outruns an undrained receiver blocks the generation itself.
+    async fn run_round(
+        &self,
+        request: GenerateRequest<'_>,
+        mut relay: Option<(mpsc::Receiver<LlmDelta>, mpsc::Sender<StreamDelta>)>,
+    ) -> Result<String, ModelError> {
         let job_id = match self
             .models
             .submit_with(
@@ -70,13 +94,32 @@ impl QueueModel<'_> {
         // Without this the queue keeps generating for a window nobody is
         // reading, and — worse on a single-lane local runtime — holds the LLM
         // lane against the next thing the user asks.
-        let snapshot = tokio::select! {
-            settled = self.models.wait(&job_id) => {
-                settled.map_err(|error| ModelError::Failed(error.to_string()))?
-            }
-            () = request.cancel.cancelled() => {
-                let _ = self.models.cancel(&job_id).await;
-                return Err(ModelError::Cancelled);
+        let waiting = self.models.wait(&job_id);
+        tokio::pin!(waiting);
+        let snapshot = loop {
+            tokio::select! {
+                biased;
+                Some(delta) = async {
+                    match relay.as_mut() {
+                        Some((rx, _)) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some((_, tx)) = relay.as_ref()
+                        && tx.send(convert(delta)).await.is_err()
+                    {
+                        // The harness stopped listening. Keep generating so the
+                        // completed text still comes back, just unwatched.
+                        relay = None;
+                    }
+                }
+                settled = &mut waiting => {
+                    break settled.map_err(|error| ModelError::Failed(error.to_string()))?;
+                }
+                () = request.cancel.cancelled() => {
+                    let _ = self.models.cancel(&job_id).await;
+                    return Err(ModelError::Cancelled);
+                }
             }
         };
 

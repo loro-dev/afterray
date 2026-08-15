@@ -6,7 +6,7 @@
 //! generation.
 
 use super::{LlmRuntimeConfig, chat_completions_url, normalize_origin, remote_http_error};
-use crate::{AdapterError, Cancellation};
+use crate::{AdapterError, Cancellation, LlmDelta};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -29,7 +29,7 @@ pub(super) async fn generate_streaming(
     config: &LlmRuntimeConfig,
     prompt: &str,
     system: Option<&str>,
-    token_tx: mpsc::Sender<String>,
+    token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
     match config.provider {
@@ -50,7 +50,7 @@ async fn generate_ollama_stream(
     config: &LlmRuntimeConfig,
     prompt: &str,
     system: Option<&str>,
-    token_tx: mpsc::Sender<String>,
+    token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
     let model = require_model(config)?;
@@ -75,7 +75,7 @@ async fn generate_openai_stream(
     config: &LlmRuntimeConfig,
     prompt: &str,
     system: Option<&str>,
-    token_tx: mpsc::Sender<String>,
+    token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
 ) -> Result<String, AdapterError> {
     let model = require_model(config)?;
@@ -158,8 +158,8 @@ async fn response_text(response: reqwest::Response) -> Result<String, AdapterErr
 async fn fold_lines(
     response: reqwest::Response,
     cancellation: Cancellation,
-    token_tx: &mpsc::Sender<String>,
-    parse_line: fn(&str) -> Option<String>,
+    token_tx: &mpsc::Sender<LlmDelta>,
+    parse_line: fn(&str) -> Option<LlmDelta>,
 ) -> Result<String, AdapterError> {
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
@@ -194,8 +194,8 @@ async fn fold_lines(
 async fn drain_complete_lines(
     pending: &mut Vec<u8>,
     assembled: &mut String,
-    token_tx: &mpsc::Sender<String>,
-    parse_line: fn(&str) -> Option<String>,
+    token_tx: &mpsc::Sender<LlmDelta>,
+    parse_line: fn(&str) -> Option<LlmDelta>,
 ) {
     while let Some(idx) = pending.iter().position(|&byte| byte == b'\n') {
         let mut line = pending.drain(..=idx).collect::<Vec<_>>();
@@ -208,39 +208,64 @@ async fn drain_complete_lines(
     }
 }
 
+/// Forwards one delta, and assembles only the ones that are the answer.
+///
+/// Reasoning never reaches `assembled`. That string is both the returned
+/// completion and what `parse_final` / `parse_tool_call` read, so folding
+/// scratch work into it would put the model's thinking in the chat window and
+/// let a stray "FINAL" inside a reasoning block end the turn.
 async fn push_delta(
     assembled: &mut String,
-    token_tx: &mpsc::Sender<String>,
-    delta: Option<String>,
+    token_tx: &mpsc::Sender<LlmDelta>,
+    delta: Option<LlmDelta>,
 ) {
-    let Some(delta) = delta.filter(|text| !text.is_empty()) else {
+    let Some(delta) = delta.filter(|delta| !delta.text.is_empty()) else {
         return;
     };
-    assembled.push_str(&delta);
+    if delta.is_content() {
+        assembled.push_str(&delta.text);
+    }
     let _ = token_tx.send(delta).await;
 }
 
-/// `message.content` from one Ollama `/api/chat` JSON line.
+/// One Ollama `/api/chat` JSON line, as answer text or as reasoning.
+///
+/// Ollama puts reasoning in `message.thinking` and leaves `message.content`
+/// empty for the whole thinking phase, so reading content alone yields nothing
+/// at all until the model is done deliberating.
 #[must_use]
-pub fn ollama_chat_delta(line: &str) -> Option<String> {
+pub fn ollama_chat_delta(line: &str) -> Option<LlmDelta> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
     let value: Value = serde_json::from_str(line).ok()?;
-    json_text(value.pointer("/message/content"))
+    if let Some(text) = json_text(value.pointer("/message/content")) {
+        return Some(LlmDelta::content(text));
+    }
+    json_text(value.pointer("/message/thinking")).map(LlmDelta::reasoning)
 }
 
-/// `choices[0].delta.content` from one SSE `data:` line.
+/// One OpenAI-compatible SSE `data:` line, as answer text or as reasoning.
+///
+/// There is no standard field for reasoning, so both spellings in the wild are
+/// accepted: `reasoning_content` (`DeepSeek`, and `vLLM`/`SGLang` serving Qwen) and
+/// `reasoning` (`OpenRouter`, and several gateways). An endpoint that sends
+/// neither simply never yields a reasoning delta.
 #[must_use]
-pub fn openai_sse_delta(line: &str) -> Option<String> {
+pub fn openai_sse_delta(line: &str) -> Option<LlmDelta> {
     let line = line.trim();
     let payload = line.strip_prefix("data:")?.trim();
     if payload.is_empty() || payload == "[DONE]" {
         return None;
     }
     let value: Value = serde_json::from_str(payload).ok()?;
-    json_text(value.pointer("/choices/0/delta/content"))
+    if let Some(text) = json_text(value.pointer("/choices/0/delta/content")) {
+        return Some(LlmDelta::content(text));
+    }
+    json_text(value.pointer("/choices/0/delta/reasoning_content"))
+        .or_else(|| json_text(value.pointer("/choices/0/delta/reasoning")))
+        .map(LlmDelta::reasoning)
 }
 
 fn json_text(value: Option<&Value>) -> Option<String> {
@@ -287,13 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn ollama_line_takes_message_content_only() {
+    fn ollama_line_prefers_content_over_thinking() {
         assert_eq!(
             ollama_chat_delta(
                 r#"{"message":{"role":"assistant","content":"你","thinking":"hmm"},"done":false}"#
-            )
-            .as_deref(),
-            Some("你")
+            ),
+            Some(LlmDelta::content("你"))
         );
         assert!(
             ollama_chat_delta(r#"{"message":{"role":"assistant","content":""},"done":true}"#)
@@ -302,17 +326,78 @@ mod tests {
         assert!(ollama_chat_delta("not-json").is_none());
     }
 
+    /// What a thinking model actually sends. Measured on `qwen3.6:35b-mlx`:
+    /// 131 of these, then one content delta. Reading content alone yields
+    /// nothing for the whole thinking phase, which is the dead air this
+    /// labelling exists to end.
+    #[test]
+    fn ollama_line_reports_thinking_as_reasoning() {
+        assert_eq!(
+            ollama_chat_delta(
+                r#"{"message":{"role":"assistant","content":"","thinking":"Here"},"done":false}"#
+            ),
+            Some(LlmDelta::reasoning("Here"))
+        );
+    }
+
     #[test]
     fn openai_sse_takes_delta_content() {
         assert_eq!(
-            openai_sse_delta(r#"data: {"choices":[{"delta":{"content":"今"}}]}"#).as_deref(),
-            Some("今")
+            openai_sse_delta(r#"data: {"choices":[{"delta":{"content":"今"}}]}"#),
+            Some(LlmDelta::content("今"))
         );
         assert!(
             openai_sse_delta(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#).is_none()
         );
         assert!(openai_sse_delta("data: [DONE]").is_none());
         assert!(openai_sse_delta("event: message").is_none());
+    }
+
+    /// There is no standard field, so both spellings in the wild are accepted:
+    /// `reasoning_content` from `DeepSeek` and `vLLM`, `reasoning` from `OpenRouter`
+    /// and several gateways.
+    #[test]
+    fn openai_sse_accepts_both_spellings_of_reasoning() {
+        assert_eq!(
+            openai_sse_delta(r#"data: {"choices":[{"delta":{"reasoning_content":"step"}}]}"#),
+            Some(LlmDelta::reasoning("step"))
+        );
+        assert_eq!(
+            openai_sse_delta(r#"data: {"choices":[{"delta":{"reasoning":"step"}}]}"#),
+            Some(LlmDelta::reasoning("step"))
+        );
+        // Content still wins when an endpoint sends both on one line.
+        assert_eq!(
+            openai_sse_delta(
+                r#"data: {"choices":[{"delta":{"content":"A","reasoning":"why"}}]}"#
+            ),
+            Some(LlmDelta::content("A"))
+        );
+    }
+
+    /// Reasoning must never reach the assembled completion. That string is both
+    /// the returned answer and what the loop parses, so a stray "FINAL" inside
+    /// a reasoning block would end the turn on the model's scratch work.
+    #[tokio::test]
+    async fn reasoning_streams_but_never_joins_the_answer() {
+        let body = concat!(
+            r#"{"message":{"content":"","thinking":"FINAL nonsense"},"done":false}"#,
+            "\n",
+            r#"{"message":{"content":"OK"},"done":false}"#,
+            "\n",
+            r#"{"message":{"content":""},"done":true}"#,
+            "\n",
+        );
+        let origin = serve_http(body, "application/x-ndjson").await;
+        let (text, deltas) =
+            generate_against(LlmProvider::Ollama, &origin, Cancellation::default())
+                .await
+                .unwrap();
+        assert_eq!(text, "OK");
+        assert_eq!(
+            deltas,
+            vec![LlmDelta::reasoning("FINAL nonsense"), LlmDelta::content("OK")]
+        );
     }
 
     #[tokio::test]
@@ -331,7 +416,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(text, "你好");
-        assert_eq!(tokens, ["你", "好"]);
+        assert_eq!(tokens, [LlmDelta::content("你"), LlmDelta::content("好")]);
     }
 
     #[tokio::test]
@@ -350,7 +435,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(text, "hello");
-        assert_eq!(tokens, ["hel", "lo"]);
+        assert_eq!(tokens, [LlmDelta::content("hel"), LlmDelta::content("lo")]);
     }
 
     #[tokio::test]
@@ -585,7 +670,7 @@ mod tests {
         provider: LlmProvider,
         origin: &str,
         cancellation: Cancellation,
-    ) -> Result<(String, Vec<String>), AdapterError> {
+    ) -> Result<(String, Vec<LlmDelta>), AdapterError> {
         let config = LlmRuntimeConfig {
             provider,
             base_url: origin.to_owned(),

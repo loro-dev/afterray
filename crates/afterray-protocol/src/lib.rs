@@ -856,6 +856,24 @@ pub enum ChatStreamEvent {
         window_tokens: usize,
         round: usize,
     },
+    /// The turn is alive but has nothing to show yet.
+    ///
+    /// Covers every stretch where the window would otherwise sit empty: a
+    /// thinking model streaming reasoning, a cold model load before the first
+    /// byte, and the generation of a `TOOL` draft that the answer gate hides.
+    /// A client that renders `elapsed_ms` or `reasoning_deltas` as a changing
+    /// number can answer "is it stuck" without trusting an animation.
+    Progress {
+        /// `generating` or `thinking`. A string rather than a closed set, so a
+        /// later phase does not break an older client's decode.
+        phase: String,
+        #[serde(default)]
+        reasoning_deltas: usize,
+        #[serde(default)]
+        elapsed_ms: u64,
+        #[serde(default)]
+        round: usize,
+    },
     /// An earlier part of the turn was dropped to make room.
     ///
     /// Announced rather than silent, and carrying the range it covers, so the
@@ -1210,6 +1228,16 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&usage).unwrap(),
             r#"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2}"#
+        );
+        let progress = ChatStreamEvent::Progress {
+            phase: "thinking".into(),
+            reasoning_deltas: 131,
+            elapsed_ms: 2_400,
+            round: 1,
+        };
+        assert_eq!(
+            serde_json::to_string(&progress).unwrap(),
+            r#"{"kind":"progress","phase":"thinking","reasoning_deltas":131,"elapsed_ms":2400,"round":1}"#
         );
         let compaction = ChatStreamEvent::Compaction {
             strategy: "prune_tool_results".into(),

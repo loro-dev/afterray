@@ -10,6 +10,7 @@
 //! the unused seams cost nothing.
 
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -17,6 +18,7 @@ use crate::budget::ContextBudget;
 use crate::cancel::CancelToken;
 use crate::compaction::{CompactionNotice, CompactionStrategy};
 use crate::fence;
+use crate::progress::{PROGRESS_INTERVAL, Phase, ProgressReport};
 use crate::tokens::estimate_tokens;
 use crate::transcript::Transcript;
 use crate::truncate::Budgeted;
@@ -36,6 +38,45 @@ pub struct GenerateRequest<'a> {
     pub cancel: &'a CancelToken,
 }
 
+/// One piece of a streaming round.
+///
+/// The harness defines its own rather than borrowing the model layer's, because
+/// it must not depend on one. `afterray-agent` converts at the seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamDelta {
+    pub kind: DeltaKind,
+    pub text: String,
+}
+
+impl StreamDelta {
+    #[must_use]
+    pub fn content(text: impl Into<String>) -> Self {
+        Self {
+            kind: DeltaKind::Content,
+            text: text.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            kind: DeltaKind::Reasoning,
+            text: text.into(),
+        }
+    }
+}
+
+/// Which stream a delta belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaKind {
+    /// Part of the answer. Goes through the gate and, if it survives, to the
+    /// user.
+    Content,
+    /// The model's reasoning. Counted as proof of life, never shown, and never
+    /// parsed — a "FINAL" inside a reasoning block must not end the turn.
+    Reasoning,
+}
+
 /// Something that can run one model round.
 ///
 /// An implementation that can stream pushes deltas into `tokens` as they
@@ -46,7 +87,7 @@ pub trait ModelSurface {
     fn generate(
         &self,
         request: GenerateRequest<'_>,
-        tokens: mpsc::Sender<String>,
+        tokens: mpsc::Sender<StreamDelta>,
     ) -> impl Future<Output = Result<String, ModelError>> + Send;
 }
 
@@ -101,6 +142,9 @@ pub enum HarnessEvent {
         window_tokens: usize,
         round: usize,
     },
+    /// The turn is alive but has nothing to show yet. See [`crate::progress`]
+    /// for the three stretches this covers.
+    Progress(ProgressReport),
     Compaction(CompactionNotice),
 }
 
@@ -330,23 +374,54 @@ where
     M: ModelSurface + Sync,
     S: EventSink,
 {
-    let (sender, mut receiver) = mpsc::channel::<String>(64);
+    let (sender, mut receiver) = mpsc::channel::<StreamDelta>(64);
     let mut gate = AnswerGate::default();
+    let round = request.round;
     let generating = model.generate(request, sender);
     tokio::pin!(generating);
 
     let cancel = request.cancel.clone();
+    let started = Instant::now();
+    let mut reasoning_deltas = 0_usize;
+    let mut shown_anything = false;
+    let mut heartbeat = tokio::time::interval(PROGRESS_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires its first tick immediately; drop it so the first beat
+    // lands one interval in. A round that finishes faster than that needs no
+    // indicator, and showing one for a few milliseconds is a flicker, not
+    // feedback.
+    heartbeat.tick().await;
+
     let text = loop {
         tokio::select! {
             // Bias towards draining tokens: a finished generate that leaves
             // deltas queued would otherwise emit them all after the fact.
             biased;
             Some(delta) = receiver.recv() => {
-                for text in gate.push(&delta) {
-                    emit(sink, HarnessEvent::Token { text }).await?;
+                match delta.kind {
+                    DeltaKind::Reasoning => reasoning_deltas += 1,
+                    DeltaKind::Content => {
+                        for text in gate.push(&delta.text) {
+                            shown_anything = true;
+                            emit(sink, HarnessEvent::Token { text }).await?;
+                        }
+                    }
                 }
             }
             result = &mut generating => break result?,
+            _ = heartbeat.tick() => {
+                // Silent once the answer is on screen: the text itself is then
+                // the proof of life, and a second indicator beside it only
+                // competes with the caret.
+                if !shown_anything {
+                    emit(sink, HarnessEvent::Progress(ProgressReport {
+                        phase: if reasoning_deltas > 0 { Phase::Thinking } else { Phase::Generating },
+                        reasoning_deltas,
+                        elapsed_ms: elapsed_ms(started),
+                        round,
+                    })).await?;
+                }
+            }
             // Backstop. A well-behaved ModelSurface stops its own job and
             // returns ModelError::Cancelled; this covers one that does not, so
             // "stop" is never worse than one round late.
@@ -354,11 +429,17 @@ where
         }
     };
     while let Ok(delta) = receiver.try_recv() {
-        for text in gate.push(&delta) {
-            emit(sink, HarnessEvent::Token { text }).await?;
+        if delta.kind == DeltaKind::Content {
+            for text in gate.push(&delta.text) {
+                emit(sink, HarnessEvent::Token { text }).await?;
+            }
         }
     }
     Ok((text, gate))
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn call_tool<T, S>(
@@ -421,6 +502,7 @@ mod tests {
     use super::*;
     use crate::compaction::PruneToolResults;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// Replays a script of round outputs, optionally as token deltas.
     struct ScriptedModel {
@@ -443,7 +525,7 @@ mod tests {
         async fn generate(
             &self,
             request: GenerateRequest<'_>,
-            tokens: mpsc::Sender<String>,
+            tokens: mpsc::Sender<StreamDelta>,
         ) -> Result<String, ModelError> {
             if request.cancel.is_cancelled() {
                 return Err(ModelError::Cancelled);
@@ -458,7 +540,7 @@ mod tests {
             if self.stream {
                 for chunk in text.as_bytes().chunks(3) {
                     let piece = String::from_utf8_lossy(chunk).into_owned();
-                    let _ = tokens.send(piece).await;
+                    let _ = tokens.send(StreamDelta::content(piece)).await;
                 }
             }
             Ok(text)
@@ -657,7 +739,7 @@ mod tests {
             async fn generate(
                 &self,
                 _request: GenerateRequest<'_>,
-                _tokens: mpsc::Sender<String>,
+                _tokens: mpsc::Sender<StreamDelta>,
             ) -> Result<String, ModelError> {
                 Err(ModelError::Missing)
             }
@@ -830,7 +912,7 @@ mod tests {
             async fn generate(
                 &self,
                 _request: GenerateRequest<'_>,
-                _tokens: mpsc::Sender<String>,
+                _tokens: mpsc::Sender<StreamDelta>,
             ) -> Result<String, ModelError> {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 Ok("FINAL\ntoo late".to_owned())
@@ -861,6 +943,223 @@ mod tests {
         .expect("the loop waited for a model that ignored the token")
         .unwrap_err();
         assert_eq!(error, LoopError::Cancelled);
+    }
+
+    /// Streams reasoning deltas, then an answer — a thinking model's shape.
+    struct ThinkingModel {
+        reasoning_deltas: usize,
+        answer: &'static str,
+    }
+
+    impl ModelSurface for ThinkingModel {
+        async fn generate(
+            &self,
+            _request: GenerateRequest<'_>,
+            tokens: mpsc::Sender<StreamDelta>,
+        ) -> Result<String, ModelError> {
+            for index in 0..self.reasoning_deltas {
+                let _ = tokens
+                    .send(StreamDelta::reasoning(format!("step{index} ")))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            let _ = tokens.send(StreamDelta::content(self.answer)).await;
+            Ok(self.answer.to_owned())
+        }
+    }
+
+    fn progress_reports(sink: &Recorder) -> Vec<ProgressReport> {
+        sink.events
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::Progress(report) => Some(*report),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bug this exists for. `qwen3.6:35b-mlx` sends its whole answer as one
+    /// content delta after ~131 reasoning deltas; without a heartbeat the window
+    /// is empty for that entire stretch.
+    #[tokio::test]
+    async fn a_thinking_model_reports_that_it_is_thinking() {
+        // Long enough to span several beats past the grace period, so the
+        // count is observed actually advancing rather than merely being set.
+        let model = ThinkingModel {
+            reasoning_deltas: 40,
+            answer: "FINAL\nOK",
+        };
+        let tools = EchoTools { body: String::new() };
+        let mut sink = Recorder::default();
+        let turn = run_turn(
+            &model,
+            &tools,
+            &mut sink,
+            &config(),
+            "system",
+            "task".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.answer, "OK");
+
+        let reports = progress_reports(&sink);
+        assert!(!reports.is_empty(), "no heartbeat during the thinking phase");
+        assert!(
+            reports.iter().any(|report| report.phase == Phase::Thinking),
+            "{reports:?}"
+        );
+        // The proof-of-life numbers have to actually move, or the indicator
+        // cannot answer "is it stuck".
+        let counts: Vec<usize> = reports.iter().map(|r| r.reasoning_deltas).collect();
+        assert!(
+            counts.last() > counts.first(),
+            "reasoning count never advanced: {counts:?}"
+        );
+        assert!(reports.iter().all(|report| report.round == 1));
+        // Reasoning is never shown, and never reaches the answer.
+        let streamed: String = sink
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::Token { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!streamed.contains("step"), "reasoning leaked: {streamed}");
+    }
+
+    /// The general case, which matters more than thinking: a model that has not
+    /// produced anything yet. Loading a 22 GB model cold took 12.7 s.
+    #[tokio::test]
+    async fn a_slow_first_token_reports_before_it_arrives() {
+        struct SlowModel;
+        impl ModelSurface for SlowModel {
+            async fn generate(
+                &self,
+                _request: GenerateRequest<'_>,
+                _tokens: mpsc::Sender<StreamDelta>,
+            ) -> Result<String, ModelError> {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Ok("FINAL\nloaded".to_owned())
+            }
+        }
+        let tools = EchoTools { body: String::new() };
+        let mut sink = Recorder::default();
+        run_turn(&SlowModel, &tools, &mut sink, &config(), "s", "t".to_owned())
+            .await
+            .unwrap();
+
+        let reports = progress_reports(&sink);
+        assert!(reports.len() >= 2, "{reports:?}");
+        assert!(
+            reports.iter().all(|report| report.phase == Phase::Generating),
+            "nothing was streaming, so nothing was thinking: {reports:?}"
+        );
+        let elapsed: Vec<u64> = reports.iter().map(|r| r.elapsed_ms).collect();
+        assert!(
+            elapsed.last() > elapsed.first(),
+            "elapsed never advanced: {elapsed:?}"
+        );
+    }
+
+    /// The third stretch, and the one nothing else covers: while a round is
+    /// generating a `TOOL` draft the gate hides every delta, and `tool_call`
+    /// cannot be emitted until the round has finished and parsed.
+    #[tokio::test]
+    async fn a_hidden_tool_draft_still_reports() {
+        struct SlowToolDraft;
+        impl ModelSurface for SlowToolDraft {
+            async fn generate(
+                &self,
+                request: GenerateRequest<'_>,
+                tokens: mpsc::Sender<StreamDelta>,
+            ) -> Result<String, ModelError> {
+                if request.round == 1 {
+                    let _ = tokens.send(StreamDelta::content("TOOL get_now")).await;
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    let _ = tokens.send(StreamDelta::content("\nARGS {}")).await;
+                    return Ok("TOOL get_now\nARGS {}".to_owned());
+                }
+                Ok("FINAL\ndone".to_owned())
+            }
+        }
+        let tools = EchoTools {
+            body: "{\"now_ms\":1}".to_owned(),
+        };
+        let mut sink = Recorder::default();
+        run_turn(
+            &SlowToolDraft,
+            &tools,
+            &mut sink,
+            &config(),
+            "s",
+            "t".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let first_round: Vec<ProgressReport> = progress_reports(&sink)
+            .into_iter()
+            .filter(|report| report.round == 1)
+            .collect();
+        assert!(
+            !first_round.is_empty(),
+            "the hidden TOOL draft reported nothing"
+        );
+    }
+
+    /// Once the answer is on screen the text is its own proof of life, and a
+    /// second indicator beside it only competes with the caret.
+    #[tokio::test]
+    async fn the_heartbeat_stops_once_the_answer_is_streaming() {
+        struct TalkThenPause;
+        impl ModelSurface for TalkThenPause {
+            async fn generate(
+                &self,
+                _request: GenerateRequest<'_>,
+                tokens: mpsc::Sender<StreamDelta>,
+            ) -> Result<String, ModelError> {
+                let _ = tokens.send(StreamDelta::content("FINAL\nhere")).await;
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Ok("FINAL\nhere".to_owned())
+            }
+        }
+        let tools = EchoTools { body: String::new() };
+        let mut sink = Recorder::default();
+        run_turn(
+            &TalkThenPause,
+            &tools,
+            &mut sink,
+            &config(),
+            "s",
+            "t".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            progress_reports(&sink).is_empty(),
+            "{:?}",
+            progress_reports(&sink)
+        );
+    }
+
+    /// A non-streaming adapter must not be reported as silent forever, nor
+    /// flicker: it simply gets heartbeats until its one-shot text lands.
+    #[tokio::test]
+    async fn a_non_streaming_adapter_still_reports_then_answers() {
+        let model = ScriptedModel::new(&["FINAL\nhello"], false);
+        let tools = EchoTools { body: String::new() };
+        let mut sink = Recorder::default();
+        let turn = run(&model, &tools, &mut sink).await.unwrap();
+        assert_eq!(turn.answer, "hello");
+        // Faster than one interval, so it must report nothing at all: an
+        // indicator that appears for a few milliseconds is a flicker.
+        assert!(
+            progress_reports(&sink).is_empty(),
+            "{:?}",
+            progress_reports(&sink)
+        );
     }
 
     #[test]

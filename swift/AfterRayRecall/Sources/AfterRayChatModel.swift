@@ -19,6 +19,9 @@ public protocol AfterRayChatModeling: ObservableObject {
     var contextUsage: ChatContextUsage? { get }
     /// Passes where the daemon dropped earlier evidence, live and restored.
     var compactionNotices: [ChatCompactionNotice] { get }
+    /// Set while the turn is alive but has nothing to show yet. Nil the rest of
+    /// the time, including before a turn starts.
+    var streamProgress: ChatProgress? { get }
 
     func refresh() async
     func select(_ id: String) async
@@ -44,7 +47,8 @@ public extension AfterRayChatModeling {
             streamingTools: streamTools,
             isSending: isSending,
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
-            liveCompactions: isSending ? compactionNotices : []
+            liveCompactions: isSending ? compactionNotices : [],
+            progress: streamProgress
         )
     }
 }
@@ -64,6 +68,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
     @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
+    @Published public private(set) var streamProgress: ChatProgress?
 
     private let daemon: any AfterRayChatServing
     private var sendTask: Task<Void, Never>?
@@ -111,6 +116,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         messages = []
         streamText = ""
         streamTools = []
+        streamProgress = nil
         errorMessage = nil
         contextUsage = nil
         compactionNotices = []
@@ -141,6 +147,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         isSending = true
         streamText = ""
         streamTools = []
+        streamProgress = nil
         // A new turn starts from this conversation's stored history, not from
         // the last turn's live notices.
         compactionNotices = ChatTranscript.compactions(in: messages)
@@ -161,6 +168,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         isSending = false
         streamText = ""
         streamTools = []
+        streamProgress = nil
         errorMessage = nil
         statusMessage = nil
         contextUsage = nil
@@ -181,6 +189,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
                 ChatStreamReducer.apply(event, to: &state)
                 streamText = state.text
                 streamTools = state.tools
+                streamProgress = state.progress
                 if let usage = state.usage { contextUsage = usage }
                 if !state.compactions.isEmpty { compactionNotices = state.compactions }
                 if let conversationId = state.conversationId {
@@ -227,6 +236,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             await refresh()
             streamText = ""
             streamTools = []
+        streamProgress = nil
             errorMessage = nil
             statusMessage = nil
         } catch {
@@ -252,6 +262,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         }
         streamText = ""
         streamTools = []
+        streamProgress = nil
     }
 
     private func finalizePartialStream(_ state: ChatStreamState? = nil) {
@@ -268,6 +279,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         }
         streamText = ""
         streamTools = []
+        streamProgress = nil
     }
 
     private func bindConversation(_ id: String) {

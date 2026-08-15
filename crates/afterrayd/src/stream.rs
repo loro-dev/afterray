@@ -320,6 +320,12 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, W> {
                 window_tokens,
                 round,
             },
+            HarnessEvent::Progress(report) => ChatStreamEvent::Progress {
+                phase: report.phase.as_str().to_owned(),
+                reasoning_deltas: report.reasoning_deltas,
+                elapsed_ms: report.elapsed_ms,
+                round: report.round,
+            },
             HarnessEvent::Compaction(notice) => {
                 eprintln!(
                     "chat.compaction strategy={} rounds={}..={} tokens={}->{}",
@@ -1021,6 +1027,142 @@ print(json.dumps({
             .map(|message| message.role)
             .collect();
         assert_eq!(roles, ["user"], "{roles:?}");
+    }
+
+    /// The whole dead-air chain against a real Ollama.
+    ///
+    /// Skips when the server or the model is not there — see
+    /// `afterray_models::remote::stream` for why a hardcoded tag is the wrong
+    /// guard. Set `AFTERRAY_OLLAMA_TEST_MODEL` to pin a different one.
+    ///
+    /// The assertion that matters is not "a progress event appeared" but that
+    /// its numbers advanced: a heartbeat with a frozen readout answers "is it
+    /// stuck" incorrectly.
+    #[tokio::test]
+    async fn live_ollama_reports_progress_before_the_first_token() {
+        let Some(model) = live_ollama_model().await else {
+            eprintln!("skip: no live Ollama chat model");
+            return;
+        };
+        eprintln!("live chat progress test using `{model}`");
+
+        let (_dir, vault) = test_vault();
+        let now = 1_786_729_937_000;
+        let session = vault.create_session_sync(now - 60_000).unwrap();
+        vault
+            .insert_moment(&session.id, now - 60_000, "image/jpeg", b"frame")
+            .unwrap();
+
+        let config = std::sync::Arc::new(std::sync::Mutex::new(
+            afterray_models::LlmRuntimeConfig {
+                provider: afterray_protocol::LlmProvider::Ollama,
+                base_url: String::new(),
+                model,
+                api_key: None,
+            },
+        ));
+        let router = afterray_models::LlmRouterAdapter::new(
+            afterray_models::ProcessAdapter::new(afterray_models::ProcessAdapterConfig::new(
+                "unused-builtin",
+                afterray_models::ModelCapability::Llm,
+                "/bin/false",
+            )),
+            config,
+        );
+        let sink = router.token_sink();
+        let models = ModelQueue::new(
+            vec![std::sync::Arc::new(router) as std::sync::Arc<dyn afterray_models::ModelAdapter>],
+            afterray_models::QueueConfig::default(),
+        )
+        .unwrap();
+
+        let ctx = ChatStreamCtx {
+            store: &vault,
+            models: &models,
+            token_sink: &sink,
+            now_ms: now,
+            llm_ready: true,
+            budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
+        };
+        let mut buf = Vec::new();
+        run_chat_stream(&mut buf, ctx, None, "Reply with exactly: OK")
+            .await
+            .unwrap();
+        let events = parse_events(&buf);
+
+        let progress: Vec<(String, usize, u64)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatStreamEvent::Progress {
+                    phase,
+                    reasoning_deltas,
+                    elapsed_ms,
+                    ..
+                } => Some((phase.clone(), *reasoning_deltas, *elapsed_ms)),
+                _ => None,
+            })
+            .collect();
+        eprintln!("progress events: {progress:?}");
+        assert!(!progress.is_empty(), "no heartbeat at all: {events:?}");
+        assert!(
+            progress.last().map(|entry| entry.2) > progress.first().map(|entry| entry.2),
+            "elapsed never advanced: {progress:?}"
+        );
+        // Reasoning must never reach the answer.
+        let answer: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatStreamEvent::Token { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        eprintln!("answer: {answer:?}");
+        assert!(!answer.is_empty());
+    }
+
+    /// A chat model this machine actually has, or `None`.
+    async fn live_ollama_model() -> Option<String> {
+        if let Ok(pinned) = std::env::var("AFTERRAY_OLLAMA_TEST_MODEL") {
+            let pinned = pinned.trim();
+            if !pinned.is_empty() {
+                return Some(pinned.to_owned());
+            }
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .ok()?;
+        let body: serde_json::Value = client
+            .get(format!(
+                "{}/api/tags",
+                afterray_models::DEFAULT_OLLAMA_BASE_URL
+            ))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let installed: Vec<&str> = body
+            .get("models")?
+            .as_array()?
+            .iter()
+            .filter(|model| {
+                model
+                    .get("capabilities")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|caps| {
+                        caps.iter().any(|cap| cap.as_str() == Some("completion"))
+                    })
+            })
+            .filter_map(|model| model.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        installed
+            .iter()
+            .find(|name| **name == "qwen3.6:35b-mlx")
+            .or_else(|| installed.first())
+            .map(|name| (*name).to_owned())
     }
 
     /// The tools speak epoch milliseconds; a seed that only spells the clock

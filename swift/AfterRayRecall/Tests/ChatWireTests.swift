@@ -40,6 +40,65 @@ final class ChatWireTests: XCTestCase {
         XCTAssertNil(try ChatStreamEventDecoder.decode(line: line))
     }
 
+    /// The dead-air heartbeat. Without it a thinking model leaves the window
+    /// blank for its whole reasoning phase — 131 deltas, measured.
+    func testProgressDecodesFromTheWire() throws {
+        let event = try ChatStreamEventDecoder.decode(
+            line: Data(
+                #"{"kind":"progress","phase":"thinking","reasoning_deltas":131,"elapsed_ms":2400,"round":1}"#.utf8
+            )
+        )
+        guard case .progress(let progress)? = event else {
+            return XCTFail("expected a progress event, got \(String(describing: event))")
+        }
+        XCTAssertEqual(progress.phase, .thinking)
+        XCTAssertEqual(progress.reasoningDeltas, 131)
+        XCTAssertEqual(progress.elapsedMs, 2_400)
+        XCTAssertEqual(progress.title, "Thinking")
+        XCTAssertEqual(progress.detail, "131 steps · 2.4s")
+    }
+
+    /// A phase this build has never heard of must still show something. Blanking
+    /// the indicator would put the dead air back.
+    func testUnknownProgressPhaseFallsBackRatherThanVanishing() throws {
+        let event = try ChatStreamEventDecoder.decode(
+            line: Data(#"{"kind":"progress","phase":"summarising","elapsed_ms":900}"#.utf8)
+        )
+        guard case .progress(let progress)? = event else {
+            return XCTFail("expected a progress event")
+        }
+        XCTAssertEqual(progress.phase, .generating)
+        XCTAssertEqual(progress.title, "Working")
+        XCTAssertEqual(progress.detail, "0.9s")
+    }
+
+    /// The general case, which matters more than thinking: nothing is streaming
+    /// at all, as during a cold model load.
+    func testProgressWithoutReasoningShowsElapsedOnly() {
+        let waiting = ChatProgress(phase: .generating, reasoningDeltas: 0, elapsedMs: 12_700, round: 1)
+        XCTAssertEqual(waiting.detail, "13s")
+    }
+
+    /// Once there is something to read, the indicator has to get out of the way
+    /// — two "it is working" signals at once is worse than one.
+    func testProgressClearsAsSoonAsThereIsSomethingToShow() {
+        var state = ChatStreamState()
+        let progress = ChatProgress(phase: .thinking, reasoningDeltas: 4, elapsedMs: 800, round: 1)
+
+        ChatStreamReducer.apply(.progress(progress), to: &state)
+        XCTAssertNotNil(state.progress)
+        ChatStreamReducer.apply(.token(text: "OK"), to: &state)
+        XCTAssertNil(state.progress)
+
+        ChatStreamReducer.apply(.progress(progress), to: &state)
+        ChatStreamReducer.apply(.toolCall(name: "get_now", argsJSON: "{}"), to: &state)
+        XCTAssertNil(state.progress, "the tool row takes over as the sign of work")
+
+        ChatStreamReducer.apply(.progress(progress), to: &state)
+        ChatStreamReducer.apply(.done(messageId: "m", conversationId: "c"), to: &state)
+        XCTAssertNil(state.progress)
+    }
+
     func testUsageAndCompactionDecodeFromTheWire() throws {
         let usage = try ChatStreamEventDecoder.decode(
             line: Data(#"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2}"#.utf8)
