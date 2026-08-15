@@ -424,7 +424,6 @@ where
                     args: args.clone(),
                 });
                 turn.tool_results.push(result.text.clone());
-                let body = result.text.clone();
                 transcript.push(name.clone(), args, result);
 
                 if round + 2 == config.budget.max_rounds {
@@ -973,6 +972,56 @@ mod tests {
         assert!(!turn.compactions.is_empty(), "nothing was compacted");
         assert!(sink.events.iter().any(|event| matches!(event, HarnessEvent::Compaction(_))));
         assert!(turn.usage.prompt_tokens <= ContextBudget::DEFAULT.window_tokens);
+    }
+
+    /// The reason the window has to be a real number: what we send has to fit
+    /// inside it.
+    ///
+    /// Runs a turn whose tool results dwarf the window, at each of the three
+    /// tiers a machine actually reports, and checks every prompt that reached
+    /// the model against the window the server was told to allocate. Going over
+    /// that line is not an error anywhere — Ollama drops the front of the
+    /// prompt and answers from what is left — so this assertion is the only
+    /// place the failure is visible at all.
+    #[tokio::test]
+    async fn every_prompt_fits_the_window_it_was_budgeted_for() {
+        for window in [4_096, 32_768, 262_144] {
+            let budget = ContextBudget::for_window(window);
+            let strategy = PruneToolResults;
+            let config = LoopConfig {
+                budget,
+                cancel: CancelToken::new(),
+                compaction: Some(&strategy),
+            };
+            let calls: Vec<&str> = vec![
+                "TOOL get_slot_card\nARGS {\"at_ms\":1}",
+                "TOOL get_slot_card\nARGS {\"at_ms\":2}",
+                "FINAL\ndone",
+            ];
+            let model = ScriptedModel::new(&calls, false);
+            // Far larger than any window here, so the cut has to come from us.
+            let tools = EchoTools {
+                body: "y".repeat(400_000),
+            };
+            let mut sink = Recorder::default();
+            let turn = run_turn(&model, &tools, &mut sink, &config, "system", task("task"))
+                .await
+                .unwrap();
+
+            for (round, prompt) in model.seen.lock().unwrap().iter().enumerate() {
+                let tokens = estimate_tokens(prompt);
+                assert!(
+                    tokens + budget.system_tokens + budget.reserve_tokens <= window,
+                    "{window} window: round {round} sent {tokens} tokens, \
+                     leaving nothing for the system prompt or the answer"
+                );
+            }
+            assert!(
+                turn.usage.prompt_tokens <= window,
+                "{window} window: reported {} prompt tokens",
+                turn.usage.prompt_tokens
+            );
+        }
     }
 
     /// Stop must land before the next model call, not after it. A round is

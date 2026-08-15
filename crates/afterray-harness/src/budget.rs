@@ -44,6 +44,48 @@ impl ContextBudget {
         max_rounds: 6,
     };
 
+    /// A budget for a real window, rather than the default's guess.
+    ///
+    /// The three derived numbers do not scale by the same rule, because they
+    /// are not the same kind of thing:
+    ///
+    /// * **Reserve** is what an answer costs, which barely grows with the
+    ///   window — an eighth of it, floored so a 4k window still gets a reply
+    ///   out and capped so a 256k one does not hold back 32k for a paragraph.
+    /// * **System** is a measurement, not a share: the prompt and the tool
+    ///   catalog cost what they cost. Shrinking the figure on a small window
+    ///   would not shrink the text, it would only make the budget wrong.
+    /// * **Rounds** fall on a narrow window, because six rounds of a 4k window
+    ///   means each tool result is cut to a few hundred tokens — below the size
+    ///   of a single useful answer. Fewer, larger results beat more, emptier
+    ///   ones.
+    #[must_use]
+    pub const fn for_window(window_tokens: usize) -> Self {
+        let window_tokens = if window_tokens < MINIMUM_WINDOW_TOKENS {
+            MINIMUM_WINDOW_TOKENS
+        } else {
+            window_tokens
+        };
+        let reserve_tokens = clamp(window_tokens / 8, 512, 4_096);
+        let system_tokens = Self::DEFAULT.system_tokens;
+        let transcript = window_tokens
+            .saturating_sub(reserve_tokens)
+            .saturating_sub(system_tokens);
+        let max_rounds = if transcript >= 8_192 {
+            6
+        } else if transcript >= 2_048 {
+            4
+        } else {
+            2
+        };
+        Self {
+            window_tokens,
+            reserve_tokens,
+            system_tokens,
+            max_rounds,
+        }
+    }
+
     /// What the transcript may occupy.
     #[must_use]
     pub const fn transcript_tokens(self) -> usize {
@@ -97,9 +139,35 @@ impl Default for ContextBudget {
     }
 }
 
+/// A window smaller than this cannot hold the system prompt, one tool result
+/// and a question at once, so honouring it would only mean failing differently.
+pub const MINIMUM_WINDOW_TOKENS: usize = 2_048;
+
+/// `usize::clamp` is not `const`, and `for_window` needs to be.
+const fn clamp(value: usize, low: usize, high: usize) -> usize {
+    if value < low {
+        low
+    } else if value > high {
+        high
+    } else {
+        value
+    }
+}
+
 /// The property the three old constants violated, enforced where it cannot be
 /// skipped: changing any default so a full turn no longer fits fails the build.
 const _: () = assert!(ContextBudget::DEFAULT.is_coherent());
+/// The default is not a special case: it is what the rule produces for the
+/// window it was written for. If they ever diverge, one of them is wrong.
+const _: () = assert!(matches!(
+    ContextBudget::for_window(16_384),
+    ContextBudget {
+        window_tokens: 16_384,
+        reserve_tokens: 2_048,
+        system_tokens: 1_024,
+        max_rounds: 6,
+    }
+));
 
 #[cfg(test)]
 mod tests {
@@ -160,6 +228,52 @@ mod tests {
         assert_eq!(budget.transcript_tokens(), 0);
         assert_eq!(budget.tool_result_tokens(), 0);
         assert!(!budget.is_coherent(), "a zero transcript is not a budget");
+    }
+
+    /// Every window a real provider can hand us must produce a budget that
+    /// holds a full turn. The tiers are the ones the machine probe reports;
+    /// the rest are windows an OpenAI-compatible endpoint might have.
+    #[test]
+    fn every_plausible_window_produces_a_coherent_budget() {
+        for window in [
+            0, 1, 512, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144, 1_048_576,
+        ] {
+            let budget = ContextBudget::for_window(window);
+            assert!(budget.is_coherent(), "{window} produced {budget:?}");
+            let used = budget.system_tokens
+                + budget.tool_result_tokens() * budget.max_rounds
+                + budget.reserve_tokens;
+            assert!(
+                used <= budget.window_tokens,
+                "{window}: {used} tokens over a {} window",
+                budget.window_tokens
+            );
+        }
+    }
+
+    /// A 16 GB Mac gets 4 096 from Ollama, and that is not enough room to run
+    /// six rounds of anything useful. It should buy fewer, bigger results.
+    #[test]
+    fn a_small_machine_trades_rounds_for_room() {
+        let small = ContextBudget::for_window(4_096);
+        let large = ContextBudget::for_window(262_144);
+        assert!(small.max_rounds < large.max_rounds);
+        assert!(
+            small.tool_result_tokens() > ContextBudget::for_window(4_096).transcript_tokens() / 7,
+            "fewer rounds should mean a larger share each"
+        );
+        // The reserve is an answer, not a proportion: it does not grow 64x.
+        assert_eq!(large.reserve_tokens, 4_096);
+        assert!(small.reserve_tokens >= 512);
+    }
+
+    /// Below this a window cannot hold its own overheads, so the budget stops
+    /// pretending and plans against the floor instead.
+    #[test]
+    fn an_impossible_window_is_floored_rather_than_honoured() {
+        let budget = ContextBudget::for_window(256);
+        assert_eq!(budget.window_tokens, MINIMUM_WINDOW_TOKENS);
+        assert!(budget.is_coherent());
     }
 
     /// The opening is a real share, not whatever is left over by accident.
