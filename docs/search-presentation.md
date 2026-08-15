@@ -14,7 +14,7 @@
 
 标题一直在采集（AX API，CGWindowList 兜底）并存进 `moments.window_title`，但 `evidence_fts` 只索引 `text_evidence.text`，所以搜不到。
 
-做法是在 `Vault::attach_accessibility_snapshot` 里补写一条 `source = 'window'` 的合成证据行（`crates/afterray-store/src/lib.rs`）。这样标题直接复用现有的 FTS、RRF 融合排序、`openMoment` 全套管线，没有第二套索引要维护。有 URL 时换行追加 —— 浏览器地址栏经常是隐藏的，URL 是屏幕上根本不存在的高信号文本。
+做法是在 `Vault::attach_accessibility_snapshot` 里补写一条 `source = 'window'` 的合成证据行（`crates/afterray-store/src/lib.rs`）。这样标题直接复用现有的 FTS、排序、`openMoment` 全套管线，没有第二套索引要维护。有 URL 时换行追加 —— 浏览器地址栏经常是隐藏的，URL 是屏幕上根本不存在的高信号文本。
 
 **去重是必需的，不是优化。** 采集每 10s 一帧，而一个窗口通常一待就是几分钟。不去重的话一天会写进 8640 条相同标题，把索引彻底淹掉。判据是"本 session 最近 10 分钟内是否已记录过同样的文本"（`WINDOW_TITLE_DEDUPE_MS`），这同时也收敛了 A↔B 窗口反复横跳的情况。schema 11 为此加了 `text_evidence(session_id, source, started_at_ms)` 索引，否则这个每 10s 一次的查询是全表扫描。
 
@@ -90,6 +90,45 @@ OCR bounding box 早就随 `text_evidence.layout_json` 持久化了，`evidence_
 **联动是白拿的。** 选中格子 → 改 `playheadMs` → `ImmersiveArtifactImage` 重新请求 → `RecallStillGate` 跑它本来的交叉渐变 → settle 后高亮层重新武装并闪烁。计数器因为读的是 `searchSession.selectedIndex` 也自动同步。为需求"滚动时同样触发渐变和高亮"写的新代码是零行。
 
 顶层的拖拽、滚轮、方向键在搜索态全部改道走整格步进，让整个画面都在结果之间擦洗而不是在墙钟上擦洗。触控板精确滚动要累积到整格（`searchScrollPointsPerCell`），否则一次轻扫会直接飞过十几条结果。
+
+---
+
+## 6. 召回口径：只认字面，不认语义
+
+上线后暴露出一个把上面整条动线架空的问题：**不管搜什么，永远返回 60 条**，而其中真正字面命中的没几条，跳过去满屏没有一个高亮框。
+
+三个原因叠在一起：
+
+**语义检索没有下限。** `Vault::semantic_search` 扫全部 embedding、按余弦排序、`truncate(limit)` 就返回了。"最近邻"不等于"近"：库里只要有 60 条以上证据，任何查询——包括乱敲的字符串——都必然被凑满。RRF 融合看到的是两路排名，看不到"这一路其实什么都没找到"。
+
+**中文根本进不了 FTS。** `evidence_fts` 用 fts5 默认的 `unicode61` 分词器，它按标点和空白切词，而汉字连写没有分隔符，于是一整段中文变成一个巨型 token。搜"会议"匹配不到"今天的会议纪要"。中文查询下 FTS 命中恒为 0，60 条结果全是语义噪声。
+
+**FTS 语法错误被静默吞掉。** 用户输入直接进 `MATCH`，带 `-`、未配对引号、裸 `AND` 时 SQLite 报语法错误，上层只 `eprintln` 然后当作空结果——同样退化成纯语义猜测。
+
+### 修法
+
+**UI 搜索路径只走全文检索。** `Request::Search` 改走 `text_hits`，不再融合语义结果。用户在搜索框里打字，找的是他记得自己看见过的字，期待被指出"那些字在这里"；embedding 空间里的邻居回答不了这个问题——它指向的那一帧根本没有可高亮的像素。语义召回保留给能自己权衡松匹配的调用方：chat agent 和 `search_evidence` 工具，走 `search_hits`。
+
+**给语义检索加余弦下限。** `SEMANTIC_MIN_SIMILARITY = 0.72`。低于它的不是匹配，只是"库里最不无关的东西"。查不到就返回空，而不是凑数——这些结果最终会被模型当成引证。
+
+**中文改走 bigram 折叠**（`crates/afterray-store/src/search_index.rs`）。不引入自定义分词器，而是让索引和查询走同一个折叠函数：
+
+```
+入库  会议纪要  →  "会议 议纪 纪要 要"
+查询  会议纪要  →  phrase("会议 议纪 纪要")
+```
+
+bigram phrase 要求位置连续，所以匹配一个 phrase 等价于匹配一个子串——"纪会"这种同字异序不会误命中。
+
+每个连写段额外吐出**末字单独一个 token**，一举两得：单字查询（`"会"*` 前缀）才能命中位于段尾的字（`开会` 里的"会"不是任何 bigram 的首字）；而因为它不是 bigram，它同时充当了段与段之间的栅栏，phrase 永远无法跨越两个相邻段拼接出一个假命中（`开会 议程` 搜不到"会议"）。
+
+日文假名同样按连写处理，韩文不动——韩语本来就分词书写。
+
+**查询整体加引号转义。** 用户打的 `AND`、`foo-bar`、落单的 `"` 一律当字面量匹配，而不是当语法解析，也就不会再有被吞掉的语法错误。
+
+### Schema 17
+
+`evidence_fts` 里旧数据存的是原文，不重建就永远搜不到。`migrate_schema_17` 在打开旧库时一次性重折叠整张索引——这是目前唯一一个不能每次开库都重跑的迁移步骤，所以 `migrate` 现在会在盖版本号**之前**读一次原版本号。
 
 ---
 

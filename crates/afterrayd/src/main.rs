@@ -600,7 +600,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             limit,
             from_ms,
             to_ms,
-        } => match search_hits(&state.store, &state.models, &query, limit.clamp(1, 100)).await {
+        } => match text_hits(&state.store, &query, limit.clamp(1, 100)) {
             Ok(mut hits) => {
                 if let (Some(from), Some(to)) = (from_ms, to_ms) {
                     let (from, to) = if from <= to { (from, to) } else { (to, from) };
@@ -1673,6 +1673,26 @@ async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: Stri
     }
 }
 
+/// What the recall UI searches with: exact text, and nothing else.
+///
+/// A person typing into the search field is looking for words they remember
+/// seeing, and expects to be shown where those words are. Semantic neighbours
+/// cannot answer that — the frame they point at has no matching pixels to
+/// highlight — so they are not offered here. Agents get them, under a floor,
+/// through [`search_hits`].
+pub(crate) fn text_hits(
+    store: &Vault,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, StoreError> {
+    store.search(query, limit)
+}
+
+/// Exact text fused with semantic recall, for callers that can weigh a loose
+/// match: the chat agent and the `search_evidence` tool.
+///
+/// The semantic side is floored by `SEMANTIC_MIN_SIMILARITY`, so a query with
+/// nothing near it comes back short rather than padded.
 pub(crate) async fn search_hits(
     store: &Vault,
     models: &ModelQueue,
@@ -3091,6 +3111,33 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "needle in local memory");
+    }
+
+    /// The recall UI reads this path, and a hit it shows is a hit it promises
+    /// to highlight. A neighbour in embedding space has no such pixels.
+    #[test]
+    fn ui_search_is_exact_text_only() {
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let evidence = vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                None,
+                "ocr",
+                "conceptual local context",
+                1,
+                None,
+                "ocr-model",
+                None,
+            )
+            .unwrap();
+        vault
+            .insert_embedding(&evidence, &[1.0, 0.0], "test-embedding")
+            .unwrap();
+
+        assert!(text_hits(&vault, "needle", 10).unwrap().is_empty());
+        assert_eq!(text_hits(&vault, "conceptual", 10).unwrap().len(), 1);
     }
 
     #[tokio::test]

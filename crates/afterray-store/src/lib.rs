@@ -51,6 +51,7 @@ mod gop;
 pub mod infoscore;
 mod jpeg;
 mod memory;
+pub mod search_index;
 mod slot;
 
 pub use gop::{
@@ -62,6 +63,7 @@ pub use memory::{
     AccessibilityDigest, accessibility_text_lines, digest_fingerprint, is_idle_digest,
     parse_accessibility_digest,
 };
+use search_index::{index_text, match_query};
 /// One stretch of transcribed speech: when it started, which track it came
 /// from, and what was said.
 pub type TranscriptLine = (i64, String, String);
@@ -79,7 +81,16 @@ pub use slot::{
     shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
 };
 
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
+
+/// Cosine floor for a semantic hit to count as a hit at all.
+///
+/// `semantic_search` returns nearest neighbours, and *nearest* is not *near*:
+/// without a floor the top of an empty-handed search is still handed back, so
+/// every query filled its page with the least-unrelated thing in the vault.
+/// nomic-embed-text puts unrelated everyday screen text well below this, so
+/// anything under it is noise wearing a rank.
+pub const SEMANTIC_MIN_SIMILARITY: f32 = 0.72;
 
 /// `text_evidence.source` for the synthetic rows that put window titles in FTS.
 pub const WINDOW_EVIDENCE_SOURCE: &str = "window";
@@ -2018,7 +2029,7 @@ impl Vault {
         )?;
         connection.execute(
             "INSERT INTO evidence_fts (evidence_id, text) VALUES (?1, ?2)",
-            params![id, text],
+            params![id, index_text(text)],
         )?;
         Ok(id)
     }
@@ -2163,7 +2174,15 @@ impl Vault {
         Ok(Some(payload.bytes.clone()))
     }
 
+    /// Exact-text search over every indexed evidence row.
+    ///
+    /// The query is folded by [`match_query`] so it speaks the same bigram
+    /// dialect the index was written in, and so FTS5 operators the user did not
+    /// mean to type cannot reach the parser.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
+        let Some(expression) = match_query(query) else {
+            return Ok(Vec::new());
+        };
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT COALESCE(
@@ -2183,8 +2202,9 @@ impl Vault {
              ORDER BY bm25(evidence_fts), te.started_at_ms DESC, te.id ASC
              LIMIT ?2",
         )?;
-        let rows =
-            statement.query_map(params![query, i64::try_from(limit).unwrap_or(20)], |row| {
+        let rows = statement.query_map(
+            params![expression, i64::try_from(limit).unwrap_or(20)],
+            |row| {
                 Ok(SearchHit {
                     moment_id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -2193,7 +2213,8 @@ impl Vault {
                     text: row.get(4)?,
                     score: (-row.get::<_, f64>(5)?) as f32,
                 })
-            })?;
+            },
+        )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -2218,6 +2239,11 @@ impl Vault {
     }
 
     /// Finds evidence recorded with the same embedding adapter as the query.
+    ///
+    /// Only neighbours at or above [`SEMANTIC_MIN_SIMILARITY`] come back. A
+    /// ranked list with no floor is not a search result — it is the whole
+    /// corpus in a helpful order — and every caller here presents its output as
+    /// matches, to the user or to a model that will cite them.
     ///
     /// V0 performs the cosine scan in Rust. This is intentionally simple and
     /// keeps the storage contract portable until corpus size justifies an ANN
@@ -2272,6 +2298,9 @@ impl Vault {
             let Some(score) = cosine_similarity(query_vector, &vector) else {
                 continue;
             };
+            if score < SEMANTIC_MIN_SIMILARITY {
+                continue;
+            }
             hit.score = score;
             hits.push(hit);
         }
@@ -2924,6 +2953,9 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
            error TEXT
          );",
     )?;
+    // Read before the version is stamped forward. Most steps here are cheap
+    // enough to re-run on every open; rebuilding the whole text index is not.
+    let from_version = stored_schema_version(connection)?;
     migrate_query_indexes(connection)?;
     migrate_schema_6(connection)?;
     migrate_schema_7(connection)?;
@@ -2937,9 +2969,19 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_14(connection)?;
     migrate_schema_15(connection)?;
     migrate_schema_16(connection)?;
+    migrate_schema_17(connection, from_version)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
+}
+
+fn stored_schema_version(connection: &Connection) -> Result<u32, StoreError> {
+    let version: Option<i64> = connection
+        .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+        .optional()?;
+    Ok(version
+        .and_then(|held| u32::try_from(held).ok())
+        .unwrap_or(0))
 }
 
 fn moment_column_names(connection: &Connection) -> Result<Vec<String>, StoreError> {
@@ -3360,6 +3402,32 @@ fn migrate_schema_16(connection: &Connection) -> Result<(), StoreError> {
             )?;
         }
     }
+    Ok(())
+}
+
+/// Rewrites `evidence_fts` in the folded form `index_text` now produces.
+///
+/// Rows indexed by an older build hold raw text, where a run of Han characters
+/// is one token and no substring of it can be searched. Nothing recovers that
+/// but a rebuild, so it happens once, on the open that finds an older file.
+fn migrate_schema_17(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
+    if from_version >= 17 {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute("DELETE FROM evidence_fts", [])?;
+    {
+        let mut read = transaction.prepare("SELECT id, text FROM text_evidence")?;
+        let mut write =
+            transaction.prepare("INSERT INTO evidence_fts (evidence_id, text) VALUES (?1, ?2)")?;
+        let mut rows = read.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let text: String = row.get(1)?;
+            write.execute(params![id, index_text(&text)])?;
+        }
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -4369,8 +4437,10 @@ mod tests {
         vault
             .insert_embedding(&first_evidence, &[1.0, 0.0], "embedding-model")
             .unwrap();
+        // Both sit above SEMANTIC_MIN_SIMILARITY; ordering is what is under
+        // test here, and the floor has its own test.
         vault
-            .insert_embedding(&second_evidence, &[0.0, 1.0], "embedding-model")
+            .insert_embedding(&second_evidence, &[0.8, 0.6], "embedding-model")
             .unwrap();
 
         let hits = vault
@@ -4412,6 +4482,121 @@ mod tests {
             vault.insert_embedding(&evidence, &[f32::NAN], "embedding-model"),
             Err(StoreError::InvalidEmbedding(_))
         ));
+    }
+
+    fn ocr_evidence(vault: &Vault, session_id: &str, text: &str, at_ms: i64) -> String {
+        vault
+            .insert_text_evidence(
+                session_id,
+                None,
+                None,
+                "ocr",
+                text,
+                at_ms,
+                None,
+                "ocr-model",
+                None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn chinese_is_searchable_by_substring() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        ocr_evidence(&vault, &session.id, "今天的会议纪要写完了", 1);
+
+        for query in ["会议", "会议纪要", "纪要", "今天的会议", "了"] {
+            assert_eq!(
+                vault.search(query, 10).unwrap().len(),
+                1,
+                "`{query}` should have matched"
+            );
+        }
+        // Same characters, wrong order — a phrase of bigrams is still a
+        // substring test, not a bag of words.
+        assert!(vault.search("纪会", 10).unwrap().is_empty());
+        assert!(vault.search("周报", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_phrase_cannot_straddle_two_separated_runs() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        ocr_evidence(&vault, &session.id, "开会 议程", 1);
+
+        assert_eq!(vault.search("开会", 10).unwrap().len(), 1);
+        assert_eq!(vault.search("议程", 10).unwrap().len(), 1);
+        // 会 ends one run and 议 starts the next; they are not a word.
+        assert!(vault.search("会议", 10).unwrap().is_empty());
+        // A run's last character is still reachable on its own.
+        assert_eq!(vault.search("会", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fts_syntax_in_a_query_is_matched_not_executed() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        ocr_evidence(&vault, &session.id, "build failed: retry-count exceeded", 1);
+
+        assert_eq!(vault.search("retry-count", 10).unwrap().len(), 1);
+        // These used to raise an FTS5 syntax error, which was swallowed and
+        // silently turned the search into a semantic guess.
+        for query in ["\"unbalanced", "AND", "* OR *", "(build"] {
+            vault
+                .search(query, 10)
+                .unwrap_or_else(|error| panic!("`{query}` failed: {error}"));
+        }
+    }
+
+    #[test]
+    fn semantic_search_drops_neighbours_that_are_merely_nearest() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let near = ocr_evidence(&vault, &session.id, "close enough", 1);
+        let far = ocr_evidence(&vault, &session.id, "nothing to do with it", 2);
+        vault.insert_embedding(&near, &[1.0, 0.05], "test").unwrap();
+        vault.insert_embedding(&far, &[0.0, 1.0], "test").unwrap();
+
+        let hits = vault.semantic_search(&[1.0, 0.0], "test", 10).unwrap();
+        assert_eq!(hits.len(), 1, "the far neighbour was still returned");
+        assert_eq!(hits[0].text, "close enough");
+    }
+
+    #[test]
+    fn reopening_an_older_vault_refolds_the_text_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            max_storage_bytes: 10_000_000_000,
+        };
+
+        {
+            let vault = Vault::open_with_key(config.clone(), [7_u8; 32]).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            let id = ocr_evidence(&vault, &session.id, "今天的会议纪要", 1);
+            // Put the index back the way a pre-17 build wrote it: raw text, one
+            // unsplittable token.
+            let connection = vault.connection.lock().unwrap();
+            connection.execute("DELETE FROM evidence_fts", []).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO evidence_fts (evidence_id, text) VALUES (?1, ?2)",
+                    params![id, "今天的会议纪要"],
+                )
+                .unwrap();
+            connection
+                .execute("UPDATE schema_meta SET version = 16", [])
+                .unwrap();
+            drop(connection);
+            assert!(
+                vault.search("会议", 10).unwrap().is_empty(),
+                "the old index was supposed to be unsearchable"
+            );
+        }
+
+        let vault = Vault::open_with_key(config, [7_u8; 32]).unwrap();
+        assert_eq!(vault.search("会议", 10).unwrap().len(), 1);
     }
 
     #[test]
