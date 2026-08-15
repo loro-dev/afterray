@@ -46,16 +46,13 @@ function AppWindow({ rec }: { rec: Rec }) {
           </div>
         )}
         {rec.app === 'Zoom' && (
-          <>
-            <div className="aw-tiles">
-              {['AL', 'JW', 'CY', '+2'].map((p) => (
-                <span key={p} className="mono">
-                  {p}
-                </span>
-              ))}
-            </div>
-            {'quote' in rec && rec.quote && <p className="aw-quote">{rec.quote}</p>}
-          </>
+          <div className="aw-tiles">
+            {['AL', 'JW', 'CY', '+2'].map((p) => (
+              <span key={p} className="mono">
+                {p}
+              </span>
+            ))}
+          </div>
         )}
         {rec.app === 'Notes' && (
           <div className="aw-lines aw-notes">
@@ -125,6 +122,15 @@ export default function RecallStage() {
     return best
   }, [pos, t.mock.records])
 
+  // the three transcript lines closest to the playhead, kept in clock order
+  const heard = useMemo(() => {
+    const near = [...t.mock.transcript]
+      .sort((a, b) => Math.abs(a.pos - pos) - Math.abs(b.pos - pos))
+      .slice(0, 3)
+    const current = near[0]
+    return near.sort((a, b) => a.pos - b.pos).map((l) => ({ ...l, now: l === current }))
+  }, [pos, t.mock.transcript])
+
   // the track moves; the playhead stays dead center
   const trackW = stripW * ZOOM
   const tx = stripW / 2 - pos * trackW
@@ -138,10 +144,6 @@ export default function RecallStage() {
 
   return (
     <div className="mock rc-stage">
-      {/* the captured screen of the pointed moment, dimmed under the overlay */}
-      <div className="rc-window" key={rec.time}>
-        <AppWindow rec={rec} />
-      </div>
       <div className="rc-scrim" aria-hidden="true" />
 
           <div className="rc-search">
@@ -150,6 +152,34 @@ export default function RecallStage() {
               <path d="m20 20-3.8-3.8" />
             </svg>
             {t.mock.searchHint}
+          </div>
+
+          {/* what was on screen, beside what was being said at the same second */}
+          <div className="rc-body">
+            <div className="rc-window" key={rec.time}>
+              <AppWindow rec={rec} />
+            </div>
+            <aside className="rc-heard" aria-live="polite">
+              <div className="rc-heard-head mono">
+                <span className="rc-wave" aria-hidden="true">
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                </span>
+                {t.mock.heardLabel}
+              </div>
+              <ol className="rc-heard-lines">
+                {heard.map((l) => (
+                  <li key={l.time} className={l.now ? 'rc-heard-now' : ''}>
+                    <span className="rc-heard-meta mono">
+                      {l.time} · {l.who}
+                    </span>
+                    <p>{l.text}</p>
+                  </li>
+                ))}
+              </ol>
+            </aside>
           </div>
 
           <div className="rc-cluster">

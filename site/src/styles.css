@@ -520,7 +520,12 @@ button:focus-visible {
 .rc-stage {
   position: relative;
   overflow: hidden;
-  padding: 0;
+  /* chrome is pinned top and bottom; the padding reserves their lanes so the
+     captured window and the transcript can never slide under them */
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 4.4rem 1.25rem 6.6rem;
   min-height: 560px;
   /* deslop-ignore 06 — this is the captured-desktop wallpaper inside the product mock */
   background:
@@ -531,12 +536,88 @@ button:focus-visible {
     radial-gradient(ellipse 45% 40% at 30% 70%, rgba(229, 138, 77, 0.08), transparent 65%),
     #0a0a0d;
 }
+.rc-body {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: 1.1rem;
+  align-items: start;
+}
 .rc-window {
-  position: absolute;
-  left: 50%;
-  top: 40%;
-  transform: translate(-50%, -50%);
-  width: min(42%, 28rem);
+  min-width: 0;
+}
+/* a tall capture must not stretch the stage past its chrome */
+.rc-window .appwin-body {
+  max-height: 250px;
+  overflow: hidden;
+}
+
+/* the transcript layer — what was being said while that screen was up */
+.rc-heard {
+  min-width: 0;
+  border-radius: 10px;
+  padding: 0.8rem 0.9rem;
+  background: rgba(6, 6, 7, 0.58);
+  box-shadow: 0 0 0 1px oklch(1 0 0 / 0.08);
+}
+.rc-heard-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.7rem;
+  font-size: 0.6rem;
+  letter-spacing: 0.14em;
+  color: var(--accent);
+}
+.rc-heard-lines {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+.rc-heard-lines li {
+  opacity: 0.4;
+  transition: opacity 220ms ease-out;
+}
+.rc-heard-now {
+  opacity: 1;
+}
+.rc-heard-meta {
+  display: block;
+  margin-bottom: 0.15rem;
+  font-size: 0.58rem;
+  color: var(--ink-faint);
+}
+.rc-heard-lines p {
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--ink-dim);
+}
+.rc-heard-now p {
+  color: var(--ink);
+}
+.rc-wave {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 10px;
+}
+.rc-wave i {
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  transform-origin: bottom;
+  animation: rc-wave 1s ease-in-out infinite;
+}
+.rc-wave i:nth-child(1) { height: 40%; }
+.rc-wave i:nth-child(2) { height: 90%; animation-delay: 0.15s; }
+.rc-wave i:nth-child(3) { height: 60%; animation-delay: 0.3s; }
+.rc-wave i:nth-child(4) { height: 30%; animation-delay: 0.45s; }
+@keyframes rc-wave {
+  50% {
+    transform: scaleY(0.35);
+  }
 }
 .rc-scrim {
   position: absolute;
@@ -597,6 +678,7 @@ button:focus-visible {
   background: var(--accent);
 }
 .rc-strip {
+  mask-image: linear-gradient(90deg, transparent, #000 3%, #000 97%, transparent);
   position: absolute;
   left: 1rem;
   right: 1rem;
@@ -774,10 +856,6 @@ button:focus-visible {
   border-radius: 5px;
   color: rgba(242, 237, 226, 0.7);
   font-size: 0.62rem;
-}
-.aw-quote {
-  font-size: 0.8rem;
-  line-height: 1.5;
 }
 .aw-notes strong {
   display: block;
@@ -1189,8 +1267,15 @@ button.sa-chip.sa-chip-active {
   .section {
     padding: 5rem 1.4rem;
   }
-  .hero-stage .rc-stage {
-    min-height: 400px;
+  .rc-body {
+    grid-template-columns: 1fr;
+    gap: 0.85rem;
+  }
+  .rc-window .appwin-body {
+    max-height: 160px;
+  }
+  .rc-heard-lines li:not(.rc-heard-now) {
+    display: none;
   }
   .hero-stage {
     padding-inline: 1.4rem;
@@ -1234,7 +1319,8 @@ button.sa-chip.sa-chip-active {
     transition: none;
   }
   .grain,
-  .cli-caret {
+  .cli-caret,
+  .rc-wave i {
     animation: none;
   }
 }
