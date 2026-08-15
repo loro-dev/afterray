@@ -394,7 +394,7 @@ button:focus-visible {
 .section {
   max-width: var(--maxw);
   margin: 0 auto;
-  padding: 8rem 2rem;
+  padding: 6rem 2rem;
 }
 
 /* ---------------- jobs-to-be-done ---------------- */
@@ -440,13 +440,8 @@ button:focus-visible {
   color: var(--accent);
   vertical-align: -0.08em;
 }
-.statement-sub {
-  margin-top: 1.6rem;
-  color: var(--ink-dim);
-  max-width: 32rem;
-}
 .pillar-grid {
-  margin-top: 4.5rem;
+  margin-top: 3.5rem;
   display: grid;
   grid-template-columns: 1fr 1fr;
   column-gap: 4rem;
@@ -1232,10 +1227,6 @@ button.sa-chip.sa-chip-active {
   font-size: clamp(2.4rem, 6vw, 4.6rem);
   font-weight: 600;
   line-height: 1.12;
-}
-.final-sub {
-  margin-top: 1.4rem;
-  color: var(--ink-dim);
 }
 .final-cta .hero-ctas {
   justify-content: center;

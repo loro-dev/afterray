@@ -17,7 +17,6 @@ export default function Closer() {
             <br />
             {t.privacy.statementB}
           </h2>
-          <p className="statement-sub">{t.privacy.sub}</p>
         </Reveal>
         <div className="pillar-grid">
           {t.privacy.pillars.map((p, i) => (
@@ -55,7 +54,6 @@ export default function Closer() {
             <br />
             <Rich parts={t.final.titleB} />
           </h2>
-          <p className="final-sub">{t.final.sub}</p>
           <div className="hero-ctas">
             <a className="btn btn-primary" href="#download">
               {t.final.ctaPrimary}

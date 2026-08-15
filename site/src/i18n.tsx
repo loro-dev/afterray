@@ -52,7 +52,7 @@ const en = {
     },
   ],
   recall: {
-    body: 'Press ⇧⌘Space in any app and the day comes back — the screen as it was, the audio as it sounded. Zoom the timeline from one second out to a month and land on the exact moment.',
+    body: '⇧⌘Space from any app. Zoom from one second out to a month.',
     mock: {
       status: 'Recording',
       searchHint: 'Search your day — Tab for AI chat',
@@ -98,11 +98,10 @@ const en = {
   memories: {
     titleA: ['You did a lot today.'] as Part[],
     titleB: ["Here's ", { em: 'what it was.' }] as Part[],
-    body: 'AfterRay folds your day into episodes and writes a line or two about each — what you were doing, and what it was for. The model runs on this Mac, and it is told never to invent a file, a URL, or a task it did not see.',
+    body: 'AfterRay writes your day back to you, hour by hour. The model runs here, and it is told never to invent a file, a URL, or a task it did not see.',
     points: [
       'Written on the hour, without being asked',
       'Every line opens to the moment behind it',
-      'Grounded in what was actually on screen',
     ],
     mock: {
       head: 'Friday, Aug 14',
@@ -134,7 +133,7 @@ const en = {
   searchAsk: {
     titleA: ['Half-remember it.'] as Part[],
     titleB: ['Find it ', { em: 'exactly.' }] as Part[],
-    body: 'Forget the filename, forget the app. Full-text search plus on-device semantic embeddings take any half-remembered phrase straight to the evidence — or just ask, and get an answer with citations you can tap to replay.',
+    body: 'Forget the filename and the app. A half-remembered phrase is enough — or just ask.',
     points: [
       'Joint search across OCR text and transcripts',
       'Semantic search: by meaning, not just keywords',
@@ -246,7 +245,6 @@ const en = {
   privacy: {
     statementA: ' bytes',
     statementB: 'leave your Mac.',
-    sub: 'Screen, audio, and semantics are captured to an encrypted vault on this Mac. OCR, speech recognition, and embeddings run on-device. Summaries and answers come from a model running here. There is no account to create and no server to trust — the originals stay put, for as long as you keep them.',
     pillars: [
       {
         title: 'Captured locally',
@@ -280,7 +278,6 @@ const en = {
   final: {
     titleA: ['Give your Mac'] as Part[],
     titleB: ['a memory that ', { em: 'never forgets.' }] as Part[],
-    sub: 'Runs on your Mac · No account · Your data stays yours',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'GitHub',
   },
@@ -328,7 +325,7 @@ const zh: Copy = {
     },
   ],
   recall: {
-    body: '在任意 App 里按下 ⇧⌘Space，这一天就回来了——当时的画面，当时的声音。时间线从一秒连续缩放到一个月，落回确切的那一刻。',
+    body: '任意 App 里按 ⇧⌘Space。从一秒缩放到一个月。',
     mock: {
       status: '录制中',
       searchHint: '搜索你的一天 — Tab 打开 AI 对话',
@@ -372,11 +369,10 @@ const zh: Copy = {
   memories: {
     titleA: ['今天你做了很多，'],
     titleB: ['它都替你', { em: '记下来了。' }],
-    body: 'AfterRay 把这一天折叠成一个个片段，为每段写下一两句——你当时在做什么、为了什么。模型跑在这台 Mac 上，并且被明确要求：没看见的文件、链接、任务，一个字都不能编。',
+    body: 'AfterRay 按小时把这一天写回给你。模型跑在本机，并且被明确要求：没看见的文件、链接、任务，一个字都不能编。',
     points: [
       '整点自动写好，不用你开口',
       '每一行都能翻回背后那一刻',
-      '只依据屏幕上真实出现过的内容',
     ],
     mock: {
       head: '8 月 14 日 周五',
@@ -408,7 +404,7 @@ const zh: Copy = {
   searchAsk: {
     titleA: ['只记得大概，'],
     titleB: ['也能找回', { em: '确切。' }],
-    body: '不记得文件名，不记得在哪个 App——没关系。全文检索叠加本地语义 embedding，用你记住的只言片语直接跳回证据；或者干脆问一句，拿到的答案自带可回放的时刻引用。',
+    body: '不记得文件名，不记得在哪个 App，只记得只言片语——够了。或者干脆问一句。',
     points: [
       'OCR 全文 + 语音转写联合检索',
       '语义搜索：按「意思」而不只是关键字',
@@ -517,7 +513,6 @@ const zh: Copy = {
   privacy: {
     statementA: ' 字节',
     statementB: '离开你的 Mac。',
-    sub: '屏幕、声音与语义，捕获进这台 Mac 上的加密 Vault。OCR、语音识别与 embedding 都在本机完成。总结和回答，来自跑在这里的模型。没有账号要注册，没有服务器需要信任——原件留在原地，你留多久它就在多久。',
     pillars: [
       {
         title: '捕获在本地',
@@ -551,7 +546,6 @@ const zh: Copy = {
   final: {
     titleA: ['让你的 Mac'],
     titleB: ['拥有', { em: '不会遗忘' }, '的记忆。'],
-    sub: '本机运行 · 无需账号 · 你的数据永远只是你的',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: 'GitHub',
   },
