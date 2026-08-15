@@ -526,18 +526,30 @@ private var historyPanelScene: [SnapshotScene] {
 MainActor.assumeIsolated { SnapshotRunner.main() }
 
 
-/// The exclusion lists, rendered offscreen. They are the one settings surface
-/// where being wrong is a privacy failure rather than an annoyance, so they get
-/// checked against pixels rather than assumed from the code.
+/// Privacy exclusions and gated developer controls, rendered offscreen so
+/// settings layout changes are checked against pixels rather than assumed.
 @MainActor
 private var settingsScenes: [SnapshotScene] {
     let empty = SettingsPreviewModel()
     let filled = SettingsPreviewModel()
+    let developer = SettingsPreviewModel()
     filled.excludedBundleIds = ["com.tencent.xinWeChat", "com.tinyspeck.slackmacgap"]
     filled.excludedDomains = ["bank.example", "mail.example.com"]
+    developer.unlockDeveloperOptions()
+    developer.setDeveloperOptionsEnabled(true)
     return [
         settingsScene(name: "14-settings-exclusions-empty", model: empty),
         settingsScene(name: "15-settings-exclusions-filled", model: filled),
+        settingsScene(
+            name: "16-settings-advanced-developer-toggle",
+            model: developer,
+            initialPage: .advanced
+        ),
+        settingsScene(
+            name: "16-settings-developer-options",
+            model: developer,
+            initialPage: .developer
+        ),
     ]
 }
 
@@ -588,13 +600,17 @@ private var captionScenes: [SnapshotScene] {
 }
 
 @MainActor
-private func settingsScene(name: String, model: SettingsPreviewModel) -> SnapshotScene {
+private func settingsScene(
+    name: String,
+    model: SettingsPreviewModel,
+    initialPage: AfterRaySettingsPage = .general
+) -> SnapshotScene {
     SnapshotScene(
         name: name,
         size: CGSize(width: 900, height: 700),
         settleSeconds: 1.2,
         content: AnyView(
-            AfterRaySettingsView(model: model, onClose: {}, initialPage: .general)
+            AfterRaySettingsView(model: model, onClose: {}, initialPage: initialPage)
                 .frame(width: 900, height: 700)
         )
     )

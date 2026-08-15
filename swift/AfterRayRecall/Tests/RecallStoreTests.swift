@@ -109,6 +109,128 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.selectedMoment?.id, "m1")
         XCTAssertEqual(store.moments.map(\.id), ["m1", "m2", "m3"])
     }
+
+    func testSelectingLoadedOlderDayPreservesNewerHistoryAndPagination() async {
+        let today = summaryDay("today", startingAt: 400)
+        let pagedYesterday = summaryDay("paged-yesterday", startingAt: 300)
+        let selectedYesterday = summaryDay("selected-yesterday", startingAt: 300)
+        let older = summaryDay("older", startingAt: 200)
+        let daemon = SummaryHistoryDaemon(
+            selectedDays: [
+                today.dayStartMs: today,
+                selectedYesterday.dayStartMs: selectedYesterday,
+            ],
+            pages: [
+                today.dayStartMs: SummaryHistoryPage(
+                    days: [pagedYesterday],
+                    nextBeforeMs: pagedYesterday.dayStartMs,
+                    hasMore: true
+                ),
+                pagedYesterday.dayStartMs: SummaryHistoryPage(
+                    days: [older],
+                    nextBeforeMs: nil,
+                    hasMore: false
+                ),
+            ]
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.loadDaySummary(dayMs: today.dayStartMs, force: true)
+        XCTAssertEqual(store.summaryHistory, [today, pagedYesterday])
+        XCTAssertTrue(store.summaryHistoryHasMore)
+
+        await store.loadDaySummary(dayMs: selectedYesterday.dayStartMs, force: true)
+        XCTAssertEqual(store.daySummary, selectedYesterday)
+        XCTAssertEqual(store.summaryHistory, [today, selectedYesterday])
+        XCTAssertTrue(store.summaryHistoryHasMore)
+        let requestsAfterSelection = await daemon.recordedSummaryHistoryRequests()
+        XCTAssertEqual(requestsAfterSelection, [today.dayStartMs])
+
+        await store.loadOlderSummaryHistory()
+        XCTAssertEqual(store.summaryHistory, [today, selectedYesterday, older])
+        XCTAssertFalse(store.summaryHistoryHasMore)
+        let requestsAfterPagination = await daemon.recordedSummaryHistoryRequests()
+        XCTAssertEqual(requestsAfterPagination, [today.dayStartMs, pagedYesterday.dayStartMs])
+    }
+
+    func testSelectingUnloadedOlderDayKeepsHistorySortedWhenPaginationFillsGap() async {
+        let today = summaryDay("today", startingAt: 400)
+        let yesterday = summaryDay("yesterday", startingAt: 300)
+        let middle = summaryDay("middle", startingAt: 200)
+        let selectedOlder = summaryDay("selected-older", startingAt: 100)
+        let daemon = SummaryHistoryDaemon(
+            selectedDays: [
+                today.dayStartMs: today,
+                selectedOlder.dayStartMs: selectedOlder,
+            ],
+            pages: [
+                today.dayStartMs: SummaryHistoryPage(
+                    days: [yesterday],
+                    nextBeforeMs: yesterday.dayStartMs,
+                    hasMore: true
+                ),
+                yesterday.dayStartMs: SummaryHistoryPage(
+                    days: [middle],
+                    nextBeforeMs: nil,
+                    hasMore: false
+                ),
+            ]
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.loadDaySummary(dayMs: today.dayStartMs, force: true)
+        await store.loadDaySummary(dayMs: selectedOlder.dayStartMs, force: true)
+        XCTAssertEqual(store.summaryHistory, [today, yesterday, selectedOlder])
+
+        await store.loadOlderSummaryHistory()
+        XCTAssertEqual(store.summaryHistory, [today, yesterday, middle, selectedOlder])
+    }
+}
+
+private func summaryDay(_ day: String, startingAt dayStartMs: Int64) -> DaySummary {
+    DaySummary(day: day, dayStartMs: dayStartMs, dayEndMs: dayStartMs + 99, slots: [])
+}
+
+private actor SummaryHistoryDaemon: RecallDaemonServing {
+    private let selectedDays: [Int64: DaySummary]
+    private let pages: [Int64: SummaryHistoryPage]
+    private var summaryHistoryRequests: [Int64?] = []
+
+    init(selectedDays: [Int64: DaySummary], pages: [Int64: SummaryHistoryPage]) {
+        self.selectedDays = selectedDays
+        self.pages = pages
+    }
+
+    func sessions() async throws -> [RecallSession] { [] }
+    func timeline() async throws -> [RecallMoment] { [] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
+    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
+    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
+
+    func daySummary(dayMs: Int64) async throws -> DaySummary {
+        guard let summary = selectedDays[dayMs] else {
+            throw DaemonClientError.rejected("No summary for \(dayMs)")
+        }
+        return summary
+    }
+
+    func summaryHistory(beforeMs: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
+        summaryHistoryRequests.append(beforeMs)
+        guard let beforeMs, let page = pages[beforeMs] else {
+            return SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
+        }
+        return page
+    }
+
+    func recordedSummaryHistoryRequests() -> [Int64?] {
+        summaryHistoryRequests
+    }
+
+    func artifact(id: String) async throws -> ArtifactPayload {
+        ArtifactPayload(id: id, contentType: "image/png", bytes: Data())
+    }
+
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 
 private actor RefreshingDaemon: RecallDaemonServing {

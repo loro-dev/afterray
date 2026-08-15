@@ -1190,6 +1190,43 @@ button.sa-chip.sa-chip-active {
   font-size: 0.78rem;
 }
 
+/* Set apart by a rule rather than a card: the cage is a claim about the same
+   product, not a second feature competing with the one above it. */
+.agents-jail {
+  margin-top: 2.25rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--line);
+  max-width: 40rem;
+}
+.agents-jail-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+.agents-jail-body {
+  margin-top: 0.55rem;
+  font-size: 0.88rem;
+  color: var(--ink-dim);
+}
+.agents-jail-proof {
+  display: inline-block;
+  margin-top: 0.7rem;
+  font-size: 0.78rem;
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-soft);
+  padding-bottom: 1px;
+  transition: border-color 0.15s ease;
+}
+.agents-jail-proof:hover {
+  border-bottom-color: var(--accent);
+}
+.agents-jail-caveat {
+  margin-top: 0.85rem;
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
 /* ---------------- pipeline / specs ---------------- */
 .pipe-row {
   margin: 3.5rem auto 4rem;

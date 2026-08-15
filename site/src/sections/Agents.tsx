@@ -51,6 +51,26 @@ export default function Agents() {
           <p className="agents-label dim">{t.toolsLabel}</p>
           <p className="agents-tools">{t.tools.join(' · ')}</p>
         </Reveal>
+        {/* The counterpart to the section above it: that one is the agent we
+            open the vault to, this one is the agent we keep in a cage. Read
+            together they say what the boundary is in both directions. */}
+        <Reveal delay={90}>
+          <div className="agents-jail">
+            <p className="agents-jail-title">{t.jailTitle}</p>
+            <p className="agents-jail-body">{t.jailBody}</p>
+            <a
+              className="agents-jail-proof mono"
+              href={t.jailProofHref}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {t.jailProof}
+            </a>
+            {/* Said plainly rather than buried: a privacy claim that is false
+                in a configuration we ship is worse than no claim. */}
+            <p className="agents-jail-caveat dim">{t.jailCaveat}</p>
+          </div>
+        </Reveal>
       </div>
       <Reveal className="feature-mock" delay={150}>
         <div className="mock cli-mock mono agents-install">

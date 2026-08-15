@@ -309,6 +309,7 @@ public struct ModelJob: Codable, Equatable, Identifiable, Sendable {
 
 public struct ModelDownloadProgress: Codable, Equatable, Sendable {
     public let packId: String
+    public let queuedPackIds: [String]
     public let state: ModelPackState
     public let bytes: UInt64
     public let expectedBytes: UInt64?
@@ -318,6 +319,7 @@ public struct ModelDownloadProgress: Codable, Equatable, Sendable {
 
     public init(
         packId: String,
+        queuedPackIds: [String] = [],
         state: ModelPackState = .downloading,
         bytes: UInt64,
         expectedBytes: UInt64? = nil,
@@ -326,6 +328,7 @@ public struct ModelDownloadProgress: Codable, Equatable, Sendable {
         error: String? = nil
     ) {
         self.packId = packId
+        self.queuedPackIds = queuedPackIds
         self.state = state
         self.bytes = bytes
         self.expectedBytes = expectedBytes
@@ -343,8 +346,15 @@ public struct ModelDownloadProgress: Codable, Equatable, Sendable {
         fraction.map { Int(($0 * 100).rounded(.down)) }
     }
 
+    public var isActive: Bool {
+        state == .downloading || state == .verifying
+    }
+
+    public var isPaused: Bool { state == .paused }
+
     enum CodingKeys: String, CodingKey {
         case packId = "pack_id"
+        case queuedPackIds = "queued_pack_ids"
         case state
         case bytes
         case expectedBytes = "expected_bytes"
@@ -356,6 +366,7 @@ public struct ModelDownloadProgress: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         packId = try container.decode(String.self, forKey: .packId)
+        queuedPackIds = try container.decodeIfPresent([String].self, forKey: .queuedPackIds) ?? []
         state = try container.decodeIfPresent(ModelPackState.self, forKey: .state) ?? .downloading
         bytes = try container.decode(UInt64.self, forKey: .bytes)
         expectedBytes = try container.decodeIfPresent(UInt64.self, forKey: .expectedBytes)
@@ -369,6 +380,7 @@ public enum ModelPackState: String, Codable, Equatable, Sendable {
     case notDownloaded = "not_downloaded"
     case downloading
     case verifying
+    case paused
     case ready
     case inUse = "in_use"
     case failed
@@ -564,6 +576,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public let captureIntervalSeconds: UInt64
     public let storageLimitBytes: UInt64
     public let excludedBundleIds: [String]
+    /// Credential-bearing and system apps the daemon never captures.
+    public let protectedBundleIds: [String]
     /// Hosts never recorded. Subdomains are covered by the daemon.
     public let excludedDomains: [String]
     public let llmProvider: LlmProvider
@@ -581,6 +595,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         captureIntervalSeconds: UInt64,
         storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
         excludedBundleIds: [String] = [],
+        protectedBundleIds: [String] = [],
         excludedDomains: [String] = [],
         llmProvider: LlmProvider = .mlxLocal,
         llmBaseUrl: String = "",
@@ -596,6 +611,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.captureIntervalSeconds = captureIntervalSeconds
         self.storageLimitBytes = storageLimitBytes
         self.excludedBundleIds = excludedBundleIds
+        self.protectedBundleIds = protectedBundleIds
         self.excludedDomains = excludedDomains
         self.llmProvider = llmProvider
         self.llmBaseUrl = llmBaseUrl
@@ -613,6 +629,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case captureIntervalSeconds = "capture_interval_seconds"
         case storageLimitBytes = "storage_limit_bytes"
         case excludedBundleIds = "excluded_bundle_ids"
+        case protectedBundleIds = "protected_bundle_ids"
         case excludedDomains = "excluded_domains"
         case llmProvider = "llm_provider"
         case llmBaseUrl = "llm_base_url"
@@ -632,6 +649,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
             ?? Self.defaultStorageLimitBytes
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
+        protectedBundleIds = try container.decodeIfPresent([String].self, forKey: .protectedBundleIds) ?? []
         excludedDomains = try container.decodeIfPresent([String].self, forKey: .excludedDomains) ?? []
         llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .mlxLocal
         llmBaseUrl = try container.decodeIfPresent(String.self, forKey: .llmBaseUrl) ?? ""

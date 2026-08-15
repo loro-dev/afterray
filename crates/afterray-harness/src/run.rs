@@ -293,6 +293,10 @@ impl From<ModelError> for LoopError {
 /// [`LoopError::Model`] when a round could not produce text,
 /// [`LoopError::SinkClosed`] when the client hung up, and
 /// [`LoopError::Exhausted`] when every round was spent without an answer.
+// Keeping the state transitions in one function makes the round budget,
+// cancellation checks, tool execution, and answer-only final round auditable
+// as one loop. Splitting it would hide transitions behind helper side effects.
+#[allow(clippy::too_many_lines)]
 pub async fn run_turn<M, T, S>(
     model: &M,
     tools: &T,

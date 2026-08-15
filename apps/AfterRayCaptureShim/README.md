@@ -49,3 +49,11 @@ After the `ready` event, enter one command per line:
 Stdout is reserved for JSON-line events. JPEG and bounded M4A segments are
 written beneath `--output-dir`; Rust consumes the paths and imports them into
 the AfterRay store.
+
+Before taking a screenshot, the shim checks the foreground browser's private
+window state. Supported Chromium browsers expose a read-only AppleScript
+window mode; Firefox and Accessibility chrome provide positive fallbacks. The
+script never requests a tab URL or title. macOS may ask for Automation access
+to the active Chromium browser. If that access is denied or a browser does not
+expose a stable signal, detection remains best-effort rather than treating an
+unknown result as a regular window.

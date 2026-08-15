@@ -50,11 +50,10 @@ pub fn installed_socket_path() -> std::io::Result<PathBuf> {
 }
 
 /// A binary at `<checkout>/target/{debug,release}/x` belongs to a source
-/// build, which the app runs out of `<checkout>/.afterray-dev`. Keyed on the
-/// executable's own path rather than the working directory: an agent's
-/// working directory is attacker-chosen soil, and planting
-/// `.afterray-dev/afterray.sock` in a repository would otherwise be enough to
-/// intercept everything the CLI asks for.
+/// build. The checkout identifies the socket, but cannot contain it: macOS's
+/// Unix socket path limit is shorter than a typical Lody worktree path.
+/// Keying on the executable rather than the working directory also prevents an
+/// attacker-chosen cwd from redirecting the CLI.
 fn development_socket_path(executable: &Path) -> Option<PathBuf> {
     let profile_dir = executable.parent()?;
     if !matches!(profile_dir.file_name()?.to_str()?, "debug" | "release") {
@@ -64,12 +63,24 @@ fn development_socket_path(executable: &Path) -> Option<PathBuf> {
     if target_dir.file_name()?.to_str()? != "target" {
         return None;
     }
+    let checkout = target_dir.parent()?;
+    let canonical = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    let token = fnv1a64(canonical.to_string_lossy().as_bytes());
     Some(
-        target_dir
-            .parent()?
-            .join(".afterray-dev")
-            .join("afterray.sock"),
+        dirs::cache_dir()?
+            .join("AfterRay")
+            .join("DevSockets")
+            .join(format!("{token:016x}.sock")),
     )
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -78,18 +89,24 @@ mod tests {
 
     #[test]
     fn a_cargo_artifact_resolves_the_checkout_socket() {
+        let release =
+            development_socket_path(Path::new("/Users/dev/afterray/target/release/afterray"))
+                .unwrap();
+        let debug =
+            development_socket_path(Path::new("/Users/dev/afterray/target/debug/afterrayd"))
+                .unwrap();
+        assert_eq!(release, debug);
         assert_eq!(
-            development_socket_path(Path::new("/Users/dev/afterray/target/release/afterray")),
-            Some(PathBuf::from(
-                "/Users/dev/afterray/.afterray-dev/afterray.sock"
-            ))
+            release.extension().and_then(|value| value.to_str()),
+            Some("sock")
         );
-        assert_eq!(
-            development_socket_path(Path::new("/Users/dev/afterray/target/debug/afterrayd")),
-            Some(PathBuf::from(
-                "/Users/dev/afterray/.afterray-dev/afterray.sock"
-            ))
-        );
+        assert!(!release.starts_with("/Users/dev/afterray"), "{release:?}");
+        assert!(release.as_os_str().len() < 104, "{release:?}");
+    }
+
+    #[test]
+    fn checkout_hash_matches_the_cross_language_test_vector() {
+        assert_eq!(fnv1a64(b"hello"), 0xa430_d846_80aa_bd0b);
     }
 
     #[test]
@@ -99,7 +116,9 @@ mod tests {
             None
         );
         assert_eq!(
-            development_socket_path(Path::new("/Applications/AfterRay.app/Contents/Helpers/afterray")),
+            development_socket_path(Path::new(
+                "/Applications/AfterRay.app/Contents/Helpers/afterray"
+            )),
             None
         );
         // `release` alone is not a cargo layout: the parent has to be `target`.

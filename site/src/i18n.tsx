@@ -234,6 +234,18 @@ const en = {
     install: 'npx skills add loro-dev/afterray -g',
     installOut: 'installed afterray → Claude Code, Codex, Hermes',
     note: 'Read-only. The vault key never leaves the daemon.',
+    jailTitle: 'The assistant inside AfterRay is caged.',
+    jailBody:
+      'It reads your vault and answers, and it has no second mode. No HTTP client, '
+      + 'because the crate the loop lives in depends on nothing that could make a '
+      + 'request. No shell and no filesystem, because a build rule fails if a tool so '
+      + 'much as names them.',
+    jailProof: 'Three dependencies and one build rule. Both are readable in a minute.',
+    jailProofHref:
+      'https://github.com/loro-dev/afterray/blob/main/docs/harness-threat-model.md',
+    jailCaveat:
+      'Point it at a local model and none of this leaves the Mac. Point it at a cloud '
+      + 'endpoint and the prompt goes there — that is what choosing one means.',
     mock: [
       { cmd: 'afterray search "keeping favorites" --limit 1', out: '[ { "source": "transcript", "time": "Wed 11:02 AM",\n    "text": "favorites never expire…" } ]' },
       { cmd: 'afterray ask "where did we land on retention?"', out: '{ "answer": "Stars are exempt; the rest fits the storage budget.",\n  "citations": [ "Wed 3:15 PM · GitHub" ] }' },
@@ -500,6 +512,17 @@ const zh: Copy = {
     install: 'npx skills add loro-dev/afterray -g',
     installOut: 'installed afterray → Claude Code, Codex, Hermes',
     note: '只读。Vault 密钥永不离开守护进程。',
+    jailTitle: 'AfterRay 内置的助手被关在笼子里。',
+    jailBody:
+      '它读你的 vault，然后回答，没有第二种模式。没有 HTTP 客户端——它运行的那个 '
+      + 'crate 的依赖里就没有任何能发请求的东西。没有 shell、没有文件系统——工具的源码里'
+      + '只要出现这些名字，构建就会失败。',
+    jailProof: '三个依赖，一条构建规则。一分钟就能读完。',
+    jailProofHref:
+      'https://github.com/loro-dev/afterray/blob/main/docs/harness-threat-model.md',
+    jailCaveat:
+      '配本地模型，这些一个字节都不出这台 Mac。配云端接口，prompt 就会送过去——'
+      + '选择云端模型，本来就是这个意思。',
     mock: [
       { cmd: 'afterray search "保留收藏" --limit 1', out: '[ { "source": "transcript", "time": "周三 11:02",\n    "text": "收藏永不过期…" } ]' },
       { cmd: 'afterray ask "保留怎么定的？"', out: '{ "answer": "标星豁免；其余的在存储预算内。",\n  "citations": [ "周三 15:15 · GitHub" ] }' },

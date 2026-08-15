@@ -22,25 +22,35 @@ final class OnboardingController: ObservableObject {
     private static let completedKey = "dev.afterray.onboarding.completed.v1"
 
     private let defaults: UserDefaults
-    private let model: AfterRayOnboardingModel
+    private var model: AfterRayOnboardingModel
     private var panel: OnboardingPanel?
+    private var practiceMonitor: Any?
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private(set) var isFinished: Bool
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        isFinished = defaults.bool(forKey: Self.completedKey)
+        isFinished = !CommandLine.arguments.contains("--onboarding")
+            && defaults.bool(forKey: Self.completedKey)
+        model = Self.makeModel()
+    }
+
+    private static func makeModel() -> AfterRayOnboardingModel {
         let exclusions = OnboardingExclusions()
-        model = AfterRayOnboardingModel(
+        return AfterRayOnboardingModel(
             hotKeys: .shared,
             privacyActions: AfterRayOnboardingPrivacyActions(
                 excludedApps: { exclusions.bundleIds },
                 excludedDomains: { exclusions.domains },
+                protectedApps: { exclusions.protectedBundleIds },
+                refresh: { await exclusions.load() },
                 addApp: { await exclusions.pickApp() },
                 removeApp: { bundleID in await exclusions.removeApp(bundleID) },
                 addDomain: { typed in await exclusions.addDomain(typed) },
                 removeDomain: { domain in await exclusions.removeDomain(domain) },
-                displayName: { OnboardingExclusions.displayName(for: $0) }
+                displayName: { OnboardingExclusions.displayName(for: $0) },
+                iconPath: { OnboardingExclusions.iconPath(for: $0) },
+                message: { exclusions.message }
             ),
             cliActions: AfterRayOnboardingCliActions(
                 status: { AfterRayCliInstall.statusSummary },
@@ -57,11 +67,11 @@ final class OnboardingController: ObservableObject {
                         socketPath: DaemonSupervisor.shared.socketPath
                     ).modelLibrary()
                 },
-                download: { packID in
+                download: { packIDs in
                     _ = try await DaemonSupervisor.shared.startIfNeeded()
                     return try await UnixSocketDaemonClient(
                         socketPath: DaemonSupervisor.shared.socketPath
-                    ).downloadModels(packID: packID)
+                    ).startModelDownloads(packIDs: packIDs)
                 }
             )
         )
@@ -71,6 +81,21 @@ final class OnboardingController: ObservableObject {
 
     func showIfNeeded() {
         guard !isFinished, panel == nil else { return }
+        show()
+    }
+
+    /// Development-only entry point wired into the menu bar. It leaves the
+    /// completion preference intact, so quitting halfway through a replay
+    /// cannot turn the next normal launch back into a first launch.
+    func replay() {
+        if let panel, panel.isVisible {
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
+        AfterRaySettingsController.shared.hide()
+        RecallOverlayController.shared.hide(returnFocus: false)
+        model = Self.makeModel()
+        isFinished = false
         show()
     }
 
@@ -84,6 +109,7 @@ final class OnboardingController: ObservableObject {
     func finish() {
         guard !isFinished || isVisible else { return }
         isFinished = true
+        model.stopObservingModelDownloads()
         defaults.set(true, forKey: Self.completedKey)
         dismissPanel()
         let pending = waiters
@@ -138,6 +164,7 @@ final class OnboardingController: ObservableObject {
         panel.alphaValue = 0
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+        beginPracticeMonitoring()
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.34
@@ -148,6 +175,7 @@ final class OnboardingController: ObservableObject {
     }
 
     private func dismissPanel() {
+        endPracticeMonitoring()
         guard let panel else { return }
         self.panel = nil
         NSAnimationContext.runAnimationGroup { context in
@@ -156,6 +184,33 @@ final class OnboardingController: ObservableObject {
         } completionHandler: {
             panel.orderOut(nil)
         }
+    }
+
+    private func beginPracticeMonitoring() {
+        guard practiceMonitor == nil else { return }
+        practiceMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.flagsChanged, .keyDown, .keyUp]
+        ) { [weak self] event in
+            guard let self else { return event }
+            model.updatePracticeModifiers(RecallHotKey.Modifiers(event.modifierFlags))
+            switch event.type {
+            case .keyDown:
+                if !event.isARepeat {
+                    model.updatePracticeKey(keyCode: event.keyCode, isPressed: true)
+                }
+            case .keyUp:
+                model.updatePracticeKey(keyCode: event.keyCode, isPressed: false)
+            default:
+                break
+            }
+            return event
+        }
+    }
+
+    private func endPracticeMonitoring() {
+        guard let practiceMonitor else { return }
+        NSEvent.removeMonitor(practiceMonitor)
+        self.practiceMonitor = nil
     }
 
     private var targetScreen: NSScreen {

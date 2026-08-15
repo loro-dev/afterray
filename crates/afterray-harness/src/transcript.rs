@@ -89,7 +89,6 @@ impl Transcript {
         self.entries.push(Entry::Control(text.into()));
     }
 
-    #[must_use]
     pub fn rounds(&self) -> impl Iterator<Item = &Round> {
         self.entries.iter().filter_map(|entry| match entry {
             Entry::Tool(round) => Some(round),

@@ -225,7 +225,12 @@ pub enum Request {
     DownloadModels {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pack_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pack_ids: Vec<String>,
     },
+    PauseModelDownloads,
+    ResumeModelDownloads,
+    CancelModelDownloads,
     RemoveModel {
         pack_id: String,
     },
@@ -243,6 +248,8 @@ pub struct ModelLibrary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelDownloadProgress {
     pub pack_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_pack_ids: Vec<String>,
     #[serde(default)]
     pub state: ModelPackState,
     pub bytes: u64,
@@ -261,6 +268,7 @@ pub enum ModelPackState {
     NotDownloaded,
     Downloading,
     Verifying,
+    Paused,
     Ready,
     InUse,
     Failed,
@@ -410,6 +418,10 @@ pub struct AppSettings {
     pub storage_limit_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_bundle_ids: Vec<String>,
+    /// Credential-bearing and system surfaces the daemon always excludes.
+    /// Clients use this to explain why these rows cannot be removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_bundle_ids: Vec<String>,
     /// Hosts whose pages are never recorded. Matched on the URL the
     /// accessibility snapshot reports, subdomains included.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1414,15 +1426,28 @@ mod tests {
     #[test]
     fn download_models_wire_shape_is_stable() {
         assert_eq!(
-            serde_json::to_string(&Request::DownloadModels { pack_id: None }).unwrap(),
+            serde_json::to_string(&Request::DownloadModels {
+                pack_id: None,
+                pack_ids: Vec::new(),
+            })
+            .unwrap(),
             r#"{"type":"download_models"}"#
         );
         assert_eq!(
             serde_json::to_string(&Request::DownloadModels {
-                pack_id: Some("asr".into())
+                pack_id: Some("asr".into()),
+                pack_ids: Vec::new(),
             })
             .unwrap(),
             r#"{"type":"download_models","pack_id":"asr"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::DownloadModels {
+                pack_id: None,
+                pack_ids: vec!["asr".into(), "embedding".into()],
+            })
+            .unwrap(),
+            r#"{"type":"download_models","pack_ids":["asr","embedding"]}"#
         );
     }
 
@@ -1439,6 +1464,26 @@ mod tests {
         );
         let state: ModelPackState = serde_json::from_str(r#""in_use""#).unwrap();
         assert_eq!(state, ModelPackState::InUse);
+    }
+
+    #[test]
+    fn model_download_control_wire_shapes_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::PauseModelDownloads).unwrap(),
+            r#"{"type":"pause_model_downloads"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ResumeModelDownloads).unwrap(),
+            r#"{"type":"resume_model_downloads"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::CancelModelDownloads).unwrap(),
+            r#"{"type":"cancel_model_downloads"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelPackState::Paused).unwrap(),
+            r#""paused""#
+        );
     }
 
     #[test]

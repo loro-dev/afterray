@@ -1,4 +1,4 @@
-.PHONY: check test test-repeat build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools publish publish-dry-run
+.PHONY: check test test-repeat build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools publish publish-dry-run
 
 # `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
 # `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
@@ -10,6 +10,7 @@ check:
 test:
 	cargo test --workspace
 	swift test
+	swift test --package-path apps/AfterRayCaptureShim
 
 # A concurrency or I/O test does not fail; it fails sometimes. One green run
 # proves nothing about a test that races, which is how a capture helper that
@@ -66,6 +67,11 @@ dev-ui:
 
 open:
 	./scripts/open-dev.sh
+
+# Rebuild the real app and force the welcome flow without deleting the user's
+# completion preference.
+onboarding: v0-build
+	./scripts/open-dev.sh --onboarding
 
 stop:
 	./scripts/stop-dev.sh

@@ -11,6 +11,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var downloadingID: String? { get }
     var downloadProgress: Double? { get }
     var downloadStatus: String? { get }
+    var isControllingDownload: Bool { get }
     var isUpdatingAudio: Bool { get }
     var isUpdatingStorageLimit: Bool { get }
     var isUpdatingLanguage: Bool { get }
@@ -38,6 +39,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var updatesSupported: Bool { get }
     var automaticUpdates: Bool { get }
     var updateStatus: String { get }
+    var developerOptionsUnlocked: Bool { get }
+    var developerOptionsEnabled: Bool { get }
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
@@ -53,6 +56,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func clearHistory(_ scope: HistoryScope) async
     func reveal(_ path: String)
     func download(packID: String?) async
+    func pauseModelDownloads() async
+    func resumeModelDownloads() async
+    func cancelModelDownloads() async
     func remove(packID: String) async
     func revealLogs()
     func copyDiagnostics()
@@ -62,6 +68,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func installCli() async
     func setAutomaticUpdates(_ enabled: Bool)
     func checkForUpdates()
+    func unlockDeveloperOptions()
+    func setDeveloperOptionsEnabled(_ enabled: Bool)
+    func replayOnboarding()
 }
 
 public struct AfterRayStorageSnapshot: Equatable, Sendable {
@@ -159,6 +168,7 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
     case general
     case models
     case advanced
+    case developer
     case diagnostics
 
     public var id: String { rawValue }
@@ -168,6 +178,7 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .general: "General"
         case .models: "AI Models"
         case .advanced: "Advanced"
+        case .developer: "Developer Options"
         case .diagnostics: "Diagnostics"
         }
     }
@@ -179,6 +190,7 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .general: "How you open AfterRay, what it captures, and how much room it takes."
         case .models: "Pick where Ask runs, and manage on-device model packs."
         case .advanced: "Capture cadence and where AfterRay keeps its files."
+        case .developer: "Development-only controls and first-run testing."
         case .diagnostics: "Logs and a copyable report for bug reports."
         }
     }
@@ -188,6 +200,7 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .general: "slider.horizontal.3"
         case .models: "cpu"
         case .advanced: "wrench.and.screwdriver"
+        case .developer: "hammer"
         case .diagnostics: "stethoscope"
         }
     }
@@ -197,8 +210,47 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .general: "slider.horizontal.3"
         case .models: "cpu.fill"
         case .advanced: "wrench.and.screwdriver.fill"
+        case .developer: "hammer.fill"
         case .diagnostics: "stethoscope"
         }
+    }
+
+    static func visiblePages(developerOptionsEnabled: Bool) -> [Self] {
+        allCases.filter { $0 != .developer || developerOptionsEnabled }
+    }
+}
+
+struct SettingsDeveloperUnlockSequence {
+    private static let phrase = Array("loro")
+    private static let maximumPause: TimeInterval = 2
+
+    private var matchedCount = 0
+    private var lastInputAt: TimeInterval?
+
+    mutating func consume(_ input: String, at timestamp: TimeInterval) -> Bool {
+        guard input.count == 1, let character = input.lowercased().first else {
+            reset()
+            return false
+        }
+        if let lastInputAt, timestamp - lastInputAt > Self.maximumPause {
+            matchedCount = 0
+        }
+        lastInputAt = timestamp
+
+        if character == Self.phrase[matchedCount] {
+            matchedCount += 1
+        } else {
+            matchedCount = character == Self.phrase[0] ? 1 : 0
+        }
+
+        guard matchedCount == Self.phrase.count else { return false }
+        reset()
+        return true
+    }
+
+    private mutating func reset() {
+        matchedCount = 0
+        lastInputAt = nil
     }
 }
 
@@ -309,6 +361,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 .strokeBorder(.white.opacity(0.09), lineWidth: 1)
         }
         .task { await model.refresh() }
+        .onChange(of: model.developerOptionsEnabled) { _, enabled in
+            if !enabled, page == .developer {
+                page = .advanced
+            }
+        }
     }
 
     // MARK: Sidebar
@@ -328,7 +385,9 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             .padding(.top, 6)
 
             VStack(spacing: 2) {
-                ForEach(AfterRaySettingsPage.allCases) { item in
+                ForEach(AfterRaySettingsPage.visiblePages(
+                    developerOptionsEnabled: model.developerOptionsEnabled
+                )) { item in
                     SettingsSidebarRow(
                         page: item,
                         isSelected: page == item,
@@ -338,6 +397,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     }
                 }
             }
+            .animation(.easeOut(duration: 0.16), value: model.developerOptionsEnabled)
             Spacer(minLength: 0)
         }
         .padding(12)
@@ -354,7 +414,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             switch page {
             case .general: generalPage
             case .models: modelsPage
-            case .advanced: advancedPage
+            case .advanced:
+                advancedPage
+                    .background {
+                        if !model.developerOptionsUnlocked {
+                            SettingsDeveloperUnlockMonitor {
+                                withAnimation(.easeOut(duration: 0.16)) {
+                                    model.unlockDeveloperOptions()
+                                }
+                            }
+                            .frame(width: 0, height: 0)
+                        }
+                    }
+            case .developer: developerPage
             case .diagnostics: diagnosticsPage
             }
         }
@@ -525,11 +597,17 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     if index > 0 { SettingsSeparator() }
                     let name = appName(for: bundleID)
                     SettingsRow(title: name, subtitle: name == bundleID ? nil : bundleID) {
-                        Button("Include") {
-                            Task { await model.includeBundle(bundleID) }
+                        if model.settings?.protectedBundleIds.contains(bundleID) == true {
+                            Label("Always excluded", systemImage: "lock.fill")
+                                .font(.settingsRowSubtitle)
+                                .foregroundStyle(SettingsPalette.secondaryLabel)
+                        } else {
+                            Button("Include") {
+                                Task { await model.includeBundle(bundleID) }
+                            }
+                            .buttonStyle(SettingsButtonStyle())
+                            .disabled(model.isUpdatingExclusions)
                         }
-                        .buttonStyle(SettingsButtonStyle())
-                        .disabled(model.isUpdatingExclusions)
                     }
                 }
                 SettingsSeparator()
@@ -783,7 +861,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             return FileManager.default.displayName(atPath: url.path)
         }
-        return bundleID
+        return AfterRayPrivacyCatalog.protectedName(for: bundleID) ?? bundleID
     }
 
     // MARK: Models
@@ -850,9 +928,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @ViewBuilder
     private var packsFooter: some View {
         if model.downloadingID != nil, let status = model.downloadStatus {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
+                    if model.library?.download?.isPaused == true {
+                        Image(systemName: "pause.circle.fill")
+                            .foregroundStyle(SettingsPalette.secondaryLabel)
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
                     Text(status)
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
@@ -868,6 +951,30 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 ProgressView(value: model.downloadProgress ?? 0)
                     .progressViewStyle(.linear)
                     .tint(SettingsPalette.accent)
+                HStack(spacing: 10) {
+                    Text(model.library?.download?.isPaused == true
+                        ? "Partial files are kept for resume."
+                        : "Pause keeps partial files; cancel removes them.")
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.tertiaryLabel)
+                    Spacer(minLength: 8)
+                    if model.library?.download?.isPaused == true {
+                        Button("Resume") {
+                            Task { await model.resumeModelDownloads() }
+                        }
+                        .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                    } else {
+                        Button("Pause") {
+                            Task { await model.pauseModelDownloads() }
+                        }
+                        .buttonStyle(SettingsButtonStyle())
+                    }
+                    Button("Cancel") {
+                        Task { await model.cancelModelDownloads() }
+                    }
+                    .buttonStyle(SettingsButtonStyle())
+                }
+                .disabled(model.isControllingDownload)
             }
             .padding(.horizontal, SettingsMetrics.rowInset)
             .padding(.vertical, 12)
@@ -985,6 +1092,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                             .progressViewStyle(.linear)
                             .tint(SettingsPalette.accent)
                     }
+                } else if model.library?.download?.isActive == true,
+                          model.library?.download?.queuedPackIds.contains(pack.id) == true
+                {
+                    Label("Waiting to download", systemImage: "clock")
+                        .font(.settingsCaption)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
                 }
 
                 HStack(spacing: 10) {
@@ -1001,7 +1114,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         Button("Remove…") { confirmingMlxRemoval = true }
                             .buttonStyle(SettingsButtonStyle())
                             .disabled(pack.state == .inUse || model.downloadingID != nil)
-                    case .downloading, .verifying, .incompatible:
+                    case .downloading, .verifying, .paused, .incompatible:
                         EmptyView()
                     }
                     Spacer()
@@ -1057,6 +1170,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         case .notDownloaded: "Not downloaded"
         case .downloading: "Downloading"
         case .verifying: "Verifying"
+        case .paused: "Paused"
         case .ready: "Ready"
         case .inUse: "Loaded"
         case .failed: "Failed"
@@ -1067,7 +1181,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private func mlxStateTone(_ state: ModelPackState) -> SettingsTone {
         switch state {
         case .ready, .inUse: .positive
-        case .downloading, .verifying: .neutral
+        case .downloading, .verifying, .paused: .neutral
         case .notDownloaded: .warning
         case .failed, .incompatible: .danger
         }
@@ -1211,8 +1325,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private func modelPackRow(_ pack: ModelPack) -> some View {
-        let downloading = model.downloadingID == pack.id
-            || model.library?.download?.packId == pack.id
+        let downloading = model.library?.download?.isActive == true
+            && (model.downloadingID == pack.id || model.library?.download?.packId == pack.id)
+        let paused = model.library?.download?.isPaused == true
+            && model.library?.download?.packId == pack.id
+        let queued = model.library?.download?.isActive == true
+            && model.library?.download?.queuedPackIds.contains(pack.id) == true
         return SettingsRow(
             title: pack.name,
             subtitle: packSubtitle(pack),
@@ -1225,6 +1343,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                         .monospacedDigit()
+                } else if paused {
+                    Image(systemName: "pause.circle.fill")
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                    Text(percentLabel(model.downloadProgress).map { "Paused · \($0)" } ?? "Paused")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                        .monospacedDigit()
+                } else if queued {
+                    Image(systemName: "clock")
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                    Text("Waiting")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
                 } else {
                     SettingsPill(packStatus(pack), tone: packTone(pack))
                     if pack.present {
@@ -1256,6 +1387,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private func packStatus(_ pack: ModelPack) -> String {
         if pack.state == .failed { return "Failed" }
         if pack.state == .incompatible { return "Incompatible" }
+        if pack.state == .paused { return "Paused" }
         if pack.state == .verifying { return "Verifying" }
         if pack.state == .inUse { return "Loaded" }
         if pack.present { return "Ready" }
@@ -1310,6 +1442,23 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var advancedPage: some View {
+        if model.developerOptionsUnlocked {
+            SettingsSection(title: "Developer Options") {
+                SettingsRow(
+                    title: "Show developer settings",
+                    subtitle: "Adds a development-only page to the sidebar."
+                ) {
+                    Toggle("", isOn: Binding(
+                        get: { model.developerOptionsEnabled },
+                        set: { model.setDeveloperOptionsEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+            }
+            .transition(.opacity)
+        }
+
         if model.updatesSupported {
             SettingsSection(
                 title: "Updates",
@@ -1392,6 +1541,23 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private var captureCadenceTitle: String {
         let seconds = model.settings?.captureIntervalSeconds ?? 10
         return "One still every \(seconds) second\(seconds == 1 ? "" : "s")"
+    }
+
+    // MARK: Developer
+
+    private var developerPage: some View {
+        SettingsSection(
+            title: "Onboarding",
+            footnote: "Reopens the first-run flow without changing downloads or other settings."
+        ) {
+            SettingsRow(
+                title: "Replay onboarding",
+                subtitle: "Close Settings and start again from the shortcut lesson."
+            ) {
+                Button("Replay") { model.replayOnboarding() }
+                    .buttonStyle(SettingsButtonStyle(kind: .prominent))
+            }
+        }
     }
 
     // MARK: Diagnostics
@@ -1802,6 +1968,67 @@ private struct StorageCompositionBar: View {
 }
 
 // MARK: - Controls
+
+private struct SettingsDeveloperUnlockMonitor: NSViewRepresentable {
+    let onUnlock: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onUnlock: onUnlock)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.install(for: view)
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.onUnlock = onUnlock
+        context.coordinator.view = view
+    }
+
+    static func dismantleNSView(_: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class Coordinator {
+        var onUnlock: () -> Void
+        weak var view: NSView?
+        private var monitor: Any?
+        private var sequence = SettingsDeveloperUnlockSequence()
+
+        init(onUnlock: @escaping () -> Void) {
+            self.onUnlock = onUnlock
+        }
+
+        func install(for view: NSView) {
+            self.view = view
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self,
+                      self.view?.window?.isKeyWindow == true,
+                      !event.isARepeat,
+                      event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                      let characters = event.charactersIgnoringModifiers
+                else { return event }
+                if sequence.consume(characters, at: event.timestamp) {
+                    onUnlock()
+                }
+                // The hidden sequence has no text field to receive it. Consume
+                // its letters so a successful attempt does not produce four
+                // AppKit error beeps; unrelated keys keep their normal path.
+                return ["l", "o", "r"].contains(characters.lowercased()) ? nil : event
+            }
+        }
+
+        func uninstall() {
+            guard let monitor else { return }
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+            view = nil
+        }
+    }
+}
 
 private struct SettingsSidebarRow: View {
     let page: AfterRaySettingsPage

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 public enum AfterRayOnboardingStage: Equatable, Sendable {
@@ -13,28 +14,40 @@ public enum AfterRayOnboardingStage: Equatable, Sendable {
 public struct AfterRayOnboardingPrivacyActions: Sendable {
     public var excludedApps: @MainActor @Sendable () -> [String]
     public var excludedDomains: @MainActor @Sendable () -> [String]
+    public var protectedApps: @MainActor @Sendable () -> Set<String>
+    public var refresh: @MainActor @Sendable () async -> Void
     public var addApp: @MainActor @Sendable () async -> Void
     public var removeApp: @MainActor @Sendable (_ bundleID: String) async -> Void
     public var addDomain: @MainActor @Sendable (_ typed: String) async -> Void
     public var removeDomain: @MainActor @Sendable (_ domain: String) async -> Void
     public var displayName: @MainActor @Sendable (_ bundleID: String) -> String
+    public var iconPath: @MainActor @Sendable (_ bundleID: String) -> String?
+    public var message: @MainActor @Sendable () -> String?
 
     public init(
         excludedApps: @escaping @MainActor @Sendable () -> [String],
         excludedDomains: @escaping @MainActor @Sendable () -> [String],
+        protectedApps: @escaping @MainActor @Sendable () -> Set<String> = { [] },
+        refresh: @escaping @MainActor @Sendable () async -> Void = {},
         addApp: @escaping @MainActor @Sendable () async -> Void,
         removeApp: @escaping @MainActor @Sendable (_ bundleID: String) async -> Void,
         addDomain: @escaping @MainActor @Sendable (_ typed: String) async -> Void,
         removeDomain: @escaping @MainActor @Sendable (_ domain: String) async -> Void,
-        displayName: @escaping @MainActor @Sendable (_ bundleID: String) -> String = { $0 }
+        displayName: @escaping @MainActor @Sendable (_ bundleID: String) -> String = { $0 },
+        iconPath: @escaping @MainActor @Sendable (_ bundleID: String) -> String? = { _ in nil },
+        message: @escaping @MainActor @Sendable () -> String? = { nil }
     ) {
         self.excludedApps = excludedApps
         self.excludedDomains = excludedDomains
+        self.protectedApps = protectedApps
+        self.refresh = refresh
         self.addApp = addApp
         self.removeApp = removeApp
         self.addDomain = addDomain
         self.removeDomain = removeDomain
         self.displayName = displayName
+        self.iconPath = iconPath
+        self.message = message
     }
 }
 
@@ -64,11 +77,11 @@ public struct AfterRayOnboardingCliActions: Sendable {
 /// of this view makes onboarding usable in previews and tests.
 public struct AfterRayOnboardingModelActions: Sendable {
     public var status: @MainActor @Sendable () async throws -> ModelLibrary
-    public var download: @MainActor @Sendable (_ packID: String) async throws -> ModelLibrary
+    public var download: @MainActor @Sendable (_ packIDs: [String]) async throws -> ModelLibrary
 
     public init(
         status: @escaping @MainActor @Sendable () async throws -> ModelLibrary,
-        download: @escaping @MainActor @Sendable (_ packID: String) async throws -> ModelLibrary
+        download: @escaping @MainActor @Sendable (_ packIDs: [String]) async throws -> ModelLibrary
     ) {
         self.status = status
         self.download = download
@@ -80,6 +93,8 @@ public struct AfterRayOnboardingModelActions: Sendable {
 @MainActor
 public final class AfterRayOnboardingModel: ObservableObject {
     @Published public private(set) var didPractice = false
+    @Published public private(set) var pressedPracticeSegments: Set<String> = []
+    @Published public private(set) var highlightedPracticeSegments: Set<String> = []
     @Published public private(set) var stage: AfterRayOnboardingStage = .hotKey
     @Published public private(set) var cliStatus = "Not installed yet."
     @Published public private(set) var cliInstalled = false
@@ -88,13 +103,16 @@ public final class AfterRayOnboardingModel: ObservableObject {
     @Published public private(set) var modelLibrary: ModelLibrary?
     @Published public private(set) var isLoadingModels = false
     @Published public private(set) var isDownloadingModels = false
+    @Published public private(set) var isStartingModelDownload = false
     @Published public private(set) var downloadingPackID: String?
     @Published public var modelMessage: String?
+    @Published public private(set) var isUpdatingPrivacy = false
 
     public let hotKeys: RecallHotKeyStore
     public let privacyActions: AfterRayOnboardingPrivacyActions?
     public let cliActions: AfterRayOnboardingCliActions?
     public let modelActions: AfterRayOnboardingModelActions?
+    private var modelDownloadMonitor: Task<Void, Never>?
 
     public init(
         hotKeys: RecallHotKeyStore,
@@ -115,14 +133,55 @@ public final class AfterRayOnboardingModel: ObservableObject {
     public func registerPractice() -> Bool {
         guard stage == .hotKey, !didPractice, !hotKeys.isRecording else { return false }
         didPractice = true
+        highlightedPracticeSegments = Set(hotKeys.hotKey.segments)
+        let keySegment = hotKeys.hotKey.keyLabel
+        pressedPracticeSegments.insert(keySegment)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(140))
+            self?.pressedPracticeSegments.remove(keySegment)
+        }
         return true
+    }
+
+    /// Mirrors the physical chord one key at a time. A released key keeps its
+    /// highlight, so the lesson visibly accumulates progress instead of
+    /// flashing the whole shortcut only after it succeeds.
+    public func updatePracticeModifiers(_ modifiers: RecallHotKey.Modifiers) {
+        guard stage == .hotKey, !hotKeys.isRecording else { return }
+        let heldModifiers = hotKeys.hotKey.modifiers.intersection(modifiers)
+        var heldSegments = Set(heldModifiers.glyphs)
+        if pressedPracticeSegments.contains(hotKeys.hotKey.keyLabel) {
+            heldSegments.insert(hotKeys.hotKey.keyLabel)
+        }
+        pressedPracticeSegments = heldSegments
+        highlightedPracticeSegments.formUnion(heldSegments)
+    }
+
+    public func updatePracticeKey(keyCode: UInt16, isPressed: Bool) {
+        guard stage == .hotKey, !hotKeys.isRecording, keyCode == hotKeys.hotKey.keyCode else { return }
+        let segment = hotKeys.hotKey.keyLabel
+        if isPressed {
+            pressedPracticeSegments.insert(segment)
+            highlightedPracticeSegments.insert(segment)
+        } else {
+            pressedPracticeSegments.remove(segment)
+        }
+    }
+
+    public func beginHotKeyRecording() {
+        didPractice = false
+        pressedPracticeSegments.removeAll()
+        highlightedPracticeSegments.removeAll()
+        hotKeys.beginRecording()
     }
 
     public func advanceFromHotKey() {
         guard stage == .hotKey else { return }
         hotKeys.cancelRecording()
+        pressedPracticeSegments.removeAll()
         if privacyActions != nil {
             stage = .privacy
+            Task { await refreshPrivacy() }
         } else {
             enterStageAfterPrivacy()
         }
@@ -131,6 +190,78 @@ public final class AfterRayOnboardingModel: ObservableObject {
     public func advanceFromPrivacy() {
         guard stage == .privacy else { return }
         enterStageAfterPrivacy()
+    }
+
+    public func goBack() {
+        switch stage {
+        case .hotKey:
+            return
+        case .privacy:
+            stage = .hotKey
+        case .cli:
+            if privacyActions != nil {
+                stage = .privacy
+                Task { await refreshPrivacy() }
+            } else {
+                stage = .hotKey
+            }
+        case .models:
+            stopObservingModelDownloads()
+            if cliActions != nil {
+                stage = .cli
+                refreshCli()
+            } else if privacyActions != nil {
+                stage = .privacy
+                Task { await refreshPrivacy() }
+            } else {
+                stage = .hotKey
+            }
+        }
+    }
+
+    public var protectedPrivacyApps: Set<String> {
+        privacyActions?.protectedApps() ?? []
+    }
+
+    public var privacyMessage: String? {
+        privacyActions?.message()
+    }
+
+    public func refreshPrivacy() async {
+        guard let privacyActions else { return }
+        isUpdatingPrivacy = true
+        await privacyActions.refresh()
+        isUpdatingPrivacy = false
+        objectWillChange.send()
+    }
+
+    public func addPrivacyApp() async {
+        await performPrivacyUpdate { await $0.addApp() }
+    }
+
+    public func removePrivacyApp(_ bundleID: String) async {
+        guard !protectedPrivacyApps.contains(bundleID) else { return }
+        await performPrivacyUpdate { await $0.removeApp(bundleID) }
+    }
+
+    public func addPrivacyDomain(_ typed: String) async {
+        await performPrivacyUpdate { await $0.addDomain(typed) }
+    }
+
+    public func removePrivacyDomain(_ domain: String) async {
+        await performPrivacyUpdate { await $0.removeDomain(domain) }
+    }
+
+    private func performPrivacyUpdate(
+        _ operation: (AfterRayOnboardingPrivacyActions) async -> Void
+    ) async {
+        guard let privacyActions, !isUpdatingPrivacy else { return }
+        isUpdatingPrivacy = true
+        await operation(privacyActions)
+        isUpdatingPrivacy = false
+        // The action host owns the arrays. Forward its completed mutation to
+        // this observable model so SwiftUI actually reads the closures again.
+        objectWillChange.send()
     }
 
     /// A host that supplies no CLI or model hooks leaves onboarding on the
@@ -198,56 +329,100 @@ public final class AfterRayOnboardingModel: ObservableObject {
         modelLibrary?.download?.fraction
     }
 
+    public var modelDownloadPercent: Int? {
+        modelLibrary?.download?.percent
+    }
+
+    public var modelDownloadPaused: Bool {
+        modelLibrary?.download?.isPaused == true
+    }
+
+    public var scheduledModelPackIDs: Set<String> {
+        guard let download = modelLibrary?.download, download.isActive else { return [] }
+        return Set([download.packId] + download.queuedPackIds)
+    }
+
+    public var hasUnscheduledRequiredModelPacks: Bool {
+        let scheduled = scheduledModelPackIDs
+        return missingRequiredModelPacks.contains { !scheduled.contains($0.id) }
+    }
+
     public func refreshModels() async {
         guard let modelActions else { return }
         isLoadingModels = true
         defer { isLoadingModels = false }
         do {
-            modelLibrary = try await modelActions.status()
-            modelMessage = nil
+            applyModelLibrary(try await modelActions.status())
+            if modelLibrary?.download?.state != .failed {
+                modelMessage = nil
+            }
         } catch {
             modelMessage = error.localizedDescription
         }
     }
 
     public func downloadRequiredModels() async {
-        guard let modelActions, !isDownloadingModels else { return }
+        guard let modelActions, !isStartingModelDownload else { return }
         if modelLibrary == nil { await refreshModels() }
-        let packIDs = missingRequiredModelPacks.map(\.id)
+        let scheduled = scheduledModelPackIDs
+        let packIDs = missingRequiredModelPacks.map(\.id).filter { !scheduled.contains($0) }
         guard !packIDs.isEmpty else { return }
 
-        isDownloadingModels = true
+        isStartingModelDownload = true
         modelMessage = nil
-        defer {
-            isDownloadingModels = false
-            downloadingPackID = nil
-        }
+        defer { isStartingModelDownload = false }
 
         do {
-            for packID in packIDs {
-                downloadingPackID = packID
-                let progress = Task { @MainActor in
-                    while !Task.isCancelled {
-                        if let next = try? await modelActions.status() {
-                            modelLibrary = next
-                        }
-                        try? await Task.sleep(for: .milliseconds(350))
-                    }
-                }
-                do {
-                    modelLibrary = try await modelActions.download(packID)
-                } catch {
-                    progress.cancel()
-                    _ = await progress.result
-                    throw error
-                }
-                progress.cancel()
-                _ = await progress.result
-            }
-            modelLibrary = try await modelActions.status()
-            modelMessage = "Required models are ready."
+            applyModelLibrary(try await modelActions.download(packIDs))
         } catch {
             modelMessage = error.localizedDescription
+        }
+    }
+
+    public func stopObservingModelDownloads() {
+        modelDownloadMonitor?.cancel()
+        modelDownloadMonitor = nil
+    }
+
+    private func applyModelLibrary(_ next: ModelLibrary) {
+        modelLibrary = next
+        guard let download = next.download else {
+            isDownloadingModels = false
+            downloadingPackID = nil
+            if next.packs.filter(\.required).allSatisfy(\.present) {
+                modelMessage = "Required models are ready."
+            }
+            return
+        }
+
+        isDownloadingModels = download.isActive
+        downloadingPackID = download.isActive || download.isPaused ? download.packId : nil
+        if download.state == .failed, let error = download.error, !error.isEmpty {
+            modelMessage = error
+        }
+        if download.isActive {
+            startModelDownloadMonitor()
+        }
+    }
+
+    private func startModelDownloadMonitor() {
+        guard modelDownloadMonitor == nil, let modelActions else { return }
+        modelDownloadMonitor = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { modelDownloadMonitor = nil }
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(350))
+                    guard !Task.isCancelled else { return }
+                    applyModelLibrary(try await modelActions.status())
+                    guard modelLibrary?.download?.isActive == true else { return }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    modelMessage = error.localizedDescription
+                    return
+                }
+            }
         }
     }
 }
@@ -333,9 +508,11 @@ public struct AfterRayOnboardingView: View {
 
     private var headline: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(greeting)
-                .font(.system(size: 13, weight: .medium, design: .rounded))
-                .foregroundStyle(RecallPalette.textTertiary)
+            if model.stage == .hotKey {
+                Text(greeting)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(RecallPalette.textTertiary)
+            }
             Text(headlineTitle)
                 .font(.system(size: 26, weight: .semibold))
                 .foregroundStyle(RecallPalette.textPrimary)
@@ -346,13 +523,13 @@ public struct AfterRayOnboardingView: View {
     private var headlineTitle: String {
         switch model.stage {
         case .hotKey:
-            return "Press this to open AfterRay."
+            return "Open AfterRay."
         case .privacy:
-            return "Decide what AfterRay should skip."
+            return "Choose what to skip."
         case .cli:
-            return "Let other agents use your history."
+            return "Connect your agents."
         case .models:
-            return "Prepare AfterRay's local models."
+            return "Set up local models."
         }
     }
 
@@ -384,7 +561,10 @@ public struct AfterRayOnboardingView: View {
             RecallHotKeyField(
                 store: hotKeys,
                 size: .hero,
-                isHighlighted: model.didPractice
+                isHighlighted: model.didPractice,
+                pressedSegments: model.pressedPracticeSegments,
+                highlightedSegments: model.highlightedPracticeSegments,
+                onBeginRecording: model.beginHotKeyRecording
             )
             hotKeyHint
         }
@@ -418,68 +598,85 @@ public struct AfterRayOnboardingView: View {
     @ViewBuilder
     private var privacyStage: some View {
         if let privacy = model.privacyActions {
-            HStack(alignment: .top, spacing: 14) {
-                OnboardingExclusionColumn(
-                    title: "Exclude these apps",
-                    empty: "Nothing excluded yet.",
-                    entries: privacy.excludedApps().map {
-                        OnboardingExclusionEntry(id: $0, label: privacy.displayName($0))
-                    },
-                    onRemove: { id in Task { await privacy.removeApp(id) } },
-                    accessory: {
-                        Button {
-                            Task { await privacy.addApp() }
-                        } label: {
-                            Label("Add app", systemImage: "plus")
-                                .font(.system(size: 12, weight: .medium, design: .rounded))
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .top, spacing: 14) {
+                    OnboardingExclusionColumn(
+                        title: "Apps",
+                        empty: "None",
+                        entries: privacy.excludedApps().map {
+                            OnboardingExclusionEntry(
+                                id: $0,
+                                label: privacy.displayName($0),
+                                isProtected: model.protectedPrivacyApps.contains($0),
+                                iconPath: privacy.iconPath($0),
+                                isApplication: true
+                            )
+                        },
+                        onRemove: { id in Task { await model.removePrivacyApp(id) } },
+                        accessory: {
+                            Button {
+                                Task { await model.addPrivacyApp() }
+                            } label: {
+                                Label("Add app", systemImage: "plus")
+                                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                            }
+                            .buttonStyle(OnboardingQuietButtonStyle())
+                            .disabled(model.isUpdatingPrivacy)
                         }
-                        .buttonStyle(OnboardingQuietButtonStyle())
-                    }
-                )
+                    )
 
-                OnboardingExclusionColumn(
-                    title: "Exclude these websites",
-                    empty: "Nothing excluded yet.",
-                    entries: privacy.excludedDomains().map {
-                        OnboardingExclusionEntry(id: $0, label: $0)
-                    },
-                    onRemove: { domain in Task { await privacy.removeDomain(domain) } },
-                    accessory: {
-                        HStack(spacing: 7) {
-                            Image(systemName: "globe")
-                                .font(.system(size: 12))
-                                .foregroundStyle(RecallPalette.textSecondary)
-                            TextField("example.com", text: $domainDraft)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 12, design: .rounded))
-                                .onSubmit { submitDomain(privacy) }
-                            Button("Save") { submitDomain(privacy) }
-                                .buttonStyle(OnboardingQuietButtonStyle())
-                                .disabled(
-                                    domainDraft
-                                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                                        .isEmpty
-                                )
+                    OnboardingExclusionColumn(
+                        title: "Websites",
+                        empty: "None",
+                        entries: privacy.excludedDomains().map {
+                            OnboardingExclusionEntry(id: $0, label: $0)
+                        },
+                        onRemove: { domain in Task { await model.removePrivacyDomain(domain) } },
+                        accessory: {
+                            HStack(spacing: 7) {
+                                Image(systemName: "globe")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(RecallPalette.textSecondary)
+                                TextField("example.com", text: $domainDraft)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 12, design: .rounded))
+                                    .onSubmit { submitDomain() }
+                                Button("Save") { submitDomain() }
+                                    .buttonStyle(OnboardingQuietButtonStyle())
+                                    .disabled(
+                                        model.isUpdatingPrivacy
+                                            || domainDraft
+                                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                                            .isEmpty
+                                    )
+                            }
                         }
-                    }
-                )
+                    )
+                }
+                .frame(maxWidth: .infinity, minHeight: 174, maxHeight: 174)
+
+                Text(model.privacyMessage ?? "Installed password managers are skipped automatically.")
+                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(model.privacyMessage == nil ? RecallPalette.textSecondary : RecallPalette.ray)
+                    .lineLimit(1)
             }
             .frame(maxWidth: .infinity, minHeight: 196, maxHeight: 196)
         }
     }
 
-    private func submitDomain(_ privacy: AfterRayOnboardingPrivacyActions) {
+    private func submitDomain() {
         let typed = domainDraft
-        guard !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !model.isUpdatingPrivacy,
+              !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
         domainDraft = ""
-        Task { await privacy.addDomain(typed) }
+        Task { await model.addPrivacyDomain(typed) }
     }
 
     private var privacyFooter: some View {
         HStack(spacing: 10) {
-            Text("Exclusions follow the app in front and the site your browser reports.")
-                .font(.system(size: 11, design: .rounded))
-                .foregroundStyle(RecallPalette.textSecondary)
+            Button("Back") { model.goBack() }
+                .buttonStyle(OnboardingQuietButtonStyle())
             Spacer(minLength: 8)
             Button("Continue") { model.advanceFromPrivacy() }
                 .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
@@ -490,7 +687,7 @@ public struct AfterRayOnboardingView: View {
     private var cliStage: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text(
-                "Install the `afterray` CLI so Claude Code, Codex, Cursor, and similar tools can search your encrypted vault. V0 installs the full developer CLI, which can also change settings and delete history — install it for agents you trust."
+                "Install the CLI for trusted agents. It can search your vault, change settings, and delete history."
             )
             .font(.system(size: 13, weight: .medium, design: .rounded))
             .foregroundStyle(RecallPalette.textSecondary)
@@ -539,7 +736,7 @@ public struct AfterRayOnboardingView: View {
 
     private var modelsStage: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Transcription and search need two on-device model packs. They stay on this Mac and can be removed later in Settings.")
+            Text("Transcription and search use two local model packs. Manage them later in Settings.")
                 .font(.system(size: 13, weight: .medium, design: .rounded))
                 .foregroundStyle(RecallPalette.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -547,7 +744,7 @@ public struct AfterRayOnboardingView: View {
             if model.isLoadingModels, model.modelLibrary == nil {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("Checking installed models…")
+                    Text("Checking models…")
                 }
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(RecallPalette.textTertiary)
@@ -561,38 +758,76 @@ public struct AfterRayOnboardingView: View {
                 .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
 
-            if model.isDownloadingModels {
-                ProgressView(value: model.modelDownloadProgress ?? 0)
-                    .progressViewStyle(.linear)
-                    .tint(RecallPalette.ray)
+            if model.isDownloadingModels, let download = model.modelLibrary?.download {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(download.state == .verifying ? "Verifying \(modelPackName(download.packId))…" : "Downloading \(modelPackName(download.packId))…")
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundStyle(RecallPalette.textSecondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text("\(model.modelDownloadPercent ?? 0)%")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(RecallPalette.textPrimary)
+                            .monospacedDigit()
+                    }
+                    ProgressView(value: model.modelDownloadProgress ?? 0)
+                        .progressViewStyle(.linear)
+                        .tint(RecallPalette.ray)
+                }
             }
 
-            Text(model.modelMessage ?? "The optional local assistant is about 17 GB and can be installed later in Settings.")
+            Text(modelStageNote)
                 .font(.system(size: 11, weight: .medium, design: .rounded))
                 .foregroundStyle(model.modelMessage == nil ? RecallPalette.textTertiary : RecallPalette.ray)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
+    private var modelStageNote: String {
+        if let message = model.modelMessage { return message }
+        if model.isDownloadingModels { return "Close anytime. Downloads continue in the background." }
+        if model.modelDownloadPaused { return "Paused. Resume here or manage downloads in Settings." }
+        return "Optional local assistant: about 17 GB. Install it later in Settings."
+    }
+
     private func modelPackRow(_ pack: ModelPack) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: pack.present ? "checkmark.circle.fill" : "arrow.down.circle")
+        let download = model.modelLibrary?.download
+        let isCurrent = !pack.present
+            && (download?.isActive == true || download?.isPaused == true)
+            && download?.packId == pack.id
+        let isQueued = download?.isActive == true && download?.queuedPackIds.contains(pack.id) == true
+        return HStack(spacing: 10) {
+            Image(systemName: pack.present ? "checkmark.circle.fill" : isQueued ? "clock" : "arrow.down.circle")
                 .foregroundStyle(pack.present ? .white.opacity(0.9) : RecallPalette.ray)
             VStack(alignment: .leading, spacing: 2) {
                 Text(pack.name)
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(RecallPalette.textPrimary)
-                Text(pack.present ? "Installed" : "Download · \(modelSize(pack.expectedBytes))")
+                Text(modelPackSubtitle(pack, isCurrent: isCurrent, isQueued: isQueued))
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(RecallPalette.textTertiary)
             }
             Spacer()
-            if model.downloadingPackID == pack.id {
+            if isCurrent, download?.isActive == true {
                 ProgressView().controlSize(.small)
             }
         }
         .padding(.horizontal, 12)
         .frame(height: 48)
+    }
+
+    private func modelPackSubtitle(_ pack: ModelPack, isCurrent: Bool, isQueued: Bool) -> String {
+        if pack.present { return "Installed" }
+        if isCurrent, model.modelDownloadPaused { return "Paused · \(model.modelDownloadPercent ?? 0)%" }
+        if isCurrent, model.modelLibrary?.download?.state == .verifying { return "Verifying files" }
+        if isCurrent { return "Downloading · \(model.modelDownloadPercent ?? 0)%" }
+        if isQueued { return "Waiting to download" }
+        return "Download · \(modelSize(pack.expectedBytes))"
+    }
+
+    private func modelPackName(_ packID: String) -> String {
+        model.modelLibrary?.packs.first { $0.id == packID }?.name ?? "model"
     }
 
     private func modelSize(_ bytes: UInt64?) -> String {
@@ -657,7 +892,7 @@ public struct AfterRayOnboardingView: View {
                 Button("Never mind", action: hotKeys.cancelRecording)
                     .buttonStyle(OnboardingQuietButtonStyle())
             } else {
-                Button("Change shortcut") { hotKeys.beginRecording() }
+                Button("Change shortcut") { model.beginHotKeyRecording() }
                     .buttonStyle(OnboardingQuietButtonStyle())
                 if !hotKeys.isDefault {
                     Button("Reset", action: hotKeys.restoreDefault)
@@ -675,9 +910,11 @@ public struct AfterRayOnboardingView: View {
 
     private var cliFooter: some View {
         HStack(spacing: 10) {
-            Button("Skip CLI") { continueFromCli() }
+            Button("Back") { model.goBack() }
                 .buttonStyle(OnboardingQuietButtonStyle())
             Spacer(minLength: 8)
+            Button("Skip CLI") { continueFromCli() }
+                .buttonStyle(OnboardingQuietButtonStyle())
             if !model.cliInstalled {
                 Button(model.isInstallingCli ? "Installing…" : "Install CLI") {
                     Task { await model.installCli() }
@@ -693,29 +930,42 @@ public struct AfterRayOnboardingView: View {
 
     private var modelsFooter: some View {
         HStack(spacing: 10) {
-            if !model.requiredModelsReady {
-                Button("Skip for now", action: finish)
-                    .buttonStyle(OnboardingQuietButtonStyle())
-                    .disabled(model.isDownloadingModels)
-            }
+            Button("Back") { model.goBack() }
+                .buttonStyle(OnboardingQuietButtonStyle())
             Spacer(minLength: 8)
-            if model.modelLibrary == nil, !model.isLoadingModels {
+            if model.isDownloadingModels {
+                if model.hasUnscheduledRequiredModelPacks {
+                    Button("Download models") { Task { await model.downloadRequiredModels() } }
+                        .buttonStyle(OnboardingQuietButtonStyle())
+                        .disabled(model.isStartingModelDownload)
+                }
+                Button("Close", action: finish)
+                    .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
+                    .keyboardShortcut(.defaultAction)
+            } else if model.modelLibrary == nil, !model.isLoadingModels {
                 Button("Check again") { Task { await model.refreshModels() } }
                     .buttonStyle(OnboardingQuietButtonStyle())
-            }
-            if model.requiredModelsReady {
+            } else if model.requiredModelsReady {
                 Button("Start using AfterRay", action: finish)
                     .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
                     .keyboardShortcut(.defaultAction)
             } else if model.modelLibrary != nil {
-                Button(model.isDownloadingModels ? "Downloading…" : "Download required models") {
+                Button("Skip for now", action: finish)
+                    .buttonStyle(OnboardingQuietButtonStyle())
+                Button(modelDownloadButtonTitle) {
                     Task { await model.downloadRequiredModels() }
                 }
                 .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
-                .disabled(model.isDownloadingModels)
+                .disabled(model.isStartingModelDownload || !model.hasUnscheduledRequiredModelPacks)
                 .keyboardShortcut(.defaultAction)
             }
         }
+    }
+
+    private var modelDownloadButtonTitle: String {
+        if model.isStartingModelDownload { return "Starting…" }
+        if model.modelDownloadPaused { return "Resume download" }
+        return "Download models"
     }
 
     private var backdrop: some View {
@@ -784,7 +1034,7 @@ private struct OnboardingPrimaryButtonStyle: ButtonStyle {
                 radius: 12,
                 y: 3
             )
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
             .animation(.easeOut(duration: 0.24), value: isKeyAction)
     }
@@ -803,6 +1053,7 @@ private struct OnboardingQuietButtonStyle: ButtonStyle {
             .padding(.horizontal, 12)
             .frame(height: 30)
             .background(.white.opacity(configuration.isPressed ? 0.05 : 0.08), in: Capsule())
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
@@ -810,6 +1061,9 @@ private struct OnboardingQuietButtonStyle: ButtonStyle {
 struct OnboardingExclusionEntry: Identifiable, Equatable {
     let id: String
     let label: String
+    var isProtected = false
+    var iconPath: String? = nil
+    var isApplication = false
 }
 
 /// One exclusion list: an action row on top, then what has been excluded.
@@ -847,22 +1101,33 @@ struct OnboardingExclusionColumn<Accessory: View>: View {
                         VStack(alignment: .leading, spacing: 0) {
                             ForEach(entries) { entry in
                                 HStack(spacing: 8) {
+                                    if entry.isApplication {
+                                        OnboardingApplicationIcon(path: entry.iconPath)
+                                    }
                                     Text(entry.label)
                                         .font(.system(size: 12, design: .rounded))
                                         .foregroundStyle(RecallPalette.textPrimary)
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Spacer(minLength: 8)
-                                    Button {
-                                        onRemove(entry.id)
-                                    } label: {
-                                        Image(systemName: "xmark")
-                                            .font(.system(size: 9, weight: .semibold))
-                                            .foregroundStyle(RecallPalette.textSecondary)
+                                    if entry.isProtected {
+                                        Image(systemName: "lock.fill")
+                                            .font(.system(size: 8, weight: .semibold))
+                                            .foregroundStyle(RecallPalette.textTertiary)
                                             .frame(width: 18, height: 18)
+                                            .help("Always excluded for privacy")
+                                    } else {
+                                        Button {
+                                            onRemove(entry.id)
+                                        } label: {
+                                            Image(systemName: "xmark")
+                                                .font(.system(size: 9, weight: .semibold))
+                                                .foregroundStyle(RecallPalette.textSecondary)
+                                                .frame(width: 18, height: 18)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Stop excluding \(entry.label)")
                                     }
-                                    .buttonStyle(.plain)
-                                    .help("Stop excluding \(entry.label)")
                                 }
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 7)
@@ -881,5 +1146,32 @@ struct OnboardingExclusionColumn<Accessory: View>: View {
                     }
             }
         }
+    }
+}
+
+private struct OnboardingApplicationIcon: View {
+    let path: String?
+
+    var body: some View {
+        Group {
+            if let path {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: path))
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                Image(systemName: "app")
+                    .resizable()
+                    .scaledToFit()
+                    .padding(3)
+                    .foregroundStyle(RecallPalette.textSecondary)
+            }
+        }
+        .scaledToFit()
+        .frame(width: 20, height: 20)
+        .overlay {
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .stroke(.white.opacity(0.10), lineWidth: 1)
+        }
+        .accessibilityHidden(true)
     }
 }

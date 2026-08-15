@@ -141,7 +141,16 @@ fn main() {
         "{:<22} {:>6} {:>8} {:>8} {:>10} {:>8} {:>8} {:>7}",
         "strategy", "runs", "1-frame", "max", "ivf", "KiB/fr", "vs JPEG", "secs"
     );
-    print_row("JPEG baseline", 0, 0, 0, jpeg_bytes, jpeg_bytes, SAMPLE, 0.0);
+    print_row(
+        "JPEG baseline",
+        0,
+        0,
+        0,
+        jpeg_bytes,
+        jpeg_bytes,
+        SAMPLE,
+        0.0,
+    );
     print_row(
         &by_app.label,
         by_app.runs,
@@ -345,7 +354,12 @@ fn app_counts(window: &[&Moment]) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for moment in window {
         *counts
-            .entry(moment.application_name.clone().unwrap_or_else(|| "?".into()))
+            .entry(
+                moment
+                    .application_name
+                    .clone()
+                    .unwrap_or_else(|| "?".into()),
+            )
             .or_insert(0) += 1;
     }
     let mut rows: Vec<_> = counts.into_iter().collect();
@@ -382,7 +396,11 @@ fn print_row(
     println!(
         "{:<22} {:>6} {:>8} {:>8} {:>7.1} MiB {:>8.1} {:>7} {:>6.1}",
         label,
-        if runs == 0 { "-".into() } else { runs.to_string() },
+        if runs == 0 {
+            "-".into()
+        } else {
+            runs.to_string()
+        },
         if runs == 0 {
             "-".into()
         } else {

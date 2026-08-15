@@ -31,7 +31,21 @@ struct AfterRayApp: App {
     @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Settings { EmptyView() }
+        Settings {
+            AfterRaySettingsScene()
+        }
+        .windowResizability(.contentSize)
+    }
+}
+
+private struct AfterRaySettingsScene: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        AfterRaySettingsView(
+            model: AfterRaySettingsController.shared.model,
+            onClose: { dismiss() }
+        )
     }
 }
 

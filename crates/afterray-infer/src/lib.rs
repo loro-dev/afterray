@@ -59,7 +59,8 @@ pub fn execute(config: &InferConfig, input: &ModelInput) -> Result<ModelOutput, 
             vector: embed_text(&config.embedding_model, text)?,
         }),
         ModelInput::Llm { .. } => Err(AdapterError::InvalidOutput(
-            "LLM generation runs on the MLX worker or a configured endpoint, not this worker".into(),
+            "LLM generation runs on the MLX worker or a configured endpoint, not this worker"
+                .into(),
         )),
     }
 }
