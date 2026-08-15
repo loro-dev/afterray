@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useState,
@@ -571,22 +572,33 @@ function detectLang(): Lang {
 }
 
 export function LangProvider({ children }: { children: ReactNode }) {
-  const [lang, setLangState] = useState<Lang>(detectLang)
+  // The prerendered HTML is English, so both sides must start there or the
+  // trees disagree on hydration. The reader's language is picked up in an
+  // effect, which never runs on the server.
+  const [lang, setLangState] = useState<Lang>('en')
+
+  useEffect(() => {
+    setLangState(detectLang())
+  }, [])
 
   useEffect(() => {
     document.documentElement.lang = copy[lang].meta.htmlLang
     document.title = copy[lang].meta.title
-    try {
-      localStorage.setItem(STORAGE_KEY, lang)
-    } catch {
-      /* ignore */
-    }
   }, [lang])
 
+  // Persist only a deliberate choice. Writing on every change would let the
+  // pre-detection default overwrite a language the reader already picked.
+  const setLang = useCallback((next: Lang) => {
+    setLangState(next)
+    try {
+      localStorage.setItem(STORAGE_KEY, next)
+    } catch {
+      /* private mode etc. */
+    }
+  }, [])
+
   return (
-    <LangCtx.Provider value={{ lang, setLang: setLangState }}>
-      {children}
-    </LangCtx.Provider>
+    <LangCtx.Provider value={{ lang, setLang }}>{children}</LangCtx.Provider>
   )
 }
 

@@ -1,2 +1,4 @@
 node_modules/
 dist/
+# intermediate SSR bundle; prerender.mjs deletes it, but a failed build leaves it
+dist-ssr/
