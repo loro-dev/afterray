@@ -244,6 +244,66 @@ while the job is still pending, and the outlet is armed there.
 Plus a parser boundary bug: `FINAL` and `TOOL` were matched as prefixes, so
 "Finally, …" was delivered as "ly, …".
 
+## The context window, and where its number comes from
+
+Three numbers claim to be "the context window" and they are routinely different:
+what the architecture allows (Qwen3.5 says 262 144 at both sizes), what the
+machine can afford, and what the loaded instance actually got. Ollama picks the
+second from installed RAM, and a prompt longer than the result is cut *before
+the model reads it* — no error, no event, just an answer to a question with its
+front missing. Budgeting carefully against the wrong number buys nothing.
+
+**The tiers are Ollama's, deliberately.** `context_tokens_for_memory` in
+`afterray-platform-macos` copies the boundaries Ollama itself uses: under 24 GiB
+4 096, under 48 GiB 32 768, above that 262 144. A curve of our own would mean
+asking for a window the server then declines to give. The probe (`sysctl
+hw.memsize`) is kept apart from the arithmetic so the arithmetic is testable,
+and a machine that will not answer falls to the *smallest* tier — under-claiming
+costs room, over-claiming costs the front of the question.
+
+**Then the provider is asked.** `probe_context_tokens` reads `/api/show` for the
+architectural ceiling (the key is architecture-prefixed, so it matches on the
+`.context_length` suffix rather than guessing `qwen35.`) and `/api/ps` for what a
+resident instance actually got. The smallest real constraint wins. It runs per
+turn, not at startup: `/api/ps` only tells the truth once the model is loaded,
+which is exactly when it matters.
+
+**`OLLAMA_CONTEXT_LENGTH` / `OLLAMA_NUM_CTX` win over the tier.** Someone who set
+one has already made this decision, and quietly exceeding it allocates memory
+they declined to give. A pin is still bounded by what actually loaded — a pin
+above the server's allocation is a wish, not a window. The caveat is that we only
+see the variable when the daemon shares the server's environment; when we do not,
+`/api/ps` reports the pinned value anyway, so it is honoured either way, just one
+round later.
+
+**The number is declared, not assumed.** `/api/chat` now carries
+`options.num_ctx`, and it is the same figure the harness budgeted against —
+budget for more than we declare and the prompt gets cut, declare more than we
+budget for and a KV cache nobody uses sits in the same memory as everything
+else. `LlmRuntimeConfig.context_tokens` exists so those two cannot drift apart.
+For an OpenAI-compatible endpoint there is nothing to probe and this machine's
+memory says nothing about someone else's server, so it assumes 32 768; those
+endpoints reject an over-long prompt with an error rather than truncating it
+silently, which is what makes a guess acceptable there and not here.
+
+**The budget derives from the window rather than being tuned per tier.**
+`ContextBudget::for_window` scales the three parts by what they are: the reserve
+is an answer, so it is an eighth of the window clamped to [512, 4 096]; the
+system share is a measurement of the prompt and catalog, so it does not scale at
+all; and rounds fall from six to four on a narrow window, because six rounds of
+a 4 096 window cuts each tool result to a few hundred tokens — fewer, larger
+results beat more, emptier ones. `for_window(16_384)` reproduces the old
+`DEFAULT` exactly, asserted at compile time.
+
+Two things fell out of testing it. A tool result whose payload sits on one JSON
+line — every `get_ocr` reply — used to lose the entire payload, because
+`truncate_head` stops at the last line that fits whole and the envelope was all
+that fit. It now cuts into that line when enough room remains, which took the
+useful share of a 4 096-token window's tool budget from about a fifth to nearly
+all of it. And `PROTOCOL_VERSION` went to 8: `ChatAbort` was added while the
+version still read 7, so an app that knows stop and a daemon that does not both
+claimed 7, the handshake passed, and the user's stop did nothing.
+
 ## Not started
 
 Phase 4 (steering) and phase 5 (`SummarizeOldest`), plus the plan's note about
@@ -255,9 +315,6 @@ Four more, named in review and genuinely outstanding:
   by a map in `AppState` rather than by a type that owns the session, its tool
   registry, its policy hooks and its event log. `afterray-agent` remains a
   queue binding plus error classification; the name is ahead of the contents.
-- **The context window is a constant, not the model's.** `ContextBudget::DEFAULT`
-  assumes 16 384 tokens whatever is configured. It should come from the provider
-  settings, which means carrying a window through `LlmRuntimeConfig`.
 - **Long-term history is still trimmed by character count.** `fold_history`
   keeps the first message and drops from the middle until it fits, with no
   summary, no tombstone and no recoverable log. Compaction covers the in-turn
