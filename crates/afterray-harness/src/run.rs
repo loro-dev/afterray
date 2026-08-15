@@ -139,6 +139,13 @@ pub enum HarnessEvent {
     },
     ToolResult {
         name: String,
+        /// The result as the transcript received it, already capped.
+        ///
+        /// Carried on the event, not just returned in [`Turn`], because a host
+        /// persists the turn *as it runs*: a turn that is interrupted still has
+        /// to keep what it already looked up, and by then there is no `Turn` to
+        /// read it from.
+        text: String,
         chars: usize,
         truncated: bool,
         dropped: usize,
@@ -232,6 +239,49 @@ pub struct RoundReasoning {
 pub struct ToolCallRecord {
     pub name: String,
     pub args: Value,
+    /// What the call returned — **the bytes that went to the model**, after
+    /// truncation, not the original.
+    ///
+    /// This is the whole point. Storing the raw result and re-truncating it on
+    /// replay would make the same past render differently on a machine with a
+    /// different window, or after the user changes a setting: the budget
+    /// changes, `tool_result_tokens` changes, the cut lands elsewhere, and the
+    /// append-only prefix is gone. What was sent is what is kept, and it is
+    /// replayed byte for byte with no budget logic anywhere near it.
+    ///
+    /// `None` on rows written before results were stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Characters in `result`. Redundant with it, and written anyway: the chat
+    /// panel reads this field to caption the call, and it predates the result
+    /// being stored at all.
+    #[serde(default, rename = "chars", skip_serializing_if = "Option::is_none")]
+    pub chars: Option<usize>,
+    /// Whether that result had already been cut when it was sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_tokens: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` shape
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+impl ToolCallRecord {
+    /// A call and the result exactly as the transcript received it.
+    #[must_use]
+    pub fn new(name: String, args: Value, result: &Budgeted) -> Self {
+        Self {
+            name,
+            args,
+            chars: Some(result.text.chars().count()),
+            result: Some(result.text.clone()),
+            truncated: result.truncated,
+            dropped_tokens: result.dropped_tokens,
+        }
+    }
 }
 
 /// How full the window got on the last round.
@@ -455,10 +505,9 @@ where
                     break;
                 }
                 let result = call_tool(tools, sink, &config.cancel, &name, &args).await?;
-                turn.tool_calls.push(ToolCallRecord {
-                    name: name.clone(),
-                    args: args.clone(),
-                });
+                turn
+                    .tool_calls
+                    .push(ToolCallRecord::new(name.clone(), args.clone(), &result));
                 turn.tool_results.push(result.text.clone());
                 transcript.push(name.clone(), args, result);
 
@@ -603,6 +652,7 @@ where
         sink,
         HarnessEvent::ToolResult {
             name: name.to_owned(),
+            text: result.text.clone(),
             chars: result.text.chars().count(),
             truncated: result.truncated,
             dropped: result.dropped_tokens,
