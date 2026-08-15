@@ -24,7 +24,7 @@ export default function Hero() {
           <a className="btn btn-primary" href="#download">
             {t.ctaPrimary}
           </a>
-          <a className="btn btn-ghost" href="#features">
+          <a className="btn btn-ghost" href="#memories">
             {t.ctaSecondary}
           </a>
         </div>

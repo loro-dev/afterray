@@ -145,19 +145,6 @@ button:focus-visible {
   outline: 1px solid oklch(1 0 0 / 0.1);
   outline-offset: -1px;
 }
-.nav-links {
-  display: flex;
-  gap: 2rem;
-  font-size: 0.86rem;
-}
-.nav-links a {
-  color: var(--ink-dim);
-  text-decoration: none;
-  transition: color 150ms ease-out;
-}
-.nav-links a:hover {
-  color: var(--accent);
-}
 .nav-actions {
   display: flex;
   align-items: center;
@@ -1269,9 +1256,6 @@ button.sa-chip.sa-chip-active {
   }
   .privacy .pipe-row {
     margin-top: 4rem;
-  }
-  .nav-links {
-    display: none;
   }
   .nav {
     padding-inline: calc(1.2rem + env(safe-area-inset-left)) calc(1.2rem + env(safe-area-inset-right));

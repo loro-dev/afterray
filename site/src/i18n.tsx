@@ -22,9 +22,6 @@ const en = {
     htmlLang: 'en',
   },
   nav: {
-    features: 'Recall',
-    cli: 'Agents',
-    privacy: 'Privacy',
     language: 'Language',
     skip: 'Skip to content',
   },
@@ -295,9 +292,6 @@ const zh: Copy = {
     htmlLang: 'zh-CN',
   },
   nav: {
-    features: '回放',
-    cli: 'Agent',
-    privacy: '隐私',
     language: '语言',
     skip: '跳到正文',
   },

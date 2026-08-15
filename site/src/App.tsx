@@ -8,18 +8,12 @@ import SearchAsk from './sections/SearchAsk'
 import Closer from './sections/Closer'
 
 function Nav() {
-  const t = useCopy().nav
   return (
     <nav className="nav">
       <a className="nav-logo" href="#top">
         <img src="/logo.png" alt="" className="logo-img" />
         <span className="mono">AfterRay</span>
       </a>
-      <div className="nav-links">
-        <a href="#cli">{t.cli}</a>
-        <a href="#features">{t.features}</a>
-        <a href="#privacy">{t.privacy}</a>
-      </div>
       <div className="nav-actions">
         <LangMenu />
       </div>
