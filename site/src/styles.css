@@ -150,6 +150,26 @@ button:focus-visible {
   align-items: center;
   gap: 0.9rem;
 }
+.nav-repo {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--ink-dim);
+  text-decoration: none;
+  transition-property: color, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+.nav-repo:hover {
+  color: var(--accent);
+}
+.nav-repo:active {
+  transform: scale(0.96);
+}
+.nav-repo span {
+  font-size: 0.9rem;
+  letter-spacing: 0;
+}
 /* language switcher: a globe that opens the list of locales, so adding a
    third language does not mean redesigning a two-state toggle */
 .lang-menu {

@@ -15,6 +15,16 @@ function Nav() {
         <span className="mono">AfterRay</span>
       </a>
       <div className="nav-actions">
+        <a
+          className="nav-repo mono"
+          href="https://github.com/loro-dev/afterray"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="GitHub repository"
+        >
+          GitHub
+          <span aria-hidden="true">↗</span>
+        </a>
         <LangMenu />
       </div>
     </nav>
