@@ -18,7 +18,7 @@ export const LANGS: { code: Lang; label: string }[] = [
 
 const en = {
   meta: {
-    title: 'AfterRay — Your Mac remembers everything, for you and for your agent.',
+    title: 'AfterRay — A searchable recording of everything you see and hear.',
     htmlLang: 'en',
   },
   nav: {
@@ -30,9 +30,9 @@ const en = {
   },
   hero: {
     eyebrow: 'Local-first computer history',
-    titleA: ['Your Mac remembers everything,'] as Part[],
-    titleB: ['for you and for ', { em: 'your agent.' }] as Part[],
-    sub: 'AfterRay keeps what you saw and heard on this machine. Search it, replay it, or let Claude Code and Codex look it up for you. None of it leaves the Mac.',
+    titleA: ['A searchable recording'] as Part[],
+    titleB: ['of everything you ', { em: 'see and hear.' }] as Part[],
+    sub: 'AfterRay captures your screen and the audio around it all day and keeps it on this Mac. Replay any moment, search it by half a phrase, or let Claude Code and Codex look it up for you.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
     facts: ['macOS 15+ · Apple Silicon', 'No account, no telemetry', 'Nothing leaves this Mac'],
@@ -296,7 +296,7 @@ export type Copy = typeof en
 
 const zh: Copy = {
   meta: {
-    title: 'AfterRay — 你的 Mac 记得一切，为你，也为你的 agent',
+    title: 'AfterRay — 一份可搜索的记录，装下你看到和听到的一切',
     htmlLang: 'zh-CN',
   },
   nav: {
@@ -308,9 +308,9 @@ const zh: Copy = {
   },
   hero: {
     eyebrow: '纯本地的 computer history',
-    titleA: ['你的 Mac 记得一切，'],
-    titleB: ['为你，也为', { em: '你的 agent。' }],
-    sub: 'AfterRay 把你看到的、听到的留在这台机器上。你可以搜、可以回放，也可以让 Claude Code、Codex 替你去查。这些东西不会离开本机。',
+    titleA: ['一份可搜索的记录，'],
+    titleB: ['装下你', { em: '看到和听到的一切。' }],
+    sub: 'AfterRay 整天捕获你的屏幕和周围的声音，全部留在这台 Mac 上。回放任意一刻，用记得的只言片语搜出来，也可以让 Claude Code、Codex 替你去查。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
     facts: ['macOS 15+ · Apple Silicon', '无账号，无遥测', '数据不出这台 Mac'],
