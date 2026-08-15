@@ -291,11 +291,14 @@ button:focus-visible {
   padding: 0 2rem;
   text-align: start;
 }
+/* one sentence, on a short measure, bright enough to actually read —
+   the reassurances live in .hero-facts rather than in this paragraph */
 .hero-sub {
   margin-top: 1.6rem;
-  max-width: 34rem;
-  color: var(--ink-dim);
-  font-size: 1.05rem;
+  max-width: 31rem;
+  color: rgba(242, 237, 226, 0.72);
+  font-size: 1.15rem;
+  line-height: 1.55;
 }
 .hero-ctas {
   margin-top: 2.2rem;

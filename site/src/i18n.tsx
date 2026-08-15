@@ -32,10 +32,10 @@ const en = {
     eyebrow: 'Local-first computer history',
     titleA: ['Remember'] as Part[],
     titleB: [{ em: 'everything.' }] as Part[],
-    sub: 'AfterRay records your screen and the audio around it all day. Replay any moment, search it, or let Claude Code and Codex look it up — and exclude any app you would rather it did not see. All on this Mac.',
+    sub: 'AfterRay records your screen and audio all day — so you and your agent can find anything you saw or heard.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
-    facts: ['macOS 15+ · Apple Silicon', 'Pause or delete anytime', 'Nothing leaves this Mac'],
+    facts: ['macOS 15+', 'Exclude any app', 'Pause or delete anytime', 'Nothing leaves this Mac'],
   },
   jtbd: [
     {
@@ -310,10 +310,10 @@ const zh: Copy = {
     eyebrow: '纯本地的 computer history',
     titleA: ['记住'],
     titleB: [{ em: '一切。' }],
-    sub: 'AfterRay 整天记录你的屏幕和周围的声音。回放任意一刻、搜索它，或者让 Claude Code、Codex 替你去查——不想被记录的 App，随时排除。全程在这台 Mac 上。',
+    sub: 'AfterRay 整天记录你的屏幕和声音——你看到、听到的一切，你和你的 agent 都能再找到。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
-    facts: ['macOS 15+ · Apple Silicon', '随时暂停或删除', '数据不出这台 Mac'],
+    facts: ['macOS 15+', '可排除任意 App', '随时暂停或删除', '数据不出这台 Mac'],
   },
   jtbd: [
     {
