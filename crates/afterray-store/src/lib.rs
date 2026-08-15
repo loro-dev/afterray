@@ -81,7 +81,7 @@ pub use slot::{
     shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
 };
 
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Cosine floor for a semantic hit to count as a hit at all.
 ///
@@ -2969,7 +2969,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_14(connection)?;
     migrate_schema_15(connection)?;
     migrate_schema_16(connection)?;
-    migrate_schema_17(connection, from_version)?;
+    migrate_schema_18(connection, from_version)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -3407,11 +3407,14 @@ fn migrate_schema_16(connection: &Connection) -> Result<(), StoreError> {
 
 /// Rewrites `evidence_fts` in the folded form `index_text` now produces.
 ///
-/// Rows indexed by an older build hold raw text, where a run of Han characters
-/// is one token and no substring of it can be searched. Nothing recovers that
-/// but a rebuild, so it happens once, on the open that finds an older file.
-fn migrate_schema_17(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
-    if from_version >= 17 {
+/// Rows indexed before 17 hold raw text, where a run of Han characters is one
+/// token and no substring of it can be searched. 18 refolds again because the
+/// run rules changed under it: `々`, `〆` and `〇` joined the run, so a vault
+/// stamped 17 has `人々` split across two tokens that the query no longer asks
+/// for. Either way nothing recovers the old rows but a rebuild, so it happens
+/// once, on the open that finds the older file.
+fn migrate_schema_18(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
+    if from_version >= 18 {
         return Ok(());
     }
     let transaction = connection.unchecked_transaction()?;
@@ -4533,6 +4536,51 @@ mod tests {
         assert_eq!(vault.search("会", 10).unwrap().len(), 1);
     }
 
+    /// `々` stands in for the ideograph before it, so it is part of the word.
+    /// While it was Latin, `時々` became `"時"* AND "々"` and matched any row
+    /// holding both characters, however far apart.
+    #[test]
+    fn iteration_marks_only_match_where_they_are_adjacent() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        ocr_evidence(&vault, &session.id, "時計と長々しい話", 1);
+
+        assert!(
+            vault.search("時々", 10).unwrap().is_empty(),
+            "時 and 々 are both present but never touching"
+        );
+
+        ocr_evidence(&vault, &session.id, "時々雨が降る", 2);
+        assert_eq!(vault.search("時々", 10).unwrap().len(), 1);
+        assert_eq!(vault.search("人々", 10).unwrap().len(), 0);
+    }
+
+    /// FTS5 throws the hyphen away when it indexes, so only a phrase carries
+    /// the adjacency the user typed. As two AND'd terms, `retry-count` matched
+    /// a row with a retry in one sentence and a count in another — and then had
+    /// no `retry-count` on screen to highlight.
+    #[test]
+    fn punctuation_joined_words_have_to_be_adjacent() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        ocr_evidence(
+            &vault,
+            &session.id,
+            "retry the request; the count was wrong",
+            1,
+        );
+
+        assert!(
+            vault.search("retry-count", 10).unwrap().is_empty(),
+            "retry and count are both present but a whole clause apart"
+        );
+
+        ocr_evidence(&vault, &session.id, "build failed: retry-count exceeded", 2);
+        assert_eq!(vault.search("retry-count", 10).unwrap().len(), 1);
+        // Typed with a space, they are two terms again, and both rows qualify.
+        assert_eq!(vault.search("retry count", 10).unwrap().len(), 2);
+    }
+
     #[test]
     fn fts_syntax_in_a_query_is_matched_not_executed() {
         let (_directory, vault) = test_vault(10);
@@ -4597,6 +4645,43 @@ mod tests {
 
         let vault = Vault::open_with_key(config, [7_u8; 32]).unwrap();
         assert_eq!(vault.search("会议", 10).unwrap().len(), 1);
+    }
+
+    /// 17 was folded already, just by rules that left `々` outside the run.
+    /// Without the bump those rows keep a fold the query no longer asks for.
+    #[test]
+    fn a_vault_stamped_seventeen_is_refolded_for_the_new_run_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            max_storage_bytes: 10_000_000_000,
+        };
+
+        {
+            let vault = Vault::open_with_key(config.clone(), [7_u8; 32]).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            let id = ocr_evidence(&vault, &session.id, "時々雨が降る", 1);
+            let connection = vault.connection.lock().unwrap();
+            connection.execute("DELETE FROM evidence_fts", []).unwrap();
+            // What index_text produced while 々 broke the run in two.
+            connection
+                .execute(
+                    "INSERT INTO evidence_fts (evidence_id, text) VALUES (?1, ?2)",
+                    params![id, "時 々 雨が が降 降る る "],
+                )
+                .unwrap();
+            connection
+                .execute("UPDATE schema_meta SET version = 17", [])
+                .unwrap();
+            drop(connection);
+            assert!(
+                vault.search("時々", 10).unwrap().is_empty(),
+                "the 17-era fold has no 時々 bigram to find"
+            );
+        }
+
+        let vault = Vault::open_with_key(config, [7_u8; 32]).unwrap();
+        assert_eq!(vault.search("時々", 10).unwrap().len(), 1);
     }
 
     #[test]

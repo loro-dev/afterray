@@ -26,9 +26,16 @@
 /// Characters whose scripts are written without spaces, so FTS5 cannot break
 /// them apart on its own. Hangul is deliberately absent: Korean is written with
 /// spaces between words and tokenizes correctly already.
+///
+/// `々`, `〆` and `〇` have to be in here even though they live in the
+/// punctuation block. They stand in for an ideograph mid-word — `人々`, `時々`,
+/// `二〇二五` — and Rust calls them alphabetic, so leaving them out did not just
+/// split the run, it fed the halves to the Latin path as separate `AND` terms.
+/// `時々` then matched any text holding a 時 and a 々 anywhere.
 fn is_scriptio_continua(character: char) -> bool {
     matches!(u32::from(character),
-        0x3040..=0x30FF        // hiragana, katakana
+        0x3005..=0x3007        // 々 iteration, 〆 closing, 〇 ideographic zero
+        | 0x3040..=0x30FF      // hiragana, katakana
         | 0x3400..=0x4DBF      // CJK unified ideographs extension A
         | 0x4E00..=0x9FFF      // CJK unified ideographs
         | 0xF900..=0xFAFF      // CJK compatibility ideographs
@@ -93,25 +100,41 @@ fn run_grams(run: &[char]) -> Vec<String> {
 /// quoted, which is what keeps FTS5 operators the user did not mean to type
 /// (`AND`, `foo-bar`, a lone `"`) from being read as syntax — or from raising
 /// an error that silently turned the whole search into a semantic guess.
+///
+/// **Only whitespace separates terms.** Words joined by punctuation are one
+/// phrase, because that is what the user typed and what they will look for on
+/// screen: `retry-count` has to mean "these two, in this order, touching", not
+/// "a retry somewhere and a count somewhere". FTS5 drops the hyphen when it
+/// indexes, so the phrase is how the adjacency survives.
 #[must_use]
 pub fn match_query(query: &str) -> Option<String> {
     let mut terms: Vec<String> = Vec::new();
     let mut run: Vec<char> = Vec::new();
     let mut word = String::new();
+    let mut phrase: Vec<String> = Vec::new();
 
     for character in query.chars() {
         if is_scriptio_continua(character) {
-            push_word(&mut word, &mut terms);
+            // A CJK run cannot join the phrase around it: its own fence unigram
+            // sits between the two, so no phrase could span them anyway.
+            end_word(&mut word, &mut phrase);
+            push_phrase_term(&mut phrase, &mut terms);
             run.push(character);
         } else if character.is_alphanumeric() || character == '_' || character == '\'' {
             push_run_term(&mut run, &mut terms);
             word.push(character);
+        } else if character.is_whitespace() {
+            end_word(&mut word, &mut phrase);
+            push_phrase_term(&mut phrase, &mut terms);
+            push_run_term(&mut run, &mut terms);
         } else {
-            push_word(&mut word, &mut terms);
+            // Punctuation ends the word but holds the phrase open.
+            end_word(&mut word, &mut phrase);
             push_run_term(&mut run, &mut terms);
         }
     }
-    push_word(&mut word, &mut terms);
+    end_word(&mut word, &mut phrase);
+    push_phrase_term(&mut phrase, &mut terms);
     push_run_term(&mut run, &mut terms);
 
     if terms.is_empty() {
@@ -120,12 +143,22 @@ pub fn match_query(query: &str) -> Option<String> {
     Some(terms.join(" AND "))
 }
 
-fn push_word(word: &mut String, terms: &mut Vec<String>) {
+fn end_word(word: &mut String, phrase: &mut Vec<String>) {
     if word.is_empty() {
         return;
     }
-    terms.push(quote(word));
+    phrase.push(word.clone());
     word.clear();
+}
+
+fn push_phrase_term(phrase: &mut Vec<String>, terms: &mut Vec<String>) {
+    if phrase.is_empty() {
+        return;
+    }
+    // One quoted string either way; FTS5 reads several tokens inside the quotes
+    // as a phrase, which is exactly the adjacency the punctuation implied.
+    terms.push(quote(&phrase.join(" ")));
+    phrase.clear();
 }
 
 fn push_run_term(run: &mut Vec<char>, terms: &mut Vec<String>) {
@@ -198,9 +231,43 @@ mod tests {
     #[test]
     fn fts_syntax_the_user_typed_is_quoted_not_obeyed() {
         assert_eq!(match_query("AND"), Some("\"AND\"".into()));
-        assert_eq!(match_query("foo-bar"), Some("\"foo\" AND \"bar\"".into()));
         assert_eq!(match_query("say \"hi\""), Some("\"say\" AND \"hi\"".into()));
-        assert_eq!(match_query("a*b"), Some("\"a\" AND \"b\"".into()));
+    }
+
+    /// `retry-count` is one thing the user saw, not two things they want
+    /// co-located. Only whitespace is allowed to split terms.
+    #[test]
+    fn punctuation_binds_words_into_a_phrase() {
+        assert_eq!(match_query("retry-count"), Some("\"retry count\"".into()));
+        assert_eq!(match_query("a*b"), Some("\"a b\"".into()));
+        assert_eq!(match_query("v1.2.3"), Some("\"v1 2 3\"".into()));
+        // Whitespace still separates, even with punctuation next to it.
+        assert_eq!(
+            match_query("build, retry"),
+            Some("\"build\" AND \"retry\"".into())
+        );
+    }
+
+    /// The iteration mark is a stand-in for the ideograph before it, so it
+    /// belongs to the run. Treated as Latin it split `時々` into two terms that
+    /// matched a 時 and a 々 anywhere in the same evidence row.
+    #[test]
+    fn iteration_marks_stay_inside_the_run() {
+        assert_eq!(match_query("時々"), Some("\"時々\"".into()));
+        assert_eq!(match_query("人々"), Some("\"人々\"".into()));
+        assert_eq!(match_query("二〇二五"), Some("\"二〇 〇二 二五\"".into()));
+        assert_eq!(index_text("時々"), "時々 々 ");
+    }
+
+    /// Both fixes are the same promise: a hit has the query in it, contiguously.
+    #[test]
+    fn non_adjacent_characters_do_not_match() {
+        // 時 and 々 both occur, never touching.
+        let scattered = index_text("時計と長々しい話");
+        assert!(!scattered.contains("時々"));
+        assert_eq!(match_query("時々"), Some("\"時々\"".into()));
+        // And where they do touch, the bigram is there to be found.
+        assert!(index_text("時々雨が降る").contains("時々"));
     }
 
     #[test]
