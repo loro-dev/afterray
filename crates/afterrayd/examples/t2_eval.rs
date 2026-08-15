@@ -108,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
         let job = queue
             .submit(ModelInput::Llm {
+                messages: Vec::new(),
                 prompt: user.clone(),
                 system: Some(T2_SYSTEM_PROMPT.to_owned()),
             })

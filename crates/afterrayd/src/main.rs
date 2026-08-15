@@ -2175,7 +2175,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         // the task.
         afterray_harness::Opening {
             seed: String::new(),
-            history: String::new(),
+            history: Vec::new(),
             task: inputs.user.clone(),
         },
     )
@@ -2533,6 +2533,7 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
     let job_id = match state
         .models
         .submit(ModelInput::Llm {
+            messages: Vec::new(),
             prompt,
             system: Some(
                 "You are AfterRay. Be concise and never invent missing evidence.".to_owned(),

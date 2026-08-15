@@ -18,8 +18,6 @@ use crate::agent::AgentError;
 use crate::turn_row::TurnRow;
 use crate::tools::{ToolHost, tool_catalog_text};
 
-const FOLD_CHAR_CAP: usize = 8_000;
-const RECENT_TURNS: usize = 6;
 const TITLE_CHARS: usize = 24;
 
 const SYSTEM_PROMPT: &str = "You are AfterRay, a local memory assistant for this computer. \
@@ -159,7 +157,7 @@ where
         .store
         .conversation_messages(&conversation_id)
         .map_err(|error| anyhow::anyhow!(error))?;
-    let history = fold_history(&prior);
+    let history = crate::chat::history_messages(&prior);
     if let Err(error) =
         ctx.store
             .append_message(&conversation_id, "user", message.trim(), None, ctx.now_ms)
@@ -188,7 +186,7 @@ where
     let mut peer_present = write_event(write, &started).await.is_ok();
 
     let seed = chat_seed(ctx.store, ctx.now_ms);
-    let opening = build_opening(&seed, &history, message);
+    let opening = build_opening(&seed, history, message);
     let mut outcome = run_agent(write, &ctx, opening, &mut row, &mut peer_present).await;
     row.set_tool_log(if outcome.tool_log.is_empty() {
         None
@@ -366,6 +364,14 @@ pub(crate) fn compaction_line(notice: &CompactionNotice) -> String {
     // Per strategy, because the two remove entirely different things. Saying
     // "dropped earlier tool results" when what actually went was half the
     // conversation is worse than saying nothing.
+    if notice.strategy == afterray_harness::PruneToolResults::HISTORY_NAME {
+        return format!(
+            "Dropped the oldest messages in this conversation to stay inside the context \
+             window (~{} → ~{} tokens). They are still in the thread above; ask about them \
+             again and it will read them back.",
+            notice.tokens_before, notice.tokens_after
+        );
+    }
     if notice.strategy == "trim_opening" {
         return format!(
             "Trimmed the earlier conversation to stay inside the context window \
@@ -640,50 +646,6 @@ fn conversation_title(message: &str) -> String {
     }
 }
 
-fn fold_history(messages: &[ConversationMessage]) -> String {
-    // Compaction rows are for the reader, not the model. Folding them back in
-    // would spend context explaining that context ran out, and would grow every
-    // subsequent turn's prompt by one line per pass.
-    let messages: Vec<ConversationMessage> = messages
-        .iter()
-        .filter(|message| message.role != COMPACTION_ROLE)
-        .cloned()
-        .collect();
-    if messages.is_empty() {
-        return String::new();
-    }
-    let mut kept: Vec<&ConversationMessage> = Vec::new();
-    if let Some(first) = messages.first() {
-        kept.push(first);
-    }
-    let recent_from = messages
-        .len()
-        .saturating_sub(RECENT_TURNS.saturating_mul(2))
-        .max(1);
-    for message in &messages[recent_from..] {
-        if kept.last().is_some_and(|last| last.id == message.id) {
-            continue;
-        }
-        kept.push(message);
-    }
-
-    let mut lines: Vec<String> = kept.iter().map(|message| format_turn(message)).collect();
-    let mut body = lines.join("\n");
-    while lines.len() > 1 && body.chars().count() > FOLD_CHAR_CAP {
-        lines.remove(1);
-        body = lines.join("\n");
-    }
-    if body.chars().count() > FOLD_CHAR_CAP {
-        body.chars().take(FOLD_CHAR_CAP).collect()
-    } else {
-        body
-    }
-}
-
-fn format_turn(message: &ConversationMessage) -> String {
-    format!("{}: {}", message.role, message.content)
-}
-
 fn chat_seed(store: &Vault, now_ms: i64) -> String {
     let now = chrono::DateTime::from_timestamp_millis(now_ms)
         .unwrap_or_else(chrono::Utc::now)
@@ -734,10 +696,10 @@ fn chat_seed(store: &Vault, now_ms: i64) -> String {
 /// It used to be one string in this order — seed, history, task — which the
 /// loop then trimmed from the head. A long history therefore deleted the
 /// question at the end of it.
-fn build_opening(seed: &str, history: &str, message: &str) -> Opening {
+fn build_opening(seed: &str, history: Vec<afterray_harness::Message>, message: &str) -> Opening {
     Opening {
         seed: seed.to_owned(),
-        history: history.to_owned(),
+        history,
         task: message.trim().to_owned(),
     }
 }
@@ -799,7 +761,7 @@ mod tests {
     /// would spend context explaining that context ran out, and would grow
     /// every later turn by one line per pass.
     #[test]
-    fn fold_leaves_compaction_rows_out_of_the_prompt() {
+    fn a_compaction_row_travels_with_the_conversation() {
         let messages = vec![
             ConversationMessage {
                 id: "m0".into(),
@@ -835,10 +797,24 @@ mod tests {
                 created_at_ms: 3,
             },
         ];
-        let folded = fold_history(&messages);
-        assert!(folded.contains("what did I do"), "{folded}");
-        assert!(folded.contains("You read a design doc"), "{folded}");
-        assert!(!folded.contains("Dropped 2 earlier"), "{folded}");
+        let history = crate::chat::history_messages(&messages);
+        let text: Vec<&str> = history
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(text.iter().any(|line| line.contains("what did I do")), "{text:?}");
+        assert!(
+            text.iter().any(|line| line.contains("You read a design doc")),
+            "{text:?}"
+        );
+        // The compaction row now travels with the conversation instead of being
+        // filtered out. Skipping it left a question in the array with no sign
+        // of why its answer was thin.
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("[AfterRay]") && line.contains("Dropped 2 earlier")),
+            "{text:?}"
+        );
     }
 
     /// The line a user reads where the agent stopped being able to see. It has
@@ -868,8 +844,10 @@ mod tests {
         assert!(one.contains("1 earlier tool result to"), "{one}");
     }
 
+    /// Twenty turns in, every one of them is still in the array and none has
+    /// been rewritten. Folding kept the first and the last six.
     #[test]
-    fn fold_keeps_first_and_recent_turns() {
+    fn a_long_thread_keeps_every_turn_it_ever_had() {
         let messages: Vec<ConversationMessage> = (0..20)
             .map(|index| ConversationMessage {
                 id: format!("m{index}"),
@@ -883,13 +861,13 @@ mod tests {
                 created_at_ms: i64::from(index),
             })
             .collect();
-        let folded = fold_history(&messages);
-        assert!(folded.contains("user: msg0"), "{folded}");
-        assert!(folded.contains("assistant: msg19"), "{folded}");
-        assert!(!folded.contains("msg2"), "{folded}");
+        let history = crate::chat::history_messages(&messages);
+        assert_eq!(history.len(), 20);
+        assert!(history[0].content.contains("msg0"), "{:?}", history[0]);
+        assert_eq!(history[19].content, "msg19");
+        // The one folding always dropped.
+        assert!(history[2].content.contains("msg2"), "{:?}", history[2]);
     }
-
-
 
     #[tokio::test]
     async fn empty_message_is_an_error_event() {
@@ -1247,6 +1225,116 @@ print(json.dumps({
             "the last prompt was {chars} chars, over a {}-token transcript share",
             budget.transcript_tokens()
         );
+    }
+
+    /// The invariant, end to end: each turn's array extends the last one's
+    /// rather than rewriting it, through the real chat path and a real worker.
+    ///
+    /// "Extends" excludes the final message on purpose. That one carries the
+    /// clock and the question just asked, and it is *supposed* to change every
+    /// turn — putting it last is the whole point, because everything in front
+    /// of it then stays byte-identical and a provider cache can match it. Once
+    /// the question has been answered and stored it re-enters the array as its
+    /// own message and never moves again.
+    #[tokio::test]
+    async fn each_turn_extends_the_array_it_sent_last_time() {
+        let (_dir, vault) = test_vault();
+        let now = 1_786_729_937_000;
+        let session = vault.create_session_sync(now - 60_000).unwrap();
+        vault
+            .insert_moment(&session.id, now - 60_000, "image/jpeg", b"frame")
+            .unwrap();
+
+        let dump = _dir.path().join("messages.jsonl");
+        // The worker writes back the array it was handed. `ModelInput` is
+        // serialised to the worker as-is, so this is the same value the remote
+        // adapter puts on the wire.
+        let script = format!(
+            r#"
+import json, sys
+req = json.load(sys.stdin)
+messages = (req.get("input") or {{}}).get("messages") or []
+with open({dump:?}, "a") as handle:
+    handle.write(json.dumps(messages, ensure_ascii=False) + "\n")
+seen_tool = any(m["content"].startswith("TOOL ") for m in messages)
+text = "FINAL\nYou were reading." if seen_tool else "TOOL get_now\nARGS {{}}"
+print(json.dumps({{
+  "protocol_version": 1,
+  "output": {{"type": "llm", "text": text}},
+  "retryable": False
+}}))
+"#,
+            dump = dump.display().to_string()
+        );
+        let models = queue(vec![llm_script(&script)]);
+        let sink = LlmTokenSink::default();
+
+        let mut conversation = None;
+        for (index, question) in ["what was I reading", "and before that", "and the day before"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut out = Vec::new();
+            run_chat_stream(
+                &mut out,
+                ChatStreamCtx {
+                    store: &vault,
+                    models: &models,
+                    token_sink: &sink,
+                    // A later clock each turn, deliberately: the seed moves and
+                    // must not be what breaks the prefix.
+                    now_ms: now + (index as i64) * 90_000,
+                    llm_ready: true,
+                    budget: ContextBudget::DEFAULT,
+                    cancel: CancelToken::new(),
+                },
+                conversation.as_deref(),
+                question,
+            )
+            .await
+            .unwrap();
+            conversation = Some(vault.conversations(10).unwrap()[0].id.clone());
+        }
+
+        let dumped = std::fs::read_to_string(&dump).unwrap();
+        let arrays: Vec<Vec<serde_json::Value>> = dumped
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // Turn one needs two rounds (it calls a tool); turns two and three see
+        // the replayed call already and answer straight away.
+        assert_eq!(arrays.len(), 4, "unexpected round shape: {arrays:?}");
+
+        for (label, array) in [("turn 2", &arrays[2]), ("turn 3", &arrays[3])] {
+            eprintln!("{label} ({} messages):", array.len());
+            for message in array {
+                eprintln!("  {} | {}", message["role"], preview(&message["content"]));
+            }
+        }
+
+        // Everything except the volatile tail is append-only.
+        let stable = |array: &Vec<serde_json::Value>| array[..array.len() - 1].to_vec();
+        let second = stable(&arrays[2]);
+        let third = stable(&arrays[3]);
+        assert!(
+            second.len() < third.len() && third[..second.len()] == second[..],
+            "turn 3 rewrote what turn 2 had sent:\n{second:#?}\n{third:#?}"
+        );
+        // And what turn one looked up is still visible two turns later.
+        assert!(
+            third
+                .iter()
+                .any(|message| message["content"].as_str().is_some_and(|c| c.contains("TOOL get_now"))),
+            "the tool call from turn one went missing: {third:?}"
+        );
+    }
+
+    fn preview(value: &serde_json::Value) -> String {
+        let text = value.as_str().unwrap_or_default().replace('\n', " ⏎ ");
+        if text.chars().count() <= 90 {
+            return text;
+        }
+        format!("{}…", text.chars().take(90).collect::<String>())
     }
 
     /// Phase 3's whole point. The app's stop button shuts the socket, which
@@ -1679,6 +1767,145 @@ print(json.dumps({
             !assistant.content.is_empty() || assistant.reasoning.is_some(),
             "the row kept neither text nor reasoning"
         );
+    }
+
+    /// A real model, two turns, and the second one answering from the first.
+    ///
+    /// The unit tests prove the array is shaped correctly. This proves a model
+    /// can read it: the replayed exchanges are fenced user turns and bracketed
+    /// `[AfterRay]` notes, which is a shape nothing was reading until now.
+    #[tokio::test]
+    async fn live_ollama_carries_a_conversation_across_turns() {
+        // The smallest installed chat model rather than the best one: this
+        // checks that a model can read the array, not how well it reasons, and
+        // a 22 GB thinking model spends minutes per turn doing neither.
+        let Some(model) = live_ollama_small_model().await else {
+            eprintln!("skip: no live Ollama chat model");
+            return;
+        };
+        eprintln!("live multi-turn test using `{model}`");
+
+        let (_dir, vault) = test_vault();
+        let now = 1_786_729_937_000;
+        let session = vault.create_session_sync(now - 60_000).unwrap();
+        vault
+            .insert_moment(&session.id, now - 60_000, "image/jpeg", b"frame")
+            .unwrap();
+
+        let config = std::sync::Arc::new(std::sync::Mutex::new(
+            afterray_models::LlmRuntimeConfig {
+                provider: afterray_protocol::LlmProvider::Ollama,
+                base_url: String::new(),
+                model,
+                api_key: None,
+                context_tokens: Some(32_768),
+            },
+        ));
+        let router = afterray_models::LlmRouterAdapter::new(config);
+        let sink = router.token_sink();
+        let models = ModelQueue::new(
+            vec![std::sync::Arc::new(router) as std::sync::Arc<dyn afterray_models::ModelAdapter>],
+            afterray_models::QueueConfig::default(),
+        )
+        .unwrap();
+
+        // A fact the vault cannot supply, so a correct second answer can only
+        // have come from the first turn's message being in the array.
+        let questions = [
+            "Remember this codeword and then answer FINAL: ZANZIBAR-7741. Just acknowledge it.",
+            "What was the codeword I gave you? Answer with FINAL and the codeword.",
+        ];
+        let mut conversation = None;
+        let mut answers = Vec::new();
+        for (index, question) in questions.into_iter().enumerate() {
+            let mut out = Vec::new();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(180),
+                run_chat_stream(
+                    &mut out,
+                    ChatStreamCtx {
+                        store: &vault,
+                        models: &models,
+                        token_sink: &sink,
+                        now_ms: now + (index as i64) * 60_000,
+                        llm_ready: true,
+                        budget: ContextBudget::for_window(32_768),
+                        cancel: CancelToken::new(),
+                    },
+                    conversation.as_deref(),
+                    question,
+                ),
+            )
+            .await
+            .expect("a live turn ran over its timeout");
+            result.unwrap();
+            conversation = Some(vault.conversations(10).unwrap()[0].id.clone());
+            let text: String = parse_events(&out)
+                .iter()
+                .filter_map(|event| match event {
+                    ChatStreamEvent::Token { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            eprintln!("live turn {}: {}", index + 1, text.trim());
+            answers.push(text);
+        }
+
+        assert!(
+            answers[1].contains("ZANZIBAR-7741"),
+            "the second turn could not see the first: {:?}",
+            answers[1]
+        );
+    }
+
+    /// The smallest chat model this machine has, for tests that only need a
+    /// model to read something rather than to be good at answering.
+    async fn live_ollama_small_model() -> Option<String> {
+        if let Ok(pinned) = std::env::var("AFTERRAY_OLLAMA_TEST_MODEL") {
+            let pinned = pinned.trim();
+            if !pinned.is_empty() {
+                return Some(pinned.to_owned());
+            }
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .ok()?;
+        let body: serde_json::Value = client
+            .get(format!(
+                "{}/api/tags",
+                afterray_models::DEFAULT_OLLAMA_BASE_URL
+            ))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let mut chat: Vec<(u64, String)> = body
+            .get("models")?
+            .as_array()?
+            .iter()
+            .filter(|model| {
+                model
+                    .get("capabilities")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|caps| {
+                        caps.iter().any(|cap| cap.as_str() == Some("completion"))
+                    })
+            })
+            .filter_map(|model| {
+                let name = model.get("name")?.as_str()?;
+                (!name.contains("embed")).then(|| {
+                    (
+                        model.get("size").and_then(serde_json::Value::as_u64).unwrap_or(u64::MAX),
+                        name.to_owned(),
+                    )
+                })
+            })
+            .collect();
+        chat.sort_unstable();
+        chat.into_iter().next().map(|(_, name)| name)
     }
 
     /// A chat model this machine actually has, or `None`.

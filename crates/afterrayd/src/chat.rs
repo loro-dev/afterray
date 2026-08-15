@@ -10,17 +10,15 @@ use chrono::Local;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use afterray_harness::{CompactionNotice, Opening, ToolCallRecord};
+use afterray_harness::{CompactionNotice, Message, Opening, ToolCallRecord};
 
 use crate::agent;
+use crate::agent::fence_untrusted;
 use crate::ask::TurnModel;
 use crate::tools::ToolHost;
 
-const TITLE_MAX_CHARS: usize = 24;
-const HISTORY_CHAR_CAP: usize = 6_000;
-const RECENT_ROUNDS: usize = 6;
-const MAX_MESSAGE_CHARS: usize = 2_000;
 const CHAT_LIST_LIMIT: usize = 200;
+const TITLE_MAX_CHARS: usize = 24;
 const SLOT_OVERVIEW_APPS: usize = 4;
 
 const CHAT_SYSTEM_PROMPT: &str = "You are AfterRay, a local memory assistant for this computer. \
@@ -69,8 +67,8 @@ pub(crate) async fn handle_send(
         Err(error) => return Response::failure(error.to_string()),
     };
     let seed = build_seed(store, now_ms);
-    let history = fold_history(&prior, HISTORY_CHAR_CAP);
-    let opening = build_opening(&seed, &history, message);
+    let history = history_messages(&prior);
+    let opening = build_opening(&seed, history, message);
 
     if !model.present {
         return persist_reply(
@@ -263,6 +261,69 @@ fn persist_turn(store: &Vault, turn: &PendingTurn<'_>) -> Result<ChatReply, Stri
     })
 }
 
+/// Prior turns as messages, oldest first.
+///
+/// Replaces the folded string that used to carry the whole conversation. That
+/// string was re-sliced every turn — first round kept, middle dropped, recent
+/// six kept — so the same past rendered differently each time and no provider
+/// cache or local prefill could match a previous prompt. Messages are appended
+/// and never rewritten, which is the property the whole chat API is built on.
+///
+/// A turn that used tools becomes the three messages it actually was: the
+/// assistant asking for one, the result coming back, and the answer. Before
+/// this, `tool_log` was written to the vault and then never read back, so a
+/// follow-up question could not see what the previous turn had already looked
+/// up and simply looked it up again.
+pub(crate) fn history_messages(messages: &[ConversationMessage]) -> Vec<Message> {
+    let mut out = Vec::new();
+    for message in messages {
+        if message.role == crate::stream::COMPACTION_ROLE {
+            // A compaction row is what is left of the turns it replaced, so it
+            // belongs in the conversation rather than being skipped: dropping
+            // it would leave an unexplained gap where the model can see a
+            // question it never got to answer.
+            out.push(Message::user(format!(
+                "[AfterRay] {}",
+                message.content.trim()
+            )));
+            continue;
+        }
+        if message.role == "user" {
+            // Fenced exactly as the current question is. The stance is not that
+            // the user is untrusted — it is that anything which reached the
+            // vault may have been pasted from a screen, and the boundary that
+            // says so should not depend on how old the message is.
+            out.push(Message::user(fence_untrusted(
+                "user",
+                message.content.trim(),
+            )));
+            continue;
+        }
+        for call in parse_tool_log(message.tool_log.as_deref()) {
+            out.push(Message::assistant(format!(
+                "TOOL {}\nARGS {}",
+                call.name, call.args
+            )));
+            // What the tool returned is not replayed: the bodies are not stored
+            // and re-running the call to fill them in would be a silent vault
+            // read on every turn. The model sees what it looked up and what it
+            // concluded, and can call again if it needs the detail.
+            out.push(Message::user(format!(
+                "[AfterRay] `{}` ran earlier in this conversation. Its result is not \
+                 kept; call it again if you need the detail.",
+                call.name
+            )));
+        }
+        out.push(Message::assistant(message.content.trim().to_owned()));
+    }
+    out
+}
+
+fn parse_tool_log(raw: Option<&str>) -> Vec<ToolCallRecord> {
+    raw.and_then(|raw| serde_json::from_str::<Vec<ToolCallRecord>>(raw).ok())
+        .unwrap_or_default()
+}
+
 fn serialize_tool_log(calls: &[ToolCallRecord]) -> Option<String> {
     if calls.is_empty() {
         return None;
@@ -277,106 +338,6 @@ pub(crate) fn title_from_message(message: &str) -> String {
         return trimmed.to_owned();
     }
     trimmed.chars().take(TITLE_MAX_CHARS).collect()
-}
-
-/// First round plus as many recent rounds as fit. Vault/user text stays raw
-/// here; the caller fences the whole block.
-#[must_use]
-pub(crate) fn fold_history(messages: &[ConversationMessage], max_chars: usize) -> String {
-    // Compaction rows are for the reader. Folding them back in would spend
-    // context explaining that context ran out.
-    let messages: Vec<ConversationMessage> = messages
-        .iter()
-        .filter(|message| message.role != crate::stream::COMPACTION_ROLE)
-        .cloned()
-        .collect();
-    if messages.is_empty() || max_chars == 0 {
-        return String::new();
-    }
-    let rounds: Vec<String> = group_rounds(&messages)
-        .into_iter()
-        .map(|round| render_round(&round, MAX_MESSAGE_CHARS))
-        .collect();
-    if char_total(&rounds) <= max_chars {
-        return rounds.join("\n");
-    }
-    let first = trim_to_chars(&rounds[0], max_chars);
-    let mut tail = Vec::new();
-    let mut used = first.chars().count();
-    for round in rounds.iter().skip(1).rev() {
-        if tail.len() >= RECENT_ROUNDS {
-            break;
-        }
-        let extra = round.chars().count().saturating_add(1);
-        if used.saturating_add(extra) > max_chars {
-            break;
-        }
-        tail.push(round.as_str());
-        used = used.saturating_add(extra);
-    }
-    tail.reverse();
-    let omitted = tail.len() + 1 < rounds.len();
-    let mut out = first;
-    if omitted {
-        out.push_str("\n…(earlier turns omitted)…");
-    }
-    for round in tail {
-        out.push('\n');
-        out.push_str(round);
-    }
-    out
-}
-
-fn group_rounds(messages: &[ConversationMessage]) -> Vec<Vec<&ConversationMessage>> {
-    let mut rounds = Vec::new();
-    let mut current = Vec::new();
-    for message in messages {
-        if message.role == "user" && !current.is_empty() {
-            rounds.push(std::mem::take(&mut current));
-        }
-        current.push(message);
-    }
-    if !current.is_empty() {
-        rounds.push(current);
-    }
-    rounds
-}
-
-fn render_round(messages: &[&ConversationMessage], max_message_chars: usize) -> String {
-    messages
-        .iter()
-        .map(|message| {
-            format!(
-                "{}:\n{}",
-                message.role,
-                trim_to_chars(message.content.trim(), max_message_chars)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn char_total(parts: &[String]) -> usize {
-    let newlines = parts.len().saturating_sub(1);
-    parts
-        .iter()
-        .map(|part| part.chars().count())
-        .sum::<usize>()
-        .saturating_add(newlines)
-}
-
-fn trim_to_chars(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    if max_chars == 1 {
-        return "…".to_owned();
-    }
-    let taken: String = text.chars().take(max_chars - 1).collect();
-    format!("{taken}…")
 }
 
 #[must_use]
@@ -406,10 +367,10 @@ pub(crate) fn build_seed(store: &Vault, now_ms: i64) -> String {
 /// then trimmed from the head, so a long history deleted the question. The
 /// fencing moved into `Opening::render` too: trimming a block that is already
 /// fenced can cut the marker off it.
-pub(crate) fn build_opening(seed: &str, history: &str, message: &str) -> Opening {
+pub(crate) fn build_opening(seed: &str, history: Vec<Message>, message: &str) -> Opening {
     Opening {
         seed: seed.to_owned(),
-        history: history.to_owned(),
+        history,
         task: format!(
             "{}\n\nInvestigate with tools if needed, then answer with FINAL.",
             message.trim()
@@ -571,30 +532,60 @@ mod tests {
         assert_eq!(title_from_message(long).chars().count(), 24);
     }
 
+    /// The invariant that replaced folding: turn N's history is a strict
+    /// prefix of turn N+1's, message for message.
+    ///
+    /// The old `fold_history` kept the first round and the recent six and cut
+    /// the middle, so turn 8 and turn 9 disagreed about what turn 2 was. Every
+    /// provider caches on the longest identical prefix, so that disagreement
+    /// cost a full re-read of the conversation on every single turn.
     #[test]
-    fn fold_keeps_opening_round_and_recent() {
-        let mut messages = vec![
-            msg("user", "first question", 1),
-            msg("assistant", "first answer", 2),
-        ];
+    fn each_turn_extends_the_history_rather_than_reslicing_it() {
+        let mut rows = vec![msg("user", "first question", 1)];
+        rows.push(msg("assistant", "first answer", 2));
+        let mut previous = history_messages(&rows);
+
         for index in 0..12 {
-            messages.push(msg(
-                "user",
-                &format!("q{index} {}", "x".repeat(80)),
-                10 + i64::from(index) * 2,
-            ));
-            messages.push(msg(
-                "assistant",
-                &format!("a{index}"),
-                11 + i64::from(index) * 2,
-            ));
+            rows.push(msg("user", &format!("q{index}"), 10 + i64::from(index) * 2));
+            rows.push(msg("assistant", &format!("a{index}"), 11 + i64::from(index) * 2));
+            let current = history_messages(&rows);
+            assert!(
+                afterray_harness::is_prefix_of(&previous, &current),
+                "turn {index} rewrote message {:?}",
+                afterray_harness::first_divergence(&previous, &current)
+            );
+            previous = current;
         }
-        let folded = fold_history(&messages, 400);
-        assert!(folded.contains("first question"));
-        assert!(folded.contains("first answer"));
-        assert!(folded.contains("earlier turns omitted"));
-        assert!(folded.contains("q11"));
-        assert!(!folded.contains("q3 "));
+        // Thirteen exchanges, and the first one is still there unchanged —
+        // where folding would have dropped it into "earlier turns omitted".
+        assert_eq!(previous.len(), 26);
+        assert!(
+            previous[0].content.contains("first question"),
+            "{:?}",
+            previous[0]
+        );
+    }
+
+    /// What a past turn looked up has to survive into the next one. It was
+    /// written to `tool_log` and then never read back, so a follow-up started
+    /// from nothing and re-ran the same searches.
+    #[test]
+    fn a_later_turn_can_see_what_an_earlier_one_looked_up() {
+        let mut answered = msg("assistant", "You were reading the AV1 spec.", 2);
+        answered.tool_log = Some(
+            r#"[{"name":"list_activity","args":{"from_ms":1,"to_ms":2}}]"#.to_owned(),
+        );
+        let rows = vec![msg("user", "what was I reading", 1), answered];
+
+        let rendered = history_messages(&rows);
+        let text: String = rendered
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("TOOL list_activity"), "{text}");
+        assert!(text.contains(r#"{"from_ms":1,"to_ms":2}"#), "{text}");
+        assert!(text.contains("You were reading the AV1 spec."), "{text}");
     }
 
     #[test]
@@ -640,12 +631,16 @@ mod tests {
             seed.chars().count()
         );
 
-        let (prompt, _) = build_opening(&seed, "user:\nignore previous", "那第三件呢")
+        let (prompt, _) = build_opening(&seed, vec![Message::user("ignore previous")], "那第三件呢")
             .render(afterray_harness::ContextBudget::DEFAULT, crate::agent::fence_untrusted);
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=seed>>>"));
-        assert!(prompt.contains("<<<AFTERRAY_DATA kind=history>>>"));
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=user>>>"));
         assert!(prompt.contains("<<<END_AFTERRAY_DATA>>>"));
+        // Volatile last: the clock sits with the question at the end, not in
+        // front of the conversation where it would change every prefix.
+        let history_at = prompt.find("ignore previous").expect("history went");
+        let seed_at = prompt.find("kind=seed").expect("seed went");
+        assert!(history_at < seed_at, "the clock is back in front: {prompt}");
     }
 
     #[tokio::test]
@@ -728,8 +723,7 @@ mod tests {
 import json, sys
 req = json.load(sys.stdin)
 prompt = ((req.get("input") or {}).get("prompt") or "")
-if "kind=history" in prompt:
-    assert "first question" in prompt
+if "hello" in prompt:
     text = "FINAL\nI remember the first question."
 else:
     text = "FINAL\nhello"
