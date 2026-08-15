@@ -824,7 +824,10 @@ mod catalog_drift {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The fixtures build a real vault before narrowing it; production code in
+    // this file only ever sees the read-only handle.
     use afterray_models::QueueConfig;
+    use afterray_store::Vault;
     use afterray_store::VaultConfig;
 
     const DAY: i64 = 86_400_000;

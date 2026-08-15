@@ -1,7 +1,11 @@
 .PHONY: check test build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools publish publish-dry-run
 
+# `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
+# `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
+# while `make check` stays green — which is exactly how a8167f8 was committed
+# with four compile errors in it.
 check:
-	cargo check --workspace
+	cargo check --workspace --all-targets
 
 test:
 	cargo test --workspace

@@ -1279,6 +1279,58 @@ print(json.dumps({
     /// has gone. The turn must not treat that as a reason to stop.
     struct DeadPipe;
 
+    /// Whether the model has produced anything worth keeping yet.
+    ///
+    /// A token, or any reasoning. Waiting for a token alone is not enough: a
+    /// round that resolves to a tool call is hidden by the answer gate, and a
+    /// model can spend every round that way — one run took 193 s and finished
+    /// all six rounds without ever emitting one.
+    fn produced_something(seen: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(seen);
+        text.contains(r#""kind":"token""#)
+            || text
+                .split(r#""reasoning_deltas":"#)
+                .skip(1)
+                .any(|rest| !rest.starts_with('0'))
+    }
+
+    /// Collects the stream and presses stop the moment anything appears.
+    ///
+    /// Tripping on real output rather than on a timer is what makes the live
+    /// stop test deterministic: it asserts "a turn stopped after producing
+    /// something keeps it", which is the actual contract, instead of assuming
+    /// the model reached that point within some number of seconds.
+    struct TripOnFirstOutput {
+        seen: Vec<u8>,
+        cancel: CancelToken,
+    }
+
+    impl tokio::io::AsyncWrite for TripOnFirstOutput {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.seen.extend_from_slice(buf);
+            if !self.cancel.is_cancelled() && produced_something(&self.seen) {
+                self.cancel.cancel();
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     impl tokio::io::AsyncWrite for DeadPipe {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
@@ -1389,15 +1441,12 @@ print(json.dumps({
         )
         .unwrap();
 
-        // Stop once the model has had time to think and start answering.
+        // Stop as soon as the model has actually produced something, rather
+        // than after a fixed wait. A 22 GB model loads in anywhere from one
+        // second warm to thirteen cold, so any clock-based stop is a race: an
+        // earlier version of this test fired at 9 s and passed or failed
+        // depending on whether the weights were in page cache.
         let cancel = CancelToken::new();
-        let fired = cancel.clone();
-        tokio::spawn(async move {
-            // Long enough that a 35B model has finished loading and is
-            // genuinely producing: at 2.5 s it was still in prefill.
-            tokio::time::sleep(std::time::Duration::from_millis(9_000)).await;
-            fired.cancel();
-        });
 
         let ctx = ChatStreamCtx {
             store: &vault,
@@ -1406,17 +1455,21 @@ print(json.dumps({
             now_ms: now,
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
-            cancel,
+            cancel: cancel.clone(),
         };
-        let mut buf = Vec::new();
+        let mut writer = TripOnFirstOutput {
+            seen: Vec::new(),
+            cancel: cancel.clone(),
+        };
         run_chat_stream(
-            &mut buf,
+            &mut writer,
             ctx,
             None,
             "Count slowly from one to forty in words, one number per line.",
         )
         .await
         .unwrap();
+        let buf = writer.seen;
 
         let events = parse_events(&buf);
         eprintln!(
@@ -1448,6 +1501,9 @@ print(json.dumps({
             assistant.status.as_deref(),
             Some(afterray_protocol::MESSAGE_STATUS_ABORTED)
         );
+        // Stopped right after the model's first output, so the row must hold
+        // whatever that was — text if it had started answering, reasoning if it
+        // was still thinking. Both are work the user would otherwise have lost.
         assert!(
             !assistant.content.is_empty() || assistant.reasoning.is_some(),
             "the row kept neither text nor reasoning"

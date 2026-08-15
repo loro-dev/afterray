@@ -2859,16 +2859,23 @@ impl Vault {
         }
     }
 
+    /// Bytes the capture artifacts hold, the counterpart to
+    /// [`Self::conversation_bytes`]. The two budgets are separate pools; see
+    /// [`CONVERSATION_LIMIT_BYTES`] for why.
+    fn artifact_bytes(connection: &Connection) -> Result<i64, StoreError> {
+        Ok(connection.query_row(
+            "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
+            [ARTIFACT_FILE_OVERHEAD_BYTES],
+            |row| row.get(0),
+        )?)
+    }
+
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
         loop {
             let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
             let mut connection = self.connection.lock().unwrap();
-            let used: i64 = connection.query_row(
-                "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
-                [ARTIFACT_FILE_OVERHEAD_BYTES],
-                |row| row.get(0),
-            )?;
+            let used = Self::artifact_bytes(&connection)?;
             let excess = used.saturating_sub(max).max(0);
             if excess == 0 {
                 return Ok(());
