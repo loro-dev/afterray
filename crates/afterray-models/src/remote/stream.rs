@@ -720,7 +720,7 @@ mod tests {
     /// and nothing downstream would report it.
     #[tokio::test]
     async fn the_window_we_budgeted_for_is_declared_on_the_wire() {
-        let (origin, requests) = serve_capturing(
+        let (origin, captured) = serve_capturing(
             concat!(r#"{"message":{"content":"ok"},"done":true}"#, "\n"),
             "application/x-ndjson",
         )
@@ -750,28 +750,39 @@ mod tests {
         .unwrap();
         collector.await.unwrap();
 
-        let request = requests.lock().unwrap().clone();
-        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-        let parsed: Value = serde_json::from_str(body).expect(body);
+        // Awaiting the capture is what makes this deterministic. Finishing the
+        // response says nothing about the server task having recorded the
+        // request; only the channel does.
+        let request = captured.await.expect("the server never captured a request");
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+        // The whole request in the message, not just the body: a short read
+        // shows up here as an empty string, and "EOF while parsing" says
+        // nothing about where it came from.
+        let parsed: Value = serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("body was not JSON ({error}); request was:\n{request}"));
         assert_eq!(parsed["options"]["num_ctx"], 32_768, "{body}");
     }
 
-    /// Like `serve_http`, but hands back what the client sent.
+    /// Like `serve_http`, but hands the request back over a channel.
+    ///
+    /// A shared cell would need the test to guess when the server task had
+    /// filled it; a `oneshot` makes the wait explicit and the capture complete.
     async fn serve_capturing(
         body: &str,
         content_type: &str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body = body.to_owned();
         let content_type = content_type.to_owned();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let captured = std::sync::Arc::clone(&seen);
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0_u8; 8192];
-            let read = socket.read(&mut buf).await.unwrap_or(0);
-            *captured.lock().unwrap() = String::from_utf8_lossy(&buf[..read]).into_owned();
+            let request = read_whole_request(&mut socket).await;
+            let _ = captured_tx.send(request);
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -779,7 +790,37 @@ mod tests {
             socket.write_all(header.as_bytes()).await.unwrap();
             socket.write_all(body.as_bytes()).await.unwrap();
         });
-        (format!("http://{addr}"), seen)
+        (format!("http://{addr}"), captured_rx)
+    }
+
+    /// Reads the head, then exactly as many more bytes as it declares.
+    ///
+    /// One `read` is not one request: the client may flush headers and body
+    /// separately, and TCP may split them anywhere. Stopping at the first chunk
+    /// is how this test used to pass one run in five.
+    async fn read_whole_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+            let Some(head_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_lowercase();
+            let declared = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if raw.len() >= head_end + 4 + declared {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&raw).into_owned()
     }
 
     async fn serve_http(body: &str, content_type: &str) -> String {

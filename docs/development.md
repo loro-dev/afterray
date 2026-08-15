@@ -73,6 +73,27 @@ swift test
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Two habits neither the compiler nor the Makefile can enforce, both written down
+because each was learned by shipping the mistake.
+
+**Judge a build by its exit code, never by a filtered count.** `cargo clippy … |
+grep -c warning` prints a number and exits 0 whether the build succeeded or
+failed, so a broken build reads as a clean one. `make check` uses
+`--all-targets` for the same reason: plain `cargo check --workspace` does not
+compile `#[cfg(test)]` modules at all.
+
+**A new test that touches concurrency or I/O gets at least five consecutive runs
+before it is committed.** Such a test does not fail — it fails *sometimes*, and
+the first green run is not evidence. A capture helper here passed one run in
+five: it read the socket once, assumed one `read` was one request, and let the
+assertion race the server task that recorded it. Both the incompleteness and the
+race were invisible in a single run.
+
+```sh
+make test-repeat N=10                                   # until it breaks
+make test-repeat N=10 TEST=the_window_we_budgeted_for   # one suspect
+```
+
 ## Repository layout
 
 ```text
