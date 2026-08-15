@@ -8,6 +8,7 @@ use chrono::Local;
 use std::fmt::Write as _;
 
 use crate::agent;
+use crate::budget::ContextBudget;
 use crate::search_hits;
 use crate::tools::ToolHost;
 
@@ -412,6 +413,7 @@ pub(crate) async fn handle_ask(
         store,
         models,
         now_ms,
+        budget: ContextBudget::DEFAULT,
     };
     let system = format!("{ASK_SYSTEM_PROMPT}\n\n{QWEN35_TOOL_PROTOCOL_SUFFIX}");
     match agent::run_readonly_agent(models, &host, &system, &user).await {

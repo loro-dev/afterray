@@ -10,11 +10,11 @@ use serde_json::Value;
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 
-use crate::agent::AgentError;
+use crate::agent::{AgentError, fence_untrusted};
+use crate::budget::ContextBudget;
 use crate::tools::{ToolHost, tool_catalog_text};
+use crate::transcript::Transcript;
 
-const MAX_ROUNDS: usize = 5;
-const MAX_HISTORY_CHARS: usize = 14_000;
 const FOLD_CHAR_CAP: usize = 8_000;
 const RECENT_TURNS: usize = 6;
 const TITLE_CHARS: usize = 24;
@@ -173,17 +173,34 @@ async fn run_agent<W: AsyncWrite + Unpin>(
     ctx: &ChatStreamCtx<'_>,
     user: &str,
 ) -> Result<(String, Vec<ToolLogEntry>), String> {
-    let mut transcript = format!("{user}\n");
+    let budget = ContextBudget::DEFAULT;
+    let mut transcript = Transcript::new(format!("{user}\n"), fence_untrusted);
     let system = format!("{SYSTEM_PROMPT}\n\n{}", tool_catalog_text());
     let host = ToolHost {
         store: ctx.store,
         models: ctx.models,
         now_ms: ctx.now_ms,
+        budget,
     };
     let mut tool_log = Vec::new();
 
-    for round in 0..MAX_ROUNDS {
-        let prompt = clip_transcript(&transcript);
+    for round in 0..budget.max_rounds {
+        for entry in transcript.fit(budget) {
+            eprintln!(
+                "chat.compaction round={} tool={} tokens_freed={}",
+                entry.round, entry.tool, entry.tokens_freed
+            );
+        }
+        let prompt = transcript.render();
+        // Context pressure used to be invisible from every angle. At minimum
+        // it belongs in the log; the `usage` stream event carries it to the app.
+        eprintln!(
+            "chat.usage round={} prompt_tokens={} window_tokens={} results_held={}",
+            round + 1,
+            transcript.tokens(),
+            budget.window_tokens,
+            transcript.rounds().iter().filter(|entry| !entry.pruned).count(),
+        );
         let (text, mut gate) =
             generate_round(write, ctx.models, ctx.token_sink, &prompt, &system).await?;
 
@@ -203,9 +220,9 @@ async fn run_agent<W: AsyncWrite + Unpin>(
             .map_err(|error| error.to_string())?;
             let result = match host.invoke(&name, &args).await {
                 Ok(result) => result,
-                Err(error) => format!("ERROR: {error}"),
+                Err(error) => crate::truncate::Budgeted::verbatim(format!("ERROR: {error}")),
             };
-            let chars = result.chars().count();
+            let chars = result.text.chars().count();
             write_event(
                 write,
                 &ChatStreamEvent::ToolResult {
@@ -220,10 +237,12 @@ async fn run_agent<W: AsyncWrite + Unpin>(
                 args: args.clone(),
                 chars,
             });
-            writeln_tool(&mut transcript, &name, &args, &result);
-            if round + 1 == MAX_ROUNDS {
+            let last_round = round + 1 == budget.max_rounds;
+            let body = result.text.clone();
+            transcript.push(name.clone(), args, result);
+            if last_round {
                 let answer = format!(
-                    "I reached the tool limit before finishing. Last tool `{name}` returned:\n{result}"
+                    "I reached the tool limit before finishing. Last tool `{name}` returned:\n{body}"
                 );
                 write_event(
                     write,
@@ -486,32 +505,6 @@ fn build_user_prompt(seed: &str, history: &str, message: &str) -> String {
     body.push_str(message.trim());
     body.push('\n');
     body
-}
-
-/// Drops the middle, not the head. The opening carries the clock, the epoch
-/// anchors and the question; a long tool result must not strand the model
-/// without them.
-fn clip_transcript(transcript: &str) -> String {
-    let total = transcript.chars().count();
-    if total <= MAX_HISTORY_CHARS {
-        return transcript.to_owned();
-    }
-    let head_chars = MAX_HISTORY_CHARS / 3;
-    let tail_chars = MAX_HISTORY_CHARS - head_chars;
-    let head: String = transcript.chars().take(head_chars).collect();
-    let tail: String = transcript.chars().skip(total - tail_chars).collect();
-    format!("{head}\n…(middle of the tool transcript omitted)…\n{tail}")
-}
-
-fn writeln_tool(transcript: &mut String, name: &str, args: &Value, result: &str) {
-    use std::fmt::Write as _;
-    let _ = writeln!(transcript, "\nAssistant called TOOL {name}");
-    let _ = writeln!(transcript, "ARGS {args}");
-    let _ = writeln!(transcript, "Tool result:\n{result}\n");
-    let _ = writeln!(
-        transcript,
-        "Continue. Call another TOOL or answer with FINAL."
-    );
 }
 
 /// Holds token deltas until we know they are the user-visible answer.

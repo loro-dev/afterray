@@ -1,10 +1,14 @@
 mod agent;
 mod ask;
+mod budget;
 mod chat;
 mod gop_packer;
 mod memory;
 mod stream;
+mod tokens;
 mod tools;
+mod transcript;
+mod truncate;
 
 use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_thumbnail};
 use afterray_models::{
@@ -1943,7 +1947,7 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
 /// background sweeper so both agree on what "summarised" means.
 async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
     /// Rounds are model calls, so this bounds both cost and transcript
-    /// growth. The transcript is append-only — never clipped — so a
+    /// growth. The transcript is append-only — never pruned — so a
     /// prefix-caching runtime re-prefills only each round's delta.
     const T2_MAX_ROUNDS: usize = 8;
 
@@ -1967,8 +1971,11 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         inputs.system,
         &inputs.user,
         agent::AgentLoopConfig {
-            max_rounds: T2_MAX_ROUNDS,
-            clip_chars: None,
+            budget: budget::ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..budget::ContextBudget::DEFAULT
+            },
+            prune: false,
             priority: afterray_models::JobPriority::Background {
                 lease: Some(lease_hold.id()),
             },
@@ -2000,9 +2007,10 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         .map(|call| call.name.as_str())
         .collect();
     eprintln!(
-        "slot.t2 slot={slot_start_ms} prompt_chars={} rounds={} tools={tool_names:?} \
+        "slot.t2 slot={slot_start_ms} prompt_tokens={}/{} rounds={} tools={tool_names:?} \
          out_chars={} latency_ms={latency_ms} parsed={} entities_dropped={}",
-        inputs.user.chars().count(),
+        turn.usage.prompt_tokens,
+        turn.usage.window_tokens,
         turn.tool_calls.len() + 1,
         turn.answer.chars().count(),
         parsed.is_some(),
@@ -2561,8 +2569,12 @@ impl SlotT2Tools<'_> {
 }
 
 impl agent::ToolSurface for SlotT2Tools<'_> {
-    async fn invoke(&self, name: &str, args: &serde_json::Value) -> Result<String, String> {
-        match name {
+    async fn invoke(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<truncate::Budgeted, String> {
+        let text = match name {
             "get_run_text" => self.get_run_text(args),
             "get_transcript" => self.get_transcript(),
             "get_ocr" => self.get_ocr(args),
@@ -2570,7 +2582,10 @@ impl agent::ToolSurface for SlotT2Tools<'_> {
             other => Err(format!(
                 "unknown tool `{other}`; available: get_run_text, get_transcript, get_ocr, get_prev_cards"
             )),
-        }
+        }?;
+        // These tools already page themselves against `T2_TOOL_PAGE_CHARS`, so
+        // there is nothing left for a second budget to cut.
+        Ok(truncate::Budgeted::verbatim(text))
     }
 }
 

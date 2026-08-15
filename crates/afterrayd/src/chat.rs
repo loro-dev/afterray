@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::agent::{self, ToolCallRecord, fence_untrusted};
+use crate::budget::ContextBudget;
 use crate::tools::ToolHost;
 
 const TITLE_MAX_CHARS: usize = 24;
@@ -84,9 +85,17 @@ pub(crate) async fn handle_send(
         store,
         models,
         now_ms,
+        budget: ContextBudget::DEFAULT,
     };
     match agent::run_readonly_agent_traced(models, &host, CHAT_SYSTEM_PROMPT, &user).await {
         Ok(turn) => {
+            eprintln!(
+                "chat.usage rounds={} prompt_tokens={} window_tokens={} pruned={}",
+                turn.usage.rounds,
+                turn.usage.prompt_tokens,
+                turn.usage.window_tokens,
+                turn.pruned.len(),
+            );
             let tool_log = serialize_tool_log(&turn.tool_calls);
             persist_reply(
                 store,

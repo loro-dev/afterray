@@ -6,11 +6,13 @@ use afterray_store::{Vault, parse_accessibility_digest};
 use chrono::Local;
 use serde_json::{Value, json};
 
+use crate::budget::ContextBudget;
 use crate::search_hits;
+use crate::truncate::{Budgeted, truncate_head};
+
 
 const DEFAULT_SEARCH_LIMIT: usize = 8;
 const DEFAULT_LIST_LIMIT: usize = 40;
-const MAX_TOOL_CHARS: usize = 6_000;
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
@@ -21,10 +23,18 @@ pub struct ToolHost<'a> {
     /// The wall clock for this turn. Every range answer is anchored to it so
     /// the model never has to derive epoch milliseconds on its own.
     pub now_ms: i64,
+    /// What one result may occupy. Carried on the host rather than read from a
+    /// constant so a caller with a wider window is not held to the narrowest.
+    pub budget: ContextBudget,
 }
 
 impl ToolHost<'_> {
-    pub async fn invoke(&self, name: &str, args: &Value) -> Result<String, String> {
+    /// Dispatch. The arms below are the authority on what exists; the tests at
+    /// the bottom of this file read them straight out of the source and hold
+    /// [`tool_catalog_text`] and every system prompt to them. Two hand-written
+    /// lists is how `get_day_summary` came to be callable but absent from
+    /// chat's prompt for a whole release.
+    pub async fn invoke(&self, name: &str, args: &Value) -> Result<Budgeted, String> {
         let result = match name {
             "get_now" => self.get_now(),
             "search_evidence" => self.search_evidence(args).await,
@@ -40,7 +50,7 @@ impl ToolHost<'_> {
             "get_ax_tree" => self.get_ax_tree(args),
             other => Err(format!("unknown tool `{other}`")),
         }?;
-        Ok(truncate_tool_output(&result))
+        Ok(truncate_head(&result, self.budget.tool_result_tokens()))
     }
 
     /// The clock, ready-made windows, and what the vault actually holds.
@@ -506,15 +516,6 @@ fn parse_range(
     Ok((from_ms, to_ms, limit))
 }
 
-fn truncate_tool_output(text: &str) -> String {
-    let count = text.chars().count();
-    if count <= MAX_TOOL_CHARS {
-        return text.to_owned();
-    }
-    let taken: String = text.chars().take(MAX_TOOL_CHARS.saturating_sub(1)).collect();
-    format!("{taken}…")
-}
-
 /// Catalog shown to the LLM in agent prompts.
 #[must_use]
 pub fn tool_catalog_text() -> &'static str {
@@ -638,9 +639,9 @@ mod tests {
         // hours would land on yesterday and the day tool would rightly refuse.
         let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
         seed_day(&vault, noon, noon + 1_800_000);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+        let host = ToolHost { store: &vault, models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
 
-        let text = host.invoke("get_day_summary", &json!({})).await.unwrap();
+        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
         assert!(text.contains("Chased a GOP header bug"), "{text}");
         assert!(text.contains("Read the IVF length check"), "{text}");
         // The at_ms has to come back or the model cannot drill in.
@@ -656,9 +657,9 @@ mod tests {
         // hours would land on yesterday and the day tool would rightly refuse.
         let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
         seed_day(&vault, noon, noon + 1_800_000);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+        let host = ToolHost { store: &vault, models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
 
-        let text = host.invoke("get_day_summary", &json!({})).await.unwrap();
+        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
         assert!(text.contains("not summarised"), "{text}");
         assert!(text.contains("get_slot_card"), "the gap note must say how to dig in: {text}");
     }
@@ -673,12 +674,13 @@ mod tests {
         seed_day(&vault, today, today + 1_800_000);
         // Push coverage back two days so yesterday sits inside the span.
         seed_moments(&vault, &[today - 2 * DAY]);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW };
+        let host = ToolHost { store: &vault, models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
 
         let text = host
             .invoke("get_day_summary", &json!({"day_ms": NOW - DAY}))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(text.contains("Nothing was recorded"), "{text}");
     }
 
@@ -690,9 +692,10 @@ mod tests {
             store: &vault,
             models: &models,
             now_ms: NOW,
+            budget: ContextBudget::DEFAULT,
         };
 
-        let raw = host.invoke("get_now", &json!({})).await.unwrap();
+        let raw = host.invoke("get_now", &json!({})).await.unwrap().text;
         let value: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["now_ms"], json!(NOW));
         assert_eq!(value["ranges"]["last_hour"]["to_ms"], json!(NOW));
@@ -712,6 +715,7 @@ mod tests {
             store: &vault,
             models: &models,
             now_ms: NOW,
+            budget: ContextBudget::DEFAULT,
         };
 
         // The exact arguments from the failing chat: right time of day, wrong year.
@@ -735,6 +739,7 @@ mod tests {
             store: &vault,
             models: &models,
             now_ms: NOW,
+            budget: ContextBudget::DEFAULT,
         };
 
         let result = host
@@ -743,7 +748,8 @@ mod tests {
                 &json!({"from_ms": NOW - 5 * DAY, "to_ms": NOW - 4 * DAY}),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(result.starts_with("[] // no activity spans"), "{result}");
         assert!(result.contains("The vault covers"), "{result}");
         assert!(result.contains(&NOW.to_string()), "{result}");
@@ -756,6 +762,7 @@ mod tests {
             store: &vault,
             models: &models,
             now_ms: NOW,
+            budget: ContextBudget::DEFAULT,
         };
 
         let error = host
@@ -773,6 +780,7 @@ mod tests {
             store: &vault,
             models: &models,
             now_ms: NOW,
+            budget: ContextBudget::DEFAULT,
         };
 
         let error = host
