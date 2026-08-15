@@ -39,34 +39,76 @@ impl Role {
     }
 }
 
+/// What a message is, beyond who said it.
+///
+/// Never goes on the wire — the seam sends `role` and `content` and nothing
+/// else. It exists so a compaction policy can act on boundaries instead of
+/// sniffing the text for a fence marker: the rule "fold tool results before
+/// touching what a person wrote" needs to know which is which, and inferring
+/// that from content is how a policy starts eating the wrong thing the day
+/// somebody pastes a fence marker into a question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A question, an answer, anything a participant actually said.
+    Text,
+    /// The assistant asking for a tool.
+    ToolCall,
+    /// What that tool returned. The first thing to go under pressure: it is
+    /// the largest, the most stale, and the only part that can be fetched
+    /// again on demand.
+    ToolResult,
+    /// The harness talking to the model.
+    Control,
+}
+
 /// One message. Immutable by convention: see the module note.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
+    pub kind: Kind,
     pub content: String,
 }
 
 impl Message {
     #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::System,
-            content: content.into(),
-        }
+        Self::new(Role::System, Kind::Text, content)
     }
 
     #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::User,
-            content: content.into(),
-        }
+        Self::new(Role::User, Kind::Text, content)
     }
 
     #[must_use]
     pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new(Role::Assistant, Kind::Text, content)
+    }
+
+    /// The assistant asking for a tool.
+    #[must_use]
+    pub fn tool_call(content: impl Into<String>) -> Self {
+        Self::new(Role::Assistant, Kind::ToolCall, content)
+    }
+
+    /// What a tool returned. A user turn because that is the only role a
+    /// provider will accept it as; `kind` is what says it is not a person.
+    #[must_use]
+    pub fn tool_result(content: impl Into<String>) -> Self {
+        Self::new(Role::User, Kind::ToolResult, content)
+    }
+
+    /// The harness's own words — a correction, or a notice about the budget.
+    #[must_use]
+    pub fn control(content: impl Into<String>) -> Self {
+        Self::new(Role::User, Kind::Control, content)
+    }
+
+    #[must_use]
+    pub fn new(role: Role, kind: Kind, content: impl Into<String>) -> Self {
         Self {
-            role: Role::Assistant,
+            role,
+            kind,
             content: content.into(),
         }
     }

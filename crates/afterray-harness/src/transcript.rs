@@ -155,9 +155,9 @@ impl Transcript {
                 // Outside any fence, and a user turn rather than an assistant
                 // one: the model must not read the harness's corrections as
                 // words it said itself.
-                Entry::Control(text) => out.push(Message::user(format!("[AfterRay] {text}"))),
+                Entry::Control(text) => out.push(Message::control(format!("[AfterRay] {text}"))),
                 Entry::Tool(round) => {
-                    out.push(Message::assistant(format!(
+                    out.push(Message::tool_call(format!(
                         "TOOL {}\nARGS {}",
                         round.name, round.args
                     )));
@@ -170,7 +170,7 @@ impl Transcript {
                             (self.fence)("tool_result", &round.result.text)
                         )
                     };
-                    out.push(Message::user(format!(
+                    out.push(Message::tool_result(format!(
                         "{body}\nContinue. Call another TOOL or answer with FINAL."
                     )));
                 }

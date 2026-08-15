@@ -16,7 +16,7 @@
 //!    inside one hands the model a fragment it has no way to recognise as one.
 
 use crate::budget::ContextBudget;
-use crate::message::Message;
+use crate::message::{Kind, Message};
 use crate::tokens::estimate_tokens;
 use crate::transcript::Transcript;
 
@@ -145,38 +145,67 @@ impl CompactionStrategy for PruneToolResults {
         history: &mut Vec<Message>,
         limit: usize,
     ) -> Vec<CompactionNotice> {
-        let tokens = |messages: &[Message]| -> usize {
-            messages
-                .iter()
-                .map(|message| estimate_tokens(&message.content))
-                .sum()
-        };
-        let tokens_before = tokens(history);
+        let tokens_before = history_tokens(history);
         if tokens_before <= limit {
             return Vec::new();
         }
 
-        // Oldest first, and always in whole messages: half an exchange is worse
-        // than none of it. The newest end is what a follow-up refers to.
+        // Tool results first, and in the same shape as the in-turn pass: the
+        // body goes, the call stays, and the replacement says so. They are the
+        // largest thing in a conversation, the most stale, and the only part
+        // that can be fetched again on demand — where a question or an answer,
+        // once gone, is gone.
+        let mut folded = 0;
+        let mut total = tokens_before;
+        for message in history.iter_mut() {
+            if total <= limit {
+                break;
+            }
+            if message.kind == Kind::ToolResult && message.content != DROPPED_RESULT {
+                total = total.saturating_sub(estimate_tokens(&message.content));
+                message.content.clear();
+                message.content.push_str(DROPPED_RESULT);
+                total += estimate_tokens(DROPPED_RESULT);
+                folded += 1;
+            }
+        }
+
+        // Still over: whole messages from the oldest end, which is the point at
+        // which a conversation really does start losing turns.
         let mut dropped = 0;
-        while tokens(history) > limit && history.len() > 1 {
+        while history_tokens(history) > limit && history.len() > 1 {
             history.remove(0);
             dropped += 1;
         }
-        if dropped == 0 {
+        if dropped > 0 {
+            history.insert(0, Self::history_marker(dropped));
+        }
+        if folded == 0 && dropped == 0 {
             return Vec::new();
         }
-        history.insert(0, Self::history_marker(dropped));
         vec![CompactionNotice {
             strategy: Self::HISTORY_NAME,
             // Rounds are an in-turn idea; a cross-turn pass covers the whole
-            // opening, and the count that matters is in the marker.
+            // opening, and what actually went is named in the marker.
             from_round: 0,
             to_round: 0,
             tokens_before,
-            tokens_after: tokens(history),
+            tokens_after: history_tokens(history),
         }]
     }
+}
+
+/// What replaces a folded result. The same sentence the in-turn pass uses, so
+/// the model reads one story about missing evidence rather than two.
+const DROPPED_RESULT: &str =
+    "Tool result: dropped to make room. Call it again if you still need it.";
+
+fn history_tokens(history: &[Message]) -> usize {
+    history.iter().map(history_tokens_of).sum()
+}
+
+fn history_tokens_of(message: &Message) -> usize {
+    estimate_tokens(&message.content)
 }
 
 #[cfg(test)]
@@ -276,6 +305,53 @@ mod history_tests {
                 ]
             })
             .collect()
+    }
+
+    /// Order of loss: results before words. A tool result can be looked up
+    /// again; a question cannot, and an answer the user has already read
+    /// disappearing from the thread's context is how a follow-up stops making
+    /// sense.
+    #[test]
+    fn tool_results_are_folded_before_anything_a_person_said() {
+        let mut history = vec![
+            Message::user("what was I reading"),
+            Message::tool_call("TOOL get_ocr\nARGS {}"),
+            Message::tool_result("x".repeat(4_000)),
+            Message::assistant("the AV1 spec"),
+            Message::user("and before that"),
+            Message::tool_call("TOOL list_activity\nARGS {}"),
+            Message::tool_result("y".repeat(4_000)),
+            Message::assistant("Mail"),
+        ];
+        let notices = PruneToolResults.compact_history(&mut history, 200);
+
+        assert_eq!(notices.len(), 1);
+        // Every word a person said is still there, in order.
+        assert_eq!(history.len(), 8, "a message was dropped: {history:?}");
+        assert_eq!(history[0].content, "what was I reading");
+        assert_eq!(history[3].content, "the AV1 spec");
+        assert_eq!(history[4].content, "and before that");
+        assert_eq!(history[7].content, "Mail");
+        // And both results went, oldest first.
+        assert_eq!(history[2].content, DROPPED_RESULT);
+        assert_eq!(history[6].content, DROPPED_RESULT);
+        // The calls survive their results: that is what stops the model simply
+        // running them again.
+        assert!(history[1].content.starts_with("TOOL get_ocr"));
+    }
+
+    /// Only as many as it takes. A conversation two hundred tokens over budget
+    /// should not lose every result it has.
+    #[test]
+    fn folding_stops_as_soon_as_it_fits() {
+        let mut history = vec![
+            Message::tool_result("x".repeat(4_000)),
+            Message::tool_result("y".repeat(40)),
+            Message::assistant("done"),
+        ];
+        PruneToolResults.compact_history(&mut history, 60);
+        assert_eq!(history[0].content, DROPPED_RESULT);
+        assert_eq!(history[1].content, "y".repeat(40), "folded more than it had to");
     }
 
     /// The cross-turn pass keeps the same contract as the in-turn one: whole
