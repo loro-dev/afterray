@@ -414,9 +414,14 @@ pub(crate) async fn handle_ask(
     }
 
     let seed = build_ask_context(question, from_ms, to_ms, &memories, &spans, &hits);
-    let user = format!(
-        "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
-    );
+    // Ask's seed already carries the evidence for the range, and it has no
+    // folded history; the question is inside the seed block it built.
+    let opening = afterray_harness::Opening {
+        task: format!(
+            "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
+        ),
+        ..afterray_harness::Opening::default()
+    };
     let host = ToolHost {
         store: afterray_store::ReadOnlyVault::new(store),
         models,
@@ -424,7 +429,7 @@ pub(crate) async fn handle_ask(
         budget: ContextBudget::DEFAULT,
     };
     let system = format!("{ASK_SYSTEM_PROMPT}\n\n{QWEN35_TOOL_PROTOCOL_SUFFIX}");
-    match agent::run_readonly_agent(models, &host, &system, &user).await {
+    match agent::run_readonly_agent(models, &host, &system, opening).await {
         Ok(answer) => Response::success(AskAnswer {
             answer: answer.trim().to_owned(),
             citations,

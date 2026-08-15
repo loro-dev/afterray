@@ -69,14 +69,28 @@ pub fn parse_final(text: &str) -> Option<String> {
 #[must_use]
 pub fn strip_final_prefix(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    let rest = upper.strip_prefix("FINAL")?;
-    let original_rest = &trimmed[trimmed.len() - rest.len()..];
-    Some(
-        original_rest
-            .trim_start_matches([':', ' ', '\n', '\r', '\t'])
-            .to_owned(),
-    )
+    let rest = strip_keyword(trimmed, "FINAL")?;
+    Some(rest.to_owned())
+}
+
+/// `text` with a leading `keyword` removed, if it is there **as a word**.
+///
+/// Without the boundary check, "Finally, I looked at Safari" begins with
+/// `FINAL` and is delivered as "ly, I looked at Safari" — a sentence mangled
+/// into nonsense by the parser rather than by the model. Only a separator or
+/// the end of the text may follow the keyword.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let upper = text.to_ascii_uppercase();
+    let rest = upper.strip_prefix(keyword)?;
+    let boundary = rest
+        .chars()
+        .next()
+        .is_none_or(|ch| ch == ':' || ch.is_whitespace());
+    if !boundary {
+        return None;
+    }
+    let original = &text[text.len() - rest.len()..];
+    Some(original.trim_start_matches([':', ' ', '\n', '\r', '\t']))
 }
 
 /// What a round's text turned out to be, tool-wise.
@@ -101,12 +115,11 @@ pub fn parse_tool_call(text: &str) -> ToolCall {
     let mut name: Option<String> = None;
     for line in trimmed.lines() {
         let line = line.trim();
-        if let Some(rest) = line.to_ascii_uppercase().strip_prefix("TOOL") {
-            let original = line[line.len() - rest.len()..].trim_start_matches([':', ' ', '\t']);
-            if !original.is_empty() {
-                name = Some(original.to_owned());
-                break;
-            }
+        if let Some(rest) = strip_keyword(line, "TOOL")
+            && !rest.is_empty()
+        {
+            name = Some(rest.to_owned());
+            break;
         }
     }
     let Some(name) = name else {
@@ -320,6 +333,23 @@ ARGS {"query": "a } b"}"#),
                 other => panic!("{raw:?} classified as {other:?}"),
             }
         }
+    }
+
+    /// `FINAL` and `TOOL` are keywords, not prefixes. A model that begins its
+    /// answer "Finally, …" had the word eaten and shipped "ly, …".
+    #[test]
+    fn a_word_that_merely_starts_with_a_keyword_is_prose() {
+        assert_eq!(classify("Finally, you read the design doc."), 
+            Step::Answer("Finally, you read the design doc.".into()));
+        assert!(parse_final("Finality is a strong word").is_none());
+        assert!(matches!(
+            classify("Toolbars were open all afternoon."),
+            Step::Answer(_)
+        ));
+        // The keywords themselves still work, with each separator.
+        assert_eq!(parse_final("FINAL: done").as_deref(), Some("done"));
+        assert_eq!(parse_final("FINAL\ndone").as_deref(), Some("done"));
+        assert_eq!(parse_final("FINAL done").as_deref(), Some("done"));
     }
 
     #[test]

@@ -209,6 +209,41 @@ that can be violated, and the opening block — task, clock, folded history — 
 a budget of its own and is trimmed before the first round rather than reaching
 the model unchecked.
 
+## Answered in a second review
+
+Four more, all confirmed in code before being changed.
+
+**The opening trim deleted the user's question.** The fix for "the first round
+can exceed the window" was `truncate_head` over the whole opening — which is
+built seed, history, task. Keeping the head kept the clock and a stale
+conversation and dropped the question at the end of it; the model then answered
+something nobody asked. The default allowance is 1 906 tokens and a folded
+Chinese history alone can be eight thousand, so it took very little. The opening
+is now `Opening { seed, history, task }` with a budget per part: the task is
+never dropped, the seed keeps its anchors, history gives up its oldest turns
+first, and a question too long for one turn is cut and *named* as such. A
+`CURRENT_TASK_SENTINEL` test fails without it. Fencing also moved inside
+`Opening::render`, after trimming — trimming a pre-fenced block can cut off its
+marker and leave the question looking like data.
+
+**Corrections were delivered as untrusted data.** The malformed-call notice and
+the final-round warning were pushed as tool results, which `Transcript::render`
+wraps in `<<<AFTERRAY_DATA kind=tool_result>>>` — and the system prompt tells
+the model to ignore instructions inside that fence. `Transcript` now has a
+`Control` entry rendered outside it.
+
+**The reserved last round was advisory.** A model that ignored the warning still
+had its tool executed, and the turn then failed anyway. The loop now refuses to
+run a tool on the final round, verified by counting invocations.
+
+**Streaming was still a race.** The outlet was armed after `submit_with`
+returned, so an idle lane could start the adapter first and the round would
+silently not stream. `ModelQueue::submit_prepared` runs a hook with the job id
+while the job is still pending, and the outlet is armed there.
+
+Plus a parser boundary bug: `FINAL` and `TOOL` were matched as prefixes, so
+"Finally, …" was delivered as "ly, …".
+
 ## Not started
 
 Phase 4 (steering) and phase 5 (`SummarizeOldest`), plus the plan's note about

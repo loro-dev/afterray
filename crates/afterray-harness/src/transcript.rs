@@ -16,6 +16,21 @@ use std::fmt::Write as _;
 use crate::tokens::estimate_tokens;
 use crate::truncate::Budgeted;
 
+/// One entry in the transcript after the opening.
+#[derive(Debug, Clone)]
+pub enum Entry {
+    /// A tool call and what it returned. Untrusted: fenced when rendered.
+    Tool(Round),
+    /// The harness speaking to the model — a correction, or a budget notice.
+    ///
+    /// Rendered **outside** the data fence, and it must be: the system prompt
+    /// tells the model to ignore instructions inside that fence, so a
+    /// correction delivered as a tool result asks to be disregarded. These are
+    /// the harness's own words, not captured data, and the only text here that
+    /// is not.
+    Control(String),
+}
+
 /// One tool call and what it returned.
 #[derive(Debug, Clone)]
 pub struct Round {
@@ -42,7 +57,7 @@ pub struct Transcript {
     /// The task, the clock anchors and any seed. Never dropped: without it the
     /// model has no epoch numbers and no question.
     opening: String,
-    rounds: Vec<Round>,
+    entries: Vec<Entry>,
     /// Wraps an untrusted body so captured screen text cannot read as an
     /// instruction. A function pointer, not an import, so this module carries
     /// no opinion about the prompt vocabulary.
@@ -55,30 +70,54 @@ impl Transcript {
     pub fn new(opening: String, fence: fn(&str, &str) -> String) -> Self {
         Self {
             opening,
-            rounds: Vec::new(),
+            entries: Vec::new(),
             fence,
         }
     }
 
     pub fn push(&mut self, name: String, args: Value, result: Budgeted) {
-        self.rounds.push(Round {
+        self.entries.push(Entry::Tool(Round {
             name,
             args,
             result,
             pruned: false,
-        });
+        }));
+    }
+
+    /// Adds a line of the harness's own, outside the untrusted fence.
+    pub fn push_control(&mut self, text: impl Into<String>) {
+        self.entries.push(Entry::Control(text.into()));
     }
 
     #[must_use]
-    pub fn rounds(&self) -> &[Round] {
-        &self.rounds
+    pub fn rounds(&self) -> impl Iterator<Item = &Round> {
+        self.entries.iter().filter_map(|entry| match entry {
+            Entry::Tool(round) => Some(round),
+            Entry::Control(_) => None,
+        })
+    }
+
+    fn rounds_mut(&mut self) -> impl Iterator<Item = &mut Round> {
+        self.entries.iter_mut().filter_map(|entry| match entry {
+            Entry::Tool(round) => Some(round),
+            Entry::Control(_) => None,
+        })
     }
 
     /// The prompt text for the next model call.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = self.opening.clone();
-        for round in &self.rounds {
+        for entry in &self.entries {
+            let round = match entry {
+                Entry::Control(text) => {
+                    // No fence: this is the harness talking, and the model is
+                    // told to disregard whatever the fence contains.
+                    let _ = writeln!(out, "\n[AfterRay] {text}");
+                    continue;
+                }
+                Entry::Tool(round) => round,
+            };
             let _ = writeln!(out, "\nAssistant called TOOL {}", round.name);
             let _ = writeln!(out, "ARGS {}", round.args);
             if round.pruned {
@@ -106,7 +145,7 @@ impl Transcript {
     /// The oldest round whose body is still present, if any.
     #[must_use]
     pub fn oldest_intact(&self) -> Option<usize> {
-        self.rounds.iter().position(|round| !round.pruned)
+        self.rounds().position(|round| !round.pruned)
     }
 
     /// Drops one round's body, returning what that freed.
@@ -114,7 +153,7 @@ impl Transcript {
     /// `None` if the index is out of range or the body has already gone. The
     /// call and its arguments are untouched by design — see the module note.
     pub fn prune_round(&mut self, index: usize) -> Option<Pruned> {
-        let round = self.rounds.get_mut(index)?;
+        let round = self.rounds_mut().nth(index)?;
         if round.pruned {
             return None;
         }
@@ -180,6 +219,52 @@ mod tests {
         assert!(rendered.contains(r#"ARGS {"at_ms":7}"#), "the call must survive");
         assert!(rendered.contains("dropped to make room"));
         assert!(!rendered.contains("\"slot\": 7"));
+    }
+
+    /// The harness's own words go outside the fence.
+    ///
+    /// A correction rendered as a tool result is wrapped in
+    /// `<<<AFTERRAY_DATA kind=tool_result>>>`, and the system prompt tells the
+    /// model to ignore instructions inside that block — so the instruction to
+    /// fix its malformed call arrived asking to be ignored.
+    #[test]
+    fn control_entries_are_not_fenced_as_untrusted_data() {
+        let mut transcript = transcript();
+        transcript.push(
+            "get_ocr".to_owned(),
+            json!({"moment_id": "m1"}),
+            result("SCREEN TEXT"),
+        );
+        transcript.push_control("Answer now with FINAL.");
+        let rendered = transcript.render();
+
+        // The captured text is fenced.
+        let fenced = rendered
+            .split("<<<AFTERRAY_DATA kind=tool_result>>>")
+            .nth(1)
+            .unwrap();
+        assert!(fenced.contains("SCREEN TEXT"));
+        // The instruction is not inside any fence.
+        let control_at = rendered.find("Answer now with FINAL.").unwrap();
+        let fence_open = rendered.find("<<<AFTERRAY_DATA").unwrap();
+        let fence_close = rendered.find("<<<END_AFTERRAY_DATA>>>").unwrap();
+        assert!(
+            control_at < fence_open || control_at > fence_close,
+            "the control entry landed inside the untrusted fence"
+        );
+        assert!(rendered.contains("[AfterRay] Answer now with FINAL."));
+    }
+
+    /// A control entry is not a round: it must not be counted or pruned.
+    #[test]
+    fn control_entries_are_not_rounds() {
+        let mut transcript = transcript();
+        transcript.push_control("just a note");
+        transcript.push("get_now".to_owned(), json!({}), result("{}"));
+        assert_eq!(transcript.rounds().count(), 1);
+        assert_eq!(transcript.oldest_intact(), Some(0));
+        assert!(transcript.prune_round(0).is_some());
+        assert!(transcript.render().contains("just a note"));
     }
 
     #[test]

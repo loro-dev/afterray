@@ -3,7 +3,7 @@
 
 use afterray_agent::QueueModel;
 use afterray_harness::{
-    CancelToken, CompactionNotice, ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError,
+    CancelToken, Opening, CompactionNotice, ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError,
     ModelError, PruneToolResults, run_turn,
 };
 use afterray_models::{JobPriority, LlmTokenSink, ModelQueue};
@@ -185,8 +185,8 @@ where
     let mut peer_present = write_event(write, &started).await.is_ok();
 
     let seed = chat_seed(ctx.store, ctx.now_ms);
-    let user = build_user_prompt(&seed, &history, message);
-    let mut outcome = run_agent(write, &ctx, &user, &mut row, &mut peer_present).await;
+    let opening = build_opening(&seed, &history, message);
+    let mut outcome = run_agent(write, &ctx, opening, &mut row, &mut peer_present).await;
     row.set_tool_log(if outcome.tool_log.is_empty() {
         None
     } else {
@@ -360,6 +360,16 @@ pub(crate) const COMPACTION_ROLE: &str = "compaction";
 
 /// What the thread shows where a compaction happened.
 pub(crate) fn compaction_line(notice: &CompactionNotice) -> String {
+    // Per strategy, because the two remove entirely different things. Saying
+    // "dropped earlier tool results" when what actually went was half the
+    // conversation is worse than saying nothing.
+    if notice.strategy == "trim_opening" {
+        return format!(
+            "Trimmed the earlier conversation to stay inside the context window \
+             (~{} → ~{} tokens). Your question was kept whole; the oldest turns went first.",
+            notice.tokens_before, notice.tokens_after
+        );
+    }
     let rounds = notice.to_round - notice.from_round + 1;
     let plural = if rounds == 1 { "result" } else { "results" };
     format!(
@@ -522,7 +532,7 @@ struct AgentOutcome {
 async fn run_agent<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     ctx: &ChatStreamCtx<'_>,
-    user: &str,
+    opening: Opening,
     row: &mut TurnRow<'_>,
     peer_present: &mut bool,
 ) -> AgentOutcome {
@@ -557,7 +567,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
             compaction: Some(&strategy),
         },
         &system,
-        format!("{user}\n"),
+        opening,
     )
     .await;
     *peer_present = sink.peer_present;
@@ -716,16 +726,17 @@ fn chat_seed(store: &Vault, now_ms: i64) -> String {
     )
 }
 
-fn build_user_prompt(seed: &str, history: &str, message: &str) -> String {
-    let mut body = seed.to_owned();
-    if !history.is_empty() {
-        body.push_str("\n\nEarlier in this conversation:\n");
-        body.push_str(history);
+/// The opening, as parts the harness can budget separately.
+///
+/// It used to be one string in this order — seed, history, task — which the
+/// loop then trimmed from the head. A long history therefore deleted the
+/// question at the end of it.
+fn build_opening(seed: &str, history: &str, message: &str) -> Opening {
+    Opening {
+        seed: seed.to_owned(),
+        history: history.to_owned(),
+        task: message.trim().to_owned(),
     }
-    body.push_str("\n\nUser task:\n");
-    body.push_str(message.trim());
-    body.push('\n');
-    body
 }
 
 #[cfg(test)]
@@ -1595,6 +1606,32 @@ print(json.dumps({
         // A conversation with no live turn is not an error — the turn may have
         // finished between the press and the request arriving.
         assert!(!running.contains_key("no-such-conversation"));
+    }
+
+    /// The two strategies remove different things and must say so. A trimmed
+    /// conversation reported as "dropped tool results" tells the user the
+    /// wrong thing about their own thread.
+    #[test]
+    fn each_compaction_strategy_names_what_it_removed() {
+        let opening = compaction_line(&CompactionNotice {
+            strategy: "trim_opening",
+            from_round: 0,
+            to_round: 0,
+            tokens_before: 9_000,
+            tokens_after: 1_900,
+        });
+        assert!(opening.contains("earlier conversation"), "{opening}");
+        assert!(opening.contains("question was kept whole"), "{opening}");
+        assert!(!opening.contains("tool result"), "{opening}");
+
+        let pruned = compaction_line(&CompactionNotice {
+            strategy: "prune_tool_results",
+            from_round: 0,
+            to_round: 1,
+            tokens_before: 100,
+            tokens_after: 50,
+        });
+        assert!(pruned.contains("tool results"), "{pruned}");
     }
 
     /// One conversation, one turn at a time — through the real claim.

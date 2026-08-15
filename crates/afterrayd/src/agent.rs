@@ -7,7 +7,7 @@
 
 use afterray_agent::QueueModel;
 use afterray_harness::{
-    Budgeted, CancelToken, CompactionNotice, ContextBudget, Discard, LoopConfig, LoopError,
+    Budgeted, Opening, CancelToken, CompactionNotice, ContextBudget, Discard, LoopConfig, LoopError,
     ModelError, PruneToolResults, ToolCallRecord, ToolSurface, Turn, TurnUsage, run_turn,
 };
 use afterray_models::{JobPriority, ModelQueue};
@@ -67,9 +67,9 @@ pub async fn run_readonly_agent(
     models: &ModelQueue,
     tools: &ToolHost<'_>,
     system: &str,
-    user: &str,
+    opening: Opening,
 ) -> Result<String, AgentError> {
-    Ok(run_readonly_agent_traced(models, tools, system, user)
+    Ok(run_readonly_agent_traced(models, tools, system, opening)
         .await?
         .answer)
 }
@@ -79,7 +79,7 @@ pub async fn run_readonly_agent_traced(
     models: &ModelQueue,
     tools: &ToolHost<'_>,
     system: &str,
-    user: &str,
+    opening: Opening,
 ) -> Result<AgentTurn, AgentError> {
     let system = format!("{system}\n\n{}", tool_catalog_text());
     let model = QueueModel {
@@ -100,7 +100,7 @@ pub async fn run_readonly_agent_traced(
             compaction: Some(&strategy),
         },
         &system,
-        format!("User task:\n{user}\n"),
+        opening,
     )
     .await?;
     Ok(turn.into())

@@ -64,14 +64,26 @@ impl QueueModel<'_> {
         request: GenerateRequest<'_>,
         tokens: mpsc::Sender<StreamDelta>,
     ) -> Result<String, ModelError> {
+        // The outlet is armed inside the submit, while the job is still
+        // pending. Arming afterwards left a gap in which an idle lane could
+        // start the adapter first, so whether a round streamed at all came down
+        // to scheduling.
+        let mut relay = None;
         let job_id = match self
             .models
-            .submit_with(
+            .submit_prepared(
                 ModelInput::Llm {
                     prompt: request.prompt.to_owned(),
                     system: Some(request.system.to_owned()),
                 },
                 self.priority,
+                |job_id| {
+                    if let Some(sink) = self.token_sink {
+                        let (adapter_tx, adapter_rx) = mpsc::channel::<LlmDelta>(64);
+                        let guard = sink.install(job_id, adapter_tx);
+                        relay = Some((adapter_rx, tokens.clone(), guard));
+                    }
+                },
             )
             .await
         {
@@ -79,20 +91,6 @@ impl QueueModel<'_> {
             Err(QueueError::MissingAdapter(_)) => return Err(ModelError::Missing),
             Err(error) => return Err(ModelError::Failed(error.to_string())),
         };
-
-        // Armed only now, because the outlet is keyed by job id: a sender
-        // installed before submitting could be taken by whichever job the
-        // single LLM lane admits next, which is how one conversation's tokens
-        // reached another's window.
-        //
-        // The cost of arming late is that a job admitted in this gap does not
-        // stream that round; its completed text still returns. Losing the
-        // stream is recoverable, mis-delivering it is not.
-        let mut relay = self.token_sink.map(|sink| {
-            let (adapter_tx, adapter_rx) = mpsc::channel::<LlmDelta>(64);
-            let guard = sink.install(&job_id, adapter_tx);
-            (adapter_rx, tokens, guard)
-        });
 
         // Race the wait against the stop signal, and take the job down with it.
         // Without this the queue keeps generating for a window nobody is
@@ -238,7 +236,7 @@ mod tests {
                 compaction: None,
             },
             "system",
-            "User task:\nhello\n".to_owned(),
+            afterray_harness::Opening { task: "hello".into(), ..Default::default() },
         )
         .await
         .unwrap_err();
@@ -280,7 +278,7 @@ print(json.dumps({
                 compaction: None,
             },
             "system",
-            "User task:\nwhat did I do\n".to_owned(),
+            afterray_harness::Opening { task: "what did I do".into(), ..Default::default() },
         )
         .await
         .unwrap();
@@ -329,7 +327,7 @@ print(json.dumps({
                     compaction: None,
                 },
                 "system",
-                "User task:\nhello\n".to_owned(),
+                afterray_harness::Opening { task: "hello".into(), ..Default::default() },
             ),
         )
         .await

@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(notice.from_round, 0);
         assert!(notice.tokens_freed() > 0);
         assert!(transcript.tokens() <= ContextBudget::DEFAULT.transcript_tokens());
-        assert!(transcript.rounds()[0].pruned);
+        assert!(transcript.rounds().next().unwrap().pruned);
         assert!(
             !transcript.rounds().last().unwrap().pruned,
             "the newest result is what the model is reasoning about"

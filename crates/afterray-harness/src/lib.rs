@@ -17,6 +17,7 @@ pub mod budget;
 pub mod cancel;
 pub mod compaction;
 pub mod fence;
+pub mod opening;
 pub mod progress;
 pub mod tokens;
 pub mod transcript;
@@ -28,6 +29,7 @@ mod run;
 pub use budget::ContextBudget;
 pub use cancel::CancelToken;
 pub use compaction::{CompactionNotice, CompactionStrategy, PruneToolResults};
+pub use opening::{Opening, OpeningTrim};
 pub use progress::{Phase, ProgressReport};
 pub use run::{
     DeltaKind, Discard, EventSink, GenerateRequest, HarnessEvent, LoopConfig, LoopError,
@@ -35,4 +37,4 @@ pub use run::{
     TurnUsage, run_turn,
 };
 pub use transcript::{Pruned, Transcript};
-pub use truncate::{Budgeted, truncate_head};
+pub use truncate::{Budgeted, truncate_head, truncate_tail};

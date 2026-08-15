@@ -2046,7 +2046,13 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
             compaction: None,
         },
         inputs.system,
-        format!("User task:\n{}\n", inputs.user),
+        // The T2 prompt is one slot's card: no history, and the card itself is
+        // the task.
+        afterray_harness::Opening {
+            seed: String::new(),
+            history: String::new(),
+            task: inputs.user.clone(),
+        },
     )
     .await
     .map_err(|error| error.to_string())?;

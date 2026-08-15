@@ -18,10 +18,11 @@ use crate::budget::ContextBudget;
 use crate::cancel::CancelToken;
 use crate::compaction::{CompactionNotice, CompactionStrategy};
 use crate::fence;
+use crate::opening::Opening;
 use crate::progress::{PROGRESS_INTERVAL, Phase, ProgressReport};
 use crate::tokens::estimate_tokens;
 use crate::transcript::Transcript;
-use crate::truncate::{Budgeted, truncate_head};
+use crate::truncate::Budgeted;
 use crate::wire::{AnswerGate, Step, classify};
 
 /// One round's request to the model.
@@ -298,32 +299,35 @@ pub async fn run_turn<M, T, S>(
     sink: &mut S,
     config: &LoopConfig<'_>,
     system: &str,
-    opening: String,
+    opening: Opening,
 ) -> Result<Turn, LoopError>
 where
     M: ModelSurface + Sync,
     T: ToolSurface + Sync,
     S: EventSink,
 {
-    // Budget the input before the first round, not only between rounds.
-    // Compaction prunes round bodies and the opening is never one, so an
-    // oversized opening — a long folded history, a large seed — used to reach
-    // the model unchecked and could exceed the window before any tool ran.
-    let opening = truncate_head(&opening, config.budget.opening_allowance());
-    if opening.truncated {
+    // Each part of the opening against its own budget. Trimming the whole
+    // block from the head kept the clock and a stale conversation and deleted
+    // the question the user had just asked — see `opening`.
+    let (rendered, trim) = opening.render(config.budget, fence::untrusted);
+    if trim.happened() {
+        let after = estimate_tokens(&rendered);
         emit(
             sink,
             HarnessEvent::Compaction(CompactionNotice {
                 strategy: "trim_opening",
                 from_round: 0,
                 to_round: 0,
-                tokens_before: opening.dropped_tokens + estimate_tokens(&opening.text),
-                tokens_after: estimate_tokens(&opening.text),
+                tokens_before: after
+                    + trim.seed_dropped
+                    + trim.history_dropped
+                    + trim.task_dropped,
+                tokens_after: after,
             }),
         )
         .await?;
     }
-    let mut transcript = Transcript::new(opening.text, fence::untrusted);
+    let mut transcript = Transcript::new(rendered, fence::untrusted);
     let mut turn = Turn::default();
 
     for round in 0..config.budget.max_rounds {
@@ -388,21 +392,15 @@ where
             // answer path, the gate hides it for starting with `TOOL`, and the
             // turn reports success having stored nothing.
             Step::Malformed { name, reason } => {
-                let note = Budgeted::verbatim(format!(
-                    "ERROR: your last reply looked like a call to `{name}` but {reason}. \
-                     Reply again with exactly two lines: TOOL <name>, then ARGS <one JSON object>."
+                // A control entry, not a tool result: results are fenced as
+                // untrusted data and the system prompt tells the model to
+                // ignore instructions inside that fence, so a correction
+                // delivered that way asks to be disregarded.
+                transcript.push_control(format!(
+                    "Your last reply looked like a call to `{name}` but {reason}. \
+                     Reply again with exactly two lines: TOOL <name>, then ARGS \
+                     <one JSON object>."
                 ));
-                emit(
-                    sink,
-                    HarnessEvent::ToolResult {
-                        name: name.clone(),
-                        chars: note.text.chars().count(),
-                        truncated: false,
-                        dropped: 0,
-                    },
-                )
-                .await?;
-                transcript.push(name, Value::Null, note);
                 if round + 1 == config.budget.max_rounds {
                     return Err(LoopError::Model(ModelError::Failed(
                         "the model never produced a usable tool call or answer".into(),
@@ -410,6 +408,16 @@ where
                 }
             }
             Step::Call { name, args } => {
+                // The last round is for answering, and saying so is not enough
+                // on its own: a model that ignores it would otherwise have its
+                // tool actually run, and the turn would fail anyway — paying
+                // for a lookup nobody reads.
+                if round + 1 == config.budget.max_rounds {
+                    transcript.push_control(format!(
+                        "`{name}` was not run: no rounds remain for this turn."
+                    ));
+                    break;
+                }
                 let result = call_tool(tools, sink, &config.cancel, &name, &args).await?;
                 turn.tool_calls.push(ToolCallRecord {
                     name: name.clone(),
@@ -420,20 +428,9 @@ where
                 transcript.push(name.clone(), args, result);
 
                 if round + 2 == config.budget.max_rounds {
-                    // One round is held back for an answer. Spending every
-                    // round on tools and then printing the last raw result as
-                    // the reply — which is what happened before — hands the
-                    // user unsynthesised, unfenced tool output and skips the
-                    // citation the prompt asks for. The model gets told instead,
-                    // and answers with what it has.
-                    transcript.push(
-                        "(budget)".to_owned(),
-                        Value::Null,
-                        Budgeted::verbatim(
-                            "No tool calls remain for this turn. Answer now with FINAL, \
-                             from the evidence above, and say what you could not check."
-                                .to_owned(),
-                        ),
+                    transcript.push_control(
+                        "No tool calls remain for this turn. Answer now with FINAL, from \
+                         the evidence above, and say what you could not check.",
                     );
                 }
             }
@@ -647,6 +644,20 @@ mod tests {
         }
     }
 
+    /// Counts how many times a tool was actually invoked.
+    #[derive(Default)]
+    struct CountingTools {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolSurface for CountingTools {
+        async fn invoke(&self, _name: &str, _args: &Value) -> Result<Budgeted, String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Budgeted::verbatim("{}".to_owned()))
+        }
+    }
+
     #[derive(Default)]
     struct Recorder {
         events: Vec<HarnessEvent>,
@@ -677,6 +688,14 @@ mod tests {
         }
     }
 
+    /// A plain opening: just the question.
+    fn task(text: &str) -> Opening {
+        Opening {
+            task: text.to_owned(),
+            ..Opening::default()
+        }
+    }
+
     fn config() -> LoopConfig<'static> {
         LoopConfig {
             budget: ContextBudget::DEFAULT,
@@ -696,7 +715,7 @@ mod tests {
             sink,
             &config(),
             "system",
-            "User task:\nwhat did I do\n".to_owned(),
+            task("what did I do"),
         )
         .await
     }
@@ -834,6 +853,29 @@ mod tests {
         );
     }
 
+    /// The reservation is enforced, not merely announced. A model that ignores
+    /// it must not have its tool actually run: the turn is going to fail, and
+    /// the lookup would be paid for and never read.
+    #[tokio::test]
+    async fn the_final_round_refuses_to_run_a_tool() {
+        let script: Vec<&str> = (0..ContextBudget::DEFAULT.max_rounds)
+            .map(|_| "TOOL get_now\nARGS {}")
+            .collect();
+        let model = ScriptedModel::new(&script, false);
+        let tools = CountingTools::default();
+        let mut sink = Recorder::default();
+        let error = run_turn(&model, &tools, &mut sink, &config(), "system", task("go"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, LoopError::Exhausted);
+        assert_eq!(
+            tools.calls.load(std::sync::atomic::Ordering::SeqCst),
+            ContextBudget::DEFAULT.max_rounds - 1,
+            "the last round's tool was executed anyway"
+        );
+    }
+
     /// A model that ignores the warning fails the turn instead of having a raw
     /// tool result printed for it.
     #[tokio::test]
@@ -873,7 +915,7 @@ mod tests {
         }
         let tools = EchoTools { body: String::new() };
         let mut sink = Recorder::default();
-        let error = run_turn(&NoModel, &tools, &mut sink, &config(), "s", "t".to_owned())
+        let error = run_turn(&NoModel, &tools, &mut sink, &config(), "s", task("t"))
             .await
             .unwrap_err();
         assert_eq!(error, LoopError::Model(ModelError::Missing));
@@ -897,7 +939,7 @@ mod tests {
             &mut Closed,
             &config(),
             "system",
-            "task".to_owned(),
+            task("task"),
         )
         .await
         .unwrap_err();
@@ -924,7 +966,7 @@ mod tests {
             body: "y".repeat(60_000),
         };
         let mut sink = Recorder::default();
-        let turn = run_turn(&model, &tools, &mut sink, &config, "system", "task".to_owned())
+        let turn = run_turn(&model, &tools, &mut sink, &config, "system", task("task"))
             .await
             .unwrap();
 
@@ -957,7 +999,7 @@ mod tests {
                 compaction: None,
             },
             "system",
-            "task".to_owned(),
+            task("task"),
         )
         .await
         .unwrap_err();
@@ -984,7 +1026,7 @@ mod tests {
                 compaction: None,
             },
             "system",
-            "task".to_owned(),
+            task("task"),
         )
         .await
         .unwrap_err();
@@ -1022,7 +1064,7 @@ mod tests {
                     compaction: None,
                 },
                 "system",
-                "task".to_owned(),
+                task("task"),
             ),
         )
         .await
@@ -1063,7 +1105,7 @@ mod tests {
                     compaction: None,
                 },
                 "system",
-                "task".to_owned(),
+                task("task"),
             ),
         )
         .await
@@ -1124,7 +1166,7 @@ mod tests {
             &mut sink,
             &config(),
             "system",
-            "task".to_owned(),
+            task("task"),
         )
         .await
         .unwrap();
@@ -1173,7 +1215,7 @@ mod tests {
         }
         let tools = EchoTools { body: String::new() };
         let mut sink = Recorder::default();
-        run_turn(&SlowModel, &tools, &mut sink, &config(), "s", "t".to_owned())
+        run_turn(&SlowModel, &tools, &mut sink, &config(), "s", task("t"))
             .await
             .unwrap();
 
@@ -1221,7 +1263,7 @@ mod tests {
             &mut sink,
             &config(),
             "s",
-            "t".to_owned(),
+            task("t"),
         )
         .await
         .unwrap();
@@ -1260,7 +1302,7 @@ mod tests {
             &mut sink,
             &config(),
             "s",
-            "t".to_owned(),
+            task("t"),
         )
         .await
         .unwrap();
@@ -1345,7 +1387,11 @@ mod tests {
         let model = ScriptedModel::new(&["FINAL\nok"], false);
         let tools = EchoTools { body: String::new() };
         let mut sink = Recorder::default();
-        let huge = "a long folded history. ".repeat(20_000);
+        let huge = Opening {
+            seed: "clock".to_owned(),
+            history: "a long folded history. ".repeat(20_000),
+            task: "CURRENT_TASK_SENTINEL".to_owned(),
+        };
         let turn = run_turn(
             &model,
             &tools,
@@ -1356,6 +1402,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let prompt = model.seen.lock().unwrap()[0].clone();
+        assert!(
+            prompt.contains("CURRENT_TASK_SENTINEL"),
+            "the question the user just asked was trimmed away"
+        );
 
         assert!(
             turn.usage.prompt_tokens <= ContextBudget::DEFAULT.window_tokens,

@@ -121,6 +121,51 @@ pub fn truncate_head(text: &str, max_tokens: usize) -> Budgeted {
     }
 }
 
+/// Keeps whole lines from the *end* of `text` until `max_tokens` is reached.
+///
+/// The counterpart to [`truncate_head`], for text whose newest part matters
+/// most: a folded conversation runs oldest to newest, so keeping its head keeps
+/// exactly the turns nobody is asking about.
+#[must_use]
+pub fn truncate_tail(text: &str, max_tokens: usize) -> Budgeted {
+    let total = estimate_tokens(text);
+    if total <= max_tokens {
+        return Budgeted::kept(text.to_owned());
+    }
+    if max_tokens == 0 {
+        return Budgeted {
+            text: marker(line_count(text), total),
+            truncated: true,
+            dropped_lines: line_count(text),
+            dropped_tokens: total,
+            partial_line: false,
+        };
+    }
+    let body_budget = max_tokens.saturating_sub(MARKER_RESERVE_TOKENS);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0_usize;
+    for line in lines.iter().rev() {
+        let cost = estimate_tokens(line) + 1;
+        if used + cost > body_budget {
+            break;
+        }
+        kept.push(line);
+        used += cost;
+    }
+    kept.reverse();
+    let dropped_lines = lines.len() - kept.len();
+    let body = kept.join("\n");
+    let dropped_tokens = total.saturating_sub(estimate_tokens(&body));
+    Budgeted {
+        text: format!("{}\n{body}", marker(dropped_lines, dropped_tokens)),
+        truncated: true,
+        dropped_lines,
+        dropped_tokens,
+        partial_line: false,
+    }
+}
+
 /// The seam marker. Phrased as an instruction because a model that reads only
 /// "truncated" tends to answer from the fragment instead of narrowing.
 fn marker(dropped_lines: usize, dropped_tokens: usize) -> String {
@@ -234,6 +279,22 @@ mod tests {
         assert!(estimate_tokens(&out.text) <= 200);
         // A character-based cut at the same number would have kept far more.
         assert!(out.text.lines().count() < 20, "{}", out.text.lines().count());
+    }
+
+    /// A folded conversation runs oldest to newest, so what has to survive is
+    /// its end.
+    #[test]
+    fn tail_truncation_keeps_the_most_recent_lines() {
+        let text = (0..200)
+            .map(|index| format!("turn {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = truncate_tail(&text, 100);
+        assert!(out.truncated);
+        assert!(out.text.contains("turn 199"), "the newest turn was dropped");
+        assert!(!out.text.contains("turn 0\n"), "{}", out.text);
+        assert!(out.text.lines().next().unwrap().starts_with('…'));
+        assert!(estimate_tokens(&out.text) <= 100);
     }
 
     #[test]

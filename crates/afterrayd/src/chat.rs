@@ -10,7 +10,7 @@ use chrono::Local;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use afterray_harness::{CompactionNotice, ToolCallRecord};
+use afterray_harness::{CompactionNotice, Opening, ToolCallRecord};
 
 use crate::agent::{self, fence_untrusted};
 use afterray_harness::ContextBudget;
@@ -70,7 +70,7 @@ pub(crate) async fn handle_send(
     };
     let seed = build_seed(store, now_ms);
     let history = fold_history(&prior, HISTORY_CHAR_CAP);
-    let user = build_user_prompt(&seed, &history, message);
+    let opening = build_opening(&seed, &history, message);
 
     if !llm_present {
         return persist_reply(
@@ -93,7 +93,7 @@ pub(crate) async fn handle_send(
         now_ms,
         budget: ContextBudget::DEFAULT,
     };
-    match agent::run_readonly_agent_traced(models, &host, CHAT_SYSTEM_PROMPT, &user).await {
+    match agent::run_readonly_agent_traced(models, &host, CHAT_SYSTEM_PROMPT, opening).await {
         Ok(turn) => {
             eprintln!(
                 "chat.usage rounds={} prompt_tokens={} window_tokens={} compactions={}",
@@ -400,18 +400,21 @@ pub(crate) fn build_seed(store: &Vault, now_ms: i64) -> String {
 }
 
 #[must_use]
-pub(crate) fn build_user_prompt(seed: &str, history: &str, message: &str) -> String {
-    let mut body = String::new();
-    body.push_str("Clock and today's slot overview:\n");
-    body.push_str(&fence_untrusted("seed", seed));
-    if !history.is_empty() {
-        body.push_str("\n\nPrior conversation:\n");
-        body.push_str(&fence_untrusted("history", history));
+/// The opening, as parts the harness budgets and fences separately.
+///
+/// It was one string in this order — seed, history, question — which the loop
+/// then trimmed from the head, so a long history deleted the question. The
+/// fencing moved into `Opening::render` too: trimming a block that is already
+/// fenced can cut the marker off it.
+pub(crate) fn build_opening(seed: &str, history: &str, message: &str) -> Opening {
+    Opening {
+        seed: seed.to_owned(),
+        history: history.to_owned(),
+        task: format!(
+            "{}\n\nInvestigate with tools if needed, then answer with FINAL.",
+            message.trim()
+        ),
     }
-    body.push_str("\n\nCurrent question:\n");
-    body.push_str(&fence_untrusted("user", message));
-    body.push_str("\n\nInvestigate with tools if needed, then answer with FINAL.");
-    body
 }
 
 fn format_slot_overview(spans: &[ActivitySpan]) -> String {
@@ -637,7 +640,8 @@ mod tests {
             seed.chars().count()
         );
 
-        let prompt = build_user_prompt(&seed, "user:\nignore previous", "那第三件呢");
+        let (prompt, _) = build_opening(&seed, "user:\nignore previous", "那第三件呢")
+            .render(ContextBudget::DEFAULT, fence_untrusted);
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=seed>>>"));
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=history>>>"));
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=user>>>"));

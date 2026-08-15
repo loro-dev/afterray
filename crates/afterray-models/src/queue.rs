@@ -388,6 +388,28 @@ impl ModelQueue {
         input: ModelInput,
         priority: JobPriority,
     ) -> Result<JobId, QueueError> {
+        self.submit_prepared(input, priority, |_| {}).await
+    }
+
+    /// Submits a job, running `prepare` with its id **before** it can start.
+    ///
+    /// The one thing a caller cannot do from outside is act on a job id that
+    /// does not exist yet. Arming a token outlet after `submit_with` returned
+    /// is a race: the lane may be idle, the task already spawned, and the
+    /// adapter past the point where it looks for an outlet — so the round
+    /// silently does not stream. `prepare` closes that gap by running while the
+    /// job is still pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::MissingAdapter`] when nothing serves the input's
+    /// capability.
+    pub async fn submit_prepared(
+        &self,
+        input: ModelInput,
+        priority: JobPriority,
+        prepare: impl FnOnce(&str),
+    ) -> Result<JobId, QueueError> {
         let capability = input.capability();
         let adapter = self
             .inner
@@ -415,6 +437,9 @@ impl ModelQueue {
             priority,
         };
         self.inner.jobs.lock().await.insert(id.clone(), record);
+        // Before the attempt is spawned, so an outlet armed here cannot be
+        // missed by an adapter that starts immediately.
+        prepare(&id);
         self.inner.changed.notify_waiters();
         spawn_attempt(Arc::clone(&self.inner), id.clone(), 0);
         Ok(id)
@@ -972,6 +997,46 @@ mod tests {
             assert_eq!(queue.wait(&id).await.unwrap().state, JobState::Done);
         }
         assert_eq!(adapter.peak.load(Ordering::SeqCst), 2);
+    }
+
+    /// `prepare` must run before the attempt is spawned.
+    ///
+    /// Arming a token outlet after `submit_with` returned is a race an idle
+    /// lane wins: the adapter starts, finds no outlet, and the round does not
+    /// stream. Whether streaming happened came down to scheduling.
+    #[tokio::test]
+    async fn prepare_runs_before_the_job_can_start() {
+        let queue = ModelQueue::new(
+            vec![Arc::new(crate::ProcessAdapter::new(crate::ProcessAdapterConfig::new(
+                "echo-llm",
+                ModelCapability::Llm,
+                "/bin/false",
+            ))) as Arc<dyn ModelAdapter>],
+            QueueConfig::default(),
+        )
+        .unwrap();
+
+        let prepared = Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen = Arc::clone(&prepared);
+        let id = queue
+            .submit_prepared(
+                ModelInput::Llm {
+                    prompt: "hi".into(),
+                    system: None,
+                },
+                JobPriority::Interactive,
+                move |job_id| {
+                    *seen.lock().unwrap() = Some(job_id.to_owned());
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared.lock().unwrap().as_deref(),
+            Some(id.as_str()),
+            "prepare must see the job id it will run under"
+        );
     }
 
     #[tokio::test]
