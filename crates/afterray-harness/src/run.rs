@@ -18,6 +18,7 @@ use crate::budget::ContextBudget;
 use crate::cancel::CancelToken;
 use crate::compaction::{CompactionNotice, CompactionStrategy};
 use crate::fence;
+use crate::message::Message;
 use crate::opening::Opening;
 use crate::progress::{PROGRESS_INTERVAL, Phase, ProgressReport};
 use crate::tokens::estimate_tokens;
@@ -29,7 +30,14 @@ use crate::wire::{AnswerGate, Step, classify};
 #[derive(Debug, Clone, Copy)]
 pub struct GenerateRequest<'a> {
     pub system: &'a str,
+    /// The conversation, flattened. For a runtime that takes one string.
     pub prompt: &'a str,
+    /// The same conversation as messages, for a runtime that takes an array.
+    ///
+    /// Both are handed over because the two runtimes want different shapes and
+    /// neither should have to reconstruct the other's — a flattening done in
+    /// two places is a flattening that will disagree in one of them.
+    pub messages: &'a [Message],
     /// One-based, for logs and the `usage` event.
     pub round: usize,
     /// Implementations must race their wait against this and stop the
@@ -313,7 +321,22 @@ where
     // Each part of the opening against its own budget. Trimming the whole
     // block from the head kept the clock and a stale conversation and deleted
     // the question the user had just asked — see `opening`.
-    let (rendered, trim) = opening.render(config.budget, fence::untrusted);
+    let mut turn_compactions = Vec::new();
+    // The conversation is brought inside its share before anything is
+    // rendered, by the same policy that prunes inside a turn. Doing it here
+    // rather than inside `render_messages` is what lets it be announced: the
+    // caller hears a `Compaction` event and can write the same row it writes
+    // for an in-turn pass.
+    let mut opening = opening;
+    if let Some(strategy) = config.compaction {
+        let limit = config.budget.opening_allowance();
+        for notice in strategy.compact_history(&mut opening.history, limit) {
+            emit(sink, HarnessEvent::Compaction(notice.clone())).await?;
+            turn_compactions.push(notice);
+        }
+    }
+    let (opening_messages, trim) = opening.render_messages(config.budget, fence::untrusted);
+    let rendered = format!("{}\n", crate::message::flatten(&opening_messages));
     if trim.happened() {
         let after = estimate_tokens(&rendered);
         emit(
@@ -332,7 +355,10 @@ where
         .await?;
     }
     let mut transcript = Transcript::new(rendered, fence::untrusted);
-    let mut turn = Turn::default();
+    let mut turn = Turn {
+        compactions: turn_compactions,
+        ..Turn::default()
+    };
 
     for round in 0..config.budget.max_rounds {
         if config.cancel.is_cancelled() {
@@ -346,6 +372,11 @@ where
         }
 
         let prompt = transcript.render();
+        // The same conversation twice, from one source: the opening's messages
+        // plus this turn's rounds. `prompt` is their flattening, so a runtime
+        // that takes one string and one that takes an array see the same thing.
+        let mut messages = opening_messages.clone();
+        messages.extend(transcript.messages());
         turn.usage = TurnUsage {
             prompt_tokens: estimate_tokens(&prompt),
             window_tokens: config.budget.window_tokens,
@@ -364,6 +395,7 @@ where
         let request = GenerateRequest {
             system,
             prompt: &prompt,
+            messages: &messages,
             round: round + 1,
             cancel: &config.cancel,
         };
@@ -1442,7 +1474,9 @@ mod tests {
         let mut sink = Recorder::default();
         let huge = Opening {
             seed: "clock".to_owned(),
-            history: "a long folded history. ".repeat(20_000),
+            history: (0..4_000)
+                .map(|index| crate::message::Message::user(format!("a long folded turn {index}")))
+                .collect(),
             task: "CURRENT_TASK_SENTINEL".to_owned(),
         };
         let turn = run_turn(
