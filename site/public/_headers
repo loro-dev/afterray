@@ -1,0 +1,13 @@
+# Vite fingerprints everything under /assets, so it can be cached forever.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# public/ files keep stable names, so they need to stay revalidatable —
+# og.png in particular, or a social card fix would take a year to propagate.
+/*.png
+  Cache-Control: public, max-age=3600
+
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
