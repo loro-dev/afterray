@@ -25,21 +25,22 @@ function AppWindow({ rec }: { rec: Rec }) {
           <>
             <div className="aw-url mono">{'url' in rec ? rec.url : rec.title}</div>
             <div className="aw-lines">
-              <i style={{ width: '92%' }} />
-              <i style={{ width: '78%' }} />
-              <i className="aw-accent" style={{ width: '64%' }} />
-              <i style={{ width: '85%' }} />
+              {[92, 78, 64, 85, 71, 88, 59, 80].map((w, i) => (
+                <i key={w} className={i === 2 ? 'aw-accent' : ''} style={{ width: `${w}%` }} />
+              ))}
             </div>
           </>
         )}
         {rec.app === 'Xcode' && (
           <div className="aw-code mono">
-            {[41, 42, 43, 44, 45].map((n, i) => (
-              <div key={n}>
-                <span className="aw-ln">{n}</span>
+            {[58, 82, 46, 74, 63, 88, 52, 70, 44, 79, 61].map((w, i) => (
+              <div key={41 + i}>
+                <span className="aw-ln">{41 + i}</span>
                 <i
-                  className={['aw-c3', '', 'aw-accent', 'aw-c2', ''][i]}
-                  style={{ width: `${[58, 82, 46, 74, 63][i]}%` }}
+                  className={
+                    ['aw-c3', '', 'aw-accent', 'aw-c2', '', '', 'aw-c3', '', 'aw-c2', '', ''][i]
+                  }
+                  style={{ width: `${w}%` }}
                 />
               </div>
             ))}
@@ -57,9 +58,9 @@ function AppWindow({ rec }: { rec: Rec }) {
         {rec.app === 'Notes' && (
           <div className="aw-lines aw-notes">
             <strong>{rec.title}</strong>
-            <i style={{ width: '88%' }} />
-            <i style={{ width: '72%' }} />
-            <i style={{ width: '80%' }} />
+            {[88, 72, 80, 64, 84, 69, 77].map((w) => (
+              <i key={w} style={{ width: `${w}%` }} />
+            ))}
           </div>
         )}
         {rec.app === 'GitHub' && (
@@ -69,9 +70,9 @@ function AppWindow({ rec }: { rec: Rec }) {
               <span className="aw-pr-chip mono">Open</span>
             </div>
             <div className="aw-lines">
-              <i style={{ width: '90%' }} />
-              <i className="aw-accent" style={{ width: '68%' }} />
-              <i style={{ width: '76%' }} />
+              {[90, 68, 76, 83, 61, 79, 72].map((w, i) => (
+                <i key={w} className={i === 1 ? 'aw-accent' : ''} style={{ width: `${w}%` }} />
+              ))}
             </div>
           </>
         )}

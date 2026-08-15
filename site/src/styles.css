@@ -552,12 +552,14 @@ button:focus-visible {
   min-width: 0;
 }
 .rc-body:not(.rc-body-split) .rc-window {
-  max-width: 30rem;
+  max-width: 41rem;
   margin-inline: auto;
 }
-/* a tall capture must not stretch the stage past its chrome */
+/* every app fills the same lane, so switching capture does not resize the
+   stage, and a tall one clips instead of pushing into the chrome */
 .rc-window .appwin-body {
-  max-height: 250px;
+  min-height: 244px;
+  max-height: 244px;
   overflow: hidden;
 }
 
