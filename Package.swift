@@ -92,6 +92,11 @@ let package = Package(
             path: "swift/AfterRayRecall/Tests"
         ),
         .testTarget(
+            name: "AfterRayAppTests",
+            dependencies: ["AfterRayApp"],
+            path: "apps/AfterRay/Tests"
+        ),
+        .testTarget(
             name: "AfterRayMlxVlmWorkerTests",
             dependencies: ["AfterRayMlxVlmWorkerCore"],
             path: "swift/AfterRayMlxVlmWorkerTests"

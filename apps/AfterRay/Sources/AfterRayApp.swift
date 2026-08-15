@@ -669,7 +669,7 @@ private final class PermissionGuideController {
     func show(for permission: RequiredPermission) {
         let panel = panel ?? makePanel()
         let hostingView = NSHostingView(
-            rootView: PermissionDropGuide(
+            rootView: PermissionSettingsGuide(
                 permission: permission,
                 onDismiss: { [weak self] in self?.hide() }
             )
@@ -763,12 +763,13 @@ private final class PermissionGuideController {
     }
 }
 
-private struct PermissionDropGuide: View {
+private struct PermissionSettingsGuide: View {
     let permission: RequiredPermission
     let onDismiss: () -> Void
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
 
     private var applicationURL: URL { Bundle.main.bundleURL }
+    private var guide: PermissionSettingsGuideContent { permission.settingsGuide }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -780,9 +781,9 @@ private struct PermissionDropGuide: View {
                     .background(.red.opacity(0.12), in: Circle())
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Add AfterRay to \(permission.title)")
+                    Text(guide.title)
                         .font(.system(size: 15, weight: .semibold))
-                    Text("Drag the application below into the list in System Settings, then turn it on.")
+                    Text(guide.instructions)
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -810,14 +811,14 @@ private struct PermissionDropGuide: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("AfterRay")
                         .font(.system(size: 14, weight: .semibold))
-                    Text("Drag into System Settings")
+                    Text(guide.applicationAction)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
 
-                Image(systemName: "hand.draw")
+                Image(systemName: guide.actionIcon)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.white.opacity(0.72))
             }
@@ -829,7 +830,9 @@ private struct PermissionDropGuide: View {
             }
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay {
-                ApplicationBundleDragSource(applicationURL: applicationURL)
+                if guide.allowsApplicationDrag {
+                    ApplicationBundleDragSource(applicationURL: applicationURL)
+                }
             }
 
             Text("After granting access, press \(hotKeys.hotKey.displayString) to return.")

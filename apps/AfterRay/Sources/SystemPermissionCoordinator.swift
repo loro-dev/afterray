@@ -153,4 +153,33 @@ enum RequiredPermission: String, CaseIterable, Identifiable {
             AXIsProcessTrusted()
         }
     }
+
+    var settingsGuide: PermissionSettingsGuideContent {
+        switch self {
+        case .microphone:
+            PermissionSettingsGuideContent(
+                title: "Turn on AfterRay for Microphone",
+                instructions: "Microphone access can't be added by dragging. Turn on AfterRay in the list.",
+                applicationAction: "Turn on the switch beside AfterRay",
+                actionIcon: "checkmark.circle",
+                allowsApplicationDrag: false
+            )
+        case .screenRecording, .accessibility:
+            PermissionSettingsGuideContent(
+                title: "Add AfterRay to \(title)",
+                instructions: "Drag the application below into the list in System Settings, then turn it on.",
+                applicationAction: "Drag into System Settings",
+                actionIcon: "hand.draw",
+                allowsApplicationDrag: true
+            )
+        }
+    }
+}
+
+struct PermissionSettingsGuideContent: Equatable {
+    let title: String
+    let instructions: String
+    let applicationAction: String
+    let actionIcon: String
+    let allowsApplicationDrag: Bool
 }
