@@ -1,4 +1,5 @@
-import { LangProvider, useLang, useCopy } from './i18n'
+import { LangProvider, useCopy } from './i18n'
+import LangMenu from './components/LangMenu'
 import Hero from './sections/Hero'
 import Agents from './sections/Agents'
 import Jtbd from './sections/Jtbd'
@@ -7,7 +8,6 @@ import SearchAsk from './sections/SearchAsk'
 import Closer from './sections/Closer'
 
 function Nav() {
-  const { lang, setLang } = useLang()
   const t = useCopy().nav
   return (
     <nav className="nav">
@@ -21,14 +21,7 @@ function Nav() {
         <a href="#privacy">{t.privacy}</a>
       </div>
       <div className="nav-actions">
-        <button
-          type="button"
-          className="lang-toggle"
-          onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
-          aria-label={lang === 'en' ? 'Switch to Chinese' : '切换到英文'}
-        >
-          {lang === 'en' ? '中文' : 'EN'}
-        </button>
+        <LangMenu />
       </div>
     </nav>
   )

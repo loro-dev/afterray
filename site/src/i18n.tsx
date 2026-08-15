@@ -9,6 +9,13 @@ import {
 export type Lang = 'en' | 'zh'
 export type Part = string | { em: string }
 
+/** Every locale the switcher offers, labelled in its own language.
+ *  Adding one means adding an entry here plus a `copy` block. */
+export const LANGS: { code: Lang; label: string }[] = [
+  { code: 'en', label: 'English' },
+  { code: 'zh', label: '中文' },
+]
+
 const en = {
   meta: {
     title: 'AfterRay — Your Mac remembers everything, for you and for your agent.',
@@ -18,6 +25,7 @@ const en = {
     features: 'Recall',
     cli: 'Agents',
     privacy: 'Privacy',
+    language: 'Language',
     skip: 'Skip to content',
   },
   hero: {
@@ -295,6 +303,7 @@ const zh: Copy = {
     features: '回放',
     cli: 'Agent',
     privacy: '隐私',
+    language: '语言',
     skip: '跳到正文',
   },
   hero: {

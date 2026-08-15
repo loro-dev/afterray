@@ -163,24 +163,69 @@ button:focus-visible {
   align-items: center;
   gap: 0.9rem;
 }
-.lang-toggle {
+/* language switcher: a globe that opens the list of locales, so adding a
+   third language does not mean redesigning a two-state toggle */
+.lang-menu {
+  position: relative;
+}
+.lang-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
   background: none;
   border: 1px solid var(--line);
   border-radius: var(--r-control);
   color: var(--ink-dim);
-  padding: 0.5rem 0.8rem;
   cursor: pointer;
-  font-size: 0.72rem;
   transition-property: color, border-color, transform;
   transition-duration: 150ms;
   transition-timing-function: ease-out;
 }
-.lang-toggle:hover {
+.lang-btn:hover,
+.lang-btn[aria-expanded='true'] {
   color: var(--accent);
   border-color: var(--accent);
 }
-.lang-toggle:active {
+.lang-btn:active {
   transform: scale(0.96);
+}
+.lang-list {
+  position: absolute;
+  top: calc(100% + 0.45rem);
+  inset-inline-end: 0;
+  z-index: 60;
+  min-width: 8.5rem;
+  display: flex;
+  flex-direction: column;
+  padding: 0.3rem;
+  background: var(--bg-elev);
+  border-radius: var(--r-card);
+  box-shadow:
+    0 0 0 1px oklch(1 0 0 / 0.1),
+    0 12px 30px rgba(0, 0, 0, 0.55);
+}
+.lang-item {
+  background: none;
+  border: none;
+  border-radius: var(--r-control);
+  color: var(--ink-dim);
+  font: inherit;
+  font-size: 0.84rem;
+  text-align: start;
+  padding: 0.45rem 0.7rem;
+  cursor: pointer;
+  transition-property: color, background;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+.lang-item:hover {
+  background: oklch(1 0 0 / 0.05);
+  color: var(--ink);
+}
+.lang-item-on {
+  color: var(--accent);
 }
 
 /* ---------------- buttons ---------------- */
