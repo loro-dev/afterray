@@ -4,13 +4,14 @@
 use afterray_agent::QueueModel;
 use afterray_harness::{
     CancelToken, Opening, CompactionNotice, ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError,
-    ModelError, PruneToolResults, run_turn,
+    ModelError, PruneToolResults, ToolCallRecord, run_turn,
 };
 use afterray_models::{JobPriority, LlmTokenSink, ModelQueue};
-use afterray_protocol::{ChatStreamEvent, ConversationMessage, local_calendar_day_bounds_ms};
+use afterray_protocol::{ChatStreamEvent, local_calendar_day_bounds_ms};
+#[cfg(test)]
+use afterray_protocol::ConversationMessage;
 use afterray_store::Vault;
 use chrono::Local;
-use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 
@@ -399,16 +400,12 @@ fn compaction_detail(notice: &CompactionNotice) -> Value {
     })
 }
 
-#[derive(Debug, Serialize)]
-struct ToolLogEntry {
-    name: String,
-    args: Value,
-    chars: usize,
-    /// Whether the body was cut to fit its budget. Stored, so reopening an old
-    /// thread still shows that an answer was built on a shortened result.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    truncated: bool,
-}
+/// The streaming path writes the same records the unary path does.
+///
+/// It used to keep a parallel struct with only `chars` and `truncated` in it,
+/// which is how the chat path — the one people actually use — ended up storing
+/// no results at all while the unary path stored them fine.
+type ToolLogEntry = ToolCallRecord;
 
 /// Turns harness events into NDJSON lines on the client's socket, and writes
 /// the turn into its row as it goes.
@@ -451,13 +448,16 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, '_, W> {
                 self.tool_log.push(ToolLogEntry {
                     name: name.clone(),
                     args: args.clone(),
-                    chars: 0,
+                    result: None,
+                    chars: None,
                     truncated: false,
+                    dropped_tokens: 0,
                 });
                 ChatStreamEvent::ToolCall { name, args }
             }
             HarnessEvent::ToolResult {
                 name,
+                text,
                 chars,
                 truncated,
                 dropped,
@@ -466,10 +466,15 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, '_, W> {
                     .tool_log
                     .iter_mut()
                     .rev()
-                    .find(|entry| entry.name == name && entry.chars == 0)
+                    .find(|entry| entry.name == name && entry.result.is_none())
                 {
-                    entry.chars = chars;
+                    // Exactly the bytes the transcript got. Replay reads this
+                    // back verbatim, so anything derived from a budget here
+                    // would make the same past render differently later.
+                    entry.result = Some(text);
+                    entry.chars = Some(chars);
                     entry.truncated = truncated;
+                    entry.dropped_tokens = dropped;
                 }
                 ChatStreamEvent::ToolResult {
                     name,
@@ -1817,7 +1822,7 @@ print(json.dumps({
         ];
         let mut conversation = None;
         let mut answers = Vec::new();
-        for (index, question) in questions.into_iter().enumerate() {
+        for (index, question) in questions.iter().enumerate() {
             let mut out = Vec::new();
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(180),
@@ -1855,6 +1860,132 @@ print(json.dumps({
             answers[1].contains("ZANZIBAR-7741"),
             "the second turn could not see the first: {:?}",
             answers[1]
+        );
+    }
+
+    /// The point of storing results: the second turn can answer from the first
+    /// turn's evidence without looking anything up again.
+    ///
+    /// Made decisive by deleting the evidence between the turns. A re-lookup
+    /// now returns nothing, so a correct answer can only have come from the
+    /// replayed result — no assumption about whether a given model *chooses*
+    /// to call a tool again, which is its policy and not our capability.
+    #[tokio::test]
+    async fn live_ollama_answers_from_a_stored_tool_result() {
+        let Some(model) = live_ollama_small_model().await else {
+            eprintln!("skip: no live Ollama chat model");
+            return;
+        };
+        eprintln!("live stored-result test using `{model}`");
+
+        let (_dir, vault) = test_vault();
+        let now = 1_786_729_937_000;
+        let session = vault.create_session_sync(now - 60_000).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, now - 60_000, "image/jpeg", b"frame")
+            .unwrap();
+        // Only reachable through a tool. The seed carries the clock and a
+        // sketch of the day but deliberately no screen text, so a model that
+        // answers with this codeword read it from the replayed result and
+        // nowhere else.
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&moment.id),
+                None,
+                "ocr",
+                "Release checklist. Build passphrase: ZANZIBAR-7741. Do not share.",
+                now - 60_000,
+                None,
+                "test",
+                None,
+            )
+            .unwrap();
+
+        let config = std::sync::Arc::new(std::sync::Mutex::new(
+            afterray_models::LlmRuntimeConfig {
+                provider: afterray_protocol::LlmProvider::Ollama,
+                base_url: String::new(),
+                model,
+                api_key: None,
+                context_tokens: Some(32_768),
+            },
+        ));
+        let router = afterray_models::LlmRouterAdapter::new(config);
+        let sink = router.token_sink();
+        let models = ModelQueue::new(
+            vec![std::sync::Arc::new(router) as std::sync::Arc<dyn afterray_models::ModelAdapter>],
+            afterray_models::QueueConfig::default(),
+        )
+        .unwrap();
+
+        let questions = [
+            format!(
+                "Call the get_ocr tool with moment_id {}. Then answer FINAL with the single \
+                 word: done.",
+                moment.id
+            ),
+            "What was the build passphrase in that screen text? Answer FINAL with just the \
+             passphrase."
+                .to_owned(),
+        ];
+        let mut conversation = None;
+        let mut answers = Vec::new();
+        for (index, question) in questions.into_iter().enumerate() {
+            let mut out = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(180),
+                run_chat_stream(
+                    &mut out,
+                    ChatStreamCtx {
+                        store: &vault,
+                        models: &models,
+                        token_sink: &sink,
+                        now_ms: now + (index as i64) * 60_000,
+                        llm_ready: true,
+                        budget: ContextBudget::for_window(32_768),
+                        cancel: CancelToken::new(),
+                    },
+                    conversation.as_deref(),
+                    question.as_str(),
+                ),
+            )
+            .await
+            .expect("a live turn ran over its timeout")
+            .unwrap();
+            conversation = Some(vault.conversations(10).unwrap()[0].id.clone());
+            if index == 0 {
+                // The evidence is gone from here on. Everything the second turn
+                // can know about it is what turn one carried forward.
+                vault.delete_moment_and_artifacts(&moment.id).unwrap();
+            }
+            let events = parse_events(&out);
+            let text: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    ChatStreamEvent::Token { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let tools: Vec<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ChatStreamEvent::ToolCall { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            eprintln!("live turn {}: tools={tools:?} answer={}", index + 1, text.trim());
+            answers.push((text, tools.len()));
+        }
+
+        assert!(
+            answers[1].0.contains("ZANZIBAR-7741"),
+            "the second turn could not read the first turn's result: {:?}",
+            answers[1].0
+        );
+        eprintln!(
+            "the second turn used {} tool call(s); the evidence was already deleted",
+            answers[1].1
         );
     }
 
@@ -1896,7 +2027,10 @@ print(json.dumps({
             })
             .filter_map(|model| {
                 let name = model.get("name")?.as_str()?;
-                (!name.contains("embed")).then(|| {
+                // Vision models are excluded as well as embedders: these tests
+                // are conversations, and a VL model spends its small budget on
+                // being multimodal rather than on following two instructions.
+                (!name.contains("embed") && !name.contains("vl")).then(|| {
                     (
                         model.get("size").and_then(serde_json::Value::as_u64).unwrap_or(u64::MAX),
                         name.to_owned(),

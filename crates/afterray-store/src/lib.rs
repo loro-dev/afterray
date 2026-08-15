@@ -4212,6 +4212,44 @@ mod tests {
         assert!(vault.conversation_bytes().unwrap() < before);
     }
 
+    /// Tool results are the largest thing a thread holds now that they are
+    /// stored, so the chat budget has to see them. They ride in `tool_log`,
+    /// which `conversation_bytes` already sums — this is the test that says so
+    /// out loud, because a column added to the row and not to the sum is a
+    /// budget that quietly stops being a budget.
+    #[test]
+    fn a_stored_tool_result_counts_against_the_chat_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: directory.path().to_path_buf(),
+                ..VaultConfig::default()
+            },
+            [4_u8; 32],
+        )
+        .unwrap();
+        let id = vault.create_conversation("thread", 1_000).unwrap();
+        vault
+            .append_message(&id, "user", "what was I reading", None, 1_000)
+            .unwrap();
+        let without = vault.conversation_bytes().unwrap();
+
+        let log = format!(
+            r#"[{{"name":"get_ocr","args":{{}},"result":"{}","chars":50000}}]"#,
+            "x".repeat(50_000)
+        );
+        vault
+            .append_message(&id, "assistant", "you were reading", Some(&log), 1_001)
+            .unwrap();
+        let with = vault.conversation_bytes().unwrap();
+
+        assert!(
+            with >= without + 50_000,
+            "a 50 KB result added {} bytes to the accounting",
+            with - without
+        );
+    }
+
     /// The floor: one conversation is never evicted, even alone and oversized.
     #[test]
     fn conversation_retention_keeps_the_last_thread() {
