@@ -332,8 +332,9 @@ button:focus-visible {
   position: relative;
   z-index: 2;
   width: 100%;
-  /* same column as the headline, so its left edge lines up with the H1 */
-  max-width: var(--maxw);
+  /* narrower than the text column so the demo reads as a framed panel
+     rather than a full-bleed band */
+  max-width: 1040px;
   margin: 3.5rem auto 0;
   padding: 0 2rem;
 }
