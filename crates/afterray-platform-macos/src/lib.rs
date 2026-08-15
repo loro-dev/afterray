@@ -6,10 +6,14 @@
 
 #![allow(unsafe_code)]
 
+mod memory;
 mod locale;
 mod power;
 
 pub use locale::preferred_languages;
+pub use memory::{
+    GIB, context_tokens_for_memory, local_context_tokens, total_memory_bytes,
+};
 
 pub use power::{
     apply_background_qos, battery_fraction, load_per_core, on_ac_power, seconds_since_user_input,
