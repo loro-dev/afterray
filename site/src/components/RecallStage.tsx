@@ -33,7 +33,7 @@ function AppWindow({ rec }: { rec: Rec }) {
         )}
         {rec.app === 'Xcode' && (
           <div className="aw-code mono">
-            {[58, 82, 46, 74, 63, 88, 52, 70, 44, 79, 61].map((w, i) => (
+            {[58, 82, 46, 74, 63, 88, 52, 70, 44].map((w, i) => (
               <div key={41 + i}>
                 <span className="aw-ln">{41 + i}</span>
                 <i
@@ -47,13 +47,21 @@ function AppWindow({ rec }: { rec: Rec }) {
           </div>
         )}
         {rec.app === 'Zoom' && (
-          <div className="aw-tiles">
-            {['AL', 'JW', 'CY', '+2'].map((p) => (
-              <span key={p} className="mono">
-                {p}
-              </span>
-            ))}
-          </div>
+          <>
+            <div className="aw-tiles">
+              {['AL', 'JW', 'CY', '+2'].map((p) => (
+                <span key={p} className="mono">
+                  {p}
+                </span>
+              ))}
+            </div>
+            <div className="aw-share mono">{rec.title}</div>
+            <div className="aw-lines">
+              {[86, 72, 64, 79, 58, 74, 68, 81].map((w, i) => (
+                <i key={w} className={i === 1 ? 'aw-accent' : ''} style={{ width: `${w}%` }} />
+              ))}
+            </div>
+          </>
         )}
         {rec.app === 'Notes' && (
           <div className="aw-lines aw-notes">
@@ -133,7 +141,7 @@ export default function RecallStage() {
     const spoken = t.mock.transcript.filter((l) => l.pos >= call.from && l.pos <= call.to)
     const near = [...spoken]
       .sort((a, b) => Math.abs(a.pos - pos) - Math.abs(b.pos - pos))
-      .slice(0, 3)
+      .slice(0, 4)
     const current = near[0]
     return near.sort((a, b) => a.pos - b.pos).map((l) => ({ ...l, now: l === current }))
   }, [pos, t.mock.segments, t.mock.transcript])
