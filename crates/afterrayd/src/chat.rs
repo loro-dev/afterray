@@ -88,7 +88,7 @@ pub(crate) async fn handle_send(
     }
 
     let host = ToolHost {
-        store,
+        store: afterray_store::ReadOnlyVault::new(store),
         models,
         now_ms,
         budget: ContextBudget::DEFAULT,

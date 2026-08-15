@@ -2,7 +2,7 @@
 
 use afterray_models::ModelQueue;
 use afterray_protocol::{AxEvidence, Moment, OcrEvidence, OcrRegion, local_calendar_day_bounds_ms};
-use afterray_store::{Vault, parse_accessibility_digest};
+use afterray_store::{ReadOnlyVault, parse_accessibility_digest};
 use chrono::Local;
 use serde_json::{Value, json};
 
@@ -18,7 +18,9 @@ const DAY_MS: i64 = 86_400_000;
 
 #[derive(Clone)]
 pub struct ToolHost<'a> {
-    pub store: &'a Vault,
+    /// Reads only. The agent's tools cannot write to the vault because the
+    /// handle they hold has no writing methods — see `afterray_store::readonly`.
+    pub store: ReadOnlyVault<'a>,
     pub models: &'a ModelQueue,
     /// The wall clock for this turn. Every range answer is anchored to it so
     /// the model never has to derive epoch milliseconds on its own.
@@ -400,7 +402,7 @@ fn timezone_label(ms: i64) -> String {
     )
 }
 
-pub fn ocr_evidence(store: &Vault, moment_id: &str) -> Result<OcrEvidence, String> {
+pub fn ocr_evidence(store: ReadOnlyVault<'_>, moment_id: &str) -> Result<OcrEvidence, String> {
     let row = store
         .ocr_evidence_for_moment(moment_id)
         .map_err(|e| e.to_string())?
@@ -417,7 +419,7 @@ pub fn ocr_evidence(store: &Vault, moment_id: &str) -> Result<OcrEvidence, Strin
     })
 }
 
-pub fn ax_evidence(store: &Vault, moment_id: &str, digest_only: bool) -> Result<AxEvidence, String> {
+pub fn ax_evidence(store: ReadOnlyVault<'_>, moment_id: &str, digest_only: bool) -> Result<AxEvidence, String> {
     let bytes = store
         .accessibility_bytes_for_moment(moment_id)
         .map_err(|e| e.to_string())?
@@ -436,7 +438,7 @@ pub fn ax_evidence(store: &Vault, moment_id: &str, digest_only: bool) -> Result<
     })
 }
 
-pub fn moment_detail(store: &Vault, moment_id: &str) -> Result<Moment, String> {
+pub fn moment_detail(store: ReadOnlyVault<'_>, moment_id: &str) -> Result<Moment, String> {
     store
         .moment_by_id(moment_id)
         .map_err(|e| e.to_string())?
@@ -572,6 +574,124 @@ or
 
 FINAL
 <answer text>"#
+}
+
+#[cfg(test)]
+mod jail {
+    //! What the agent's tools may not do, checked in the source.
+    //!
+    //! Half the jail is the type system: tools hold an
+    //! `afterray_store::ReadOnlyVault`, so they cannot write to the vault —
+    //! the methods are not on the handle. That half needs no test.
+    //!
+    //! The other half cannot be a type. Rust has no capability-based module
+    //! system: `std::fs`, `std::process` and `std::net` are in scope in every
+    //! crate, and no dependency list, newtype or sealed trait takes them away.
+    //! `ToolSurface` is an open trait precisely so the daemon can implement it
+    //! outside the harness, which also means anyone can implement one that
+    //! writes files or opens sockets.
+    //!
+    //! So this reads the tool modules and fails on the constructs that would
+    //! make an agent tool do anything but read the vault. It is deliberately
+    //! bypassable — a reviewer editing this list is the point. What must not
+    //! happen is a tool acquiring those powers *without anyone noticing*.
+
+    /// Every region that defines a surface the model can call.
+    ///
+    /// `main.rs` is the daemon and legitimately spawns workers and writes
+    /// files, so only the slot summariser's tool surface is taken from it —
+    /// scanning the whole file would be a permanent false positive.
+    fn tool_sources() -> Vec<(&'static str, String)> {
+        let main = include_str!("main.rs");
+        let slot_tools = main
+            .split_once(concat!("impl SlotT2", "Tools<'_> {"))
+            .map(|(_, rest)| {
+                let end = rest
+                    .find(concat!("fn model_", "library"))
+                    .unwrap_or(rest.len());
+                rest[..end].to_owned()
+            })
+            .expect("the SlotT2Tools impl moved; update this scan");
+        vec![
+            (
+                "tools.rs",
+                production_source(include_str!("tools.rs")).to_owned(),
+            ),
+            ("main.rs (SlotT2Tools)", slot_tools),
+        ]
+    }
+
+    /// Constructs that would take a tool outside "read the vault".
+    ///
+    /// Split and rejoined so this list cannot match itself.
+    fn forbidden() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (concat!("std::", "process"), "spawning a process"),
+            (concat!("Command", "::new"), "spawning a process"),
+            (concat!("std::", "fs::"), "touching the filesystem"),
+            (concat!("File", "::create"), "touching the filesystem"),
+            (concat!("File", "::open"), "touching the filesystem"),
+            (concat!("std::", "net::"), "opening a socket"),
+            (concat!("TcpStream", "::connect"), "opening a socket"),
+            ("reqwest", "making an HTTP request"),
+            (concat!("tokio::", "net"), "opening a socket"),
+            (concat!("tokio::", "fs"), "touching the filesystem"),
+        ]
+    }
+
+    /// The source of a tool file, minus its own test modules.
+    fn production_source(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before)
+    }
+
+    /// The test the plan asks for: adding a tool that writes, spawns or dials
+    /// out has to argue with this list first.
+    #[test]
+    fn tools_cannot_reach_the_filesystem_the_network_or_a_process() {
+        for (name, production) in tool_sources() {
+            for (needle, what) in forbidden() {
+                assert!(
+                    !production.contains(needle),
+                    "{name} mentions `{needle}` — {what}. The agent's tools read the \
+                     vault and nothing else. If this is genuinely needed, say so in \
+                     docs/harness-threat-model.md and add it to the allowlist here."
+                );
+            }
+        }
+    }
+
+    /// The type-level half, asserted from the outside: the tool surfaces hold
+    /// a read-only handle, not a `&Vault` they could write through.
+    #[test]
+    fn tool_surfaces_hold_a_read_only_vault() {
+        let tools = production_source(include_str!("tools.rs"));
+        assert!(
+            tools.contains(concat!("pub store: ReadOnly", "Vault<'a>")),
+            "ToolHost stopped holding a read-only handle"
+        );
+        let main = production_source(include_str!("main.rs"));
+        assert!(
+            main.contains(concat!("store: afterray_store::ReadOnly", "Vault<'a>")),
+            "SlotT2Tools stopped holding a read-only handle"
+        );
+    }
+
+    /// The mutation this is meant to catch, run for real: a tool that reads a
+    /// file is exactly what the list above forbids.
+    #[test]
+    fn the_check_actually_fires() {
+        let pretend_tool = concat!(
+            "fn get_config(&self) -> Result<String, String> {\n",
+            "    std::",
+            "fs::read_to_string(\"/etc/passwd\").map_err(|e| e.to_string())\n}"
+        );
+        let hit = forbidden()
+            .into_iter()
+            .find(|(needle, _)| pretend_tool.contains(needle));
+        assert!(hit.is_some(), "a filesystem-reading tool slipped past the list");
+    }
 }
 
 #[cfg(test)]
@@ -766,7 +886,7 @@ mod tests {
         // hours would land on yesterday and the day tool would rightly refuse.
         let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
         seed_day(&vault, noon, noon + 1_800_000);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
+        let host = ToolHost { store: ReadOnlyVault::new(&vault), models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
 
         let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
         assert!(text.contains("Chased a GOP header bug"), "{text}");
@@ -784,7 +904,7 @@ mod tests {
         // hours would land on yesterday and the day tool would rightly refuse.
         let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
         seed_day(&vault, noon, noon + 1_800_000);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
+        let host = ToolHost { store: ReadOnlyVault::new(&vault), models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
 
         let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
         assert!(text.contains("not summarised"), "{text}");
@@ -801,7 +921,7 @@ mod tests {
         seed_day(&vault, today, today + 1_800_000);
         // Push coverage back two days so yesterday sits inside the span.
         seed_moments(&vault, &[today - 2 * DAY]);
-        let host = ToolHost { store: &vault, models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
+        let host = ToolHost { store: ReadOnlyVault::new(&vault), models: &models, now_ms: NOW, budget: ContextBudget::DEFAULT };
 
         let text = host
             .invoke("get_day_summary", &json!({"day_ms": NOW - DAY}))
@@ -816,7 +936,7 @@ mod tests {
         let (_dir, vault, models) = host_fixture();
         seed_moments(&vault, &[NOW - DAY, NOW - 60_000]);
         let host = ToolHost {
-            store: &vault,
+            store: ReadOnlyVault::new(&vault),
             models: &models,
             now_ms: NOW,
             budget: ContextBudget::DEFAULT,
@@ -839,7 +959,7 @@ mod tests {
         let (_dir, vault, models) = host_fixture();
         seed_moments(&vault, &[NOW - DAY, NOW - 60_000]);
         let host = ToolHost {
-            store: &vault,
+            store: ReadOnlyVault::new(&vault),
             models: &models,
             now_ms: NOW,
             budget: ContextBudget::DEFAULT,
@@ -863,7 +983,7 @@ mod tests {
         let (_dir, vault, models) = host_fixture();
         seed_moments(&vault, &[NOW - 10 * DAY, NOW - 60_000]);
         let host = ToolHost {
-            store: &vault,
+            store: ReadOnlyVault::new(&vault),
             models: &models,
             now_ms: NOW,
             budget: ContextBudget::DEFAULT,
@@ -886,7 +1006,7 @@ mod tests {
     async fn empty_vault_is_reported_rather_than_silently_empty() {
         let (_dir, vault, models) = host_fixture();
         let host = ToolHost {
-            store: &vault,
+            store: ReadOnlyVault::new(&vault),
             models: &models,
             now_ms: NOW,
             budget: ContextBudget::DEFAULT,
@@ -904,7 +1024,7 @@ mod tests {
         let (_dir, vault, models) = host_fixture();
         seed_moments(&vault, &[NOW - 60_000]);
         let host = ToolHost {
-            store: &vault,
+            store: ReadOnlyVault::new(&vault),
             models: &models,
             now_ms: NOW,
             budget: ContextBudget::DEFAULT,

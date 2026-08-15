@@ -384,7 +384,14 @@ pub(crate) async fn handle_ask(
     };
 
     let search =
-        match search_hits(store, models, question, SEARCH_HIT_LIMIT.saturating_mul(2)).await {
+        match search_hits(
+            afterray_store::ReadOnlyVault::new(store),
+            models,
+            question,
+            SEARCH_HIT_LIMIT.saturating_mul(2),
+        )
+        .await
+        {
             Ok(hits) => hits_in_range(&hits, from_ms, to_ms),
             Err(error) => {
                 eprintln!("ask search failed; continuing without hits: {error}");
@@ -411,7 +418,7 @@ pub(crate) async fn handle_ask(
         "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
     );
     let host = ToolHost {
-        store,
+        store: afterray_store::ReadOnlyVault::new(store),
         models,
         now_ms,
         budget: ContextBudget::DEFAULT,

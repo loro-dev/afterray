@@ -749,12 +749,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             }
             Err(error) => Response::failure(error.to_string()),
         },
-        Request::MomentGet { moment_id } => match tools::moment_detail(&state.store, &moment_id) {
+        Request::MomentGet { moment_id } => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
             Ok(moment) => Response::success(moment),
             Err(error) => Response::failure(error),
         },
         Request::MomentAt { at_ms } => match state.store.moment_nearest(at_ms) {
-            Ok(Some(moment_id)) => match tools::moment_detail(&state.store, &moment_id) {
+            Ok(Some(moment_id)) => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
                 Ok(moment) => Response::success(moment),
                 Err(error) => Response::failure(error),
             },
@@ -791,14 +791,14 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             })
             .await
         }
-        Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(&state.store, &moment_id) {
+        Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
             Ok(evidence) => Response::success(evidence),
             Err(error) => Response::failure(error),
         },
         Request::EvidenceAx {
             moment_id,
             digest_only,
-        } => match tools::ax_evidence(&state.store, &moment_id, digest_only) {
+        } => match tools::ax_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id, digest_only) {
             Ok(evidence) => Response::success(evidence),
             Err(error) => Response::failure(error),
         },
@@ -1918,7 +1918,7 @@ pub(crate) fn text_hits(
 /// The semantic side is floored by `SEMANTIC_MIN_SIMILARITY`, so a query with
 /// nothing near it comes back short rather than padded.
 pub(crate) async fn search_hits(
-    store: &Vault,
+    store: afterray_store::ReadOnlyVault<'_>,
     models: &ModelQueue,
     query: &str,
     limit: usize,
@@ -2018,7 +2018,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     // preempts; other background summaries wait until the guard drops.
     let lease_hold = state.models.hold_llm_lease();
     let tools = SlotT2Tools {
-        store: &state.store,
+        store: afterray_store::ReadOnlyVault::new(&state.store),
         card: &inputs.card,
     };
     let model = afterray_agent::QueueModel {
@@ -2526,7 +2526,8 @@ fn slot_prompt_for(
 /// The slot-scoped tools a T2 agent may call. Every tool reads only this
 /// slot's evidence; the summariser has no business elsewhere in the vault.
 struct SlotT2Tools<'a> {
-    store: &'a afterray_store::Vault,
+    /// Reads only, like every other tool surface.
+    store: afterray_store::ReadOnlyVault<'a>,
     card: &'a afterray_store::SlotCard,
 }
 
@@ -3470,7 +3471,7 @@ mod tests {
             )
             .unwrap();
 
-        let hits = search_hits(&vault, &queue(Vec::new()), "needle", 10)
+        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &queue(Vec::new()), "needle", 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -3557,7 +3558,7 @@ print(json.dumps({
         );
         config.args = vec!["-c".to_owned(), script.to_owned()];
         let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
-        let hits = search_hits(&vault, &models, "needle", 10).await.unwrap();
+        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &models, "needle", 10).await.unwrap();
 
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|hit| hit.text == "needle exact words"));

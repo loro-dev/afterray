@@ -81,7 +81,25 @@ pub use slot::{
     shorten_place, slot_clock_label, slot_start_for, verify_t2_card,
 };
 
+mod readonly;
+pub use readonly::ReadOnlyVault;
+
 pub const SCHEMA_VERSION: u32 = 19;
+
+/// What conversations may occupy, separate from the capture budget.
+///
+/// Deliberately its own pool rather than a share of `storage_limit_bytes`.
+/// Chat is a few kilobytes per turn against gigabytes of frames, so a shared
+/// pool would let screenshots evict a year of conversations without ever
+/// noticeably relieving the pressure — and shrinking the capture limit would
+/// silently take chat history with it.
+///
+/// At roughly two kilobytes a message this holds well over a hundred thousand
+/// of them, so in practice it bounds a runaway rather than trimming real use.
+pub const CONVERSATION_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Per-row overhead charged on top of the text: ids, timestamps, indexes.
+const CONVERSATION_ROW_OVERHEAD_BYTES: i64 = 256;
 
 /// Cosine floor for a semantic hit to count as a hit at all.
 ///
@@ -2768,6 +2786,79 @@ impl Vault {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Total bytes the conversation tables hold, text and reasoning included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn conversation_bytes(&self) -> Result<u64, StoreError> {
+        let connection = self.readers.get();
+        let used: i64 = connection.query_row(
+            "SELECT COALESCE(SUM(
+                 LENGTH(CAST(content AS BLOB))
+               + LENGTH(CAST(COALESCE(tool_log, '') AS BLOB))
+               + LENGTH(CAST(COALESCE(reasoning, '') AS BLOB))
+               + LENGTH(CAST(COALESCE(usage_json, '') AS BLOB))
+               + ?1
+             ), 0) FROM conversation_messages",
+            [CONVERSATION_ROW_OVERHEAD_BYTES],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(used).unwrap_or(0))
+    }
+
+    /// Drops the least recently used conversations until chat fits its budget.
+    ///
+    /// The unit is a **whole conversation**, chosen by `updated_at_ms`. Trimming
+    /// individual messages was rejected: a thread with its middle removed is
+    /// worse than a thread that is gone, because the turns that remain refer to
+    /// each other and to evidence that is no longer named, and nothing on screen
+    /// says which parts went. A conversation disappearing from the sidebar is
+    /// something a person can see and understand.
+    ///
+    /// The most recently updated conversation is never evicted, so the thread
+    /// being written to cannot be deleted underneath its own turn — even if it
+    /// alone is over budget, in which case there is nothing better to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query or delete fails.
+    pub fn enforce_conversation_retention(&self) -> Result<Vec<String>, StoreError> {
+        self.evict_conversations_until(CONVERSATION_LIMIT_BYTES)
+    }
+
+    /// [`Self::enforce_conversation_retention`] against an explicit limit, so a
+    /// test can reach the eviction path without writing 256 MB.
+    fn evict_conversations_until(&self, limit: u64) -> Result<Vec<String>, StoreError> {
+        let mut evicted = Vec::new();
+        loop {
+            if self.conversation_bytes()? <= limit {
+                return Ok(evicted);
+            }
+            let (oldest, total) = {
+                let connection = self.readers.get();
+                let total: i64 =
+                    connection.query_row("SELECT COUNT(*) FROM conversations", [], |row| {
+                        row.get(0)
+                    })?;
+                let oldest: Option<String> = connection
+                    .query_row(
+                        "SELECT id FROM conversations ORDER BY updated_at_ms ASC, id ASC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                (oldest, total)
+            };
+            // One conversation left is the floor: it is the one in use.
+            let (Some(id), true) = (oldest, total > 1) else {
+                return Ok(evicted);
+            };
+            self.delete_conversation(&id)?;
+            evicted.push(id);
+        }
+    }
+
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
         loop {
@@ -4048,6 +4139,85 @@ mod pipeline_bench;
 
 #[cfg(test)]
 mod tests {
+
+    /// Conversations were outside every budget: an unbounded growth path, and
+    /// reasoning made each row bigger. They now have their own pool, and the
+    /// unit of eviction is a whole conversation.
+    #[test]
+    fn conversation_retention_evicts_whole_threads_oldest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: directory.path().to_path_buf(),
+                ..VaultConfig::default()
+            },
+            [3_u8; 32],
+        )
+        .unwrap();
+
+        // Four threads, oldest first, each far past the budget on its own.
+        let bulk = "x".repeat(200_000);
+        let mut ids = Vec::new();
+        for index in 0..4_i64 {
+            let id = vault
+                .create_conversation(&format!("thread {index}"), 1_000 + index)
+                .unwrap();
+            for _ in 0..8 {
+                vault
+                    .append_message(&id, "assistant", &bulk, None, 1_000 + index)
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+        let before = vault.conversation_bytes().unwrap();
+        assert!(before > 0);
+
+        // A budget small enough to bite, applied by the same code path.
+        let evicted = vault.evict_conversations_until(before / 3).unwrap();
+        assert!(!evicted.is_empty(), "nothing was evicted");
+        assert_eq!(evicted[0], ids[0], "the least recently used must go first");
+
+        let left: Vec<String> = vault
+            .conversations(100)
+            .unwrap()
+            .into_iter()
+            .map(|conversation| conversation.id)
+            .collect();
+        assert!(
+            left.contains(&ids[3]),
+            "the most recent thread must survive: it is the one in use"
+        );
+        // Whole threads, never half of one.
+        for id in &evicted {
+            assert!(
+                vault.conversation_messages(id).unwrap().is_empty(),
+                "an evicted thread left messages behind"
+            );
+        }
+        assert!(vault.conversation_bytes().unwrap() < before);
+    }
+
+    /// The floor: one conversation is never evicted, even alone and oversized.
+    #[test]
+    fn conversation_retention_keeps_the_last_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(
+            VaultConfig {
+                data_dir: directory.path().to_path_buf(),
+                ..VaultConfig::default()
+            },
+            [4_u8; 32],
+        )
+        .unwrap();
+        let id = vault.create_conversation("only", 1).unwrap();
+        vault
+            .append_message(&id, "assistant", &"y".repeat(100_000), None, 1)
+            .unwrap();
+
+        let evicted = vault.evict_conversations_until(1).unwrap();
+        assert!(evicted.is_empty());
+        assert_eq!(vault.conversations(10).unwrap().len(), 1);
+    }
     use super::*;
 
     fn test_vault(max_storage_gigabytes: u64) -> (tempfile::TempDir, Vault) {

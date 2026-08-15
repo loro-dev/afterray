@@ -67,30 +67,21 @@ pub(crate) async fn handle_chat_stream(
     // Registered under the conversation, because that is the only name the app
     // has for a turn when it presses stop on a different connection. An id that
     // was not known when the stream opened — a brand new conversation — is
-    // registered as soon as `run_chat_stream` resolves it.
-    let registration = conversation_id.clone().inspect(|id| {
-        state
-            .running_turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.clone(), cancel.clone());
-    });
-    let result = run_chat_stream_registered(
+    // registered as soon as `run_chat_stream_registered` resolves it.
+    //
+    // A guard rather than an explicit remove after the await: a panic in the
+    // turn, or this future being dropped, would otherwise strand the token.
+    let _registration = conversation_id
+        .clone()
+        .map(|id| Registration::insert(state, id, cancel.clone()));
+    run_chat_stream_registered(
         write,
         ctx,
         conversation_id.as_deref(),
         &message,
         Some((state, &cancel)),
     )
-    .await;
-    if let Some(id) = registration {
-        state
-            .running_turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
-    }
-    result
+    .await
 }
 
 /// Registers the turn under whichever conversation it resolved to, so a stop
@@ -152,18 +143,15 @@ where
         };
 
     // A new conversation had no id when the stream opened, so register it now.
-    let late_registration = registry.and_then(|(state, cancel)| {
-        let mut running = state
+    let _late_registration = registry.and_then(|(state, cancel)| {
+        let already_registered = state
             .running_turns
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if running.contains_key(&conversation_id) {
-            return None;
-        }
-        running.insert(conversation_id.clone(), cancel.clone());
-        Some((state, conversation_id.clone()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&conversation_id);
+        (!already_registered)
+            .then(|| Registration::insert(state, conversation_id.clone(), cancel.clone()))
     });
-    let _unregister = late_registration.map(|(state, id)| UnregisterOnDrop { state, id });
 
     let prior = ctx
         .store
@@ -233,6 +221,15 @@ async fn settle_turn<W: AsyncWrite + Unpin>(
     if let Err(error) = row.close(outcome.stopped.is_some()) {
         eprintln!("chat.row close failed: {error}");
     }
+    // Chat has its own budget, checked once per turn rather than per message:
+    // this is a single SUM, and a turn is the coarsest thing that grows it.
+    match ctx.store.enforce_conversation_retention() {
+        Ok(evicted) if !evicted.is_empty() => {
+            eprintln!("chat.retention evicted {} conversation(s)", evicted.len());
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("chat.retention failed: {error}"),
+    }
     if !peer_present {
         // Nobody is reading. The row is written; that is the whole result.
         return Ok(());
@@ -294,13 +291,28 @@ where
     }
 }
 
-/// Removes a late registration however the turn ends.
-struct UnregisterOnDrop<'a> {
+/// A turn's entry in the abort registry, removed however the turn ends.
+///
+/// Both registration points use this. An explicit `remove` after the await
+/// looks equivalent and is not: a panic inside the turn, or this future being
+/// dropped, would leave the token behind.
+struct Registration<'a> {
     state: &'a crate::AppState,
     id: String,
 }
 
-impl Drop for UnregisterOnDrop<'_> {
+impl<'a> Registration<'a> {
+    fn insert(state: &'a crate::AppState, id: String, cancel: CancelToken) -> Self {
+        state
+            .running_turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), cancel);
+        Self { state, id }
+    }
+}
+
+impl Drop for Registration<'_> {
     fn drop(&mut self) {
         self.state
             .running_turns
@@ -492,7 +504,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
     let budget = ctx.budget;
     let system = format!("{SYSTEM_PROMPT}\n\n{}", tool_catalog_text());
     let host = ToolHost {
-        store: ctx.store,
+        store: afterray_store::ReadOnlyVault::new(ctx.store),
         models: ctx.models,
         now_ms: ctx.now_ms,
         budget,

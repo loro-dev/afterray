@@ -681,6 +681,43 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The only adapter that can reach the network declares itself LLM-only,
+    /// and the queue routes by capability. So an embedding — the one model call
+    /// whose input is a string the agent chose — is served by the local worker
+    /// and cannot be pointed at a remote endpoint by any setting.
+    ///
+    /// This is the property `docs/harness-threat-model.md` leans on when it
+    /// says `search_evidence` is not an exfiltration path.
+    #[tokio::test]
+    async fn the_remote_router_refuses_everything_that_is_not_an_llm_call() {
+        let adapter = LlmRouterAdapter::new(
+            crate::ProcessAdapter::new(crate::ProcessAdapterConfig::new(
+                "builtin",
+                ModelCapability::Llm,
+                "/bin/false",
+            )),
+            Arc::new(std::sync::Mutex::new(LlmRuntimeConfig::default())),
+        );
+        assert_eq!(adapter.capability(), ModelCapability::Llm);
+
+        let refused = adapter
+            .execute(
+                "job-embed",
+                &ModelInput::Embedding {
+                    text: "anything the agent typed".into(),
+                },
+                Cancellation::default(),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(AdapterError::InvalidOutput(_) | AdapterError::Process(_))
+            ),
+            "the remote router accepted an embedding job: {refused:?}"
+        );
+    }
     use super::*;
 
     #[test]
