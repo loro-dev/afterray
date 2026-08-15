@@ -14,6 +14,7 @@
 //! reasoning is written down next to it.
 
 pub mod budget;
+pub mod message;
 pub mod cancel;
 pub mod compaction;
 pub mod fence;
@@ -27,6 +28,7 @@ pub mod wire;
 mod run;
 
 pub use budget::ContextBudget;
+pub use message::{Message, Role, first_divergence, flatten, is_prefix_of};
 pub use cancel::CancelToken;
 pub use compaction::{CompactionNotice, CompactionStrategy, PruneToolResults};
 pub use opening::{Opening, OpeningTrim};
