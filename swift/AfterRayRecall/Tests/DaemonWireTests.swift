@@ -486,7 +486,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 7)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 8)
     }
 
     func testRecordResultsDecodeBothDaemonBranches() throws {

@@ -5,7 +5,15 @@ use zeroize::Zeroize as _;
 pub mod socket;
 
 pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
-pub const PROTOCOL_VERSION: u32 = 7;
+/// Bumped whenever the request or event vocabulary changes.
+///
+/// The handshake is strict equality, so a version that does not move is worse
+/// than useless: at 7, an app that knows `ChatAbort` and a daemon that does not
+/// both claim 7, the handshake passes, the abort fails to deserialise, and —
+/// because a hang-up no longer cancels — the user presses stop and the model
+/// runs to completion with nothing said. 8 adds `ChatAbort` and the `started`,
+/// `usage`, `progress` and `compaction` stream events.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
