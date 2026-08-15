@@ -14,6 +14,7 @@
 //! reasoning is written down next to it.
 
 pub mod budget;
+pub mod cancel;
 pub mod compaction;
 pub mod fence;
 pub mod tokens;
@@ -24,6 +25,7 @@ pub mod wire;
 mod run;
 
 pub use budget::ContextBudget;
+pub use cancel::CancelToken;
 pub use compaction::{CompactionNotice, CompactionStrategy, PruneToolResults};
 pub use run::{
     Discard, EventSink, GenerateRequest, HarnessEvent, LoopConfig, LoopError, ModelError,

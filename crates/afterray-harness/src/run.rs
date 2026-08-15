@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::budget::ContextBudget;
+use crate::cancel::CancelToken;
 use crate::compaction::{CompactionNotice, CompactionStrategy};
 use crate::fence;
 use crate::tokens::estimate_tokens;
@@ -28,6 +29,11 @@ pub struct GenerateRequest<'a> {
     pub prompt: &'a str,
     /// One-based, for logs and the `usage` event.
     pub round: usize,
+    /// Implementations must race their wait against this and stop the
+    /// underlying job when it fires. The loop also checks it, but by then the
+    /// round has already been paid for — a model call is the longest thing a
+    /// turn does, and cancelling it is most of what "stop" means.
+    pub cancel: &'a CancelToken,
 }
 
 /// Something that can run one model round.
@@ -119,6 +125,8 @@ impl EventSink for Discard {
 pub struct LoopConfig<'a> {
     /// Rounds and token caps as one coherent set.
     pub budget: ContextBudget,
+    /// Stops the turn. [`CancelToken::new`] for a caller that never cancels.
+    pub cancel: CancelToken,
     /// How the transcript is kept inside the window. `None` runs append-only:
     /// a prefix-caching runtime then re-prefills only each round's delta, and
     /// rewriting an earlier round would invalidate the whole cached prefix.
@@ -180,6 +188,8 @@ pub enum LoopError {
     SinkClosed(String),
     /// Every round was spent without the model finishing.
     Exhausted,
+    /// The caller asked the turn to stop.
+    Cancelled,
 }
 
 impl std::fmt::Display for LoopError {
@@ -188,13 +198,17 @@ impl std::fmt::Display for LoopError {
             Self::Model(error) => write!(f, "{error}"),
             Self::SinkClosed(message) => write!(f, "{message}"),
             Self::Exhausted => write!(f, "agent loop exhausted"),
+            Self::Cancelled => write!(f, "stopped"),
         }
     }
 }
 
 impl From<ModelError> for LoopError {
     fn from(error: ModelError) -> Self {
-        Self::Model(error)
+        match error {
+            ModelError::Cancelled => Self::Cancelled,
+            other => Self::Model(other),
+        }
     }
 }
 
@@ -226,6 +240,9 @@ where
     let mut turn = Turn::default();
 
     for round in 0..config.budget.max_rounds {
+        if config.cancel.is_cancelled() {
+            return Err(LoopError::Cancelled);
+        }
         if let Some(strategy) = config.compaction {
             for notice in strategy.compact(&mut transcript, config.budget) {
                 emit(sink, HarnessEvent::Compaction(notice.clone())).await?;
@@ -253,6 +270,7 @@ where
             system,
             prompt: &prompt,
             round: round + 1,
+            cancel: &config.cancel,
         };
         let (text, mut gate) = generate_gated(model, sink, request).await?;
 
@@ -270,7 +288,7 @@ where
                 )));
             }
             Step::Call { name, args } => {
-                let result = call_tool(tools, sink, &name, &args).await?;
+                let result = call_tool(tools, sink, &config.cancel, &name, &args).await?;
                 turn.tool_calls.push(ToolCallRecord {
                     name: name.clone(),
                     args: args.clone(),
@@ -317,6 +335,7 @@ where
     let generating = model.generate(request, sender);
     tokio::pin!(generating);
 
+    let cancel = request.cancel.clone();
     let text = loop {
         tokio::select! {
             // Bias towards draining tokens: a finished generate that leaves
@@ -328,6 +347,10 @@ where
                 }
             }
             result = &mut generating => break result?,
+            // Backstop. A well-behaved ModelSurface stops its own job and
+            // returns ModelError::Cancelled; this covers one that does not, so
+            // "stop" is never worse than one round late.
+            () = cancel.cancelled() => return Err(LoopError::Cancelled),
         }
     };
     while let Ok(delta) = receiver.try_recv() {
@@ -341,6 +364,7 @@ where
 async fn call_tool<T, S>(
     tools: &T,
     sink: &mut S,
+    cancel: &CancelToken,
     name: &str,
     args: &Value,
 ) -> Result<Budgeted, LoopError>
@@ -348,6 +372,9 @@ where
     T: ToolSurface + Sync,
     S: EventSink,
 {
+    if cancel.is_cancelled() {
+        return Err(LoopError::Cancelled);
+    }
     emit(
         sink,
         HarnessEvent::ToolCall {
@@ -358,9 +385,19 @@ where
     .await?;
     // A tool error is evidence, not a turn failure: the model can read "the
     // requested window is outside the recorded history" and try another one.
-    let result = match tools.invoke(name, args).await {
-        Ok(result) => result,
-        Err(error) => Budgeted::verbatim(format!("ERROR: {error}")),
+    //
+    // Racing the invocation rather than awaiting it: a vault query runs on a
+    // blocking thread and cannot be interrupted mid-statement, but the turn
+    // does not have to wait for one it has been told to abandon. The query
+    // finishes into a dropped future.
+    let invoking = tools.invoke(name, args);
+    tokio::pin!(invoking);
+    let result = tokio::select! {
+        outcome = &mut invoking => match outcome {
+            Ok(result) => result,
+            Err(error) => Budgeted::verbatim(format!("ERROR: {error}")),
+        },
+        () = cancel.cancelled() => return Err(LoopError::Cancelled),
     };
     emit(
         sink,
@@ -408,6 +445,9 @@ mod tests {
             request: GenerateRequest<'_>,
             tokens: mpsc::Sender<String>,
         ) -> Result<String, ModelError> {
+            if request.cancel.is_cancelled() {
+                return Err(ModelError::Cancelled);
+            }
             self.seen.lock().unwrap().push(request.prompt.to_owned());
             let text = self
                 .rounds
@@ -443,6 +483,24 @@ mod tests {
         events: Vec<HarnessEvent>,
     }
 
+    /// Fires the token once it has seen `after` events, so a test can cancel
+    /// from inside a running turn rather than racing a timer.
+    struct CancelAfter {
+        cancel: CancelToken,
+        after: usize,
+        seen: usize,
+    }
+
+    impl EventSink for CancelAfter {
+        async fn emit(&mut self, _event: HarnessEvent) -> Result<(), String> {
+            self.seen += 1;
+            if self.seen >= self.after {
+                self.cancel.cancel();
+            }
+            Ok(())
+        }
+    }
+
     impl EventSink for Recorder {
         async fn emit(&mut self, event: HarnessEvent) -> Result<(), String> {
             self.events.push(event);
@@ -453,6 +511,7 @@ mod tests {
     fn config() -> LoopConfig<'static> {
         LoopConfig {
             budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
             compaction: None,
         }
     }
@@ -643,6 +702,7 @@ mod tests {
         let strategy = PruneToolResults;
         let config = LoopConfig {
             budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
             compaction: Some(&strategy),
         };
         let calls: Vec<&str> = vec![
@@ -662,6 +722,145 @@ mod tests {
         assert!(!turn.compactions.is_empty(), "nothing was compacted");
         assert!(sink.events.iter().any(|event| matches!(event, HarnessEvent::Compaction(_))));
         assert!(turn.usage.prompt_tokens <= ContextBudget::DEFAULT.window_tokens);
+    }
+
+    /// Stop must land before the next model call, not after it. A round is
+    /// the most expensive thing a turn does; noticing one round late is what
+    /// "stop" used to mean.
+    #[tokio::test]
+    async fn cancelling_between_rounds_stops_before_the_next_model_call() {
+        let model = ScriptedModel::new(&["TOOL get_now\nARGS {}", "FINAL\nnever reached"], false);
+        let tools = EchoTools { body: "{}".to_owned() };
+        let cancel = CancelToken::new();
+        // Cancelled while the first round's tool result is being folded in.
+        let mut sink = CancelAfter {
+            cancel: cancel.clone(),
+            after: 3,
+            seen: 0,
+        };
+        let error = run_turn(
+            &model,
+            &tools,
+            &mut sink,
+            &LoopConfig {
+                budget: ContextBudget::DEFAULT,
+                cancel,
+                compaction: None,
+            },
+            "system",
+            "task".to_owned(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, LoopError::Cancelled);
+        assert_eq!(
+            model.seen.lock().unwrap().len(),
+            1,
+            "a second round was started after the cancel"
+        );
+    }
+
+    /// A turn cancelled before it starts must not reach the model at all.
+    #[tokio::test]
+    async fn an_already_cancelled_turn_never_calls_the_model() {
+        let model = ScriptedModel::new(&["FINAL\nhello"], false);
+        let tools = EchoTools { body: String::new() };
+        let error = run_turn(
+            &model,
+            &tools,
+            &mut Recorder::default(),
+            &LoopConfig {
+                budget: ContextBudget::DEFAULT,
+                cancel: CancelToken::cancelled_now(),
+                compaction: None,
+            },
+            "system",
+            "task".to_owned(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, LoopError::Cancelled);
+        assert!(model.seen.lock().unwrap().is_empty());
+    }
+
+    /// The case the old code could not handle at all: a tool call that takes
+    /// seconds. The turn returns on the cancel rather than waiting it out.
+    #[tokio::test]
+    async fn cancelling_during_a_slow_tool_returns_without_waiting_for_it() {
+        struct SlowTools;
+        impl ToolSurface for SlowTools {
+            async fn invoke(&self, _name: &str, _args: &Value) -> Result<Budgeted, String> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(Budgeted::verbatim("far too late".to_owned()))
+            }
+        }
+        let model = ScriptedModel::new(&["TOOL get_slot_card\nARGS {\"at_ms\":1}"], false);
+        let cancel = CancelToken::new();
+        let fired = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            fired.cancel();
+        });
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_turn(
+                &model,
+                &SlowTools,
+                &mut Recorder::default(),
+                &LoopConfig {
+                    budget: ContextBudget::DEFAULT,
+                    cancel,
+                    compaction: None,
+                },
+                "system",
+                "task".to_owned(),
+            ),
+        )
+        .await
+        .expect("the turn waited for the tool instead of stopping")
+        .unwrap_err();
+        assert_eq!(error, LoopError::Cancelled);
+    }
+
+    /// A model that ignores the token is still stopped, one round late at worst.
+    #[tokio::test]
+    async fn a_model_that_ignores_the_token_is_still_cut_off() {
+        struct Stubborn;
+        impl ModelSurface for Stubborn {
+            async fn generate(
+                &self,
+                _request: GenerateRequest<'_>,
+                _tokens: mpsc::Sender<String>,
+            ) -> Result<String, ModelError> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok("FINAL\ntoo late".to_owned())
+            }
+        }
+        let cancel = CancelToken::new();
+        let fired = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            fired.cancel();
+        });
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_turn(
+                &Stubborn,
+                &EchoTools { body: String::new() },
+                &mut Recorder::default(),
+                &LoopConfig {
+                    budget: ContextBudget::DEFAULT,
+                    cancel,
+                    compaction: None,
+                },
+                "system",
+                "task".to_owned(),
+            ),
+        )
+        .await
+        .expect("the loop waited for a model that ignored the token")
+        .unwrap_err();
+        assert_eq!(error, LoopError::Cancelled);
     }
 
     #[test]

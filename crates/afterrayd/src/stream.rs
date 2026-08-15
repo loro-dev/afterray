@@ -3,8 +3,8 @@
 
 use afterray_agent::QueueModel;
 use afterray_harness::{
-    CompactionNotice, ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError, ModelError,
-    PruneToolResults, run_turn,
+    CancelToken, CompactionNotice, ContextBudget, EventSink, HarnessEvent, LoopConfig, LoopError,
+    ModelError, PruneToolResults, run_turn,
 };
 use afterray_models::{JobPriority, LlmTokenSink, ModelQueue};
 use afterray_protocol::{ChatStreamEvent, ConversationMessage, local_calendar_day_bounds_ms};
@@ -41,6 +41,9 @@ pub(crate) struct ChatStreamCtx<'a> {
     /// number, and the tests need to reach the pressure path without building
     /// a vault big enough to fill 16k tokens.
     pub budget: ContextBudget,
+    /// Fires when the client hangs up. The app's only way to say "stop" is to
+    /// shut its socket down, so the caller watches the read half and trips this.
+    pub cancel: CancelToken,
 }
 
 pub(crate) async fn handle_chat_stream(
@@ -48,6 +51,7 @@ pub(crate) async fn handle_chat_stream(
     state: &crate::AppState,
     conversation_id: Option<String>,
     message: String,
+    cancel: CancelToken,
 ) -> anyhow::Result<()> {
     crate::ensure_remote_llm_model(state).await;
     let ctx = ChatStreamCtx {
@@ -57,6 +61,7 @@ pub(crate) async fn handle_chat_stream(
         now_ms: crate::now_ms(),
         llm_ready: crate::llm_is_ready(state),
         budget: ContextBudget::DEFAULT,
+        cancel,
     };
     run_chat_stream(write, ctx, conversation_id.as_deref(), &message).await
 }
@@ -119,8 +124,54 @@ where
     let user = build_user_prompt(&seed, &history, message);
     match run_agent(write, &ctx, &user).await {
         Ok(outcome) => persist_done(write, ctx.store, &conversation_id, &outcome, ctx.now_ms).await,
-        Err(message) => write_event(write, &ChatStreamEvent::Error { message }).await,
+        // A stopped turn has nobody left to tell, and nothing worth storing:
+        // the app keeps whatever it already streamed. Writing to the closed
+        // socket would only turn a clean stop into an I/O error in the log.
+        Err(AgentStop::Cancelled) => Ok(()),
+        Err(AgentStop::Failed(message)) => {
+            write_event(write, &ChatStreamEvent::Error { message }).await
+        }
     }
+}
+
+/// Runs `turn` while watching the client's read half for a hang-up.
+///
+/// The app's stop button shuts its socket down, so a stopped turn arrives here
+/// as EOF. Anything else arriving mid-stream is treated the same way: this
+/// protocol is strictly one response per request, so a line during a turn means
+/// the client has moved on.
+///
+/// Returns the turn's own result and whether the peer is still there. A caller
+/// that gets `false` should close the connection: there is nothing left to
+/// serve on it.
+pub(crate) async fn run_watching_for_hangup<F, R>(
+    turn: F,
+    lines: &mut tokio::io::Lines<R>,
+    cancel: &CancelToken,
+) -> (F::Output, bool)
+where
+    F: Future,
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    tokio::pin!(turn);
+    let mut peer_present = true;
+    loop {
+        tokio::select! {
+            output = &mut turn => return (output, peer_present),
+            // Disabled after it fires: `next_line` on a closed reader returns
+            // `Ok(None)` immediately and would spin the turn out of the loop.
+            _ = lines.next_line(), if peer_present => {
+                peer_present = false;
+                cancel.cancel();
+            }
+        }
+    }
+}
+
+/// Why a turn did not produce an answer.
+enum AgentStop {
+    Cancelled,
+    Failed(String),
 }
 
 async fn persist_done<W: AsyncWrite + Unpin>(
@@ -305,7 +356,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     ctx: &ChatStreamCtx<'_>,
     user: &str,
-) -> Result<AgentOutcome, String> {
+) -> Result<AgentOutcome, AgentStop> {
     let budget = ctx.budget;
     let system = format!("{SYSTEM_PROMPT}\n\n{}", tool_catalog_text());
     let host = ToolHost {
@@ -331,6 +382,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
         &mut sink,
         &LoopConfig {
             budget,
+            cancel: ctx.cancel.clone(),
             compaction: Some(&strategy),
         },
         &system,
@@ -338,8 +390,11 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
     )
     .await
     .map_err(|error| match error {
-        LoopError::Model(ModelError::Missing) => AgentError::MissingModel.to_string(),
-        other => other.to_string(),
+        LoopError::Cancelled => AgentStop::Cancelled,
+        LoopError::Model(ModelError::Missing) => {
+            AgentStop::Failed(AgentError::MissingModel.to_string())
+        }
+        other => AgentStop::Failed(other.to_string()),
     })?;
     Ok(AgentOutcome {
         answer: turn.answer,
@@ -508,6 +563,7 @@ mod tests {
         ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig, QueueConfig,
     };
     use afterray_store::VaultConfig;
+    use tokio::io::AsyncBufReadExt as _;
     use std::sync::Arc;
 
     fn test_vault() -> (tempfile::TempDir, Vault) {
@@ -649,6 +705,7 @@ mod tests {
             now_ms: 1,
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "   ").await.unwrap();
@@ -670,6 +727,7 @@ mod tests {
             now_ms: 1,
             llm_ready: false,
             budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "hello").await.unwrap();
@@ -706,6 +764,7 @@ print(json.dumps({
             now_ms: 1_786_694_400_000,
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "我今天下午在干嘛")
@@ -804,6 +863,7 @@ print(json.dumps({
             now_ms: now,
             llm_ready: true,
             budget,
+            cancel: CancelToken::new(),
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "what was I reading")
@@ -847,6 +907,122 @@ print(json.dumps({
         );
     }
 
+    /// Phase 3's whole point. The app's stop button shuts the socket, which
+    /// arrives here as EOF, and the turn has to notice *while* it is waiting —
+    /// not at the next token write, which during a long tool call never comes.
+    #[tokio::test]
+    async fn a_client_hanging_up_stops_the_turn_mid_flight() {
+        let (client, server) = tokio::io::duplex(1_024);
+        let mut lines = tokio::io::BufReader::new(server).lines();
+        let cancel = CancelToken::new();
+
+        // A turn that would otherwise run for a minute.
+        let slow = {
+            let cancel = cancel.clone();
+            async move {
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => "finished",
+                    () = cancel.cancelled() => "stopped",
+                }
+            }
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(client);
+        });
+
+        let (outcome, peer_present) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_watching_for_hangup(slow, &mut lines, &cancel),
+        )
+        .await
+        .expect("the turn waited out its sleep instead of noticing the hang-up");
+
+        assert_eq!(outcome, "stopped");
+        assert!(!peer_present, "a closed peer must be reported as gone");
+        assert!(cancel.is_cancelled());
+    }
+
+    /// A turn nobody interrupts finishes normally, with the peer still there.
+    #[tokio::test]
+    async fn a_turn_nobody_interrupts_keeps_its_connection() {
+        let (_client, server) = tokio::io::duplex(1_024);
+        let mut lines = tokio::io::BufReader::new(server).lines();
+        let cancel = CancelToken::new();
+        let (outcome, peer_present) =
+            run_watching_for_hangup(async { "finished" }, &mut lines, &cancel).await;
+        assert_eq!(outcome, "finished");
+        assert!(peer_present);
+        assert!(!cancel.is_cancelled());
+    }
+
+    /// A stopped turn writes nothing and stores nothing: the app keeps what it
+    /// already streamed, and an error line to a closed socket would only turn a
+    /// clean stop into noise in the log.
+    #[tokio::test]
+    async fn a_cancelled_turn_persists_no_answer_and_writes_no_error() {
+        let (_dir, vault) = test_vault();
+        let script = r#"
+import json, sys, time
+json.load(sys.stdin)
+time.sleep(60)
+print(json.dumps({
+  "protocol_version": 1,
+  "output": {"type": "llm", "text": "FINAL\nfar too late"},
+  "retryable": False
+}))
+"#;
+        let models = queue(vec![llm_script(script)]);
+        let sink = LlmTokenSink::default();
+        let cancel = CancelToken::new();
+        let fired = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            fired.cancel();
+        });
+        let ctx = ChatStreamCtx {
+            store: &vault,
+            models: &models,
+            token_sink: &sink,
+            now_ms: 1_786_729_937_000,
+            llm_ready: true,
+            budget: ContextBudget::DEFAULT,
+            cancel,
+        };
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_chat_stream(&mut buf, ctx, None, "what was I reading"),
+        )
+        .await
+        .expect("a cancelled turn waited out its worker")
+        .unwrap();
+
+        let events = parse_events(&buf);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatStreamEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatStreamEvent::Done { .. })),
+            "{events:?}"
+        );
+        // The question is on record; no answer was invented for it.
+        let conversation = &vault.conversations(10).unwrap()[0].id;
+        let roles: Vec<String> = vault
+            .conversation_messages(conversation)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.role)
+            .collect();
+        assert_eq!(roles, ["user"], "{roles:?}");
+    }
+
     /// The tools speak epoch milliseconds; a seed that only spells the clock
     /// out in words leaves a small model to convert it, and it converts wrong.
     #[test]
@@ -883,6 +1059,7 @@ print(json.dumps({
             now_ms: 1,
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, Some("missing"), "hello")
@@ -925,6 +1102,7 @@ print(json.dumps({
             now_ms: 13,
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, Some(&conversation), "and then?")

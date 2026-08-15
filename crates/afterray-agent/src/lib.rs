@@ -66,11 +66,19 @@ impl QueueModel<'_> {
             Err(error) => return Err(ModelError::Failed(error.to_string())),
         };
 
-        let snapshot = self
-            .models
-            .wait(&job_id)
-            .await
-            .map_err(|error| ModelError::Failed(error.to_string()))?;
+        // Race the wait against the stop signal, and take the job down with it.
+        // Without this the queue keeps generating for a window nobody is
+        // reading, and — worse on a single-lane local runtime — holds the LLM
+        // lane against the next thing the user asks.
+        let snapshot = tokio::select! {
+            settled = self.models.wait(&job_id) => {
+                settled.map_err(|error| ModelError::Failed(error.to_string()))?
+            }
+            () = request.cancel.cancelled() => {
+                let _ = self.models.cancel(&job_id).await;
+                return Err(ModelError::Cancelled);
+            }
+        };
 
         if snapshot.state != JobState::Done {
             let error = snapshot
@@ -119,7 +127,7 @@ pub fn is_missing_model(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use afterray_harness::{ContextBudget, Discard, LoopConfig, ToolSurface, run_turn};
+    use afterray_harness::{CancelToken, ContextBudget, Discard, LoopConfig, ToolSurface, run_turn};
     use afterray_models::{
         ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig, QueueConfig,
     };
@@ -179,6 +187,7 @@ mod tests {
             &mut Discard,
             &LoopConfig {
                 budget: ContextBudget::DEFAULT,
+                cancel: CancelToken::new(),
                 compaction: None,
             },
             "system",
@@ -220,6 +229,7 @@ print(json.dumps({
             &mut Discard,
             &LoopConfig {
                 budget: ContextBudget::DEFAULT,
+                cancel: CancelToken::new(),
                 compaction: None,
             },
             "system",
@@ -229,5 +239,62 @@ print(json.dumps({
         .unwrap();
         assert_eq!(turn.answer, "You read a design doc.");
         assert_eq!(turn.usage.rounds, 1);
+    }
+
+    /// The point of Phase 3: a running worker process is actually stopped, not
+    /// merely abandoned. Before this, closing the chat window left the model
+    /// generating — and on a single-lane local runtime, holding the LLM lane
+    /// against whatever the user asked next.
+    #[tokio::test]
+    async fn cancelling_stops_the_running_job() {
+        let script = r#"
+import json, sys, time
+json.load(sys.stdin)
+time.sleep(60)
+print(json.dumps({
+  "protocol_version": 1,
+  "output": {"type": "llm", "text": "FINAL\nfar too late"},
+  "retryable": False
+}))
+"#;
+        let models = scripted(script);
+        let model = QueueModel {
+            models: &models,
+            priority: JobPriority::Interactive,
+            token_sink: None,
+        };
+        let cancel = CancelToken::new();
+        let fired = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            fired.cancel();
+        });
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_turn(
+                &model,
+                &NoTools,
+                &mut Discard,
+                &LoopConfig {
+                    budget: ContextBudget::DEFAULT,
+                    cancel,
+                    compaction: None,
+                },
+                "system",
+                "User task:\nhello\n".to_owned(),
+            ),
+        )
+        .await
+        .expect("the turn waited out a 60-second worker instead of stopping")
+        .unwrap_err();
+        assert_eq!(error, afterray_harness::LoopError::Cancelled);
+
+        // And the job itself was taken down, not left running.
+        let jobs = models.list().await;
+        assert!(
+            jobs.iter().all(|job| job.state != JobState::Running),
+            "a job was left running: {jobs:?}"
+        );
     }
 }

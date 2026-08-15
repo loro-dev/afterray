@@ -554,7 +554,27 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                 conversation_id,
                 message,
             }) => {
-                stream::handle_chat_stream(&mut write, &state, conversation_id, message).await?;
+                // The app's stop button shuts the socket down, which shows up
+                // here as EOF on the read half. Watch for it while the turn
+                // runs: the old code only noticed at the next token write, so a
+                // long tool call or a slow first token went uncancelled.
+                let cancel = afterray_harness::CancelToken::new();
+                let (result, peer_present) = stream::run_watching_for_hangup(
+                    stream::handle_chat_stream(
+                        &mut write,
+                        &state,
+                        conversation_id,
+                        message,
+                        cancel.clone(),
+                    ),
+                    &mut lines,
+                    &cancel,
+                )
+                .await;
+                result?;
+                if !peer_present {
+                    break;
+                }
             }
             Ok(Request::ReadThumbnail {
                 moment_id,
@@ -1977,6 +1997,8 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
                 max_rounds: T2_MAX_ROUNDS,
                 ..afterray_harness::ContextBudget::DEFAULT
             },
+            // The background sweeper has no user waiting on it to stop.
+            cancel: afterray_harness::CancelToken::new(),
             // Append-only. A prefix-caching runtime re-prefills only each
             // round's delta, and rewriting an earlier round would invalidate
             // the whole cached prefix. The prompt is built from one slot's

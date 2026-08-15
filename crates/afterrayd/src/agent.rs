@@ -7,8 +7,8 @@
 
 use afterray_agent::QueueModel;
 use afterray_harness::{
-    Budgeted, CompactionNotice, ContextBudget, Discard, LoopConfig, LoopError, ModelError,
-    PruneToolResults, ToolCallRecord, ToolSurface, Turn, TurnUsage, run_turn,
+    Budgeted, CancelToken, CompactionNotice, ContextBudget, Discard, LoopConfig, LoopError,
+    ModelError, PruneToolResults, ToolCallRecord, ToolSurface, Turn, TurnUsage, run_turn,
 };
 use afterray_models::{JobPriority, ModelQueue};
 use serde_json::Value;
@@ -94,6 +94,9 @@ pub async fn run_readonly_agent_traced(
         &mut Discard,
         &LoopConfig {
             budget: ContextBudget::DEFAULT,
+            // The unary RPCs have no channel a stop could arrive on: the
+            // caller is blocked on one response.
+            cancel: CancelToken::new(),
             compaction: Some(&strategy),
         },
         &system,
