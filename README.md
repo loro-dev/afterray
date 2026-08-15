@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  English · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="https://afterray.com">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#using-afterray">Using AfterRay</a> ·
