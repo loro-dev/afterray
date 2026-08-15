@@ -105,6 +105,7 @@ struct SnapshotScene {
     @MainActor
     static var all: [SnapshotScene] {
         chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
+            + captionScenes
     }
 }
 
@@ -538,6 +539,52 @@ private var settingsScenes: [SnapshotScene] {
         settingsScene(name: "14-settings-exclusions-empty", model: empty),
         settingsScene(name: "15-settings-exclusions-filled", model: filled),
     ]
+}
+
+/// The transcript caption with the summary panel open. The panel is the
+/// tallest thing in the bottom stack, so this is where the caption either
+/// stays with the timeline or gets pushed away from it.
+@MainActor
+private var captionScenes: [SnapshotScene] {
+    let long = """
+        Thank you very much. 他改革的成像也大多在他退休之后才愈发显现出来 这种工程不必在我的宽广胸襟和他极恶如愁的\
+        真心情一样 让人难忘 动容 1988年任上海市长时他曾说过这样一段话 我是一个孤儿 我的父母很早就死了 我没有见过我的父亲 \
+        我也没有兄弟姐妹 我1947年找到了党 觉得党就是我的母亲 所以我讲什么话都没有顾忌 只要对得起党
+        """
+    let moments = RecallScenario.long.moments.map { moment in
+        RecallMoment(
+            id: moment.id,
+            sessionId: moment.sessionId,
+            capturedAtMs: moment.capturedAtMs,
+            imageArtifactId: moment.imageArtifactId,
+            ocrText: moment.ocrText,
+            transcriptText: long,
+            audioArtifactId: "mock://audio/\(moment.id)",
+            applicationName: moment.applicationName,
+            bundleIdentifier: moment.bundleIdentifier
+        )
+    }
+    let playheadMs = moments[40].capturedAtMs
+    return [(1_440, 900), (1_512, 760)].map { width, height in
+        SnapshotScene(
+            name: "17-caption-summary-open-\(width)x\(height)",
+            size: CGSize(width: CGFloat(width), height: CGFloat(height)),
+            settleSeconds: 2.2,
+            content: AnyView(
+                RecallView(
+                    moments: moments,
+                    playheadMs: .constant(playheadMs),
+                    isLive: .constant(false),
+                    imageLoader: MockArtifactFactory.loader,
+                    onOpenSettings: {},
+                    recordingState: .recording,
+                    onToggleRecording: {},
+                    daySummary: .mockRich(around: playheadMs)
+                )
+                .frame(width: CGFloat(width), height: CGFloat(height))
+            )
+        )
+    }
 }
 
 @MainActor

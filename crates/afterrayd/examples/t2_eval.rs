@@ -2,9 +2,9 @@
 //!
 //! Builds the T1 card straight off a vault, renders the prompt, and submits
 //! it through `ModelQueue` + `LlmRouterAdapter` — the same harness the daemon
-//! uses — so switching `--provider` exercises the builtin GGUF worker, a
-//! local Ollama, or any OpenAI-compatible endpoint without touching a
-//! running daemon or the user's capture session.
+//! uses — so switching `--provider` exercises a local Ollama or any
+//! OpenAI-compatible endpoint without touching a running daemon or the
+//! user's capture session.
 //!
 //! ```sh
 //! cargo run -p afterrayd --example t2_eval -- \
@@ -12,8 +12,8 @@
 //! ```
 
 use afterray_models::{
-    LlmRouterAdapter, LlmRuntimeConfig, ModelAdapter, ModelCapability, ModelInput, ModelOutput,
-    ModelQueue, ProcessAdapter, ProcessAdapterConfig, QueueConfig,
+    LlmRouterAdapter, LlmRuntimeConfig, ModelAdapter, ModelInput, ModelOutput, ModelQueue,
+    QueueConfig,
 };
 use afterray_protocol::LlmProvider;
 use afterray_store::{
@@ -67,18 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model: model.clone(),
         api_key: None,
     }));
-    let worker = std::env::var_os("AFTERRAY_MODEL_WORKER").map_or_else(
-        || PathBuf::from("target/release/afterray-model-worker"),
-        PathBuf::from,
-    );
-    let adapters: Vec<Arc<dyn ModelAdapter>> = vec![Arc::new(LlmRouterAdapter::new(
-        ProcessAdapter::new(ProcessAdapterConfig::new(
-            "llama-llm",
-            ModelCapability::Llm,
-            worker,
-        )),
-        Arc::clone(&config),
-    ))];
+    let adapters: Vec<Arc<dyn ModelAdapter>> =
+        vec![Arc::new(LlmRouterAdapter::new(Arc::clone(&config)))];
     let queue = ModelQueue::new(adapters, QueueConfig::default())?;
 
     let now_ms = at_ms.unwrap_or_else(|| {

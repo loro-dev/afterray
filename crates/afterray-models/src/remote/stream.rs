@@ -39,10 +39,6 @@ pub(super) async fn generate_streaming(
         afterray_protocol::LlmProvider::OpenaiCompatible => {
             generate_openai_stream(client, config, prompt, system, token_tx, cancellation).await
         }
-        afterray_protocol::LlmProvider::Builtin => Err(AdapterError::InvalidOutput(
-            "builtin GGUF worker has no token stream; the chat path falls back to a one-shot answer"
-                .into(),
-        )),
         afterray_protocol::LlmProvider::MlxLocal => Err(AdapterError::InvalidOutput(
             "MLX local generation uses the persistent worker protocol".into(),
         )),

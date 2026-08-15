@@ -2,7 +2,7 @@ import CoreGraphics
 import SwiftUI
 
 /// The bottom bar while a search is open: one thumbnail per matched frame,
-/// newest on the left, under the same fixed playhead the app timeline uses.
+/// newest on the right, under the same fixed playhead the app timeline uses.
 ///
 /// It replaces `AppUsageTimeline` rather than sitting beside it. During a
 /// search, wall-clock browsing is not the task — moving between hits is.
@@ -95,21 +95,43 @@ struct SearchFilmstrip: View {
         )
     }
 
+    /// Only the cells that can reach the viewport are built, and each is placed
+    /// at its own x rather than stacked, so skipping the rest costs nothing —
+    /// an `HStack` would have to lay out every cell it never draws just to know
+    /// where the next one goes.
     private func cells(layout: SearchFilmstripLayout, nowMs: Int64) -> some View {
-        HStack(spacing: SearchFilmstripLayout.cellGap) {
-            ForEach(Array(session.frames.enumerated()), id: \.element.id) { index, frame in
+        ZStack(alignment: .leading) {
+            ForEach(slots(layout: layout)) { slot in
                 SearchFilmstripCell(
-                    frame: frame,
-                    isSelected: index == session.selectedIndex,
+                    frame: slot.frame,
+                    isSelected: slot.index == session.selectedIndex,
                     nowMs: nowMs,
                     loader: thumbnailLoader
                 )
-                .onTapGesture { onSelectIndex(index) }
+                .offset(x: layout.centerX(index: slot.index) - SearchFilmstripLayout.cellWidth / 2)
+                .onTapGesture { onSelectIndex(slot.index) }
             }
         }
-        .frame(width: layout.contentWidth, alignment: .leading)
+        .frame(width: layout.contentWidth, height: Self.stripHeight, alignment: .leading)
         .animation(.easeOut(duration: 0.16), value: session.selectedIndex)
     }
+
+    private func slots(layout: SearchFilmstripLayout) -> [FilmstripSlot] {
+        layout.visibleIndices(around: session.selectedIndex).compactMap { index in
+            guard session.frames.indices.contains(index) else { return nil }
+            return FilmstripSlot(index: index, frame: session.frames[index])
+        }
+    }
+}
+
+/// A cell the strip actually builds: where it ranks, and the frame that sits
+/// there. Identity follows the frame, so a new search never shows the previous
+/// one's thumbnails in the same slots.
+private struct FilmstripSlot: Identifiable {
+    let index: Int
+    let frame: SearchFrame
+
+    var id: String { frame.momentId }
 }
 
 private struct SearchFilmstripCell: View {
@@ -150,7 +172,9 @@ private struct SearchFilmstripCell: View {
         }
         .frame(width: SearchFilmstripLayout.cellWidth)
         .contentShape(Rectangle())
-        .help(frame.excerpt)
+        // Deliberately no `.help`: the excerpt is a wall of OCR text nobody can
+        // read from a tooltip, and keeping one registered per cell made every
+        // scroll tick pay for tracking areas the strip does not need.
         .task(id: frame.momentId) {
             image = await RecallThumbnailCache.shared.image(
                 momentID: frame.momentId,
@@ -159,9 +183,16 @@ private struct SearchFilmstripCell: View {
         }
     }
 
+    /// Cells are built and dropped as the strip travels, so the cache is read
+    /// during layout too: waiting for the `task` to hand back an image already
+    /// in memory shows a placeholder for a frame on every cell that returns.
+    private var displayImage: CGImage? {
+        image ?? RecallThumbnailCache.shared.cached(momentID: frame.momentId)
+    }
+
     @ViewBuilder
     private var thumbnail: some View {
-        if let image {
+        if let image = displayImage {
             Image(decorative: image, scale: 1)
                 .resizable()
                 .interpolation(.medium)

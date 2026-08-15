@@ -1,4 +1,6 @@
+import AfterRayRecall
 import AppKit
+import CryptoKit
 import Foundation
 
 /// Installs the bundled `afterray` CLI onto the user's PATH for external agents.
@@ -76,6 +78,35 @@ enum AfterRayCliInstall {
 
     static func pathExportLine() -> String {
         #"export PATH="$HOME/.local/bin:$PATH""#
+    }
+
+    /// An update moves the bundled CLI on while the copy on PATH stays behind.
+    /// The daemon rejects a mismatched protocol version outright, so the user
+    /// would see "the CLI suddenly broke" with no hint that reinstalling fixes
+    /// it. Refresh silently instead — the copy was installed from this bundle,
+    /// so replacing it with this bundle's build is what the user asked for.
+    static func refreshIfStale() {
+        guard isInstalled, let source = sourceBinaryURL() else { return }
+        guard let installed = digest(of: installURL), let bundled = digest(of: source) else {
+            return
+        }
+        guard installed != bundled else { return }
+        do {
+            try install()
+            AfterRayLog.info("refreshed the installed afterray CLI after an update")
+        } catch {
+            AfterRayLog.info("could not refresh the installed afterray CLI: \(error)")
+        }
+    }
+
+    private static func digest(of url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
 

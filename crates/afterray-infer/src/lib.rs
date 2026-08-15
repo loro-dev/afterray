@@ -9,7 +9,6 @@
 mod asr;
 mod audio;
 mod embed;
-mod llm;
 
 use afterray_models::{AdapterError, ModelInput, ModelOutput};
 use std::path::PathBuf;
@@ -17,13 +16,11 @@ use std::path::PathBuf;
 pub use asr::transcribe;
 pub use audio::load_mono_16k;
 pub use embed::embed_text;
-pub use llm::generate;
 
 #[derive(Debug, Clone)]
 pub struct InferConfig {
     pub asr_model: PathBuf,
     pub embedding_model: PathBuf,
-    pub llm_model: PathBuf,
 }
 
 impl InferConfig {
@@ -39,7 +36,6 @@ impl InferConfig {
         Self {
             asr_model: path_for("asr"),
             embedding_model: path_for("embedding"),
-            llm_model: path_for("llm"),
         }
     }
 }
@@ -62,9 +58,9 @@ pub fn execute(config: &InferConfig, input: &ModelInput) -> Result<ModelOutput, 
         ModelInput::Embedding { text } => Ok(ModelOutput::Embedding {
             vector: embed_text(&config.embedding_model, text)?,
         }),
-        ModelInput::Llm { prompt, system } => Ok(ModelOutput::Llm {
-            text: generate(&config.llm_model, prompt, system.as_deref())?,
-        }),
+        ModelInput::Llm { .. } => Err(AdapterError::InvalidOutput(
+            "LLM generation runs on the MLX worker or a configured endpoint, not this worker".into(),
+        )),
     }
 }
 

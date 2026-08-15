@@ -33,6 +33,11 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var cliStatus: String { get }
     var isInstallingCli: Bool { get }
     var cliInstalled: Bool { get }
+    /// False in a development build, where the updater is not running and the
+    /// section has nothing to control.
+    var updatesSupported: Bool { get }
+    var automaticUpdates: Bool { get }
+    var updateStatus: String { get }
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
@@ -55,6 +60,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func saveLlmConnection() async
     func probeLlm() async
     func installCli() async
+    func setAutomaticUpdates(_ enabled: Bool)
+    func checkForUpdates()
 }
 
 public struct AfterRayStorageSnapshot: Equatable, Sendable {
@@ -886,9 +893,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var providerFootnote: String {
-        switch model.settings?.llmProvider ?? .builtin {
-        case .builtin:
-            "Downloads Qwen3.6-27B Q4 (~17 GB) and runs it on this Mac. Capture keeps working without it."
+        switch model.settings?.llmProvider ?? .mlxLocal {
         case .mlxLocal:
             "Choose Qwen3.5 4B or the optional higher-quality 9B pack. Both run inside AfterRay through MLX."
         case .ollama:
@@ -900,7 +905,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var llmProviderBinding: Binding<LlmProvider> {
         Binding(
-            get: { model.settings?.llmProvider ?? .builtin },
+            get: { model.settings?.llmProvider ?? .mlxLocal },
             set: { provider in
                 Task { await model.setLlmProvider(provider) }
             }
@@ -909,9 +914,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var llmProviderPanel: some View {
-        switch model.settings?.llmProvider ?? .builtin {
-        case .builtin:
-            EmptyView()
+        switch model.settings?.llmProvider ?? .mlxLocal {
         case .mlxLocal:
             mlxLocalPanel
         case .ollama:
@@ -1307,6 +1310,31 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var advancedPage: some View {
+        if model.updatesSupported {
+            SettingsSection(
+                title: "Updates",
+                footnote: "AfterRay downloads updates in the background and installs them the next time you quit, so a recording is never interrupted."
+            ) {
+                SettingsRow(
+                    title: "Check automatically",
+                    subtitle: model.updateStatus,
+                    subtitleLineLimit: 2
+                ) {
+                    Toggle("", isOn: Binding(
+                        get: { model.automaticUpdates },
+                        set: { model.setAutomaticUpdates($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+                SettingsSeparator()
+                SettingsFooterBar {
+                    Button("Check Now") { model.checkForUpdates() }
+                        .buttonStyle(SettingsButtonStyle(kind: .standard))
+                }
+            }
+        }
+
         SettingsSection(
             title: "CLI for agents",
             footnote: "Installs `afterray` to ~/.local/bin so Claude Code, Codex, Cursor, and other tools can search your local history (read-only)."

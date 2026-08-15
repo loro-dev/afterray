@@ -306,14 +306,14 @@ private struct VisualLabView: View {
                     expectedBytes: 274_000_000
                 ),
                 ModelPack(
-                    id: "llm",
-                    name: "Qwen3.6 27B",
-                    capability: "llm",
-                    path: "/tmp/qwen.gguf",
+                    id: "llm_qwen35_4b_mlx4",
+                    name: "Qwen3.5 4B · MLX 4-bit",
+                    capability: "llm_vlm",
+                    path: "/tmp/Qwen3.5-4B-MLX-4bit",
                     present: false,
                     bytes: 0,
                     required: false,
-                    expectedBytes: 16_817_244_384
+                    expectedBytes: 3_061_129_077
                 ),
             ]
         )

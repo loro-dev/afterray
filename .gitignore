@@ -19,3 +19,7 @@ __pycache__/
 # be ignored or every session reads as a dirty tree.
 /.scratch/
 /.claude/
+
+# Local state written by `wrangler pages dev` (simulated R2, build cache).
+/.wrangler/
+/site/.wrangler/

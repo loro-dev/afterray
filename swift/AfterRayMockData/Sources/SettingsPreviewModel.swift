@@ -47,6 +47,9 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var cliStatus = "Not installed. Other AI agents cannot call `afterray` yet."
     @Published public var isInstallingCli = false
     @Published public var cliInstalled = false
+    @Published public var updatesSupported = true
+    @Published public var automaticUpdates = true
+    @Published public var updateStatus = "You are on 0.0.1 (build 1). AfterRay checks once a day."
     @Published public var recentJobs: [ModelJob] = [
         ModelJob(
             id: "job-asr",
@@ -119,17 +122,6 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
                     required: true,
                     note: "nomic-embed-text v1.5 Q4 · llama.cpp",
                     expectedBytes: 84_000_000
-                ),
-                ModelPack(
-                    id: "llm",
-                    name: "Qwen3.6 27B",
-                    capability: "llm",
-                    path: "\(modelDirectoryPath)/Qwen3.6-27B-Q4_K_M.gguf",
-                    present: false,
-                    bytes: 0,
-                    required: false,
-                    note: "Powers overlay Q&A · optional. Built-in download is Qwen3.6-27B Q4 (~17 GB). Qwen 3.7 has no local GGUF — use Ollama or an OpenAI-compatible URL for a hosted 3.7.",
-                    expectedBytes: 16_817_244_384
                 ),
             ]
         )
@@ -352,5 +344,16 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         cliInstalled = true
         cliStatus = "Installed at ~/.local/bin/afterray and available on PATH."
         message = "Preview installed afterray CLI."
+    }
+
+    public func setAutomaticUpdates(_ enabled: Bool) {
+        automaticUpdates = enabled
+        updateStatus = enabled
+            ? "You are on 0.0.1 (build 1). AfterRay checks once a day."
+            : "You are on 0.0.1 (build 1). Automatic checks are off."
+    }
+
+    public func checkForUpdates() {
+        message = "Preview checked for updates."
     }
 }

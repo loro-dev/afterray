@@ -107,11 +107,17 @@ else
 fi
 
 version="$($plist_buddy -c 'Print :CFBundleShortVersionString' "$source_plist")"
-build_number="$($plist_buddy -c 'Print :CFBundleVersion' "$source_plist")"
 bundle_identifier="$($plist_buddy -c 'Print :CFBundleIdentifier' "$source_plist")"
 minimum_macos="$($plist_buddy -c 'Print :LSMinimumSystemVersion' "$source_plist")"
+# Sparkle decides "is there an update" from CFBundleVersion and nothing else,
+# so a build number that never moves means a published release nobody
+# receives, with no error anywhere. The commit count is monotonic along a
+# linear main and needs no manual bookkeeping; the source plist keeps a
+# placeholder for development builds, which never update themselves.
+build_number="${AFTERRAY_BUILD_NUMBER:-$(git -C "$repo_root" rev-list --count HEAD)}"
 [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || die "invalid CFBundleShortVersionString: $version"
-[[ "$build_number" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || die "invalid CFBundleVersion: $build_number"
+[[ "$build_number" =~ ^[0-9]+$ ]] || die "invalid CFBundleVersion: $build_number"
+[[ "$build_number" -gt 0 ]] || die "CFBundleVersion must be positive: $build_number"
 [[ "$minimum_macos" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || die "invalid LSMinimumSystemVersion: $minimum_macos"
 [[ "$bundle_identifier" == 'dev.afterray.app' ]] || die "unexpected bundle identifier: $bundle_identifier"
 
@@ -146,6 +152,17 @@ resolve_developer_id_identity() {
   done <<<"$identities"
 }
 
+resolve_sign_update() {
+  if [[ -n "${AFTERRAY_SPARKLE_SIGN_UPDATE:-}" ]]; then
+    printf '%s\n' "$AFTERRAY_SPARKLE_SIGN_UPDATE"
+    return
+  fi
+  local cached="$repo_root/.afterray-dev/sparkle-tools/bin/sign_update"
+  [[ -x "$cached" ]] && printf '%s\n' "$cached"
+}
+
+sign_update_bin="$(resolve_sign_update)"
+
 if [[ "$mode" == 'local' ]]; then
   codesign_identity='-'
   notary_profile=''
@@ -157,6 +174,11 @@ else
   notary_profile="${AFTERRAY_NOTARY_PROFILE:-}"
   if [[ "$mode" == 'release' ]]; then
     [[ -n "$notary_profile" ]] || die 'AFTERRAY_NOTARY_PROFILE is required for a notarized release'
+    # An unsigned update archive is one no installed copy will accept, so a
+    # release that reaches this point without the tool has silently produced
+    # an unpublishable artifact.
+    [[ -n "$sign_update_bin" ]] \
+      || die 'sign_update not found; run scripts/fetch-sparkle-tools.sh or set AFTERRAY_SPARKLE_SIGN_UPDATE'
     artifact_suffix=''
   else
     artifact_suffix='-unnotarized'
@@ -170,6 +192,9 @@ app_bundle="$output_root/AfterRay.app"
 dmg_path="$release_dir/$artifact_stem.dmg"
 checksum_path="$dmg_path.sha256"
 manifest_path="$release_dir/$artifact_stem.json"
+# Sparkle updates from a zip, not the DMG: it is smaller, and unpacking it
+# does not need a mounted volume.
+update_archive_path="$release_dir/$artifact_stem.zip"
 
 case "$output_root" in
   "$repo_root"/dist/AfterRay-*-arm64) ;;
@@ -177,7 +202,7 @@ case "$output_root" in
 esac
 mkdir -p "$release_dir"
 rm -rf -- "$output_root"
-rm -f -- "$dmg_path" "$checksum_path" "$manifest_path"
+rm -f -- "$dmg_path" "$checksum_path" "$manifest_path" "$update_archive_path"
 temp_root="$(mktemp -d /tmp/afterray-release.XXXXXX)"
 
 swift_cache="$repo_root/.afterray-dev/release-swift-cache"
@@ -242,6 +267,9 @@ mkdir -p \
   "$app_bundle/Contents/Helpers" \
   "$app_bundle/Contents/Resources"
 install -m 0644 "$source_plist" "$app_bundle/Contents/Info.plist"
+# Stamped into the assembled bundle, never the source tree, and always before
+# signing (which happens further down) so the signature covers the real value.
+"$plist_buddy" -c "Set :CFBundleVersion $build_number" "$app_bundle/Contents/Info.plist"
 install -m 0644 "$repo_root/apps/AfterRay/Resources/AppIcon.icns" \
   "$app_bundle/Contents/Resources/AppIcon.icns"
 install -m 0644 "$repo_root/LICENSES/Qwen3.5-4B-MLX-4bit-NOTICE.txt" \
@@ -262,6 +290,28 @@ xcrun swift-stdlib-tool \
   --destination "$app_bundle/Contents/Helpers" \
   --sign "$codesign_identity"
 rm -f "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib.original"
+
+step 'Embedding Sparkle.framework'
+sparkle_framework="$(
+  find "$repo_root/.build/artifacts" -type d -name 'Sparkle.framework' -path '*macos*' -print -quit
+)"
+[[ -n "$sparkle_framework" ]] \
+  || die 'Sparkle.framework not found under .build/artifacts; run `swift package resolve` first'
+embedded_sparkle="$app_bundle/Contents/Frameworks/Sparkle.framework"
+mkdir -p "$app_bundle/Contents/Frameworks"
+ditto "$sparkle_framework" "$embedded_sparkle"
+# Sparkle's XPC services exist for sandboxed hosts. AfterRay is not sandboxed,
+# so shipping them would mean signing and notarizing code that never runs.
+rm -rf -- "$embedded_sparkle/Versions/B/XPCServices" "$embedded_sparkle/XPCServices"
+# Headers and module maps are build inputs, not runtime ones.
+for build_only in Headers PrivateHeaders Modules; do
+  rm -rf -- "$embedded_sparkle/Versions/B/$build_only" "$embedded_sparkle/$build_only"
+done
+[[ -x "$embedded_sparkle/Versions/B/Autoupdate" ]] \
+  || die 'embedded Sparkle.framework is missing Autoupdate'
+[[ -d "$embedded_sparkle/Versions/B/Updater.app" ]] \
+  || die 'embedded Sparkle.framework is missing Updater.app'
+
 plutil -lint "$app_bundle/Contents/Info.plist" >/dev/null
 
 bundle_binaries=(
@@ -290,6 +340,12 @@ for binary in "${bundle_binaries[@]}"; do
     [[ -n "$dependency" ]] || continue
     case "$dependency" in
       /System/Library/* | /usr/lib/*) ;;
+      # Sparkle resolves through the app's @executable_path/../Frameworks rpath
+      # rather than sitting beside the executable that links it.
+      @rpath/Sparkle.framework/*)
+        [[ -x "$embedded_sparkle/Versions/B/Sparkle" ]] \
+          || die "missing embedded Sparkle.framework for dependency '$dependency': $binary"
+        ;;
       @rpath/*)
         [[ -f "$(dirname "$binary")/${dependency##*/}" ]] \
           || die "missing bundled dynamic dependency '$dependency': $binary"
@@ -314,6 +370,12 @@ sign_executable() {
 }
 
 step "Signing nested executables (${codesign_identity})"
+# Sparkle signs from the inside out and explicitly without --deep: Autoupdate
+# and Updater.app are separate executables that Gatekeeper evaluates on their
+# own when they replace the running app.
+sign_executable "$embedded_sparkle/Versions/B/Autoupdate"
+sign_executable "$embedded_sparkle/Versions/B/Updater.app"
+sign_executable "$embedded_sparkle"
 for library in "${runtime_libraries[@]}"; do
   sign_executable "$library"
 done
@@ -333,6 +395,15 @@ for library in "${runtime_libraries[@]}"; do
   signature_details="$(codesign -d --verbose=4 "$library" 2>&1)"
   [[ "$signature_details" == *'runtime'* ]] || die "Hardened Runtime flag is missing: $library"
 done
+for sparkle_component in \
+  "$embedded_sparkle/Versions/B/Autoupdate" \
+  "$embedded_sparkle/Versions/B/Updater.app" \
+  "$embedded_sparkle"; do
+  codesign --verify --strict --verbose=2 "$sparkle_component"
+  signature_details="$(codesign -d --verbose=4 "$sparkle_component" 2>&1)"
+  [[ "$signature_details" == *'runtime'* ]] \
+    || die "Hardened Runtime flag is missing: $sparkle_component"
+done
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
 
 # Notarize the application before it goes into the DMG, so the ticket
@@ -351,6 +422,23 @@ if [[ "$mode" == 'release' ]]; then
   step 'Stapling ticket to the application'
   xcrun stapler staple "$app_bundle"
   xcrun stapler validate "$app_bundle"
+fi
+
+# Built after stapling, and deliberately not reusing the archive submitted for
+# notarization above: that one was made from the unstapled bundle. An update
+# archive without the ticket installs an app that fails Gatekeeper the first
+# time it launches on a machine that happens to be offline.
+step 'Packaging the Sparkle update archive'
+ditto -c -k --keepParent "$app_bundle" "$update_archive_path"
+update_archive_size="$(/usr/bin/stat -f%z "$update_archive_path")"
+update_signature=''
+if [[ -n "$sign_update_bin" ]]; then
+  step 'Signing the update archive (EdDSA)'
+  signature_line="$("$sign_update_bin" "$update_archive_path")"
+  update_signature="${signature_line#*edSignature=\"}"
+  update_signature="${update_signature%%\"*}"
+  [[ -n "$update_signature" && "$update_signature" != "$signature_line" ]] \
+    || die "could not parse sign_update output: $signature_line"
 fi
 
 step 'Creating compressed DMG'
@@ -391,6 +479,7 @@ fi
 checksum="$(shasum -a 256 "$dmg_path" | awk '{print $1}')"
 printf '%s  %s\n' "$checksum" "${dmg_path##*/}" >"$checksum_path"
 (cd "$release_dir" && shasum -a 256 -c "${checksum_path##*/}") >/dev/null
+update_checksum="$(shasum -a 256 "$update_archive_path" | awk '{print $1}')"
 source_commit="$(git -C "$repo_root" rev-parse HEAD)"
 cat >"$manifest_path" <<EOF
 {
@@ -404,15 +493,24 @@ cat >"$manifest_path" <<EOF
   "source_dirty": $source_dirty,
   "notarized": $notarized,
   "artifact": "${dmg_path##*/}",
-  "sha256": "$checksum"
+  "sha256": "$checksum",
+  "update_archive": "${update_archive_path##*/}",
+  "update_archive_size": $update_archive_size,
+  "update_archive_sha256": "$update_checksum",
+  "update_signature": "$update_signature"
 }
 EOF
 
 printf '\n%s\n' 'AfterRay release build completed.'
 printf '  App:      %s\n' "$app_bundle"
 printf '  DMG:      %s\n' "$dmg_path"
+printf '  Update:   %s\n' "$update_archive_path"
+printf '  Build:    %s\n' "$build_number"
 printf '  SHA-256:  %s\n' "$checksum"
 printf '  Manifest: %s\n' "$manifest_path"
+if [[ -z "$update_signature" ]]; then
+  printf '\nWARNING: The update archive is unsigned; no installed copy will accept it.\n' >&2
+fi
 if [[ "$mode" != 'release' ]]; then
   printf '\nWARNING: This artifact is marked %s and must not be published as a production release.\n' "$mode" >&2
 fi

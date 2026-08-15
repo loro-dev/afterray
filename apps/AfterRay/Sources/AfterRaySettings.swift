@@ -139,6 +139,29 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         cliInstalled = AfterRayCliInstall.isInstalled
     }
 
+    var updatesSupported: Bool { AfterRayUpdater.shared.isEnabled }
+
+    var automaticUpdates: Bool { AfterRayUpdater.shared.automaticallyChecksForUpdates }
+
+    var updateStatus: String {
+        if let staged = AfterRayUpdater.shared.stagedVersion {
+            return "Version \(staged) is downloaded and installs when you quit AfterRay."
+        }
+        let build = AfterRayUpdater.hostDescription
+        return AfterRayUpdater.shared.automaticallyChecksForUpdates
+            ? "You are on \(build). AfterRay checks once a day."
+            : "You are on \(build). Automatic checks are off."
+    }
+
+    func setAutomaticUpdates(_ enabled: Bool) {
+        objectWillChange.send()
+        AfterRayUpdater.shared.automaticallyChecksForUpdates = enabled
+    }
+
+    func checkForUpdates() {
+        AfterRayUpdater.shared.checkForUpdates()
+    }
+
     func excludeBundle(_ bundleID: String) async {
         var next = excludedBundleIds
         guard !bundleID.isEmpty, !next.contains(bundleID) else { return }
@@ -461,8 +484,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func probeLlm() async {
-        let provider = settings?.llmProvider ?? .builtin
-        guard provider != .builtin else {
+        let provider = settings?.llmProvider ?? .mlxLocal
+        guard provider != .mlxLocal else {
             llmProbe = nil
             return
         }
@@ -524,8 +547,6 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
 
     private func assistantSourceMessage(_ provider: LlmProvider) -> String {
         switch provider {
-        case .builtin:
-            "Ask will use the on-device pack when it is installed."
         case .mlxLocal:
             "Ask will use the selected Qwen3.5 MLX model through AfterRay's signed worker."
         case .ollama:

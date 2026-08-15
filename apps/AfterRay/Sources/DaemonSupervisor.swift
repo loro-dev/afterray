@@ -61,7 +61,18 @@ final class DaemonSupervisor {
 
     private func recoverIfNeeded() async throws -> Bool {
         guard !isStopped else { return false }
-        if await daemonIsReachable() { return false }
+        if let status = await daemonStatus() {
+            if Self.hostBuildMatches(status) { return false }
+            // An update replaced the bundle while the old daemon kept the
+            // socket. Reusing it would run this build's UI against the
+            // previous build's logic, against the same store, with nothing
+            // visible to the user. Replace it instead.
+            AfterRayLog.info(
+                "daemon build \(status.hostBuild ?? "unknown") does not match app build "
+                    + "\(Self.hostBuild ?? "unknown"); restarting it"
+            )
+            await terminateDaemon()
+        }
         guard !isStopped else { return false }
 
         if let process, process.isRunning {
@@ -110,6 +121,9 @@ final class DaemonSupervisor {
             developmentPath: ".build/release/afterray-mlx-vlm-worker"
         ).path
         environment["AFTERRAY_MODEL_DIR"] = defaultModelDirectory.path
+        if let hostBuild = Self.hostBuild {
+            environment["AFTERRAY_HOST_BUILD"] = hostBuild
+        }
         applyModelDefaults(to: &environment)
         child.environment = environment
         let output = DaemonOutputBuffer()
@@ -162,7 +176,12 @@ final class DaemonSupervisor {
         isStopped = true
         recoveryTask?.cancel()
         recoveryTask = nil
+        await terminateDaemon()
+    }
 
+    /// Stops whoever currently owns the socket without latching `isStopped`,
+    /// so a replaced daemon can be followed by a fresh one in the same launch.
+    private func terminateDaemon() async {
         var daemonPid = process?.processIdentifier
         do {
             let result = try await UnixSocketDaemonClient(socketPath: socketPath).shutdown()
@@ -219,12 +238,25 @@ final class DaemonSupervisor {
     }
 
     private func daemonIsReachable() async -> Bool {
-        do {
-            _ = try await UnixSocketDaemonClient(socketPath: socketPath).status()
-            return true
-        } catch {
-            return false
-        }
+        await daemonStatus() != nil
+    }
+
+    private func daemonStatus() async -> DaemonStatus? {
+        try? await UnixSocketDaemonClient(socketPath: socketPath).status()
+    }
+
+    /// `CFBundleVersion`, which `scripts/build-release.sh` stamps per release.
+    /// The marketing version cannot distinguish two builds of one release, and
+    /// an update that only fixes the daemon is exactly that case.
+    static let hostBuild: String? = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+
+    static func hostBuildMatches(_ status: DaemonStatus) -> Bool {
+        // A development tree runs a hand-built daemon whose build number is
+        // whatever the placeholder plist says. Restarting it on every app
+        // launch would fight the `make dev` workflow.
+        if developmentRepoRoot() != nil { return true }
+        guard let hostBuild, let running = status.hostBuild else { return false }
+        return hostBuild == running
     }
 
     private func applyModelDefaults(to environment: inout [String: String]) {
@@ -233,8 +265,6 @@ final class DaemonSupervisor {
                 .appendingPathComponent("Qwen3-ASR-1.7B"),
             "AFTERRAY_EMBEDDING_MODEL": defaultModelDirectory
                 .appendingPathComponent("nomic-embed-text-v1.5.Q4_K_M.gguf"),
-            "AFTERRAY_LLM_MODEL": defaultModelDirectory
-                .appendingPathComponent(environment["AFTERRAY_LLM_FILE"] ?? "Qwen3.6-27B-Q4_K_M.gguf"),
         ]
         for (key, url) in defaults where environment[key] == nil {
             if FileManager.default.fileExists(atPath: url.path) {

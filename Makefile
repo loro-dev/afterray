@@ -1,4 +1,4 @@
-.PHONY: check test build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app release release-local
+.PHONY: check test build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools publish publish-dry-run
 
 check:
 	cargo check --workspace
@@ -67,3 +67,14 @@ release:
 
 release-local:
 	./scripts/build-release.sh --local --allow-dirty
+
+# Sparkle's sign_update/generate_keys/generate_appcast are not part of the
+# Swift package; fetch them once per machine before the first release.
+sparkle-tools:
+	./scripts/fetch-sparkle-tools.sh
+
+publish:
+	./scripts/publish-release.sh
+
+publish-dry-run:
+	./scripts/publish-release.sh --dry-run

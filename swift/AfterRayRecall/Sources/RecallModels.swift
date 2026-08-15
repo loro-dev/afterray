@@ -198,19 +198,25 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let recordingState: DaemonRecordingState
     public let activeSessionId: String?
+    /// `CFBundleVersion` of the app that spawned this daemon. Nil from a
+    /// daemon started before this field existed, or from one started outside
+    /// the app.
+    public let hostBuild: String?
 
     public init(
         daemonVersion: String,
         protocolVersion: Int,
         schemaVersion: Int,
         recordingState: DaemonRecordingState,
-        activeSessionId: String? = nil
+        activeSessionId: String? = nil,
+        hostBuild: String? = nil
     ) {
         self.daemonVersion = daemonVersion
         self.protocolVersion = protocolVersion
         self.schemaVersion = schemaVersion
         self.recordingState = recordingState
         self.activeSessionId = activeSessionId
+        self.hostBuild = hostBuild
     }
 
     enum CodingKeys: String, CodingKey {
@@ -219,6 +225,7 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
         case schemaVersion = "schema_version"
         case recordingState = "recording_state"
         case activeSessionId = "active_session_id"
+        case hostBuild = "host_build"
     }
 }
 
@@ -444,7 +451,6 @@ public struct ModelPack: Codable, Equatable, Identifiable, Sendable {
 }
 
 public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
-    case builtin
     case mlxLocal = "mlx_local"
     case ollama
     case openaiCompatible = "openai_compatible"
@@ -453,11 +459,18 @@ public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
 
     public var title: String {
         switch self {
-        case .builtin: "Built-in"
         case .mlxLocal: "AfterRay Local (MLX)"
         case .ollama: "Ollama"
         case .openaiCompatible: "OpenAI compatible"
         }
+    }
+
+    /// A daemon that still has `builtin` saved — the retired llama.cpp GGUF
+    /// backend — resolves to the managed MLX packs instead of failing the
+    /// whole settings decode.
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = LlmProvider(rawValue: raw) ?? .mlxLocal
     }
 }
 
@@ -569,7 +582,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
         excludedBundleIds: [String] = [],
         excludedDomains: [String] = [],
-        llmProvider: LlmProvider = .builtin,
+        llmProvider: LlmProvider = .mlxLocal,
         llmBaseUrl: String = "",
         llmModel: String = "",
         llmApiKeySet: Bool = false,
@@ -620,7 +633,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
             ?? Self.defaultStorageLimitBytes
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
         excludedDomains = try container.decodeIfPresent([String].self, forKey: .excludedDomains) ?? []
-        llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .builtin
+        llmProvider = try container.decodeIfPresent(LlmProvider.self, forKey: .llmProvider) ?? .mlxLocal
         llmBaseUrl = try container.decodeIfPresent(String.self, forKey: .llmBaseUrl) ?? ""
         llmModel = try container.decodeIfPresent(String.self, forKey: .llmModel) ?? ""
         llmApiKeySet = try container.decodeIfPresent(Bool.self, forKey: .llmApiKeySet) ?? false

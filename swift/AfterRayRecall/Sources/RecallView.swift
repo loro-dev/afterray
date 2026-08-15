@@ -204,23 +204,6 @@ public struct RecallView: View {
 
                 Spacer(minLength: 100)
 
-                if !isLive {
-                    TranscriptCaption(
-                        text: selectedMoment?.transcriptText,
-                        canPlay: selectedMoment?.audioArtifactId != nil
-                            && (selectedMoment?.hasVisibleTranscript ?? false),
-                        isPlaying: isAudioPlaying && selectedAudioIsActive,
-                        isBuffering: isAudioBuffering && selectedAudioIsActive,
-                        onToggleAudio: {
-                            if let moment = selectedMoment {
-                                onToggleAudio?(moment)
-                            }
-                        }
-                    )
-                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-                    .padding(.bottom, 12)
-                }
-
                 if daySummaryExpanded {
                     HStack(alignment: .bottom, spacing: 0) {
                         DaySummaryPanel(
@@ -247,6 +230,26 @@ public struct RecallView: View {
                     .padding(.horizontal, RecallGeometry.overlayChromeMargin)
                     .padding(.bottom, 10)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+
+                // Last thing above the timeline chrome, so the line you heard
+                // stays next to the moment it was heard at. Above the summary
+                // panel it drifted to the top of the screen whenever the panel
+                // was open, which is where a caption reads as unrelated.
+                if !isLive, selectedMoment?.hasVisibleTranscript == true {
+                    TranscriptCaption(
+                        text: selectedMoment?.transcriptText,
+                        canPlay: selectedMoment?.audioArtifactId != nil,
+                        isPlaying: isAudioPlaying && selectedAudioIsActive,
+                        isBuffering: isAudioBuffering && selectedAudioIsActive,
+                        onToggleAudio: {
+                            if let moment = selectedMoment {
+                                onToggleAudio?(moment)
+                            }
+                        }
+                    )
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .padding(.bottom, 12)
                 }
 
                 timelineChromeRow
@@ -326,11 +329,15 @@ public struct RecallView: View {
             guard !isScrubbing else { return }
             prefetchAroundSelection()
         }
-        .onAppear { onVisibleDayChange?(playheadMs) }
-        .onChange(of: playheadDayKey) { _, _ in
+        // Waits for the settle like the prefetch above. Search results hop
+        // between days, so a single flick used to ask the daemon for a day
+        // summary — and the history pages behind it — once per cell, each
+        // answer rebuilding the whole summary document mid-scrub.
+        .task(id: "\(playheadDayKey):\(isScrubbing)") {
+            guard !isScrubbing else { return }
             onVisibleDayChange?(playheadMs)
         }
-        .task(id: highlightKey) {
+        .task(id: "\(highlightKey):\(isScrubbing)") {
             await loadHighlightRegions()
         }
         .task(id: searchSession?.selectedIndex ?? -1) {
@@ -357,6 +364,10 @@ public struct RecallView: View {
     /// frame while the fetch is in flight.
     private func loadHighlightRegions() async {
         highlightRegions = []
+        // One evidence round trip per cell the scrub passes through is a queue
+        // of requests for frames nobody is looking at any more. The boxes are
+        // only worth fetching for the frame the scrub stops on.
+        guard !isScrubbing else { return }
         guard
             let ocrLoader,
             let moment = selectedMoment,
@@ -576,8 +587,11 @@ public struct RecallView: View {
         isScrubbing = true
         if let searchSession {
             guard delta != 0 else { return }
+            // Same sign as the timeline: a positive delta pushes the content
+            // right and travels backward in time, which on the strip means the
+            // older results left of the playhead.
             if !isPrecise {
-                selectSearchIndex(searchSession.selectedIndex + (delta > 0 ? -1 : 1))
+                selectSearchIndex(searchSession.selectedIndex + (delta > 0 ? 1 : -1))
                 return
             }
             // A trackpad emits dozens of small deltas per flick. Accumulating
@@ -586,7 +600,7 @@ public struct RecallView: View {
             let steps = Int(searchScrollAccumulator / Self.searchScrollPointsPerCell)
             guard steps != 0 else { return }
             searchScrollAccumulator -= CGFloat(steps) * Self.searchScrollPointsPerCell
-            selectSearchIndex(searchSession.selectedIndex - steps)
+            selectSearchIndex(searchSession.selectedIndex + steps)
             return
         }
         guard delta != 0, !moments.isEmpty else { return }
@@ -620,7 +634,9 @@ public struct RecallView: View {
 
     private func moveSelection(by delta: Int) {
         if let searchSession {
-            selectSearchIndex(searchSession.selectedIndex + delta)
+            // Arrow keys walk the strip, not the ranking: left is older, which
+            // is the higher index in a newest-first result set.
+            selectSearchIndex(searchSession.selectedIndex - delta)
             return
         }
         let stepped = RecallPlayhead.stepMoment(

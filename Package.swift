@@ -27,6 +27,10 @@ let package = Package(
             url: "https://github.com/huggingface/swift-transformers",
             exact: "1.3.0"
         ),
+        .package(
+            url: "https://github.com/sparkle-project/Sparkle",
+            exact: "2.9.5"
+        ),
     ],
     targets: [
         .target(
@@ -40,8 +44,17 @@ let package = Package(
         ),
         .executableTarget(
             name: "AfterRayApp",
-            dependencies: ["AfterRayRecall"],
-            path: "apps/AfterRay/Sources"
+            dependencies: [
+                "AfterRayRecall",
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
+            path: "apps/AfterRay/Sources",
+            linkerSettings: [
+                // Sparkle.framework is copied into Contents/Frameworks by
+                // scripts/build-release.sh; SwiftPM emits a bare executable and
+                // does not assemble the bundle for us.
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
+            ]
         ),
         .executableTarget(
             name: "AfterRayNativeModelWorker",

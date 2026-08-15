@@ -47,7 +47,10 @@ Default packs:
 | --- | --- | --- |
 | `asr` | `Qwen/Qwen3-ASR-1.7B` | Candle Metal via `qwen3-asr` |
 | `embedding` | nomic GGUF | `llama-cpp-2` Metal |
-| `llm` | Optional on-device Qwen3.6-27B Q4 GGUF. Overlay Q&A can instead use Ollama or an OpenAI-compatible URL from Settings. Qwen 3.7 has no local GGUF. | `llama-cpp-2` Metal, Ollama, or OpenAI-compatible HTTP |
+| `llm_qwen35_4b_mlx4` | Recommended on-device assistant: pinned `mlx-community/Qwen3.5-4B-MLX-4bit` snapshot | signed MLXVLM worker |
+| `llm_qwen35_9b_mlx4` | Optional higher-quality `mlx-community/Qwen3.5-9B-MLX-4bit` snapshot | signed MLXVLM worker |
+
+Overlay Q&A can instead use Ollama or an OpenAI-compatible URL from Settings.
 
 ## Configuration
 
@@ -59,10 +62,9 @@ Default packs:
 | `AFTERRAY_ASR_MODEL` | `Qwen3-ASR-1.7B` | ASR snapshot directory |
 | `AFTERRAY_ASR_REPOSITORY` | `Qwen/Qwen3-ASR-1.7B` | Hugging Face repo |
 | `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | embedding weights |
-| `AFTERRAY_LLM_MODEL` | optional GGUF path | built-in assistant weights |
-| `AFTERRAY_LLM_REPOSITORY` | `unsloth/Qwen3.6-27B-GGUF` | Hugging Face repo for the built-in pack |
-| `AFTERRAY_LLM_FILE` | `Qwen3.6-27B-Q4_K_M.gguf` | GGUF filename in that repo |
-| `AFTERRAY_LLM_PROVIDER` | `builtin` | `builtin`, `ollama`, or `openai_compatible` |
+| `AFTERRAY_MLX_MODEL` | `Qwen3.5-4B-MLX-4bit` | 4B MLX snapshot directory |
+| `AFTERRAY_MLX_9B_MODEL` | `Qwen3.5-9B-MLX-4bit` | 9B MLX snapshot directory |
+| `AFTERRAY_LLM_PROVIDER` | `mlx_local` | `mlx_local`, `ollama`, or `openai_compatible` |
 | `AFTERRAY_LLM_BASE_URL` | empty / Ollama default | remote origin |
 | `AFTERRAY_LLM_CHAT_MODEL` | empty | remote chat model id |
 | `AFTERRAY_LLM_API_KEY` | empty | optional bearer token |

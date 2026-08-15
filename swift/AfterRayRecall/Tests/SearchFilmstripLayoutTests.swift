@@ -6,9 +6,16 @@ final class SearchFilmstripLayoutTests: XCTestCase {
 
     func testCellsAreEvenlySpacedWithGaps() {
         let layout = SearchFilmstripLayout(count: 3, viewportWidth: 600)
-        XCTAssertEqual(layout.centerX(index: 0), SearchFilmstripLayout.cellWidth / 2)
+        // Newest first in the ranking, last on the strip: time reads left to
+        // right here exactly as it does on the app timeline.
         XCTAssertEqual(
-            layout.centerX(index: 1) - layout.centerX(index: 0),
+            layout.centerX(index: 0),
+            2 * stride + SearchFilmstripLayout.cellWidth / 2,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(layout.centerX(index: 2), SearchFilmstripLayout.cellWidth / 2)
+        XCTAssertEqual(
+            layout.centerX(index: 0) - layout.centerX(index: 1),
             stride,
             accuracy: 0.001
         )
@@ -17,6 +24,29 @@ final class SearchFilmstripLayoutTests: XCTestCase {
             3 * SearchFilmstripLayout.cellWidth + 2 * SearchFilmstripLayout.cellGap,
             accuracy: 0.001
         )
+    }
+
+    func testTheNewestResultOpensAtTheRightHandEnd() {
+        let layout = SearchFilmstripLayout(count: 8, viewportWidth: 600)
+        // A fresh session selects index 0, and that cell must be the last one.
+        XCTAssertEqual(layout.slot(forIndex: 0), 7)
+        XCTAssertEqual(layout.slot(forIndex: 7), 0)
+        XCTAssertGreaterThan(layout.centerX(index: 0), layout.centerX(index: 1))
+    }
+
+    func testOnlyTheCellsNearTheViewportAreBuilt() {
+        let layout = SearchFilmstripLayout(count: 60, viewportWidth: 600)
+        let visible = layout.visibleIndices(around: 30)
+        // 600 points of viewport is roughly four cells: a window, not the set.
+        XCTAssertLessThan(visible.count, 12)
+        XCTAssertTrue(visible.contains(30))
+        XCTAssertFalse(visible.contains(0))
+        XCTAssertFalse(visible.contains(59))
+        // The ends of the strip clamp instead of running off the array.
+        XCTAssertEqual(layout.visibleIndices(around: 0).lowerBound, 0)
+        XCTAssertEqual(layout.visibleIndices(around: 59).upperBound, 60)
+        XCTAssertTrue(SearchFilmstripLayout(count: 0, viewportWidth: 600)
+            .visibleIndices(around: 0).isEmpty)
     }
 
     func testOffsetParksTheSelectedCellUnderTheCentredPlayhead() {
@@ -29,12 +59,13 @@ final class SearchFilmstripLayoutTests: XCTestCase {
 
     func testIndexAtXRoundsToTheNearestCellAndClamps() {
         let layout = SearchFilmstripLayout(count: 4, viewportWidth: 600)
-        XCTAssertEqual(layout.index(atX: 0), 0)
-        XCTAssertEqual(layout.index(atX: SearchFilmstripLayout.cellWidth / 2), 0)
-        XCTAssertEqual(layout.index(atX: stride), 1)
-        XCTAssertEqual(layout.index(atX: stride * 2 + 5), 2)
-        XCTAssertEqual(layout.index(atX: -500), 0)
-        XCTAssertEqual(layout.index(atX: 99_999), 3)
+        // x grows to the right, where the newer — lower-ranked — results are.
+        XCTAssertEqual(layout.index(atX: 0), 3)
+        XCTAssertEqual(layout.index(atX: SearchFilmstripLayout.cellWidth / 2), 3)
+        XCTAssertEqual(layout.index(atX: stride), 2)
+        XCTAssertEqual(layout.index(atX: stride * 2 + 5), 1)
+        XCTAssertEqual(layout.index(atX: -500), 3)
+        XCTAssertEqual(layout.index(atX: 99_999), 0)
     }
 
     func testEmptyStripStaysWellDefined() {
@@ -43,15 +74,16 @@ final class SearchFilmstripLayoutTests: XCTestCase {
         XCTAssertGreaterThan(layout.contentWidth, 0)
     }
 
-    func testDraggingLeftWalksTowardOlderResults() {
+    func testDraggingRightWalksTowardOlderResults() {
         let layout = SearchFilmstripLayout(count: 10, viewportWidth: 600)
-        // Older results sit to the right, so pulling content left advances.
-        XCTAssertEqual(layout.steps(forDragTranslation: -stride), 1)
-        XCTAssertEqual(layout.steps(forDragTranslation: -stride * 3), 3)
-        XCTAssertEqual(layout.steps(forDragTranslation: stride * 2), -2)
+        // Older results sit to the left, so pulling the content right — the
+        // same drag that travels backwards on the timeline — advances the rank.
+        XCTAssertEqual(layout.steps(forDragTranslation: stride), 1)
+        XCTAssertEqual(layout.steps(forDragTranslation: stride * 3), 3)
+        XCTAssertEqual(layout.steps(forDragTranslation: -stride * 2), -2)
         XCTAssertEqual(layout.steps(forDragTranslation: 0), 0)
         // A twitch smaller than half a cell must not move the selection.
-        XCTAssertEqual(layout.steps(forDragTranslation: -stride * 0.3), 0)
+        XCTAssertEqual(layout.steps(forDragTranslation: stride * 0.3), 0)
     }
 }
 

@@ -45,6 +45,24 @@ final class AfterRayControlModelTests: XCTestCase {
         XCTAssertEqual(query, "architecture")
     }
 
+    /// Reopening the overlay onto a live search re-selects the frame it was
+    /// left on, so it has to ask for the index already selected and still be
+    /// handed that frame back — returning nil there would leave the overlay
+    /// live, with the clock reading NOW over a still from hours ago.
+    func testSelectingTheAlreadySelectedFrameStillReportsIt() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+        model.searchQuery = "architecture"
+        _ = await model.search()
+
+        let selected = model.searchSession?.selectedIndex
+        XCTAssertEqual(selected, 0)
+        XCTAssertEqual(model.selectFrame(at: selected ?? -1)?.momentId, "m1")
+        XCTAssertEqual(model.searchSession?.selectedIndex, 0)
+        // Out of range still means "nothing to select".
+        XCTAssertNil(model.selectFrame(at: 7))
+    }
+
     func testEnsureRecordingStartsOnlyWhenIdle() async {
         let daemon = ControlDaemon()
         let model = AfterRayControlModel(daemon: daemon)
@@ -206,7 +224,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
             recordAudio: recordAudio ?? true,
             captureIntervalSeconds: 10,
             storageLimitBytes: storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
-            llmProvider: llmProvider ?? .builtin,
+            llmProvider: llmProvider ?? .mlxLocal,
             llmBaseUrl: llmBaseUrl ?? "",
             llmModel: llmModel ?? "",
             uiLanguage: uiLanguage ?? AppSettings.defaultLanguage,

@@ -1,16 +1,30 @@
 # 自动更新调整计划
 
-> 状态：待评审，2026-08-15
-> 基线：`main` @ `cc507e3`
+> 状态：已实施（阶段 0–2 + Cloudflare 后端），2026-08-15
+> 基线：`main` @ `1be0c77`，实施于 `worktree-auto-update`
 > 目标：让已安装的 AfterRay 能自己发现、下载、安装新版本，且不丢录制、不丢
 > 系统权限、不静默跑在旧 daemon 上。
+>
+> 落地结果与计划的偏差见文末[实施记录](#实施记录)。阶段 3（CI）未做。
+
+## Sparkle 是什么
+
+macOS 上非 App Store 分发应用的事实标准更新框架，开源、2006 年至今，Transmission、
+IINA、Bartender 那类应用都在用。它负责一件事：让 app 自己完成"检查—下载—替换—重启"。
+
+运作方式：你在服务器上放一个叫 **appcast** 的 XML（本质是个 RSS），每条 item 描述一个
+版本 —— 版本号、下载地址、最低系统要求、签名。app 里嵌入 `Sparkle.framework`，它按设定
+间隔拉这个 XML，比对本地 `CFBundleVersion`，发现更新就下载压缩包、用 EdDSA 公钥验签、
+退出 app、由一个独立的辅助进程（`Autoupdate`）把新 bundle 换上去、再把 app 拉起来。
+
+自己写要处理的是：替换一个**正在运行**的 app bundle、装在 `/Applications` 时的权限提升、
+下载文件的 quarantine 标记清除、代码签名校验、防止攻击者把你降级到有漏洞的旧版本、
+断点续传、以及替换失败时的回滚。这些 Sparkle 都做完了，且经过了二十年的实战。
 
 ## 结论先行
 
-用 **Sparkle 2**，不自研。自研要正确处理运行中 bundle 的原子替换、权限提升、
-quarantine 清除、签名校验、降级攻击防护、断点续传，Sparkle 全都解决了；本项目
-非沙盒（`build-release.sh` 的 `codesign` 只用 `--options runtime`，无
-entitlements），是 Sparkle 最省事的场景。
+用 **Sparkle 2**，不自研。本项目非沙盒（`build-release.sh` 的 `codesign` 只用
+`--options runtime`，无 entitlements），是 Sparkle 最省事的场景。
 
 代价是 `Sparkle.framework` 进 bundle、签名流程多三步、`build-release.sh` 的二进制
 审计规则要放开一个口子。
@@ -19,6 +33,10 @@ entitlements），是 Sparkle 最省事的场景。
 自动更新会以"静默失败"的形式坏掉 —— 用户收不到更新且没有任何报错，或者更新了
 但没生效。建议阶段 0 单独成一个 PR 先合。
 
+发布链路本身比预想的更接近就绪：two-pass notarization 已经把 ticket staple 到了 app
+bundle 上（`build-release.sh:352`），zip 打包步骤也已存在（`:345`），这两件恰好是
+Sparkle 的前提条件，见 1.4。
+
 ---
 
 ## 现状事实
@@ -26,6 +44,8 @@ entitlements），是 Sparkle 最省事的场景。
 | 维度 | 现状 | 位置 |
 |---|---|---|
 | 分发 | 手工 `make release` → DMG，Developer ID 签名 + notarize + staple | `scripts/build-release.sh` |
+| **notarization** | **two-pass：先 notarize app 并把 ticket staple 到 bundle，再 notarize DMG** | `build-release.sh:338-354`、`:375-389` |
+| **zip 打包** | **已存在（`ditto -c -k --keepParent`），但产物在 `$temp_root` 用完即弃** | `build-release.sh:344-345` |
 | 版本一致性 | `CFBundleShortVersionString` 与 `Cargo.toml` workspace version 强制相等 | `build-release.sh:130` |
 | **构建号** | **`CFBundleVersion` 写死 `1`，从未递增** | `apps/AfterRay/Resources/Info.plist` |
 | 沙盒 | 否 | `build-release.sh:302-314` |
@@ -139,11 +159,23 @@ codesign -f -s "$id" -o runtime Sparkle.framework
 
 ### 1.4 产物与 appcast
 
-- 更新包用 zip（`ditto -c -k --keepParent`），比 DMG 快且可靠；DMG 保留给首次下载。
+**这一节大部分已经做完了。** 脚本为 notarization 本来就要打 zip
+（`build-release.sh:344-345`），而且已经把 ticket **staple 到 app bundle 本身**而不只是
+DMG（`:352`）。后者恰好是 Sparkle 的关键前提：Sparkle 下载 zip、解压、替换 app，若
+ticket 只在 DMG 上，更新出来的 app 不带 ticket，离线首次启动会被 Gatekeeper 拦。
+`docs/releasing.md:62-64` 已记录这个顺序及其理由。
+
+剩下要做的：
+
+- **不能直接复用第 345 行那个 zip 当更新包** —— 它打在 staple 之前，里面的 app 没有
+  ticket。必须在 `stapler staple`（`:352`）之后重新 `ditto -c -k --keepParent` 一份输出到
+  `dist/`。这是个容易因为"反正已经有 zip 了"而想当然跳过的坑，且症状只在离线首次启动
+  时出现，很难在开发机上复现。
 - `sign_update` 生成 edSignature。
-- appcast item 从现有 `dist/*.json` manifest 扩展：`sparkle:version`（= CFBundleVersion）、
-  `sparkle:shortVersionString`、`sparkle:minimumSystemVersion`、`enclosure` 带
-  `sparkle:edSignature` 与 `length`。
+- appcast item 从现有 manifest（`build-release.sh:395-409`）扩展：`sparkle:version`
+  （= CFBundleVersion）、`sparkle:shortVersionString`、`sparkle:minimumSystemVersion`、
+  `enclosure` 带 `sparkle:edSignature` 与 `length`。
+- DMG 保留给首次下载，不变。
 - 托管位置见"待决策"。
 
 ---
@@ -189,10 +221,59 @@ codesign -f -s "$id" -o runtime Sparkle.framework
 | 构建号未递增 | 发布了但无人收到，无报错 | 阶段 0.1 的硬校验 |
 | 旧 daemon 残留被复用 | 新 UI 跑旧逻辑，静默写库 | 阶段 0.2 版本握手 |
 
-## 待决策
+## 待决策（已定）
 
-1. **appcast 托管**：GitHub Releases，还是 `site/public/`（现成的 vite 静态站）？后者
-   更可控，且以后能按版本或百分比做灰度。
-2. **本轮是否建 CI**：不建也能发，但阶段 0.1 的风险靠人守。
-3. **更新时机默认值**：确认"后台下载 + 退出时安装"是否符合预期，还是要更保守
-   （仅手动检查）。
+1. **appcast 托管**：Cloudflare R2 + Pages Function，域名 `afterray.com`。
+2. **本轮是否建 CI**：未做，仍是本机 `make release` → `make publish`。
+3. **更新时机默认值**：后台下载 + 退出时安装，用户可在设置里关掉自动检查。
+
+---
+
+## 实施记录
+
+### 与计划不同的三处
+
+**1. 握手比对的是 `CFBundleVersion`，不是 marketing version。**
+计划设想比对 `DaemonStatus.daemonVersion`，但那个值来自 Cargo workspace version，
+同一个 marketing version 的两次构建它完全相同 —— 而"只改了 daemon 的 patch 更新"
+恰好就是这种情况，握手会失效。改为：app 启动 daemon 时把自己的 `CFBundleVersion`
+写进 `AFTERRAY_HOST_BUILD`，daemon 在 `status` 里回显 `host_build`（新增可选字段，
+`#[serde(default)]`，不需要升 protocol_version），app 比对该值。旧 daemon 没有这个
+字段，解码为 nil，同样触发重启 —— 这正是需要的行为。
+
+**2. appcast 是动态生成的，不是静态文件。**
+`site/functions/appcast.xml.ts` 从 R2 里的 `releases.json` 渲染 XML，
+`site/functions/download/[[path]].ts` 从同一 bucket 提供二进制。发布因此是一次上传
+而不是一次站点部署：发版不会波及营销页，营销页重新部署也不会动到已发布的版本。
+
+**3. Sparkle 的 XPCServices 被删掉了。**
+它们只为沙盒宿主存在。保留意味着签名并 notarize 一批永不执行的代码，
+`build-release.sh` 会连带审计它们。`Headers`/`PrivateHeaders`/`Modules` 同理删除。
+
+### 新发现的坑（计划里没有的）
+
+- **`swift build` 产出裸可执行文件**，bundle 由 shell 组装，所以 `Sparkle.framework`
+  的嵌入和 `@executable_path/../Frameworks` 这条 rpath 都得手工加
+  （`Package.swift` 的 `linkerSettings` + `build-release.sh` 的 ditto）。
+- **两个菜单都在 `AfterRayUpdater.start()` 之前构建**，updater 未启动时它们拿不到
+  菜单项。启动顺序因此前移到 `installAppMenu()` 之前。
+- **`AfterRayCliInstall` 没有 `import AfterRayRecall`**，加日志时才暴露。
+
+### 验证
+
+- `swift build` / `cargo check --workspace` 通过
+- `swift test` 全绿（含两个新增的 `host_build` 解码用例）
+- `cargo test --workspace`：仅 `live_ollama_streams_tokens_when_running` 失败，
+  该用例在未改动的 `main` 上同样失败（本机跑着 Ollama 但缺 `qwen3.6:latest`），
+  与本次改动无关
+- `npx tsc -b`（site，含新增的 `tsconfig.functions.json`）通过
+- `make release-local` 完整跑通打包链路
+
+### 尚未做
+
+- **阶段 3 的 CI**：仍是本机发布。
+- **首次下载链接**：站点的下载按钮还是 `href="#download"` 占位。发布之后
+  `/download/AfterRay-<version>-arm64.dmg` 即可用，接上即可。
+- **R2 bucket 与 Pages 绑定尚未创建**：需要跑一次
+  `npx wrangler r2 bucket create afterray-releases`。
+- **私钥尚未备份**：见 `docs/releasing.md` 的 "The signing key"。

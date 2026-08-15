@@ -2,5 +2,14 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "afterray",
   "pages_build_output_dir": "./dist",
-  "compatibility_date": "2026-08-15"
+  "compatibility_date": "2026-08-15",
+  // Release artifacts and the index /appcast.xml is generated from. Publishing
+  // writes here (scripts/publish-release.sh) so shipping a build never means
+  // redeploying the site.
+  "r2_buckets": [
+    {
+      "binding": "RELEASES",
+      "bucket_name": "afterray-releases"
+    }
+  ]
 }

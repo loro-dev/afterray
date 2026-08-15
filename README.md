@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  English · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="https://afterray.com">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#using-afterray">Using AfterRay</a> ·
@@ -106,9 +110,10 @@ individually; the UI never opens the database or holds the key. The vault has a
 100 GB budget — adjust it in **Settings → General → Storage**, where you can
 also delete the last hour, today, or everything.
 
-**The assistant** is chosen in **Settings → AI Models**: a built-in local
-Qwen3.6-27B Q4 (~17 GB), your local Ollama, or any OpenAI-compatible `/v1`
-endpoint. Capture, OCR, and search work fine with no assistant configured.
+**The assistant** is chosen in **Settings → AI Models**: a local Qwen3.5 MLX
+pack that runs inside AfterRay (the recommended 4B, or the higher-quality 9B),
+your local Ollama, or any OpenAI-compatible `/v1` endpoint. Capture, OCR, and
+search work fine with no assistant configured.
 
 ## Using it from your agent
 
@@ -133,12 +138,12 @@ two choices extend that boundary, and both are explicit:
 
 | Path | Where data can go |
 | --- | --- |
-| Built-in model | Prompts and retrieved evidence stay on the Mac |
+| Local MLX model | Prompts and retrieved evidence stay on the Mac |
 | Local Ollama | The Ollama endpoint you configured — normally a local process |
 | OpenAI-compatible URL | The provider you chose; their storage, logging, and training policies apply |
 | External agent through the CLI | The agent's process and any model provider it uses |
 
-The built-in assistant is deliberately not a general-purpose computer agent. It
+The assistant is deliberately not a general-purpose computer agent. It
 can search and read moments, activity, memories, OCR, and Accessibility
 evidence, and has no tool for running shell commands, editing files, changing
 settings, controlling capture, deleting history, or writing to the vault.

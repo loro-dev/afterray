@@ -252,10 +252,6 @@ default_embedding_model="$repo_root/.afterray/models/nomic-embed-text-v1.5.Q4_K_
 if [[ -z "${AFTERRAY_EMBEDDING_MODEL:-}" && -f "$default_embedding_model" ]]; then
   export AFTERRAY_EMBEDDING_MODEL="$default_embedding_model"
 fi
-default_llm_model="$repo_root/.afterray/models/Qwen3.6-27B-Q4_K_M.gguf"
-if [[ -z "${AFTERRAY_LLM_MODEL:-}" && -f "$default_llm_model" ]]; then
-  export AFTERRAY_LLM_MODEL="$default_llm_model"
-fi
 daemon_log="$run_dir/afterrayd.log"
 app_log="$run_dir/afterray-app.log"
 
@@ -290,7 +286,6 @@ if [[ "$mode" == 'app' ]]; then
     AFTERRAY_MODEL_WORKER
     AFTERRAY_ASR_MODEL
     AFTERRAY_EMBEDDING_MODEL
-    AFTERRAY_LLM_MODEL
     AFTERRAY_GOP_ARCHIVE
     AFTERRAY_GOP_KEYINT
     AFTERRAY_GOP_REQUIRE_AC

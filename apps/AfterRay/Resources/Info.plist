@@ -32,5 +32,13 @@
     <string>AfterRay transcribes your voice locally while recording your computer activity.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 AfterRay.</string>
+    <key>SUFeedURL</key>
+    <string>https://afterray.com/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>tX0RoGjVlFDmuqL8XckI0M5BF6IoZx4ywGMaNx+MzfU=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
 </dict>
 </plist>

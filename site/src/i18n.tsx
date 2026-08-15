@@ -255,7 +255,7 @@ const en = {
       },
       {
         title: 'Modeled locally',
-        body: 'Summaries and answers come from a model running on your machine — a built-in GGUF, an MLX pack, or your own Ollama.',
+        body: 'Summaries and answers come from a model running on your machine — a bundled MLX pack or your own Ollama.',
       },
       {
         title: 'Encrypted at rest',
@@ -521,7 +521,7 @@ const zh: Copy = {
       },
       {
         title: '模型在本地',
-        body: '总结与问答来自本机运行的模型——内置 GGUF、MLX 包，或你自己的 Ollama。',
+        body: '总结与问答来自本机运行的模型——内置 MLX 包，或你自己的 Ollama。',
       },
       {
         title: '静态加密',

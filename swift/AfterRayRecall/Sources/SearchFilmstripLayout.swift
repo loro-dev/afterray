@@ -23,9 +23,33 @@ public struct SearchFilmstripLayout: Equatable, Sendable {
 
     public static var stride: CGFloat { cellWidth + cellGap }
 
+    /// Where cell `index` sits when read left to right.
+    ///
+    /// Results are ranked newest first, but the strip draws time the way the
+    /// app timeline does — older to the left, newer to the right — so the
+    /// ranking is laid out from the right-hand end. The newest match is
+    /// therefore the last cell, which is where a fresh search opens.
+    public func slot(forIndex index: Int) -> Int {
+        max(count - 1, 0) - index
+    }
+
     /// Centre of cell `index` along the strip.
     public func centerX(index: Int) -> CGFloat {
-        CGFloat(index) * Self.stride + Self.cellWidth / 2
+        CGFloat(slot(forIndex: index)) * Self.stride + Self.cellWidth / 2
+    }
+
+    /// The results whose cells can reach the viewport with `selected` centred,
+    /// plus a cell of slack on each side so nothing pops in at the edge.
+    ///
+    /// Sixty cells, each with a decoded thumbnail, were being built and laid
+    /// out on every scroll tick only to be clipped away — the same waste
+    /// `AppUsageTimeline` windows out of the timeline track.
+    public func visibleIndices(around selected: Int) -> Range<Int> {
+        guard count > 0 else { return 0..<0 }
+        let reach = Int((viewportWidth / 2 / Self.stride).rounded(.up)) + 1
+        let low = min(max(selected - reach, 0), count - 1)
+        let high = min(max(selected + reach, 0), count - 1)
+        return low..<(high + 1)
     }
 
     public var contentWidth: CGFloat {
@@ -44,14 +68,14 @@ public struct SearchFilmstripLayout: Equatable, Sendable {
     public func index(atX x: CGFloat) -> Int {
         guard count > 0 else { return 0 }
         let raw = Int(((x + Self.cellGap / 2) / Self.stride).rounded(.down))
-        return min(max(raw, 0), count - 1)
+        return count - 1 - min(max(raw, 0), count - 1)
     }
 
-    /// Whole-cell step for a drag of `deltaX` points. Dragging left (negative)
-    /// moves the strip left, bringing later — that is, older — cells under the
-    /// playhead, matching how the main timeline travels backwards in time.
+    /// Whole-cell step for a drag of `deltaX` points. Dragging right pulls the
+    /// strip right, bringing the cells left of the playhead — the older ones —
+    /// under it, which is the direction the main timeline travels too.
     public func steps(forDragTranslation deltaX: CGFloat) -> Int {
-        Int((-deltaX / Self.stride).rounded())
+        Int((deltaX / Self.stride).rounded())
     }
 }
 

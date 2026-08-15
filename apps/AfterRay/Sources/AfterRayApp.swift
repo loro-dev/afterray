@@ -47,10 +47,18 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         // watchdog samples the stall for the log, then kills the process so
         // the user gets their machine back.
         HangWatchdog.shared.start(logDirectory: AfterRayLog.directory)
+        // Before the daemon, the menu bar, or any window: an app running from
+        // the disk image cannot install its own updates, and moving it means
+        // relaunching from the new location.
+        if AfterRayInstallLocation.relocateIfNeeded() { return }
+        // Ahead of both menus: they ask the updater for their item while being
+        // built, and a disabled updater contributes none.
+        AfterRayUpdater.shared.start()
         installAppMenu()
         AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()
         RecallOverlayController.shared.start()
+        AfterRayCliInstall.refreshIfStale()
         OnboardingController.shared.showIfNeeded()
     }
 
@@ -87,6 +95,9 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         )
         settingsItem.target = self
         appMenu.addItem(settingsItem)
+        if let updateItem = makeUpdateMenuItem() {
+            appMenu.addItem(updateItem)
+        }
         appMenu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit AfterRay",
@@ -98,6 +109,10 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
         NSApp.mainMenu = mainMenu
+    }
+
+    private func makeUpdateMenuItem() -> NSMenuItem? {
+        AfterRayUpdater.shared.makeMenuItem()
     }
 
     @objc private func openSettings() {
@@ -233,6 +248,9 @@ private final class AfterRayMenuBar: NSObject {
         clearHour.target = self
         menu.addItem(clearHour)
         menu.addItem(.separator())
+        if let updateItem = AfterRayUpdater.shared.makeMenuItem() {
+            menu.addItem(updateItem)
+        }
         let quitItem = NSMenuItem(
             title: "Quit AfterRay",
             action: #selector(quitAfterRay),
@@ -1035,6 +1053,14 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
             audioPlayer.stop()
+            // A search outlives the overlay being dismissed, and its filmstrip
+            // comes back parked on the frame it was left on. Going live anyway
+            // put "NOW" on the clock above a still from hours ago, so reopening
+            // into a live search lands back on the selected result instead.
+            if let session = control.searchSession, session.selectedFrame != nil {
+                selectSearchFrame(session.selectedIndex)
+                return
+            }
             isLive = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
@@ -1463,11 +1489,13 @@ private struct ImmersiveQueryBar: View {
             }
             .fixedSize()
 
+            // Pointing the way the strip runs: older matches lie to its left,
+            // newer to its right, as on the timeline.
             HStack(spacing: 2) {
-                stepButton(symbol: "chevron.left", help: "Newer match", delta: -1)
-                    .disabled(session.selectedIndex == 0)
-                stepButton(symbol: "chevron.right", help: "Older match", delta: 1)
+                stepButton(symbol: "chevron.left", help: "Older match", delta: 1)
                     .disabled(session.selectedIndex >= session.frames.count - 1)
+                stepButton(symbol: "chevron.right", help: "Newer match", delta: -1)
+                    .disabled(session.selectedIndex == 0)
             }
         }
     }

@@ -14,6 +14,8 @@ public final class RecallStore: ObservableObject {
 
     private let daemon: any RecallDaemonServing
     private var sensitiveGeneration: UInt64 = 0
+    /// Rebuilt with `moments`; see `selectLoaded`.
+    private var capturedAtMsByMomentID: [String: Int64] = [:]
     private var loadedDayKey: String?
     private var summaryHistoryCursorMs: Int64?
     private var summaryHistoryGeneration: UInt64 = 0
@@ -41,6 +43,7 @@ public final class RecallStore: ObservableObject {
                 return
             }
             moments = []
+            capturedAtMsByMomentID = [:]
             applyPlayhead(0)
             daySummary = .empty
             loadedDayKey = nil
@@ -105,6 +108,14 @@ public final class RecallStore: ObservableObject {
         let preservedMomentID = preservingSelection ? selectedMoment?.id : nil
         let preservedPlayheadMs = playheadMs
         moments = loaded
+        // Walking search results asks "where is this id?" on every scroll tick,
+        // and the timeline is the whole archive — scanning it per tick is the
+        // one part of stepping that grew with how long AfterRay had been
+        // recording.
+        capturedAtMsByMomentID = Dictionary(
+            loaded.map { ($0.id, $0.capturedAtMs) },
+            uniquingKeysWith: { first, _ in first }
+        )
         if let targetID = momentID, let moment = loaded.first(where: { $0.id == targetID }) {
             applyPlayhead(moment.capturedAtMs)
         } else if preservingSelection {
@@ -151,8 +162,8 @@ public final class RecallStore: ObservableObject {
     /// full timeline reload on every step.
     @discardableResult
     public func selectLoaded(momentID: String) -> Bool {
-        guard let moment = moments.first(where: { $0.id == momentID }) else { return false }
-        applyPlayhead(moment.capturedAtMs)
+        guard let capturedAtMs = capturedAtMsByMomentID[momentID] else { return false }
+        applyPlayhead(capturedAtMs)
         return true
     }
 
@@ -245,6 +256,7 @@ public final class RecallStore: ObservableObject {
         sensitiveGeneration &+= 1
         sessions = []
         moments = []
+        capturedAtMsByMomentID = [:]
         applyPlayhead(0)
         daySummary = .empty
         summaryHistory = []
