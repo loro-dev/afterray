@@ -75,7 +75,7 @@ function AppWindow({ rec }: { rec: Rec }) {
           <>
             <div className="aw-pr">
               <span className="aw-pr-title">{rec.title}</span>
-              <span className="aw-pr-chip mono">Open</span>
+              <span className="aw-pr-chip mono">{useCopy().recall.mock.openLabel}</span>
             </div>
             <div className="aw-lines">
               {[90, 68, 76, 83, 61, 79, 72].map((w, i) => (

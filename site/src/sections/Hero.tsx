@@ -1,15 +1,16 @@
 import RecallStage from '../components/RecallStage'
-import { Rich, useCopy } from '../i18n'
+import { Rich, useCopy, useLang } from '../i18n'
 
 export default function Hero() {
   const t = useCopy().hero
   const recall = useCopy().recall
+  const { lang } = useLang()
   return (
     <header className="hero">
       <div className="hero-ray" aria-hidden="true" />
       <div className="hero-content">
         <p className="hero-eyebrow anim-in">{t.eyebrow}</p>
-        <h1 className="hero-title">
+        <h1 className={`hero-title${lang === 'zh' ? ' hero-title-oneline' : ''}`}>
           <span className="anim-in" style={{ animationDelay: '0.1s' }}>
             <Rich parts={t.titleA} />
           </span>

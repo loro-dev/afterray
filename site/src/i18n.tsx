@@ -57,6 +57,7 @@ const en = {
       date: 'Friday, Aug 14',
       hint: 'Drag to zoom · Swipe to travel · Esc to close',
       heardLabel: 'Heard',
+      openLabel: 'Open',
       // speech only exists where there was a call, so every line sits inside
       // one of the Zoom spans above — the panel appears and vanishes with them
       transcript: [
@@ -289,7 +290,7 @@ export type Copy = typeof en
 
 const zh: Copy = {
   meta: {
-    title: 'AfterRay — 记住一切，你在 Mac 上看到和听到的',
+    title: 'AfterRay — 记住你在 Mac 上看见、听见的一切。',
     htmlLang: 'zh-CN',
   },
   nav: {
@@ -297,26 +298,26 @@ const zh: Copy = {
     skip: '跳到正文',
   },
   hero: {
-    eyebrow: '纯本地的 computer history',
+    eyebrow: '本地优先的电脑历史',
     titleA: ['记住'],
     titleB: [{ em: '一切。' }],
-    sub: 'AfterRay 整天记录你的屏幕和声音——你看到、听到的一切，你和你的 agent 都能再找到。',
+    sub: 'AfterRay 全天记录你的屏幕和声音——你和你的 agent 都能找回所见所闻。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
-    facts: ['macOS 15+', '可排除 App 和网站', '随时暂停或删除', '数据不出这台 Mac'],
+    facts: ['macOS 15+', '可排除 App 和网站', '随时暂停或删除', '不出这台 Mac'],
   },
   jtbd: [
     {
-      title: '接着上次的活干',
-      body: '让它继续周二没做完的那次迁移。你动过哪些文件、什么时候动的，它都看得到。',
+      title: '从放下处接着做',
+      body: '让它接着做周二没做完的迁移。你动过哪些文件、何时动的，它都看得见。',
     },
     {
-      title: '答案来自真实发生过的事',
-      body: '「retention 最后怎么定的？」回来的是出处，不是猜测。',
+      title: '按已发生的事作答',
+      body: '「保留怎么定的？」回来的是出处，不是猜测。',
     },
     {
-      title: '替你起草',
-      body: '站会记录、PR 描述、交接文档——依据这一周真实发生的事，而不是你的记忆。',
+      title: '按你做过的事起草',
+      body: '站会记录、PR 描述、交接——按这一周写，不靠回忆。',
     },
   ],
   recall: {
@@ -326,15 +327,16 @@ const zh: Copy = {
       searchHint: '搜索你的一天 — Tab 打开 AI 对话',
       date: '8 月 14 日 周五',
       hint: '拖动缩放 · 滑动穿梭 · Esc 关闭',
-      heardLabel: '听到的',
+      heardLabel: '听到',
+      openLabel: '打开',
       transcript: [
-        { pos: 0.35, time: '12:09', who: 'Alex', text: '时间线缩放要做得像相机运镜，而不是滚动条。' },
+        { pos: 0.35, time: '12:09', who: 'Alex', text: '时间线缩放要像相机，不像滚动条。' },
         { pos: 0.39, time: '12:30', who: 'Jo', text: '能不能把播放头固定住，让轨道在下面滑？' },
-        { pos: 0.42, time: '12:46', who: '你', text: '对，就是这一点让它像运镜。' },
-        { pos: 0.46, time: '13:08', who: 'Alex', text: '那拖动时只要出关键帧就行，落点之后再补。' },
+        { pos: 0.42, time: '12:46', who: '你', text: '对——就是这一点让它像相机。' },
+        { pos: 0.46, time: '13:08', who: 'Alex', text: '那拖动时只要海报帧。落点可以后补。' },
         { pos: 0.755, time: '15:47', who: 'Chen', text: '峰值是 cold-still 打包里的重复拷贝。' },
-        { pos: 0.775, time: '15:58', who: 'Alex', text: '收藏的永不过期，其余的自动限额。' },
-        { pos: 0.79, time: '16:06', who: '你', text: 'bench 结果是 HEIF 41 毫秒，JPEG 63 毫秒。' },
+        { pos: 0.775, time: '15:58', who: 'Alex', text: '收藏永不过期。其余的保持限额。' },
+        { pos: 0.79, time: '16:06', who: '你', text: 'bench 说 HEIF 41 毫秒，JPEG 63 毫秒。' },
       ],
       segments: [
         { app: 'Xcode', from: 0, to: 0.08, dur: '43m', c: '#ff5f4a' },
@@ -353,21 +355,21 @@ const zh: Copy = {
       records: [
         { pos: 0.04, time: '9:24', app: 'Xcode', title: 'afterrayd — agent.rs', c: '#ff5f4a' },
         { pos: 0.15, time: '10:21', app: 'Safari', title: 'hot-stills-cold-gop.md', c: '#e58a4d', url: 'docs.afterray.dev/hot-stills-cold-gop' },
-        { pos: 0.29, time: '11:37', app: 'Notes', title: 'retention 点子', c: '#c9a05a' },
+        { pos: 0.29, time: '11:37', app: 'Notes', title: '保留点子', c: '#c9a05a' },
         { pos: 0.4, time: '12:36', app: 'Zoom', title: '设计评审 — 录音', c: '#a96b60' },
         { pos: 0.77, time: '15:56', app: 'Zoom', title: '设计评审 — 录音', c: '#a96b60' },
-        { pos: 0.68, time: '15:07', app: 'GitHub', title: 'PR #128 — retention 讨论', c: '#8a7a70' },
+        { pos: 0.68, time: '15:07', app: 'GitHub', title: 'PR #128 — 保留讨论', c: '#8a7a70' },
         { pos: 0.92, time: '17:58', app: 'Xcode', title: 'bench-codec — HEIF vs JPEG', c: '#ff5f4a' },
       ],
     },
   },
   memories: {
-    titleA: ['今天你做了很多，'],
-    titleB: ['它都替你', { em: '记下来了。' }],
-    body: 'AfterRay 按半小时把这一天写回给你。模型跑在本机，并且被明确要求：没看见的文件、链接、任务，一个字都不能编。',
+    titleA: ['今天你做了很多。'],
+    titleB: ['这就是', { em: '这一天。' }],
+    body: 'AfterRay 按半小时把这一天写回给你。模型跑在本机，没见过的文件、链接、任务一律不编。',
     points: [
-      '自动写好，不用你开口',
-      '每一行都能翻回背后那一刻',
+      '边走边写，不用你开口',
+      '每一行都能打开背后那一刻',
     ],
     mock: {
       head: '8 月 14 日 周五',
@@ -375,7 +377,7 @@ const zh: Copy = {
       rows: [
         {
           span: '9:00–9:30',
-          summary: '通读 afterrayd 的 agent 循环，随后开了一篇 retention 的笔记。',
+          summary: '顺着 afterrayd 的 agent 循环排查，随后开了篇保留笔记。',
           apps: 'Xcode · Notes',
         },
         {
@@ -390,42 +392,42 @@ const zh: Copy = {
         },
         {
           span: '15:30–16:00',
-          summary: '在会上调试 GOP 编码的内存峰值，之后提了 PR #128。',
+          summary: '通话中调试 GOP 编码器的内存峰值，随后提了 PR #128。',
           apps: 'Zoom · GitHub',
         },
       ],
     },
   },
   searchAsk: {
-    titleA: ['只记得大概，'],
-    titleB: ['也能找回', { em: '确切。' }],
-    body: '不记得文件名，不记得在哪个 App，只记得只言片语——够了。或者干脆问一句。',
+    titleA: ['记得个大概。'],
+    titleB: ['把它找', { em: '准。' }],
+    body: '忘掉文件名和 App。记得只言片语就够——或者直接问。',
     points: [
-      'OCR 全文 + 语音转写联合检索',
-      '语义搜索：按「意思」而不只是关键字',
-      '问答的每条结论都附可回放的引用',
+      '跨 OCR 文本和转写联合检索',
+      '语义搜索：按意思，不只按关键字',
+      '问答附带来源时刻的引用',
     ],
     mock: {
       tryLabel: '试一个',
-      searchHead: '你只记得个大概',
+      searchHead: '你记得个大概',
       foundHead: '它找到了',
-      askHead: '或者干脆问一句',
+      askHead: '或者直接问',
       screenLabel: '屏幕上',
-      heardLabel: '听到的',
+      heardLabel: '听到',
       replay: '回放',
       scenarios: [
         {
-          chip: '收藏会不会被清掉',
-          keys: ['收藏', '清', '保留', 'star'],
-          query: '收藏的东西会不会被清掉来着',
+          chip: '保留收藏',
+          keys: ['收藏', '保留', 'star'],
+          query: '保留收藏那件事',
           results: [
             {
               src: 'heard',
               app: 'Zoom',
               time: '周三 11:02',
               c: '#a96b60',
-              text: '收藏的永不过期，其余的自动限额',
-              match: '收藏的永不过期',
+              text: '收藏永不过期——其余的保持限额',
+              match: '收藏永不过期',
             },
             {
               src: 'screen',
@@ -436,7 +438,7 @@ const zh: Copy = {
               match: '存储预算',
             },
           ],
-          answer: '标了收藏的永远豁免，不会过期；其余的都在你设的存储预算之内。',
+          answer: '标了星的一律豁免、永不过期。其余的都在你设的存储预算里。',
         },
         {
           chip: '那个内存峰值',
@@ -460,7 +462,7 @@ const zh: Copy = {
               match: 'bench-codec',
             },
           ],
-          answer: 'cold-still 打包里的一次重复拷贝。周四下午发现，当晚就去掉了。',
+          answer: 'cold-still 打包里的一次重复拷贝。周四下午发现，当晚去掉。',
         },
         {
           chip: 'vault 密钥那条笔记',
@@ -484,24 +486,24 @@ const zh: Copy = {
               match: 'key hierarchy',
             },
           ],
-          answer: '在周二傍晚的 Notes 里，当时 Safari 开着 vault 加密的设计文档。',
+          answer: '周二傍晚写在 Notes 里，当时 Safari 开着 vault 加密设计文档。',
         },
       ],
     },
   },
   agents: {
     titleA: ['一条命令，'],
-    titleB: ['任意 ', { em: 'Agent。' }],
-    body: '装一次 skill。Claude Code、Codex，以及任何能读 Agent Skills 的工具，就能查你本机的历史——不用配 MCP，也不用交凭据。',
-    toolsLabel: '装进你已经在用的 Agent',
+    titleB: ['任意 ', { em: 'agent。' }],
+    body: '装一次 skill。Claude Code、Codex 和任何能读 Agent Skills 的工具，都能查你的历史——不用 MCP，不用凭据。',
+    toolsLabel: '接入你已经在用的 Agent',
     tools: ['Claude Code', 'Codex', 'Hermes', 'Cursor'],
     install: 'npx skills add loro-dev/afterray -g',
     installOut: 'installed afterray → Claude Code, Codex, Hermes',
     note: '只读。Vault 密钥永不离开守护进程。',
     mock: [
-      { cmd: 'afterray search "收藏会不会被清掉" --limit 1', out: '[ { "source": "transcript", "time": "周三 11:02",\n    "text": "收藏的永不过期…" } ]' },
-      { cmd: 'afterray ask "retention 最后怎么定的？"', out: '{ "answer": "收藏豁免，其余的在存储预算内。",\n  "citations": [ "周三 15:15 · GitHub" ] }' },
-      { cmd: 'afterray memories --from-ms … --to-ms …', out: '[ { "span": "15:00–16:00",\n    "summary": "调试 GOP 编码的内存峰值" } ]' },
+      { cmd: 'afterray search "保留收藏" --limit 1', out: '[ { "source": "transcript", "time": "周三 11:02",\n    "text": "收藏永不过期…" } ]' },
+      { cmd: 'afterray ask "保留怎么定的？"', out: '{ "answer": "标星豁免；其余的在存储预算内。",\n  "citations": [ "周三 15:15 · GitHub" ] }' },
+      { cmd: 'afterray memories --from-ms … --to-ms …', out: '[ { "span": "15:00–16:00",\n    "summary": "调试 GOP 编码器的内存峰值" } ]' },
       { cmd: 'afterray activity --from-ms … --to-ms …', out: '[ { "app": "Xcode", "duration": "2h 14m" },\n  { "app": "Zoom", "duration": "24m" } ]' },
     ],
   },
@@ -515,15 +517,15 @@ const zh: Copy = {
       },
       {
         title: '索引在本地',
-        body: 'OCR、语音识别与语义 embedding 都在本机完成，原文与向量不出设备。',
+        body: 'OCR、语音识别与语义 embedding 在本机运行。原文与向量不出设备。',
       },
       {
         title: '模型在本地',
-        body: '总结与问答由本机运行的大模型完成——内置 GGUF、MLX 包，或你自己的 Ollama。',
+        body: '总结与问答来自本机运行的模型——内置 GGUF、MLX 包，或你自己的 Ollama。',
       },
       {
-        title: '存储已加密',
-        body: 'SQLCipher + XChaCha20-Poly1305 逐条加密，密钥存于 macOS Keychain。',
+        title: '静态加密',
+        body: 'SQLCipher + XChaCha20-Poly1305 逐条加密。密钥存于 macOS Keychain。',
       },
     ],
   },
@@ -532,20 +534,20 @@ const zh: Copy = {
     rows: [
       ['平台', 'macOS 15+ · Apple Silicon（推荐 M3）'],
       ['存储', 'SQLCipher + XChaCha20-Poly1305，密钥存于 Keychain'],
-      ['磁盘', '较早的画面后台重打包成 closed-GOP AV1——原 JPEG 的 7–10%'],
+      ['磁盘', '较早的捕获会重打包成 closed-GOP AV1——原 JPEG 的 7–10%'],
       ['保留', '你自己设的存储预算，默认 100 GB——先清最早的非收藏，收藏永不过期'],
       ['模型', '本机 ASR / Embedding / LLM，或你自己的 Ollama、OpenAI 兼容接口'],
-      ['上传', '没有账号，没有遥测，没有云端同步——除非你自己接了远程模型'],
+      ['上传', '没有账号，没有遥测，没有云同步——除非你指向远程模型，否则什么都不出去'],
     ],
   },
   final: {
-    titleA: ['让你的 Mac'],
-    titleB: ['拥有', { em: '不会遗忘' }, '的记忆。'],
+    titleA: ['给你的 Mac'],
+    titleB: ['一份', { em: '不会遗忘' }, '的记忆。'],
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: 'GitHub',
   },
   footer: {
-    tagline: 'A ray that persists after the day is gone.',
+    tagline: '日子走后仍在的那道光。',
     rights: '© 2026',
   },
 }

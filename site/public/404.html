@@ -73,9 +73,24 @@
         <img src="/logo.png" alt="" width="22" height="22" />
         <span>AfterRay</span>
       </a>
-      <h1>This one it <em>doesn't</em> remember.</h1>
-      <p>That page isn't here.</p>
-      <a class="back" href="/">Back to AfterRay</a>
+      <h1 data-en="This one it <em>doesn't</em> remember." data-zh="这一页它<em>不记得</em>。">This one it <em>doesn't</em> remember.</h1>
+      <p data-en="That page isn't here." data-zh="那一页不在这儿。">That page isn't here.</p>
+      <a class="back" href="/" data-en="Back to AfterRay" data-zh="回 AfterRay">Back to AfterRay</a>
+      <script>
+        (function () {
+          var lang = 'en'
+          try {
+            var q = new URLSearchParams(location.search).get('lang')
+            var saved = localStorage.getItem('afterray-lang')
+            lang = q === 'zh' || q === 'en' ? q : saved === 'zh' || saved === 'en' ? saved : (navigator.language || '').toLowerCase().indexOf('zh') === 0 ? 'zh' : 'en'
+          } catch (e) {}
+          document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en'
+          document.title = lang === 'zh' ? '未找到 — AfterRay' : 'Not found — AfterRay'
+          document.querySelectorAll('[data-zh]').forEach(function (el) {
+            el.innerHTML = el.getAttribute(lang === 'zh' ? 'data-zh' : 'data-en')
+          })
+        })()
+      </script>
     </div>
   </body>
 </html>
