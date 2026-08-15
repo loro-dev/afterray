@@ -226,12 +226,10 @@ button:focus-visible {
 /* ---------------- hero ---------------- */
 .hero {
   position: relative;
-  min-height: 72svh;
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
   overflow: hidden;
-  padding: 8.5rem 0 3.25rem;
+  padding: 7.5rem 0 4rem;
 }
 .hero-ray {
   position: absolute;
@@ -288,6 +286,25 @@ button:focus-visible {
   position: absolute;
   inset-inline-start: -0.9rem;
   color: var(--ink-faint);
+}
+/* the recall demo rides in the hero, so the first screen has something to
+   look at and something to drag */
+.hero-stage {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  max-width: 940px;
+  margin: 3.5rem auto 0;
+  padding: 0 2rem;
+}
+.hero-stage .rc-stage {
+  min-height: 480px;
+}
+.hero-caption {
+  margin-top: 1.1rem;
+  max-width: 44rem;
+  color: var(--ink-dim);
+  font-size: 0.9rem;
 }
 .hero-eyebrow {
   font-size: 0.82rem;
@@ -460,37 +477,6 @@ button:focus-visible {
   box-shadow: 0 0 0 1px oklch(1 0 0 / 0.08);
   font-size: 0.86rem;
 }
-.recall-section {
-  padding-top: 0;
-}
-/* the headline sits above the stage, so the reader knows what they are
-   about to drag before they touch it */
-.recall-section .rail-head {
-  padding-top: 0;
-  padding-bottom: 3rem;
-  margin-bottom: 0;
-}
-.recall-bleed {
-  width: 100%;
-  max-width: 800px;
-  margin: 0 auto;
-  padding: 0 2rem;
-}
-.recall-bleed .rc-stage {
-  min-height: 540px;
-}
-.rail-head {
-  max-width: 46rem;
-  margin: 0 auto 3.5rem;
-  text-align: center;
-}
-.rail-head .feature-title {
-  font-size: clamp(2.2rem, 5vw, 3.8rem);
-}
-.rail-head .feature-body {
-  margin-inline: auto;
-}
-
 /* the recall stage — a faithful mock of the in-app overlay: dimmed
    captured screen, floating chrome, colored-bar timeline */
 .rc-stage {
@@ -1165,8 +1151,12 @@ button.sa-chip.sa-chip-active {
   .section {
     padding: 5rem 1.4rem;
   }
-  .recall-bleed .rc-stage {
-    min-height: 420px;
+  .hero-stage .rc-stage {
+    min-height: 400px;
+  }
+  .hero-stage {
+    padding-inline: 1.4rem;
+    margin-top: 2.5rem;
   }
   /* wrapped arrows dangle at line ends — nodes read fine as plain chips */
   .pipe-arrow {

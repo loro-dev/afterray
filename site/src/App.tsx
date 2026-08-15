@@ -2,7 +2,6 @@ import { LangProvider, useLang, useCopy } from './i18n'
 import Hero from './sections/Hero'
 import Agents from './sections/Agents'
 import Jtbd from './sections/Jtbd'
-import Recall from './sections/Recall'
 import Memories from './sections/Memories'
 import SearchAsk from './sections/SearchAsk'
 import Closer from './sections/Closer'
@@ -57,7 +56,6 @@ export default function App() {
           {/* the hero promises the agent already knows; cash that out first */}
           <Agents />
           <Jtbd />
-          <Recall />
           <Memories />
           <SearchAsk />
           <Closer />

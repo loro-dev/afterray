@@ -11,7 +11,7 @@ export type Part = string | { em: string }
 
 const en = {
   meta: {
-    title: 'AfterRay — Stop briefing your agent. It was there.',
+    title: 'AfterRay — Your Mac remembers everything, for you and for your agent.',
     htmlLang: 'en',
   },
   nav: {
@@ -23,9 +23,9 @@ const en = {
   },
   hero: {
     eyebrow: 'Local-first computer history',
-    titleA: ['Stop briefing your agent.'] as Part[],
-    titleB: ['It ', { em: 'was there.' }] as Part[],
-    sub: 'AfterRay records your screen and audio all day, so Claude Code and Codex can look up what you read, watched, and were told — instead of waiting for you to explain it. All on this Mac.',
+    titleA: ['Your Mac remembers everything,'] as Part[],
+    titleB: ['for you and for ', { em: 'your agent.' }] as Part[],
+    sub: 'AfterRay keeps what you saw and heard on this machine. Search it, replay it, or let Claude Code and Codex look it up for you. None of it leaves the Mac.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
     facts: ['macOS 15+ · Apple Silicon', 'No account, no telemetry', 'Nothing leaves this Mac'],
@@ -45,9 +45,7 @@ const en = {
     },
   ],
   recall: {
-    titleA: ['One hotkey,'] as Part[],
-    titleB: ['the day ', { em: 'comes back.' }] as Part[],
-    body: 'Press ⇧⌘Space in any app. The pixels as they were, the audio as it sounded, captions replaying in place. Zoom the timeline from one second out to a month and land on the exact moment.',
+    body: 'Press ⇧⌘Space in any app and the day comes back — the screen as it was, the audio as it sounded. Zoom the timeline from one second out to a month and land on the exact moment.',
     mock: {
       status: 'Recording',
       searchHint: 'Search your day — Tab for AI chat',
@@ -291,7 +289,7 @@ export type Copy = typeof en
 
 const zh: Copy = {
   meta: {
-    title: 'AfterRay — 别再交代背景了，你的 agent 当时就在',
+    title: 'AfterRay — 你的 Mac 记得一切，为你，也为你的 agent',
     htmlLang: 'zh-CN',
   },
   nav: {
@@ -303,9 +301,9 @@ const zh: Copy = {
   },
   hero: {
     eyebrow: '纯本地的 computer history',
-    titleA: ['别再交代背景了。'],
-    titleB: ['你的 agent ', { em: '当时就在。' }],
-    sub: 'AfterRay 整天记录你的屏幕和声音，Claude Code、Codex 可以直接查你读过什么、看过什么、别人跟你说过什么——不用你再解释一遍。全程在这台 Mac 上。',
+    titleA: ['你的 Mac 记得一切，'],
+    titleB: ['为你，也为', { em: '你的 agent。' }],
+    sub: 'AfterRay 把你看到的、听到的留在这台机器上。你可以搜、可以回放，也可以让 Claude Code、Codex 替你去查。这些东西不会离开本机。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
     facts: ['macOS 15+ · Apple Silicon', '无账号，无遥测', '数据不出这台 Mac'],
@@ -325,9 +323,7 @@ const zh: Copy = {
     },
   ],
   recall: {
-    titleA: ['按一下 ⇧⌘Space，'],
-    titleB: ['这一天就', { em: '回来了。' }],
-    body: '在任意 App 里按下 ⇧⌘Space。当时的画面、当时的声音，字幕原地回放。时间线从一秒连续缩放到一个月，落回确切的那一刻。',
+    body: '在任意 App 里按下 ⇧⌘Space，这一天就回来了——当时的画面，当时的声音。时间线从一秒连续缩放到一个月，落回确切的那一刻。',
     mock: {
       status: '录制中',
       searchHint: '搜索你的一天 — Tab 打开 AI 对话',

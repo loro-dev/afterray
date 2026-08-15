@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import Reveal from '../components/Reveal'
 import { ICONS } from '../appIcons'
-import { Rich, useCopy, useLang } from '../i18n'
+import { useCopy, useLang } from '../i18n'
 
 type Rec = ReturnType<typeof useCopy>['recall']['mock']['records'][number]
 
@@ -87,28 +86,7 @@ function AppWindow({ rec }: { rec: Rec }) {
 // the strip shows the day at ~3.2× its own width, like the in-app zoom
 const ZOOM = 3.2
 
-export default function Recall() {
-  const t = useCopy().recall
-  return (
-    <section className="recall-section" id="features">
-      <div className="section rail-head">
-        <Reveal>
-          <h2 className="feature-title">
-            <Rich parts={t.titleA} />
-            <br />
-            <Rich parts={t.titleB} />
-          </h2>
-          <p className="feature-body">{t.body}</p>
-        </Reveal>
-      </div>
-      <div className="recall-bleed">
-        <RecallStage />
-      </div>
-    </section>
-  )
-}
-
-function RecallStage() {
+export default function RecallStage() {
   const t = useCopy().recall
   const { lang } = useLang()
   const [pos, setPos] = useState(0.4)

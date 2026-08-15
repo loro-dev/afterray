@@ -1,7 +1,9 @@
+import RecallStage from '../components/RecallStage'
 import { Rich, useCopy } from '../i18n'
 
 export default function Hero() {
   const t = useCopy().hero
+  const recall = useCopy().recall
   return (
     <header className="hero">
       <div className="hero-ray" aria-hidden="true" />
@@ -31,6 +33,13 @@ export default function Hero() {
             <li key={f}>{f}</li>
           ))}
         </ul>
+      </div>
+
+      {/* the product itself, in the first screen — a page about seeing your
+          past should not open with nothing to look at */}
+      <div className="hero-stage anim-in" id="features" style={{ animationDelay: '0.55s' }}>
+        <RecallStage />
+        <p className="hero-caption">{recall.body}</p>
       </div>
     </header>
   )
