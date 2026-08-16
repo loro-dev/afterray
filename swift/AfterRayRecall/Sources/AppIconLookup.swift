@@ -6,6 +6,7 @@ import AppKit
 /// Shared by the timeline segments and the history panel's icon strips.
 public enum AppIconLookup {
     private static let cache = NSCache<NSString, NSImage>()
+    private static let resolver = Resolver()
     /// Marks "looked it up, there is no icon", so a missing app does not
     /// re-query Launch Services forever.
     private static let absent = NSImage(size: .zero)
@@ -39,8 +40,29 @@ public enum AppIconLookup {
     public static func iconAsync(bundleIdentifier: String?) async -> NSImage? {
         if let hit = cachedIcon(bundleIdentifier: bundleIdentifier) { return hit }
         guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return nil }
-        return await Task.detached(priority: .utility) {
-            icon(bundleIdentifier: bundleIdentifier)
-        }.value
+        return await resolver.icon(bundleIdentifier: bundleIdentifier)
+    }
+
+    /// Serializes cache misses per bundle. A stress viewport can contain
+    /// hundreds of segments but only a handful of apps; without this, every
+    /// segment launched the same Launch Services lookup concurrently.
+    private actor Resolver {
+        private var inFlight: [String: Task<NSImage?, Never>] = [:]
+
+        func icon(bundleIdentifier: String) async -> NSImage? {
+            if let hit = AppIconLookup.cachedIcon(bundleIdentifier: bundleIdentifier) {
+                return hit
+            }
+            if let existing = inFlight[bundleIdentifier] {
+                return await existing.value
+            }
+            let task = Task.detached(priority: .utility) {
+                AppIconLookup.icon(bundleIdentifier: bundleIdentifier)
+            }
+            inFlight[bundleIdentifier] = task
+            let icon = await task.value
+            inFlight[bundleIdentifier] = nil
+            return icon
+        }
     }
 }

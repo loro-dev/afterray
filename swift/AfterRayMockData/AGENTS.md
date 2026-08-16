@@ -4,7 +4,7 @@ Implements AfterRayRecall's model protocols with deterministic fixture data so t
 
 ## Key files
 
-- `Sources/RecallScenarios.swift:5` `RecallScenario` — named fixture sets: `empty`, `short`, `long`, `processing`, `favorites`, `search`. Entry point for labs and snapshots.
+- `Sources/RecallScenarios.swift:5` `RecallScenario` — named fixture sets including `empty`, `short`, `long`, `stress`, `processing`, `favorites`, and `search`. Entry point for labs and snapshots.
 - `Sources/SettingsPreviewModel.swift:6` `SettingsPreviewModel` — `AfterRaySettingsModeling` over in-memory state.
 - `Sources/ChatPreviewModel.swift:25` `ChatPreviewModel` — `AfterRayChatModeling` with scripted replies.
 

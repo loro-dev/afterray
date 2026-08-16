@@ -538,6 +538,14 @@ enum RecallDisplayedFrame {
     }
 }
 
+/// One request policy for every input path (drag, wheel and inertia): movement
+/// uses one poster per GOP; settle restores the exact Nth frame.
+enum RecallStillRequestPolicy {
+    static func artifactID(for moment: RecallMoment, isMoving: Bool) -> String {
+        isMoving ? moment.previewCacheKey : moment.displayCacheKey
+    }
+}
+
 /// Throttle, not debounce: stills keep updating while the playhead moves,
 /// at most one committed frame per `intervalMilliseconds`.
 ///

@@ -72,6 +72,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
 
     private let daemon: any AfterRayChatServing
     private var sendTask: Task<Void, Never>?
+    private var streamPresentationTask: Task<Void, Never>?
+    private var pendingStreamPresentation: ChatStreamState?
     private var clock: () -> Int64
 
     public init(
@@ -112,6 +114,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
 
     public func startNew() {
         if isSending { stop() }
+        cancelStreamPresentation()
         selectedID = nil
         messages = []
         streamText = ""
@@ -148,6 +151,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamProgress = nil
+        cancelStreamPresentation()
         // A new turn starts from this conversation's stored history, not from
         // the last turn's live notices.
         compactionNotices = ChatTranscript.compactions(in: messages)
@@ -170,6 +174,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     public func clearSensitiveState() {
         sendTask?.cancel()
         sendTask = nil
+        cancelStreamPresentation()
         conversations = []
         selectedID = nil
         messages = []
@@ -196,11 +201,10 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
                 if Task.isCancelled { break }
                 sawEvent = true
                 ChatStreamReducer.apply(event, to: &state)
-                streamText = state.text
-                streamTools = state.tools
-                streamProgress = state.progress
-                if let usage = state.usage { contextUsage = usage }
-                if !state.compactions.isEmpty { compactionNotices = state.compactions }
+                scheduleStreamPresentation(
+                    state,
+                    immediately: !event.isTextToken
+                )
                 if let conversationId = state.conversationId {
                     bindConversation(conversationId)
                 }
@@ -238,6 +242,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     }
 
     private func sendWithoutStream(_ text: String) async {
+        cancelStreamPresentation()
         do {
             let result = try await daemon.chatSend(conversationID: selectedID, message: text)
             bindConversation(result.conversationId)
@@ -245,7 +250,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             await refresh()
             streamText = ""
             streamTools = []
-        streamProgress = nil
+            streamProgress = nil
             errorMessage = nil
             statusMessage = nil
         } catch {
@@ -255,6 +260,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     }
 
     private func finishSuccessfulTurn(_ state: ChatStreamState) async {
+        presentStream(state)
+        cancelStreamPresentation()
         if let conversationId = state.conversationId ?? selectedID, !conversationId.isEmpty {
             bindConversation(conversationId)
             await loadHistory(conversationId)
@@ -281,6 +288,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     /// what was produced — including the reasoning — instead of leaving a local
     /// message whose id no reload would ever match.
     private func reloadAfterInterruption() async {
+        cancelStreamPresentation()
         streamText = ""
         streamTools = []
         streamProgress = nil
@@ -289,6 +297,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     }
 
     private func finalizePartialStream(_ state: ChatStreamState? = nil) {
+        cancelStreamPresentation()
         let snapshot = state ?? ChatStreamState(text: streamText, tools: streamTools)
         if !snapshot.text.isEmpty || !snapshot.tools.isEmpty {
             messages.append(
@@ -303,6 +312,51 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamProgress = nil
+    }
+
+    /// Token traffic can be much faster than the display. Publishing at most
+    /// once per 33 ms keeps Markdown layout and bottom-follow near 30 Hz while
+    /// tool/progress/done events remain immediate.
+    private func scheduleStreamPresentation(
+        _ state: ChatStreamState,
+        immediately: Bool
+    ) {
+        pendingStreamPresentation = state
+        if immediately {
+            streamPresentationTask?.cancel()
+            streamPresentationTask = nil
+            flushStreamPresentation()
+            return
+        }
+        guard streamPresentationTask == nil else { return }
+        streamPresentationTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(33))
+            guard !Task.isCancelled, let self else { return }
+            self.streamPresentationTask = nil
+            self.flushStreamPresentation()
+        }
+    }
+
+    private func flushStreamPresentation() {
+        guard let pendingStreamPresentation else { return }
+        self.pendingStreamPresentation = nil
+        presentStream(pendingStreamPresentation)
+    }
+
+    private func presentStream(_ state: ChatStreamState) {
+        if streamText != state.text { streamText = state.text }
+        if streamTools != state.tools { streamTools = state.tools }
+        if streamProgress != state.progress { streamProgress = state.progress }
+        if let usage = state.usage, contextUsage != usage { contextUsage = usage }
+        if !state.compactions.isEmpty, compactionNotices != state.compactions {
+            compactionNotices = state.compactions
+        }
+    }
+
+    private func cancelStreamPresentation() {
+        streamPresentationTask?.cancel()
+        streamPresentationTask = nil
+        pendingStreamPresentation = nil
     }
 
     private func bindConversation(_ id: String) {

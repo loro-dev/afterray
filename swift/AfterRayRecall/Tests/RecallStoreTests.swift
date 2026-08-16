@@ -54,6 +54,27 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
+    func testImageRepositoryUsesPosterDuringScrubAndExactAfterSettle() async throws {
+        let daemon = GopArtifactDaemon()
+        let repository = RecallImageRepository(daemon: daemon)
+
+        let firstPoster = try await repository.data(artifactID: "gop-poster:segment-1#0")
+        let samePoster = try await repository.data(artifactID: "gop-poster:segment-1#0")
+        let exact = try await repository.data(artifactID: "gop:segment-1#7")
+
+        XCTAssertEqual(firstPoster, Data("poster".utf8))
+        XCTAssertEqual(samePoster, firstPoster)
+        XCTAssertEqual(exact, Data("exact-7".utf8))
+        let calls = await daemon.gopCalls
+        XCTAssertEqual(
+            calls,
+            [
+                .init(segmentID: "segment-1", index: 0, mode: "poster"),
+                .init(segmentID: "segment-1", index: 7, mode: "exact"),
+            ]
+        )
+    }
+
     func testSystemLockClearsTimelineAndArtifactCache() async throws {
         let timelineDaemon = FakeDaemon()
         let store = RecallStore(daemon: timelineDaemon)
@@ -309,6 +330,31 @@ private actor CountingArtifactDaemon: RecallDaemonServing {
         )
     }
 
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
+}
+
+private actor GopArtifactDaemon: RecallDaemonServing {
+    struct Call: Equatable {
+        let segmentID: String
+        let index: UInt16
+        let mode: String
+    }
+
+    private(set) var gopCalls: [Call] = []
+
+    func sessions() async throws -> [RecallSession] { [] }
+    func timeline() async throws -> [RecallMoment] { [] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
+    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
+    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
+    func artifact(id: String) async throws -> ArtifactPayload {
+        ArtifactPayload(id: id, contentType: "image/jpeg", bytes: Data())
+    }
+    func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload {
+        gopCalls.append(.init(segmentID: segmentID, index: index, mode: mode))
+        let bytes = mode == "poster" ? Data("poster".utf8) : Data("exact-\(index)".utf8)
+        return ArtifactPayload(id: segmentID, contentType: "video/av1", bytes: bytes)
+    }
     func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 

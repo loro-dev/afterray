@@ -3,7 +3,10 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
-public typealias RecallThumbnailLoader = @Sendable (String) async throws -> Data
+/// Invoked by the main-actor cache. Only the returned immutable bytes cross
+/// into detached decode work, so the closure itself does not need to claim it
+/// is safe to execute concurrently.
+public typealias RecallThumbnailLoader = (String) async throws -> Data
 
 /// Small decoded thumbnails for the search filmstrip.
 ///

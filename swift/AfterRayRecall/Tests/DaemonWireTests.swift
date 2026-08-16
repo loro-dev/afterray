@@ -136,6 +136,7 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(moment.gop?.segmentId, "g1")
         XCTAssertEqual(moment.gop?.index, 3)
         XCTAssertEqual(moment.displayCacheKey, "gop:g1#3")
+        XCTAssertEqual(moment.previewCacheKey, "gop-poster:g1#0")
     }
 
     func testDisplayCacheKeyPrefersGopOverLeftoverStill() throws {
@@ -143,6 +144,19 @@ final class DaemonWireTests: XCTestCase {
         let moment = try JSONDecoder().decode(RecallMoment.self, from: Data(json.utf8))
         XCTAssertEqual(moment.imageArtifactId, "a1")
         XCTAssertEqual(moment.displayCacheKey, "gop:g1#3")
+        XCTAssertEqual(moment.previewCacheKey, "gop-poster:g1#0")
+    }
+
+    func testLooseStillUsesTheSamePreviewAndExactKey() {
+        let moment = RecallMoment(
+            id: "m1",
+            sessionId: "s1",
+            capturedAtMs: 123,
+            imageArtifactId: "a1"
+        )
+
+        XCTAssertEqual(moment.previewCacheKey, "a1")
+        XCTAssertEqual(moment.displayCacheKey, "a1")
     }
 
     func testArtifactMetaDecodesByteLengthWithoutPayload() throws {

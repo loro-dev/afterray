@@ -672,6 +672,13 @@ public enum ChatStreamReducer {
     }
 }
 
+extension ChatStreamEvent {
+    var isTextToken: Bool {
+        if case .token = self { return true }
+        return false
+    }
+}
+
 // MARK: - Tool calls
 
 public struct ChatToolCall: Equatable, Identifiable, Sendable {

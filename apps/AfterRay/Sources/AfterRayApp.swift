@@ -912,7 +912,9 @@ private struct AfterRayRootView: View {
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
     @ObservedObject private var settings = AfterRaySettingsController.shared
-    @ObservedObject private var chat = AfterRayServices.shared.chat
+    // The overlay observes chat directly. Keeping it non-observed here stops a
+    // token from rebuilding the entire recall surface underneath the panel.
+    private let chat = AfterRayServices.shared.chat
     @State private var isLive = true
     @State private var isChatPresented = false
     @State private var queryMode = ImmersiveQueryMode.search

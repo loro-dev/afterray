@@ -43,7 +43,9 @@ private struct VisualLabView: View {
     @State private var surface: LabSurface = LabSurface.launchArgument
     @State private var settingsPage: AfterRaySettingsPage = CommandLine.arguments.contains("--models") ? .models : .general
     @State private var settingsModel = SettingsPreviewModel()
-    @State private var scenario: RecallScenario = .long
+    @State private var scenario: RecallScenario = CommandLine.arguments.contains("--stress")
+        ? .stress
+        : .long
     @State private var daySummaryKind: DaySummaryLabKind = .matching
     @State private var playheadMs = RecallScenario.long.moments[12].capturedAtMs
     /// Clicking the status capsule walks the states so every label and dot
@@ -71,7 +73,8 @@ private struct VisualLabView: View {
     }
 
     private var moments: [RecallMoment] {
-        scenario.moments.map { moment in
+        guard !favoriteOverrides.isEmpty else { return scenario.moments }
+        return scenario.moments.map { moment in
             guard favoriteOverrides.contains(moment.id) else { return moment }
             var copy = moment
             copy.isFavorite.toggle()

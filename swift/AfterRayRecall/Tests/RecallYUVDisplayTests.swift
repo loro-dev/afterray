@@ -62,6 +62,30 @@ final class RecallYUVDisplayTests: XCTestCase {
         XCTAssertGreaterThan(CVPixelBufferGetHeight(buffer), 0)
     }
 
+    func testCompatibleGopsReuseTheVideoToolboxSession() throws {
+        let candidates = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("crates/afterray-codec/fixtures/closed-gop-64x64.ivf"),
+            URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("crates/afterray-codec/fixtures/closed-gop-64x64.ivf"),
+        ]
+        guard let url = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            throw XCTSkip("golden IVF fixture not visible from the Swift test cwd")
+        }
+        let data = try Data(contentsOf: url)
+        let decoder = RecallAV1Decoder()
+
+        XCTAssertNotNil(decoder.decode(data))
+        let afterFirst = decoder.sessionCreationCount
+        XCTAssertNotNil(decoder.decode(data))
+
+        XCTAssertEqual(decoder.sessionCreationCount, afterFirst)
+    }
+
     func testNonJPEGFallsBackToImageIO() throws {
         let png = try encodePNG(width: 32, height: 24, color: .green)
         XCTAssertFalse(RecallFrameDecoder.isJPEG(png))

@@ -10,6 +10,7 @@ struct SearchFilmstrip: View {
     let session: RecallSearchSession
     let tuning: RecallVisualTuning
     let selectedDate: Date
+    let isScrubbing: Bool
     let thumbnailLoader: RecallThumbnailLoader
     let onSelectIndex: (Int) -> Void
     let onViewportWidthChange: (CGFloat) -> Void
@@ -113,7 +114,7 @@ struct SearchFilmstrip: View {
             }
         }
         .frame(width: layout.contentWidth, height: Self.stripHeight, alignment: .leading)
-        .animation(.easeOut(duration: 0.16), value: session.selectedIndex)
+        .animation(isScrubbing ? nil : .easeOut(duration: 0.16), value: session.selectedIndex)
     }
 
     private func slots(layout: SearchFilmstripLayout) -> [FilmstripSlot] {

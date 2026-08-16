@@ -173,6 +173,30 @@ final class TimelineLayoutTests: XCTestCase {
         )
     }
 
+    func testMovingWithinAGopSharesPosterThenSettlesOnTheExactNthFrame() {
+        let first = RecallMoment(
+            id: "a",
+            sessionId: "s",
+            capturedAtMs: 0,
+            gop: RecallGopRef(segmentId: "segment", index: 2, frameCount: 12)
+        )
+        let second = RecallMoment(
+            id: "b",
+            sessionId: "s",
+            capturedAtMs: 10_000,
+            gop: RecallGopRef(segmentId: "segment", index: 9, frameCount: 12)
+        )
+
+        XCTAssertEqual(
+            RecallStillRequestPolicy.artifactID(for: first, isMoving: true),
+            RecallStillRequestPolicy.artifactID(for: second, isMoving: true)
+        )
+        XCTAssertEqual(
+            RecallStillRequestPolicy.artifactID(for: second, isMoving: false),
+            "gop:segment#9"
+        )
+    }
+
     func testLeavingLiveMovesByTimelinePointsAndEnteringLiveSnapsToEnd() {
         let moments = [
             moment(id: "a", at: 0, app: "Safari", bundle: "safari"),
@@ -325,6 +349,28 @@ final class TimelineLayoutTests: XCTestCase {
                 slice.map(\.id),
                 expected.map(\.id),
                 "culled slice at \(start) is not the set of runs touching the range"
+            )
+        }
+    }
+
+    func testTwentyThousandMomentArchiveKeepsVisibleNodeCountBounded() {
+        let moments = (0..<20_000).map { index in
+            moment(
+                id: "stress-\(index)",
+                at: Int64(index) * 10_000,
+                app: "App \(index % 2)",
+                bundle: "app.\(index % 2)"
+            )
+        }
+        let layout = TimelineLayout(moments: moments, viewportWidth: 1_000, density: 0.12)
+        XCTAssertEqual(layout.runs.count, moments.count)
+
+        for center in [CGFloat(0), layout.contentWidth / 2, layout.contentWidth] {
+            let visible = layout.runs(intersecting: (center - 600)...(center + 600))
+            XCTAssertLessThanOrEqual(
+                visible.count,
+                242,
+                "archive length must not leak into the number of SwiftUI segment nodes"
             )
         }
     }

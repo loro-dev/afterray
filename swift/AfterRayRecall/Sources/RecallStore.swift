@@ -5,7 +5,9 @@ public final class RecallStore: ObservableObject {
     @Published public private(set) var sessions: [RecallSession] = []
     @Published public private(set) var moments: [RecallMoment] = []
     @Published public private(set) var playheadMs: Int64 = 0
-    @Published public private(set) var selectedIndex: Int = 0
+    /// Kept for API compatibility, but not published separately: `playheadMs`
+    /// is the observable source of truth and publishing both doubled updates.
+    public private(set) var selectedIndex: Int = 0
     @Published public private(set) var loadState: RecallLoadState = .ready
     @Published public private(set) var daySummary: DaySummary = .empty
     @Published public private(set) var summaryHistory: [DaySummary] = []
@@ -14,8 +16,12 @@ public final class RecallStore: ObservableObject {
 
     private let daemon: any RecallDaemonServing
     private var sensitiveGeneration: UInt64 = 0
+    private var timelineRevision: UInt64 = 0
     /// Rebuilt with `moments`; see `selectLoaded`.
     private var capturedAtMsByMomentID: [String: Int64] = [:]
+    /// Prepared with the timeline off-main. Recomputing the median capture
+    /// interval inside every selection made the final scrub commit O(n log n).
+    private var timelineBounds: (startMs: Int64, endMs: Int64) = (0, 1)
     private var loadedDayKey: String?
     private var summaryHistoryCursorMs: Int64?
     private var summaryHistoryGeneration: UInt64 = 0
@@ -32,10 +38,11 @@ public final class RecallStore: ObservableObject {
         let requestGeneration = sensitiveGeneration
         do {
             let loadedSessions = try await daemon.sessions().sorted { $0.startedAtMs < $1.startedAtMs }
-            let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
+            let rawMoments = try await daemon.timeline()
+            let prepared = await Self.prepareTimeline(rawMoments)
             guard sensitiveGeneration == requestGeneration else { return }
             sessions = loadedSessions
-            apply(loaded, preservingSelection: preservingSelection)
+            apply(prepared, preservingSelection: preservingSelection)
             await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
@@ -43,7 +50,9 @@ public final class RecallStore: ObservableObject {
                 return
             }
             moments = []
+            timelineRevision &+= 1
             capturedAtMsByMomentID = [:]
+            timelineBounds = (0, 1)
             applyPlayhead(0)
             daySummary = .empty
             loadedDayKey = nil
@@ -61,19 +70,22 @@ public final class RecallStore: ObservableObject {
 
         let overlapStart = max(moments.count - 20, 0)
         let sinceMs = moments[overlapStart].capturedAtMs
+        let requestRevision = timelineRevision
         let requestGeneration = sensitiveGeneration
         do {
-            let updated = try await daemon.timeline(sinceMs: sinceMs)
-                .sorted { left, right in
-                    if left.capturedAtMs == right.capturedAtMs { return left.id < right.id }
-                    return left.capturedAtMs < right.capturedAtMs
-                }
-            guard sensitiveGeneration == requestGeneration else { return }
-            guard !updated.isEmpty else { return }
-            let prefix = moments.prefix { $0.capturedAtMs < sinceMs }
-            let existingOverlap = Array(moments.dropFirst(prefix.count))
-            guard existingOverlap != updated else { return }
-            apply(Array(prefix) + updated, preservingSelection: preservingSelection)
+            let rawUpdated = try await daemon.timeline(sinceMs: sinceMs)
+            guard sensitiveGeneration == requestGeneration,
+                  timelineRevision == requestRevision
+            else { return }
+            guard !rawUpdated.isEmpty else { return }
+            let current = moments
+            guard let prepared = await Task.detached(priority: .userInitiated, operation: {
+                Self.mergeTimeline(current: current, sinceMs: sinceMs, updated: rawUpdated)
+            }).value else { return }
+            guard sensitiveGeneration == requestGeneration,
+                  timelineRevision == requestRevision
+            else { return }
+            apply(prepared, preservingSelection: preservingSelection)
             await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
@@ -91,14 +103,15 @@ public final class RecallStore: ObservableObject {
         preservingSelection: Bool = false
     ) async throws {
         let requestGeneration = sensitiveGeneration
-        let loaded = try await daemon.moments(sessionID: id).sorted { $0.capturedAtMs < $1.capturedAtMs }
+        let rawMoments = try await daemon.moments(sessionID: id)
+        let prepared = await Self.prepareTimeline(rawMoments)
         guard sensitiveGeneration == requestGeneration else { return }
-        apply(loaded, selecting: momentID, preservingSelection: preservingSelection)
+        apply(prepared, selecting: momentID, preservingSelection: preservingSelection)
         await loadDaySummary(dayMs: playheadMs, force: true)
     }
 
     private func apply(
-        _ loaded: [RecallMoment],
+        _ prepared: PreparedTimeline,
         selecting momentID: String? = nil,
         preservingSelection: Bool = false
     ) {
@@ -107,23 +120,25 @@ public final class RecallStore: ObservableObject {
         // must preserve their newest position rather than a stale snapshot.
         let preservedMomentID = preservingSelection ? selectedMoment?.id : nil
         let preservedPlayheadMs = playheadMs
+        let loaded = prepared.moments
         moments = loaded
+        timelineRevision &+= 1
         // Walking search results asks "where is this id?" on every scroll tick,
         // and the timeline is the whole archive — scanning it per tick is the
         // one part of stepping that grew with how long AfterRay had been
         // recording.
-        capturedAtMsByMomentID = Dictionary(
-            loaded.map { ($0.id, $0.capturedAtMs) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        if let targetID = momentID, let moment = loaded.first(where: { $0.id == targetID }) {
-            applyPlayhead(moment.capturedAtMs)
+        capturedAtMsByMomentID = prepared.capturedAtMsByMomentID
+        timelineBounds = prepared.bounds
+        if let targetID = momentID, let capturedAtMs = prepared.capturedAtMsByMomentID[targetID] {
+            applyPlayhead(capturedAtMs)
         } else if preservingSelection {
-            let bounds = TimelineLayout.timeBounds(moments: loaded)
+            let bounds = prepared.bounds
             if !loaded.isEmpty, preservedPlayheadMs >= bounds.startMs, preservedPlayheadMs <= bounds.endMs {
                 applyPlayhead(preservedPlayheadMs)
-            } else if let preservedMomentID, let moment = loaded.first(where: { $0.id == preservedMomentID }) {
-                applyPlayhead(moment.capturedAtMs)
+            } else if let preservedMomentID,
+                      let capturedAtMs = prepared.capturedAtMsByMomentID[preservedMomentID]
+            {
+                applyPlayhead(capturedAtMs)
             } else {
                 applyPlayhead(loaded.last?.capturedAtMs ?? 0)
             }
@@ -144,9 +159,10 @@ public final class RecallStore: ObservableObject {
     public func openMoment(id momentID: String) async {
         let requestGeneration = sensitiveGeneration
         do {
-            let loaded = try await daemon.timeline().sorted { $0.capturedAtMs < $1.capturedAtMs }
+            let rawMoments = try await daemon.timeline()
+            let prepared = await Self.prepareTimeline(rawMoments)
             guard sensitiveGeneration == requestGeneration else { return }
-            apply(loaded, selecting: momentID)
+            apply(prepared, selecting: momentID)
             await loadDaySummary(dayMs: playheadMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
@@ -275,7 +291,9 @@ public final class RecallStore: ObservableObject {
         sensitiveGeneration &+= 1
         sessions = []
         moments = []
+        timelineRevision &+= 1
         capturedAtMsByMomentID = [:]
+        timelineBounds = (0, 1)
         applyPlayhead(0)
         daySummary = .empty
         summaryHistory = []
@@ -288,14 +306,86 @@ public final class RecallStore: ObservableObject {
     }
 
     private func applyPlayhead(_ ms: Int64) {
-        playheadMs = RecallPlayhead.clamp(ms, moments: moments)
+        playheadMs = moments.isEmpty
+            ? 0
+            : min(max(ms, timelineBounds.startMs), timelineBounds.endMs)
         selectedIndex = RecallPlayhead.resolveIndex(playheadMs: playheadMs, moments: moments) ?? 0
+    }
+
+    private struct PreparedTimeline: Sendable {
+        let moments: [RecallMoment]
+        let capturedAtMsByMomentID: [String: Int64]
+        let bounds: (startMs: Int64, endMs: Int64)
+    }
+
+    nonisolated private static func prepareTimeline(
+        _ moments: [RecallMoment]
+    ) async -> PreparedTimeline {
+        await Task.detached(priority: .userInitiated) {
+            prepareTimelineSync(moments)
+        }.value
+    }
+
+    nonisolated private static func prepareTimelineSync(
+        _ moments: [RecallMoment]
+    ) -> PreparedTimeline {
+        let sorted = moments.sorted { left, right in
+            if left.capturedAtMs == right.capturedAtMs { return left.id < right.id }
+            return left.capturedAtMs < right.capturedAtMs
+        }
+        return prepareSortedTimeline(sorted)
+    }
+
+    nonisolated private static func prepareSortedTimeline(
+        _ sorted: [RecallMoment]
+    ) -> PreparedTimeline {
+        return PreparedTimeline(
+            moments: sorted,
+            capturedAtMsByMomentID: Dictionary(
+                sorted.lazy.map { ($0.id, $0.capturedAtMs) },
+                uniquingKeysWith: { first, _ in first }
+            ),
+            bounds: TimelineLayout.timeBounds(moments: sorted)
+        )
+    }
+
+    nonisolated private static func mergeTimeline(
+        current: [RecallMoment],
+        sinceMs: Int64,
+        updated: [RecallMoment]
+    ) -> PreparedTimeline? {
+        let sortedUpdate = prepareTimelineSync(updated).moments
+        let prefixCount = current.partitioningIndex { $0.capturedAtMs >= sinceMs }
+        guard Array(current.dropFirst(prefixCount)) != sortedUpdate else { return nil }
+        var merged = Array(current.prefix(prefixCount))
+        merged.append(contentsOf: sortedUpdate)
+        return prepareSortedTimeline(merged)
     }
 
     private static func isDaemonConnectionError(_ error: Error) -> Bool {
         guard let daemonError = error as? DaemonClientError else { return false }
         if case .connection = daemonError { return true }
         return false
+    }
+}
+
+private extension RandomAccessCollection {
+    /// First index whose element satisfies `belongsInSecondPartition`.
+    func partitioningIndex(
+        where belongsInSecondPartition: (Element) -> Bool
+    ) -> Index {
+        var lower = startIndex
+        var upper = endIndex
+        while lower != upper {
+            let distance = distance(from: lower, to: upper)
+            let middle = index(lower, offsetBy: distance / 2)
+            if belongsInSecondPartition(self[middle]) {
+                upper = middle
+            } else {
+                lower = index(after: middle)
+            }
+        }
+        return lower
     }
 }
 
@@ -370,6 +460,18 @@ public actor RecallImageRepository {
     }
 
     private static func fetch(daemon: any RecallDaemonServing, artifactID: String) async throws -> Data {
+        if artifactID.hasPrefix("gop-poster:") {
+            let body = artifactID.dropFirst("gop-poster:".count)
+            let parts = body.split(separator: "#", maxSplits: 1)
+            guard parts.count == 2, let index = UInt16(parts[1]) else {
+                throw DaemonClientError.invalidResponse
+            }
+            return try await daemon.gopFrame(
+                segmentID: String(parts[0]),
+                index: index,
+                mode: "poster"
+            ).bytes
+        }
         if artifactID.hasPrefix("gop:") {
             let body = artifactID.dropFirst(4)
             let parts = body.split(separator: "#", maxSplits: 1)

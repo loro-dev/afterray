@@ -1,4 +1,4 @@
-.PHONY: check test test-repeat build daemon status models visual-lab settings-lab chat-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
+.PHONY: check test test-repeat build daemon status models visual-lab visual-lab-stress visual-lab-stress-profile settings-lab chat-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
 
 # `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
 # `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
@@ -46,6 +46,12 @@ models:
 
 visual-lab:
 	swift run afterray-visual-lab
+
+visual-lab-stress:
+	swift run afterray-visual-lab -- --stress
+
+visual-lab-stress-profile:
+	AFTERRAY_UI_PERF_LOG=1 AFTERRAY_UI_PERF_AUTORUN=1 swift run -c release afterray-visual-lab -- --stress
 
 settings-lab:
 	swift run afterray-visual-lab -- --settings --models

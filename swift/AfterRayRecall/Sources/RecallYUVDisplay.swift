@@ -47,6 +47,7 @@ struct ArtifactYUVView: NSViewRepresentable {
 }
 
 final class ArtifactLayerView: NSView {
+    private static let opacityAnimationKey = "afterray.content-opacity"
     private var displayedFrame: RecallDisplayFrame?
 
     override func makeBackingLayer() -> CALayer {
@@ -85,8 +86,36 @@ final class ArtifactLayerView: NSView {
         guard let layer, layer.opacity != opacity else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: Self.opacityAnimationKey)
         layer.opacity = opacity
         CATransaction.commit()
+    }
+
+    /// Runs entirely on Core Animation's render server. The old async loop
+    /// woke the main actor every 8 ms, directly competing with a 120 Hz scrub.
+    func animateContentOpacity(
+        to value: CGFloat,
+        duration: TimeInterval,
+        timingFunction: CAMediaTimingFunction
+    ) {
+        guard let layer else { return }
+        let target = Float(min(max(value, 0), 1))
+        let start = layer.presentation()?.opacity ?? layer.opacity
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = target
+        CATransaction.commit()
+        guard duration > 0, start != target else {
+            layer.removeAnimation(forKey: Self.opacityAnimationKey)
+            return
+        }
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = start
+        animation.toValue = target
+        animation.duration = duration
+        animation.timingFunction = timingFunction
+        animation.isRemovedOnCompletion = true
+        layer.add(animation, forKey: Self.opacityAnimationKey)
     }
 
     func display(_ frame: RecallDisplayFrame?) {
@@ -105,6 +134,7 @@ final class ArtifactLayerView: NSView {
         displayedFrame = nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        layer?.removeAnimation(forKey: Self.opacityAnimationKey)
         videoRenderer?.flush()
         layer?.opacity = 0
         CATransaction.commit()
@@ -461,6 +491,8 @@ final class RecallAV1Decoder: @unchecked Sendable {
     private let lock = NSLock()
     private var session: VTDecompressionSession?
     private var format: CMVideoFormatDescription?
+    private var sessionConfiguration: SessionConfiguration?
+    private(set) var sessionCreationCount = 0
 
     func decode(_ data: Data) -> CVPixelBuffer? {
         lock.lock()
@@ -494,6 +526,17 @@ final class RecallAV1Decoder: @unchecked Sendable {
 
     private func prepare(ivf: ParsedIVF) -> Bool {
         guard let av1c = makeAv1C(from: ivf.frames[0]) else { return false }
+        let configuration = SessionConfiguration(
+            width: ivf.width,
+            height: ivf.height,
+            av1c: av1c
+        )
+        // GOPs produced by one capture stream normally share this exact
+        // configuration. Their first frame is a keyframe, so VideoToolbox can
+        // accept the next independent GOP without rebuilding its session.
+        if session != nil, sessionConfiguration == configuration, format != nil {
+            return true
+        }
         let atoms: [String: Data] = ["av1C": av1c]
         let extensions: [CFString: Any] = [
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms,
@@ -511,6 +554,7 @@ final class RecallAV1Decoder: @unchecked Sendable {
         if let session { VTDecompressionSessionInvalidate(session) }
         session = nil
         format = formatOut
+        sessionConfiguration = nil
         let pixelFormats: [OSType] = [
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -533,10 +577,18 @@ final class RecallAV1Decoder: @unchecked Sendable {
             )
             if status == noErr, let created {
                 session = created
+                sessionConfiguration = configuration
+                sessionCreationCount += 1
                 return true
             }
         }
         return false
+    }
+
+    private struct SessionConfiguration: Equatable {
+        let width: Int
+        let height: Int
+        let av1c: Data
     }
 }
 

@@ -6,6 +6,7 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
     case empty
     case short
     case long
+    case stress
     case processing
     case favorites
     case search
@@ -17,6 +18,7 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
         case .empty: "Empty"
         case .short: "Short"
         case .long: "Long day"
+        case .stress: "20K GOP stress"
         case .processing: "Processing"
         case .favorites: "Favorites"
         case .search: "Search"
@@ -28,6 +30,7 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
         case .empty: []
         case .short: Self.makeMoments(count: 7)
         case .long: Self.makeMoments(count: 84)
+        case .stress: Self.stressMoments
         case .processing: Self.makeMoments(count: 11, processing: true)
         case .favorites: Self.makeMoments(count: 22, favoriteEvery: 4)
         case .search: MockSearchData.moments
@@ -50,12 +53,13 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
             return DaySummary(day: DaySummaryLayout.localDayKey(ms: Self.baseMs), dayStartMs: bounds.start, dayEndMs: bounds.end, slots: [])
         case .short:
             return .mockFactsOnly(around: Self.baseMs)
-        case .long, .processing, .favorites, .search:
+        case .long, .stress, .processing, .favorites, .search:
             return .mockRich(around: Self.baseMs)
         }
     }
 
     static let baseMs: Int64 = 1_786_483_800_000
+    private static let stressMoments = makeGopMoments(count: 20_000)
 
     private static func makeMoments(
         count: Int,
@@ -94,6 +98,36 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
                 audioArtifactId: index.isMultiple(of: 3) ? "mock://audio/\(index)" : nil,
                 applicationName: app.0,
                 bundleIdentifier: app.1
+            )
+        }
+    }
+
+    /// Large enough to expose O(n)-per-frame work and shaped like the cold
+    /// archive: twelve moments share one GOP and have no leftover JPEG still.
+    private static func makeGopMoments(count: Int) -> [RecallMoment] {
+        let applications = [
+            ("Figma", "com.figma.Desktop"),
+            ("Safari", "com.apple.Safari"),
+            ("Xcode", "com.apple.dt.Xcode"),
+            ("Slack", "com.tinyspeck.slackmacgap"),
+        ]
+        return (0..<count).map { index in
+            let gopIndex = UInt16(index % 12)
+            let segment = index / 12
+            let app = applications[(index / 90) % applications.count]
+            return RecallMoment(
+                id: "stress-moment-\(index)",
+                sessionId: "stress-session",
+                capturedAtMs: baseMs + Int64(index * 10_000),
+                gop: RecallGopRef(
+                    segmentId: "mock-segment-\(segment)",
+                    index: gopIndex,
+                    frameCount: UInt16(min(12, count - segment * 12))
+                ),
+                ocrText: "Stress moment \(index)",
+                applicationName: app.0,
+                bundleIdentifier: app.1,
+                windowTitle: "Long archive · \(index)"
             )
         }
     }
@@ -277,7 +311,9 @@ public enum MockSearchData {
 
     public static let thumbnailLoader: RecallThumbnailLoader = { momentID in
         let index = Int(momentID.split(separator: "-").last ?? "0") ?? 0
-        return try MockArtifactFactory.renderFrame(index: index)
+        return try await Task.detached(priority: .utility) {
+            try MockArtifactFactory.renderFrame(index: index)
+        }.value
     }
 
     public static let ocrLoader: RecallOcrLoader = { momentID in
@@ -291,8 +327,19 @@ public enum MockSearchData {
 
 public enum MockArtifactFactory {
     public static let loader: RecallImageLoader = { artifactID in
-        let index = Int(artifactID.split(separator: "/").last ?? "0") ?? 0
-        return try renderFrame(index: index)
+        let index: Int
+        if artifactID.hasPrefix("gop:") || artifactID.hasPrefix("gop-poster:") {
+            let body = artifactID.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+            let parts = body.split(separator: "#", maxSplits: 1)
+            let segment = Int(parts.first?.split(separator: "-").last ?? "0") ?? 0
+            let frame = Int(parts.count == 2 ? parts[1] : "0") ?? 0
+            index = segment * 12 + frame
+        } else {
+            index = Int(artifactID.split(separator: "/").last ?? "0") ?? 0
+        }
+        return try await Task.detached(priority: .utility) {
+            try renderFrame(index: index)
+        }.value
     }
 
     public static func renderFrame(index: Int) throws -> Data {

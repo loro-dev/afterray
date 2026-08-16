@@ -59,6 +59,11 @@ public struct RecallView: View {
     /// settles. Prefetch and panel-follow both wait for the settle: doing
     /// either per frame at coast speed was the stutter being reported.
     @State private var isScrubbing = false
+    /// Continuous travel stays inside this view. The store binding is committed
+    /// once when motion settles, so the app root, history and audio pipeline do
+    /// not republish at display-link frequency.
+    @State private var scrubPlayheadMs: Int64?
+    @State private var scrubIsLive: Bool?
     @State private var followPulse = 0
     @AppStorage(DaySummaryLayout.expandedStorageKey) private var daySummaryExpanded = true
     @State private var settledStill: SettledStill?
@@ -138,7 +143,23 @@ public struct RecallView: View {
     }
 
     private var selectedMoment: RecallMoment? {
-        RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
+        RecallPlayhead.resolve(playheadMs: renderedPlayheadMs, moments: moments)
+    }
+
+    private var renderedPlayheadMs: Int64 {
+        scrubPlayheadMs ?? playheadMs
+    }
+
+    private var renderedIsLive: Bool {
+        scrubIsLive ?? isLive
+    }
+
+    private var displayedArtifactID: String? {
+        guard let selectedMoment else { return nil }
+        return RecallStillRequestPolicy.artifactID(
+            for: selectedMoment,
+            isMoving: isScrubbing
+        )
     }
 
     /// Read on every scroll tick from three places — the drag handler, the
@@ -154,11 +175,11 @@ public struct RecallView: View {
 
     public var body: some View {
         ZStack {
-            if !isLive {
+            if !renderedIsLive {
                 RecallPalette.background.ignoresSafeArea()
             }
 
-            if !moments.isEmpty || isLive {
+            if !moments.isEmpty || renderedIsLive {
                 recallContent
             } else if case .failed(let message) = loadState {
                 FailureView(message: message, onReload: onReload)
@@ -177,10 +198,11 @@ public struct RecallView: View {
 
     private var recallContent: some View {
         ZStack {
-            if !isLive, let moment = selectedMoment {
+            if !renderedIsLive, let artifactID = displayedArtifactID {
                 ImmersiveArtifactImage(
-                    artifactID: moment.displayCacheKey,
+                    artifactID: artifactID,
                     loader: imageLoader,
+                    animatesTransition: !isScrubbing,
                     onSettled: { settledStill = $0 }
                 )
             }
@@ -188,7 +210,7 @@ public struct RecallView: View {
             chromeGradients
 
             // Above the scrims: a dimmed highlight defeats the purpose.
-            if !isLive, let still = settledStill, still.id == selectedMoment?.displayCacheKey {
+            if !renderedIsLive, let still = settledStill, still.id == selectedMoment?.displayCacheKey {
                 OcrHighlightOverlay(
                     regions: highlightRegions,
                     pixelSize: still.pixelSize,
@@ -236,7 +258,7 @@ public struct RecallView: View {
                 // stays next to the moment it was heard at. Above the summary
                 // panel it drifted to the top of the screen whenever the panel
                 // was open, which is where a caption reads as unrelated.
-                if !isLive, selectedMoment?.hasVisibleTranscript == true {
+                if !renderedIsLive, selectedMoment?.hasVisibleTranscript == true {
                     TranscriptCaption(
                         text: selectedMoment?.transcriptText,
                         canPlay: selectedMoment?.audioArtifactId != nil,
@@ -260,6 +282,7 @@ public struct RecallView: View {
                         session: searchSession,
                         tuning: tuning,
                         selectedDate: selectedDate,
+                        isScrubbing: isScrubbing,
                         thumbnailLoader: thumbnailLoader,
                         onSelectIndex: { onSelectSearchFrame?($0) },
                         onViewportWidthChange: { timelineViewportWidth = $0 }
@@ -268,8 +291,8 @@ public struct RecallView: View {
                 } else {
                     AppUsageTimeline(
                         layout: timelineLayout,
-                        playheadMs: playheadMs,
-                        isLive: isLive,
+                        playheadMs: renderedPlayheadMs,
+                        isLive: renderedIsLive,
                         selectedMoment: selectedMoment,
                         tuning: tuning,
                         zoom: $timelineZoom,
@@ -281,7 +304,7 @@ public struct RecallView: View {
                 }
             }
 
-            if showsDetails, !isLive, let moment = selectedMoment {
+            if showsDetails, !renderedIsLive, let moment = selectedMoment {
                 HStack {
                     Spacer(minLength: 0)
                     RecallDetailsMenu(
@@ -309,11 +332,14 @@ public struct RecallView: View {
         .contentShape(Rectangle())
         .simultaneousGesture(recallDrag)
         .onChange(of: isZoomingTimeline) { _, zooming in
-            if zooming { dragOrigin = nil }
+            if zooming {
+                dragOrigin = nil
+                finishScrubbing()
+            }
         }
         .onMoveCommand(perform: handleMoveCommand)
         .onKeyPress(.space) {
-            guard !isLive, let moment = selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else {
+            guard !renderedIsLive, let moment = selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else {
                 return .ignored
             }
             onToggleAudio?(moment)
@@ -327,6 +353,10 @@ public struct RecallView: View {
             // main-thread churn. The visible still keeps updating through
             // its own throttle; neighbours warm once motion settles.
             guard !isScrubbing else { return }
+            // Give the newly requested exact Nth frame first access to the
+            // daemon and VideoToolbox before low-priority poster warming.
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled, !isScrubbing else { return }
             prefetchAroundSelection()
         }
         // Waits for the settle like the prefetch above. Search results hop
@@ -335,18 +365,19 @@ public struct RecallView: View {
         // answer rebuilding the whole summary document mid-scrub.
         .task(id: "\(playheadDayKey):\(isScrubbing)") {
             guard !isScrubbing else { return }
-            onVisibleDayChange?(playheadMs)
+            onVisibleDayChange?(renderedPlayheadMs)
         }
         .task(id: "\(highlightKey):\(isScrubbing)") {
             await loadHighlightRegions()
         }
-        .task(id: searchSession?.selectedIndex ?? -1) {
+        .task(id: "\(searchSession?.selectedIndex ?? -1):\(isScrubbing)") {
+            guard !isScrubbing else { return }
             prefetchFilmstripThumbnails()
         }
     }
 
     private var playheadDayKey: String {
-        DaySummaryLayout.localDayKey(ms: playheadMs)
+        DaySummaryLayout.localDayKey(ms: renderedPlayheadMs)
     }
 
     /// Reloading is only worth it when the frame or the query actually changed.
@@ -355,7 +386,7 @@ public struct RecallView: View {
     }
 
     private var selectedDate: Date {
-        let ms = selectedMoment?.capturedAtMs ?? playheadMs
+        let ms = selectedMoment?.capturedAtMs ?? renderedPlayheadMs
         return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
     }
 
@@ -401,7 +432,7 @@ public struct RecallView: View {
     /// recalled still only — in live view they would dim the real desktop.
     private var chromeGradients: some View {
         ZStack {
-            if !isLive {
+            if !renderedIsLive {
                 LinearGradient(
                     colors: [.black.opacity(tuning.topScrimOpacity), .clear],
                     startPoint: .top,
@@ -437,13 +468,13 @@ public struct RecallView: View {
         // Top-aligned: the identity capsule grows downward when it carries a
         // window title, and the chrome cluster must not grow with it.
         HStack(alignment: .top, spacing: RecallGeometry.overlayChromeItemGap) {
-            if !isLive {
+            if !renderedIsLive {
                 AppIdentity(moment: selectedMoment)
             }
 
             Spacer(minLength: 24)
 
-            if isProcessing, !isLive {
+            if isProcessing, !renderedIsLive {
                 Label("Understanding", systemImage: "sparkles")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.86))
@@ -454,7 +485,7 @@ public struct RecallView: View {
 
             RecallGlassCluster {
                 HStack(spacing: RecallGeometry.overlayChromeItemGap) {
-                    if !isLive {
+                    if !renderedIsLive {
                         RecallChromeIconButton(
                             symbol: showsDetails ? "sidebar.right" : "info.circle",
                             help: showsDetails ? "Hide captured context" : "Show captured context",
@@ -525,7 +556,7 @@ public struct RecallView: View {
             }
             .padding(.horizontal, RecallGeometry.overlayChromeMargin)
 
-            PlayheadTimestamp(date: selectedDate, isLive: isLive)
+            PlayheadTimestamp(date: selectedDate, isLive: renderedIsLive)
         }
     }
 
@@ -538,6 +569,7 @@ public struct RecallView: View {
                     return
                 }
                 if let searchSession {
+                    beginScrubbing(holdsPlayhead: false)
                     // Search results are discrete, so a drag walks whole cells
                     // rather than scrubbing continuously through time.
                     let origin = searchDragOrigin ?? searchSession.selectedIndex
@@ -551,7 +583,8 @@ public struct RecallView: View {
                     return
                 }
                 if dragOrigin == nil {
-                    dragOrigin = (playheadMs, isLive)
+                    beginScrubbing()
+                    dragOrigin = (renderedPlayheadMs, renderedIsLive)
                 }
                 guard let origin = dragOrigin else { return }
                 let scale = 54 / max(tuning.dragPointsPerMoment, 1)
@@ -561,11 +594,12 @@ public struct RecallView: View {
                     deltaX: value.translation.width * scale,
                     layout: timelineLayout
                 )
-                selectPlayhead(playheadMs: moved.playheadMs, isLive: moved.isLive)
+                selectTransientPlayhead(playheadMs: moved.playheadMs, isLive: moved.isLive)
             }
             .onEnded { _ in
                 dragOrigin = nil
                 searchDragOrigin = nil
+                finishScrubbing()
             }
     }
 
@@ -580,12 +614,11 @@ public struct RecallView: View {
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
         if ended {
             searchScrollAccumulator = 0
-            isScrubbing = false
-            followPulse += 1
+            finishScrubbing()
             return
         }
-        isScrubbing = true
         if let searchSession {
+            beginScrubbing(holdsPlayhead: false)
             guard delta != 0 else { return }
             // Same sign as the timeline: a positive delta pushes the content
             // right and travels backward in time, which on the strip means the
@@ -603,25 +636,26 @@ public struct RecallView: View {
             selectSearchIndex(searchSession.selectedIndex + steps)
             return
         }
+        beginScrubbing()
         guard delta != 0, !moments.isEmpty else { return }
         if !isPrecise {
             let stepped = RecallPlayhead.stepMoment(
-                playheadMs: playheadMs,
-                isLive: isLive,
+                playheadMs: renderedPlayheadMs,
+                isLive: renderedIsLive,
                 delta: delta > 0 ? -1 : 1,
                 moments: moments
             )
-            selectPlayhead(playheadMs: stepped.playheadMs, isLive: stepped.isLive)
+            selectTransientPlayhead(playheadMs: stepped.playheadMs, isLive: stepped.isLive)
             return
         }
 
         let moved = RecallPlayhead.move(
-            playheadMs: playheadMs,
-            isLive: isLive,
+            playheadMs: renderedPlayheadMs,
+            isLive: renderedIsLive,
             deltaX: delta,
             layout: timelineLayout
         )
-        selectPlayhead(playheadMs: moved.playheadMs, isLive: moved.isLive)
+        selectTransientPlayhead(playheadMs: moved.playheadMs, isLive: moved.isLive)
     }
 
     private func handleMoveCommand(_ direction: MoveCommandDirection) {
@@ -666,21 +700,62 @@ public struct RecallView: View {
         }
     }
 
+    private func beginScrubbing(holdsPlayhead: Bool = true) {
+        guard !isScrubbing else { return }
+        if holdsPlayhead {
+            scrubPlayheadMs = playheadMs
+            scrubIsLive = isLive
+        }
+        isScrubbing = true
+        RecallDecodedImageCache.shared.prioritizeScrubPreviews()
+    }
+
+    private func selectTransientPlayhead(playheadMs nextMs: Int64, isLive nextLive: Bool) {
+        guard !moments.isEmpty else { return }
+        let layout = timelineLayout
+        let clampedMs = nextLive
+            ? (moments.last?.capturedAtMs ?? nextMs)
+            : layout.clamp(nextMs)
+        if clampedMs != renderedPlayheadMs {
+            movementDirection = clampedMs > renderedPlayheadMs ? 1 : -1
+        }
+        scrubPlayheadMs = clampedMs
+        scrubIsLive = nextLive
+    }
+
+    private func finishScrubbing() {
+        guard isScrubbing else { return }
+        let settledMs = renderedPlayheadMs
+        let settledIsLive = renderedIsLive
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            playheadMs = settledMs
+            isLive = settledIsLive
+            scrubPlayheadMs = nil
+            scrubIsLive = nil
+            isScrubbing = false
+            followPulse += 1
+        }
+    }
+
     private func prefetchAroundSelection() {
         guard !moments.isEmpty else { return }
-        let center = RecallPlayhead.resolveIndex(playheadMs: playheadMs, moments: moments)
+        let center = RecallPlayhead.resolveIndex(playheadMs: renderedPlayheadMs, moments: moments)
             ?? moments.count - 1
         var offsets = [0]
-        for distance in 1...20 {
+        for distance in 1...8 {
             offsets.append(distance * movementDirection)
             offsets.append(-distance * movementDirection)
         }
         let artifactIDs = offsets.compactMap { offset -> String? in
             let index = center + offset
-            return moments.indices.contains(index) ? moments[index].displayCacheKey : nil
+            return moments.indices.contains(index) ? moments[index].previewCacheKey : nil
         }
+        var seen = Set<String>()
+        let uniqueArtifactIDs = artifactIDs.filter { seen.insert($0).inserted }
         RecallDecodedImageCache.shared.prefetch(
-            artifactIDs: artifactIDs,
+            artifactIDs: uniqueArtifactIDs,
             loader: imageLoader
         )
     }
@@ -695,6 +770,7 @@ struct SettledStill: Equatable {
 private struct ImmersiveArtifactImage: View {
     let artifactID: String
     let loader: RecallImageLoader
+    let animatesTransition: Bool
     var onSettled: ((SettledStill) -> Void)?
     @StateObject private var player = RecallStillPlayer()
 
@@ -722,10 +798,10 @@ private struct ImmersiveArtifactImage: View {
         .allowsHitTesting(false)
         .onAppear {
             player.updateLoader(loader)
-            player.request(artifactID)
+            player.request(artifactID, animated: animatesTransition)
         }
         .onChange(of: artifactID) { _, newID in
-            player.request(newID)
+            player.request(newID, animated: animatesTransition)
         }
         .onChange(of: player.settled) { _, settled in
             if let settled { onSettled?(settled) }
@@ -747,7 +823,8 @@ private struct PresentedStill: Equatable {
 
 /// Exactly two layers. A slot's frame is only replaced while its opacity is 0.
 /// When the incoming slot reaches 100% it becomes the base; the old base is
-/// hidden and cleared. Display stills are always decoded fresh — no cache.
+/// hidden and cleared. Visible requests consume the same bounded decoded-frame
+/// cache warmed after settle, instead of paying a second VideoToolbox decode.
 @MainActor
 private final class RecallStillPlayer: ObservableObject {
     let slotA = ArtifactViewAttachment()
@@ -773,7 +850,7 @@ private final class RecallStillPlayer: ObservableObject {
     private var loadGeneration: UInt64 = 0
     private var fadeGeneration: UInt64 = 0
     private var isAnimating = false
-    private var incomingOpacity: CGFloat = 0
+    private var animatesRequest: [String: Bool] = [:]
     private var baseSlot: Slot = .a
     private var incomingSlot: Slot { baseSlot.other }
 
@@ -781,7 +858,8 @@ private final class RecallStillPlayer: ObservableObject {
         self.loader = loader
     }
 
-    func request(_ artifactID: String) {
+    func request(_ artifactID: String, animated: Bool) {
+        animatesRequest[artifactID] = animated
         handle(gate.request(artifactID))
     }
 
@@ -790,6 +868,7 @@ private final class RecallStillPlayer: ObservableObject {
         transitionTask?.cancel()
         fadeGeneration &+= 1
         isAnimating = false
+        animatesRequest.removeAll()
     }
 
     private func handle(_ step: RecallStillGate.Step) {
@@ -812,6 +891,7 @@ private final class RecallStillPlayer: ObservableObject {
             if let frame {
                 self.consumeReady(id, frame: frame)
             } else {
+                self.animatesRequest[id] = nil
                 self.handle(self.gate.loadFailed(id))
             }
         }
@@ -819,13 +899,15 @@ private final class RecallStillPlayer: ObservableObject {
 
     private func loadFresh(_ id: String) async -> RecallDisplayFrame? {
         guard let loader else { return nil }
-        guard let data = try? await loader(id) else { return nil }
-        return await Task.detached(priority: .userInitiated) {
-            RecallFrameDecoder.decode(data)
-        }.value
+        return await RecallDecodedImageCache.shared.frame(
+            artifactID: id,
+            loader: loader,
+            priority: .userInitiated
+        )
     }
 
     private func consumeReady(_ id: String, frame: RecallDisplayFrame) {
+        let animated = animatesRequest.removeValue(forKey: id) ?? true
         switch gate.frameReady(id) {
         case .ignore:
             return
@@ -837,7 +919,10 @@ private final class RecallStillPlayer: ObservableObject {
                 self.handle(self.gate.commitSettle(id))
             }
         case .transition:
-            startIncomingFade(PresentedStill(id: id, frame: frame))
+            startIncomingFade(
+                PresentedStill(id: id, frame: frame),
+                animated: animated
+            )
         }
     }
 
@@ -857,7 +942,6 @@ private final class RecallStillPlayer: ObservableObject {
     private func installBase(_ still: PresentedStill) {
         fadeGeneration &+= 1
         isAnimating = false
-        incomingOpacity = 0
         overlaySlotIsA = incomingSlot == .a
         view(incomingSlot)?.clearDisplayedContent()
         let base = view(baseSlot)
@@ -867,7 +951,7 @@ private final class RecallStillPlayer: ObservableObject {
         settled = SettledStill(id: still.id, pixelSize: still.frame.pixelSize)
     }
 
-    private func startIncomingFade(_ still: PresentedStill) {
+    private func startIncomingFade(_ still: PresentedStill, animated: Bool) {
         guard !isAnimating else { return }
         isAnimating = true
         fadeGeneration &+= 1
@@ -883,7 +967,22 @@ private final class RecallStillPlayer: ObservableObject {
             await Task.yield()
             try? await Task.sleep(for: .milliseconds(8))
             guard self.isCurrentFade(generation) else { return }
-            await self.rampIncoming(generation: generation)
+            let duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || !animated
+                ? 0
+                : RecallStillGate.animationDuration
+            incoming?.animateContentOpacity(
+                to: 1,
+                duration: duration,
+                timingFunction: CAMediaTimingFunction(
+                    controlPoints: 0.22,
+                    0.85,
+                    0.87,
+                    0.22
+                )
+            )
+            if duration > 0 {
+                try? await Task.sleep(for: RecallStillGate.interval)
+            }
             guard self.isCurrentFade(generation) else { return }
             self.promoteIncomingToBase()
             self.isAnimating = false
@@ -897,27 +996,8 @@ private final class RecallStillPlayer: ObservableObject {
         outgoing?.setContentOpacity(0)
         outgoing?.clearDisplayedContent()
         baseSlot = incomingSlot
-        incomingOpacity = 0
         overlaySlotIsA = incomingSlot == .a
         hasVisibleStill = true
-    }
-
-    private func rampIncoming(generation: UInt64) async {
-        let duration = RecallStillGate.animationDuration
-        let began = CACurrentMediaTime()
-        incomingOpacity = 0
-        while isCurrentFade(generation) {
-            let elapsed = CACurrentMediaTime() - began
-            let t = duration <= 0 ? 1 : min(elapsed / duration, 1)
-            incomingOpacity = RecallStillGate.fadeProgress(at: t)
-            view(incomingSlot)?.setContentOpacity(incomingOpacity)
-            if t >= 1 { break }
-            try? await Task.sleep(for: .milliseconds(8))
-        }
-        if isCurrentFade(generation) {
-            incomingOpacity = 1
-            view(incomingSlot)?.setContentOpacity(1)
-        }
     }
 
     private func view(_ slot: Slot) -> ArtifactLayerView? {
@@ -937,15 +1017,16 @@ private final class RecallDecodedImageCache {
     static let shared = RecallDecodedImageCache()
 
     private let frames = NSCache<NSString, RecallDisplayFrame>()
-    private var inFlight: [String: Task<RecallDisplayFrame?, Never>] = [:]
+    private var inFlight: [String: InFlight] = [:]
     private var pendingPrefetches: [PrefetchRequest] = []
     private var activePrefetches = 0
-    private let maximumConcurrentPrefetches = 6
+    private let maximumConcurrentPrefetches = 1
     private var generation: UInt64 = 0
+    private var nextInFlightToken: UInt64 = 0
 
     private init() {
-        frames.countLimit = 48
-        frames.totalCostLimit = 1_536 * 1_024 * 1_024
+        frames.countLimit = 20
+        frames.totalCostLimit = 384 * 1_024 * 1_024
     }
 
     func cached(artifactID: String) -> RecallDisplayFrame? {
@@ -954,20 +1035,26 @@ private final class RecallDecodedImageCache {
 
     func frame(
         artifactID: String,
-        loader: @escaping RecallImageLoader
+        loader: @escaping RecallImageLoader,
+        priority: TaskPriority = .utility
     ) async -> RecallDisplayFrame? {
         if let cached = cached(artifactID: artifactID) { return cached }
-        if let existing = inFlight[artifactID] { return await existing.value }
+        if let existing = inFlight[artifactID] { return await existing.task.value }
 
         let requestGeneration = generation
+        nextInFlightToken &+= 1
+        let token = nextInFlightToken
         let task = Task { @MainActor () -> RecallDisplayFrame? in
             guard let data = try? await loader(artifactID) else { return nil }
-            return await Task.detached(priority: .userInitiated) {
+            guard !Task.isCancelled else { return nil }
+            let decoded = await Task.detached(priority: priority) {
                 RecallFrameDecoder.decode(data)
             }.value
+            return Task.isCancelled ? nil : decoded
         }
-        inFlight[artifactID] = task
+        inFlight[artifactID] = InFlight(token: token, task: task)
         let decoded = await task.value
+        guard inFlight[artifactID]?.token == token else { return decoded }
         inFlight[artifactID] = nil
         guard generation == requestGeneration else { return decoded }
         if let decoded {
@@ -978,10 +1065,22 @@ private final class RecallDecodedImageCache {
 
     func clearSensitiveData() {
         generation &+= 1
-        inFlight.values.forEach { $0.cancel() }
+        inFlight.values.forEach { $0.task.cancel() }
         inFlight.removeAll()
         pendingPrefetches.removeAll()
         frames.removeAllObjects()
+    }
+
+    /// Drop queued neighbours and exact GOP loads as soon as the finger moves.
+    /// Raw daemon reads may still finish into their encrypted-data cache, but a
+    /// cancelled exact request is checked before it can occupy VideoToolbox.
+    func prioritizeScrubPreviews() {
+        pendingPrefetches.removeAll()
+        let exactGopIDs = inFlight.keys.filter { $0.hasPrefix("gop:") }
+        for artifactID in exactGopIDs {
+            inFlight[artifactID]?.task.cancel()
+            inFlight[artifactID] = nil
+        }
     }
 
     func prefetch(
@@ -1010,7 +1109,8 @@ private final class RecallDecodedImageCache {
                 guard let self else { return }
                 _ = await frame(
                     artifactID: request.artifactID,
-                    loader: request.loader
+                    loader: request.loader,
+                    priority: .utility
                 )
                 activePrefetches -= 1
                 pumpPrefetches()
@@ -1021,6 +1121,11 @@ private final class RecallDecodedImageCache {
     private struct PrefetchRequest {
         let artifactID: String
         let loader: RecallImageLoader
+    }
+
+    private struct InFlight {
+        let token: UInt64
+        let task: Task<RecallDisplayFrame?, Never>
     }
 }
 
@@ -1439,10 +1544,15 @@ private struct AppUsageSegmentView: View {
     let run: AppUsageRun
     let width: CGFloat
     let height: Double
+    @State private var resolvedColor: Color?
+    @State private var resolvedColorBundleIdentifier: String?
 
     private var color: Color {
         if run.isIdle { return Color.white.opacity(0.08) }
-        return AppIconPalette.color(
+        let resolved = resolvedColorBundleIdentifier == run.bundleIdentifier
+            ? resolvedColor
+            : nil
+        return resolved ?? AppIconPalette.cachedColor(
             bundleIdentifier: run.bundleIdentifier,
             fallbackSeed: run.bundleIdentifier ?? run.applicationName
         )
@@ -1489,12 +1599,25 @@ private struct AppUsageSegmentView: View {
         }
         .frame(height: height)
         .contentShape(Rectangle())
+        .task(id: run.bundleIdentifier) {
+            guard !run.isIdle else { return }
+            let bundleIdentifier = run.bundleIdentifier
+            let color = await AppIconPalette.colorAsync(
+                bundleIdentifier: run.bundleIdentifier,
+                fallbackSeed: run.bundleIdentifier ?? run.applicationName
+            )
+            guard !Task.isCancelled else { return }
+            resolvedColor = color
+            resolvedColorBundleIdentifier = bundleIdentifier
+        }
     }
 }
 
 private struct ApplicationIcon: View {
     let bundleIdentifier: String?
     let size: CGFloat
+    @State private var loadedIcon: NSImage?
+    @State private var loadedIconBundleIdentifier: String?
 
     var body: some View {
         Group {
@@ -1516,10 +1639,17 @@ private struct ApplicationIcon: View {
             RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
                 .strokeBorder(.white.opacity(0.14), lineWidth: 1)
         }
+        .task(id: bundleIdentifier) {
+            let icon = await AppIconLookup.iconAsync(bundleIdentifier: bundleIdentifier)
+            guard !Task.isCancelled else { return }
+            loadedIcon = icon
+            loadedIconBundleIdentifier = bundleIdentifier
+        }
     }
 
     private var icon: NSImage? {
-        AppIconLookup.icon(bundleIdentifier: bundleIdentifier)
+        let loaded = loadedIconBundleIdentifier == bundleIdentifier ? loadedIcon : nil
+        return loaded ?? AppIconLookup.cachedIcon(bundleIdentifier: bundleIdentifier)
     }
 }
 
@@ -1574,6 +1704,7 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         var onScroll: (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void
         private var monitor: Any?
         private var displayLink: CADisplayLink?
+        private var stressDriverTask: Task<Void, Never>?
         /// Gesture deltas awaiting the next frame — emitted 1:1, uncapped.
         /// The old ±160 accumulator with a 40-point/frame drain threw away
         /// most of every hard flick; that ceiling was the "sticky" feel.
@@ -1583,6 +1714,11 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         private var isScrolling = false
         private var lastEventTime: CFTimeInterval = 0
         private var lastFrameTime: CFTimeInterval = 0
+        /// Opt-in release-build measurement for the stress lab. Normal app
+        /// launches do not allocate samples or print anything.
+        private var frameMetrics = ScrubFrameMetrics(
+            enabled: ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_LOG"] == "1"
+        )
         /// Our own deceleration. System momentum events are swallowed:
         /// macOS restarts momentum on every flick, whereas stacking releases
         /// is exactly the accelerate-by-repeated-swipes feel being asked for.
@@ -1621,35 +1757,88 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                         // Swallow system momentum entirely; ours replaces it.
                         return nil
                     }
-                    switch event.phase {
-                    case .began:
-                        flick.reset()
-                        inertia.fingerMoved(delta: Double(delta))
-                    case .changed:
-                        inertia.fingerMoved(delta: Double(delta))
-                        pendingDirect += delta
-                        flick.record(delta: Double(delta), at: now)
-                    case .ended:
-                        inertia.release(pointsPerSecond: flick.releaseVelocity(at: now))
-                        pendingEnd = true
-                    case .cancelled:
-                        flick.reset()
-                        pendingEnd = true
-                    default:
-                        // Precise deltas without phases (some mice): direct.
-                        pendingDirect += delta
-                    }
-                    pendingIsPrecise = true
+                    acceptPrecise(delta: delta, phase: event.phase, at: now)
                 } else {
                     pendingDirect += delta
                     pendingIsPrecise = false
                     pendingEnd = true
+                    lastEventTime = now
+                    isScrolling = true
+                    wakeDisplayLink()
                 }
-                lastEventTime = now
-                isScrolling = true
                 return nil
             }
             attachDisplayLinkIfNeeded()
+            startStressDriverIfNeeded()
+        }
+
+        private func acceptPrecise(
+            delta: CGFloat,
+            phase: NSEvent.Phase,
+            at now: CFTimeInterval
+        ) {
+            switch phase {
+            case .began:
+                flick.reset()
+                inertia.fingerMoved(delta: Double(delta))
+            case .changed:
+                inertia.fingerMoved(delta: Double(delta))
+                pendingDirect += delta
+                flick.record(delta: Double(delta), at: now)
+            case .ended:
+                inertia.release(pointsPerSecond: flick.releaseVelocity(at: now))
+                pendingEnd = true
+            case .cancelled:
+                flick.reset()
+                pendingEnd = true
+            default:
+                // Precise deltas without phases (some mice): direct.
+                pendingDirect += delta
+            }
+            pendingIsPrecise = true
+            lastEventTime = now
+            isScrolling = true
+            wakeDisplayLink()
+        }
+
+        /// In-process input starts after AppKit routing and then uses exactly
+        /// the production display-link/inertia path. It exists only for the
+        /// release stress lab because macOS rejects synthetic HID input from
+        /// unsigned test runners without Accessibility permission.
+        private func startStressDriverIfNeeded() {
+            let environment = ProcessInfo.processInfo.environment
+            guard environment["AFTERRAY_UI_PERF_AUTORUN"] == "1" else {
+                return
+            }
+            let delayMilliseconds = Int(environment["AFTERRAY_UI_PERF_AUTORUN_DELAY_MS"] ?? "")
+                ?? 750
+            stressDriverTask?.cancel()
+            stressDriverTask = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(delayMilliseconds))
+                    for flickIndex in 0..<4 {
+                        guard let self else { return }
+                        acceptPrecise(
+                            delta: -8,
+                            phase: .began,
+                            at: CACurrentMediaTime()
+                        )
+                        for _ in 0..<18 {
+                            acceptPrecise(
+                                delta: CGFloat(-12 - flickIndex * 3),
+                                phase: .changed,
+                                at: CACurrentMediaTime()
+                            )
+                            try await Task.sleep(for: .milliseconds(8))
+                        }
+                        acceptPrecise(delta: 0, phase: .ended, at: CACurrentMediaTime())
+                        try await Task.sleep(for: .milliseconds(180))
+                    }
+                    self?.stressDriverTask = nil
+                } catch {
+                    return
+                }
+            }
         }
 
         func attachDisplayLinkIfNeeded() {
@@ -1669,7 +1858,14 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 preferred: 120
             )
             displayLink.add(to: .main, forMode: .common)
+            displayLink.isPaused = !isScrolling
             self.displayLink = displayLink
+        }
+
+        private func wakeDisplayLink() {
+            attachDisplayLinkIfNeeded()
+            lastFrameTime = 0
+            displayLink?.isPaused = false
         }
 
         private func shouldHandle(_ event: NSEvent) -> Bool {
@@ -1705,13 +1901,17 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         func stop() {
             if let monitor { NSEvent.removeMonitor(monitor) }
             monitor = nil
+            stressDriverTask?.cancel()
+            stressDriverTask = nil
             displayLink?.invalidate()
             displayLink = nil
         }
 
         @objc private func displayLinkDidFire(_ link: CADisplayLink) {
             let now = link.timestamp
-            let dt = lastFrameTime == 0 ? 1.0 / 120.0 : min(now - lastFrameTime, 0.05)
+            let previousFrameTime = lastFrameTime
+            let frameInterval = previousFrameTime == 0 ? nil : now - previousFrameTime
+            let dt = frameInterval.map { min($0, 0.05) } ?? (1.0 / 120.0)
             lastFrameTime = now
 
             // Direct gesture movement passes through whole — the finger is
@@ -1721,7 +1921,12 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             let glide = CGFloat(inertia.step(dt: dt))
             let delta = direct + glide
             if delta != 0 {
+                let handlerStart = CACurrentMediaTime()
                 onScroll(delta, pendingIsPrecise, false)
+                frameMetrics.record(
+                    frameInterval: frameInterval,
+                    handlerDuration: CACurrentMediaTime() - handlerStart
+                )
             }
 
             let quiet = direct == 0 && !inertia.isCoasting
@@ -1731,9 +1936,73 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             if quiet, pendingEnd || wentIdle {
                 pendingEnd = false
                 isScrolling = false
+                let settleStart = CACurrentMediaTime()
                 onScroll(0, pendingIsPrecise, true)
+                frameMetrics.finish(
+                    settleDuration: CACurrentMediaTime() - settleStart
+                )
+                lastFrameTime = 0
+                link.isPaused = true
             }
         }
+    }
+}
+
+/// Keeps performance evidence next to the display-link boundary being
+/// budgeted. It intentionally measures callback cadence and the synchronous
+/// scrub handler separately: interval spikes reveal missed scheduling/render
+/// opportunities, while handler time tells us whether our own hot path spent
+/// the 8.33 ms budget.
+private struct ScrubFrameMetrics {
+    let enabled: Bool
+    private var frameIntervals: [CFTimeInterval] = []
+    private var handlerDurations: [CFTimeInterval] = []
+
+    init(enabled: Bool) {
+        self.enabled = enabled
+    }
+
+    mutating func record(
+        frameInterval: CFTimeInterval?,
+        handlerDuration: CFTimeInterval
+    ) {
+        guard enabled else { return }
+        if let frameInterval { frameIntervals.append(frameInterval) }
+        handlerDurations.append(handlerDuration)
+    }
+
+    mutating func finish(settleDuration: CFTimeInterval) {
+        guard enabled, !handlerDurations.isEmpty else { return }
+        let intervals = frameIntervals.sorted()
+        let handlers = handlerDurations.sorted()
+        let meanInterval = intervals.isEmpty
+            ? 0
+            : intervals.reduce(0, +) / Double(intervals.count)
+        let refreshRate = meanInterval > 0 ? 1 / meanInterval : 0
+        let overTwelvePointFiveMs = intervals.lazy.filter { $0 > 0.0125 }.count
+        let overSixteenPointSevenMs = intervals.lazy.filter { $0 > 1.0 / 60.0 }.count
+        print(
+            String(
+                format: "[afterray-ui-perf] callbacks=%d hz=%.1f interval_p95_ms=%.2f interval_max_ms=%.2f over_12.5ms=%d over_16.7ms=%d handler_p95_ms=%.3f handler_max_ms=%.3f settle_ms=%.3f",
+                handlerDurations.count,
+                refreshRate,
+                percentile(intervals, 0.95) * 1_000,
+                (intervals.last ?? 0) * 1_000,
+                overTwelvePointFiveMs,
+                overSixteenPointSevenMs,
+                percentile(handlers, 0.95) * 1_000,
+                (handlers.last ?? 0) * 1_000,
+                settleDuration * 1_000
+            )
+        )
+        frameIntervals.removeAll(keepingCapacity: true)
+        handlerDurations.removeAll(keepingCapacity: true)
+    }
+
+    private func percentile(_ sorted: [CFTimeInterval], _ fraction: Double) -> CFTimeInterval {
+        guard !sorted.isEmpty else { return 0 }
+        let index = min(Int((Double(sorted.count - 1) * fraction).rounded(.up)), sorted.count - 1)
+        return sorted[index]
     }
 }
 
@@ -2230,40 +2499,46 @@ public enum RecallPalette {
 /// to stay readable on the dark track.
 enum AppIconPalette {
     private static let cache = NSCache<NSString, Swatch>()
+    private static let sampler = Sampler()
 
-    static func color(bundleIdentifier: String?, fallbackSeed: String) -> Color {
+    /// Render-loop lookup. A cache miss returns the deterministic fallback and
+    /// never asks Launch Services or samples pixels synchronously.
+    static func cachedColor(bundleIdentifier: String?, fallbackSeed: String) -> Color {
         if let bundleIdentifier {
             if let cached = cache.object(forKey: bundleIdentifier as NSString) {
                 return cached.color.map(Color.init(nsColor:))
                     ?? RecallPalette.appColor(seed: fallbackSeed)
             }
-            if let icon = applicationIcon(bundleIdentifier: bundleIdentifier),
-               let hsl = averageHSL(from: icon)
-            {
-                let rgb = RecallColorMath.rgb(
-                    hue: hsl.hue,
-                    saturation: min(max(hsl.saturation, 0.38), 0.90),
-                    lightness: min(max(hsl.lightness, 0.36), 0.62)
-                )
-                let nsColor = NSColor(
-                    calibratedRed: rgb.red,
-                    green: rgb.green,
-                    blue: rgb.blue,
-                    alpha: 1
-                )
-                cache.setObject(Swatch(nsColor), forKey: bundleIdentifier as NSString)
-                return Color(nsColor: nsColor)
-            }
-            cache.setObject(Swatch(nil), forKey: bundleIdentifier as NSString)
         }
         return RecallPalette.appColor(seed: fallbackSeed)
     }
 
-    private static func applicationIcon(bundleIdentifier: String) -> NSImage? {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
-            return nil
+    static func colorAsync(bundleIdentifier: String?, fallbackSeed: String) async -> Color {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else {
+            return RecallPalette.appColor(seed: fallbackSeed)
         }
-        return NSWorkspace.shared.icon(forFile: url.path)
+        if let cached = cache.object(forKey: bundleIdentifier as NSString) {
+            return cached.color.map(Color.init(nsColor:))
+                ?? RecallPalette.appColor(seed: fallbackSeed)
+        }
+        let sample = await sampler.sample(bundleIdentifier: bundleIdentifier)
+        let swatch: Swatch
+        switch sample {
+        case .color(let red, let green, let blue):
+            swatch = Swatch(
+                NSColor(
+                    calibratedRed: CGFloat(red),
+                    green: CGFloat(green),
+                    blue: CGFloat(blue),
+                    alpha: 1
+                )
+            )
+        case .missing:
+            swatch = Swatch(nil)
+        }
+        cache.setObject(swatch, forKey: bundleIdentifier as NSString)
+        return swatch.color.map(Color.init(nsColor:))
+            ?? RecallPalette.appColor(seed: fallbackSeed)
     }
 
     private static func averageHSL(from image: NSImage) -> (hue: CGFloat, saturation: CGFloat, lightness: CGFloat)? {
@@ -2329,6 +2604,46 @@ enum AppIconPalette {
     private final class Swatch: NSObject {
         let color: NSColor?
         init(_ color: NSColor?) { self.color = color }
+    }
+
+    private enum Sample: Sendable {
+        case color(red: Double, green: Double, blue: Double)
+        case missing
+    }
+
+    private actor Sampler {
+        private var resolved: [String: Sample] = [:]
+        private var inFlight: [String: Task<Sample, Never>] = [:]
+
+        func sample(bundleIdentifier: String) async -> Sample {
+            if let resolved = resolved[bundleIdentifier] { return resolved }
+            if let existing = inFlight[bundleIdentifier] { return await existing.value }
+            let task = Task<Sample, Never> {
+                guard let icon = await AppIconLookup.iconAsync(bundleIdentifier: bundleIdentifier) else {
+                    return .missing
+                }
+                return await Task.detached(priority: .utility) {
+                    guard let hsl = AppIconPalette.averageHSL(from: icon) else {
+                        return Sample.missing
+                    }
+                    let rgb = RecallColorMath.rgb(
+                        hue: hsl.hue,
+                        saturation: min(max(hsl.saturation, 0.38), 0.90),
+                        lightness: min(max(hsl.lightness, 0.36), 0.62)
+                    )
+                    return Sample.color(
+                        red: Double(rgb.red),
+                        green: Double(rgb.green),
+                        blue: Double(rgb.blue)
+                    )
+                }.value
+            }
+            inFlight[bundleIdentifier] = task
+            let result = await task.value
+            inFlight[bundleIdentifier] = nil
+            resolved[bundleIdentifier] = result
+            return result
+        }
     }
 }
 
