@@ -54,7 +54,7 @@ impl ModelSurface for QueueModel<'_> {
 fn to_model_message(message: &Message) -> ChatMessage {
     ChatMessage {
         role: message.role.wire_name().to_owned(),
-        content: message.content.clone(),
+        content: message.content().to_owned(),
     }
 }
 

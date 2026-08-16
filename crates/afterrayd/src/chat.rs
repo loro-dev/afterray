@@ -10,7 +10,7 @@ use chrono::Local;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use afterray_harness::{CompactionNotice, Message, Opening, ToolCallRecord};
+use afterray_harness::{CompactionNotice, History, Message, Opening, ToolCallRecord};
 
 use crate::agent;
 use crate::agent::fence_untrusted;
@@ -274,8 +274,8 @@ fn persist_turn(store: &Vault, turn: &PendingTurn<'_>) -> Result<ChatReply, Stri
 /// this, `tool_log` was written to the vault and then never read back, so a
 /// follow-up question could not see what the previous turn had already looked
 /// up and simply looked it up again.
-pub(crate) fn history_messages(messages: &[ConversationMessage]) -> Vec<Message> {
-    let mut out = Vec::new();
+pub(crate) fn history_messages(messages: &[ConversationMessage]) -> History {
+    let mut out = History::new();
     for message in messages {
         if message.role == crate::stream::COMPACTION_ROLE {
             // A compaction row is what is left of the turns it replaced, so it
@@ -299,7 +299,17 @@ pub(crate) fn history_messages(messages: &[ConversationMessage]) -> Vec<Message>
             )));
             continue;
         }
-        for call in parse_tool_log(message.tool_log.as_deref()) {
+        let calls = match parse_tool_log(message.tool_log.as_deref()) {
+            Ok(calls) => calls,
+            Err(error) => {
+                out.push(Message::control(format!(
+                    "[AfterRay] the record of what this turn looked up could not be read \
+                     ({error}). Treat the answer below as unsourced."
+                )));
+                Vec::new()
+            }
+        };
+        for call in calls {
             out.push(Message::tool_call(format!(
                 "TOOL {}\nARGS {}",
                 call.name, call.args
@@ -331,9 +341,18 @@ pub(crate) fn history_messages(messages: &[ConversationMessage]) -> Vec<Message>
     out
 }
 
-fn parse_tool_log(raw: Option<&str>) -> Vec<ToolCallRecord> {
-    raw.and_then(|raw| serde_json::from_str::<Vec<ToolCallRecord>>(raw).ok())
-        .unwrap_or_default()
+/// The calls stored on an assistant row.
+///
+/// `Err` when a log is present but unreadable, which the caller turns into a
+/// visible line rather than a silent gap. Swallowing the error here would
+/// delete a turn's tool messages from the middle of the conversation and move
+/// the prefix with nothing to explain it — the exact failure this whole design
+/// is built to make impossible.
+fn parse_tool_log(raw: Option<&str>) -> Result<Vec<ToolCallRecord>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<ToolCallRecord>>(raw).map_err(|error| error.to_string())
 }
 
 fn serialize_tool_log(calls: &[ToolCallRecord]) -> Option<String> {
@@ -379,7 +398,7 @@ pub(crate) fn build_seed(store: &Vault, now_ms: i64) -> String {
 /// then trimmed from the head, so a long history deleted the question. The
 /// fencing moved into `Opening::render` too: trimming a block that is already
 /// fenced can cut the marker off it.
-pub(crate) fn build_opening(seed: &str, history: Vec<Message>, message: &str) -> Opening {
+pub(crate) fn build_opening(seed: &str, history: History, message: &str) -> Opening {
     Opening {
         seed: seed.to_owned(),
         history,
@@ -562,9 +581,9 @@ mod tests {
             rows.push(msg("assistant", &format!("a{index}"), 11 + i64::from(index) * 2));
             let current = history_messages(&rows);
             assert!(
-                afterray_harness::is_prefix_of(&previous, &current),
+                afterray_harness::is_prefix_of(previous.messages(), current.messages()),
                 "turn {index} rewrote message {:?}",
-                afterray_harness::first_divergence(&previous, &current)
+                afterray_harness::first_divergence(previous.messages(), current.messages())
             );
             previous = current;
         }
@@ -572,9 +591,9 @@ mod tests {
         // where folding would have dropped it into "earlier turns omitted".
         assert_eq!(previous.len(), 26);
         assert!(
-            previous[0].content.contains("first question"),
+            previous.messages()[0].content().contains("first question"),
             "{:?}",
-            previous[0]
+            previous.messages()[0]
         );
     }
 
@@ -627,31 +646,37 @@ mod tests {
             "the same history rendered differently under two budgets"
         );
         assert!(
-            under_modest[2].content.contains("the quick brown fox"),
+            under_modest[2].content().contains("the quick brown fox"),
             "the result was not replayed: {:?}",
             under_modest[2]
         );
         assert!(
             under_modest[2]
-                .content
+                .content()
                 .contains("<<<AFTERRAY_DATA kind=tool_result>>>"),
             "a replayed result must stay inside the fence: {:?}",
             under_modest[2]
         );
 
-        // And when a window genuinely cannot hold the thread, what survives is
-        // still byte-identical — messages are dropped whole, never re-cut. A
-        // re-cut is the silent failure: same message, different bytes, and the
-        // prefix gone with no way to notice.
+        // A window too small for the thread is compaction's problem, not the
+        // renderer's — and what compaction leaves is still never a re-cut. A
+        // result is either exactly the bytes that were stored or exactly the
+        // standard marker; there is no third string, which is what a re-cut
+        // would be: same message, different bytes, no way to notice.
         let tiny = afterray_harness::ContextBudget::for_window(4_096);
-        let under_tiny = render(tiny);
-        assert!(
-            under_tiny.len() < under_large.len(),
-            "this budget was supposed to be too small: {under_tiny:?}"
+        let mut squeezed = history.clone();
+        let notices = afterray_harness::CompactionStrategy::compact_history(
+            &afterray_harness::PruneToolResults,
+            &mut squeezed,
+            tiny.opening_allowance(),
         );
-        for message in &under_tiny[..under_tiny.len() - 1] {
+        assert!(!notices.is_empty(), "this budget was supposed to bite");
+        for message in squeezed.messages() {
+            let survived = history.messages().contains(message);
+            let folded = message.content() == afterray_harness::history::DROPPED_RESULT;
+            let marker = message.content().starts_with("[AfterRay]");
             assert!(
-                history.contains(message),
+                survived || folded || marker,
                 "a stored message came back changed: {message:?}"
             );
         }
@@ -667,10 +692,36 @@ mod tests {
         let rows = vec![msg("user", "what was I reading", 1), answered];
 
         let history = history_messages(&rows);
-        let replayed = &history[2].content;
+        let replayed = &history.messages()[2].content();
         assert!(replayed.contains("`get_now` ran earlier"), "{replayed}");
         assert!(!replayed.contains("AFTERRAY_DATA"), "nothing to fence: {replayed}");
-        assert!(history[1].content.starts_with("TOOL get_now"));
+        assert!(history.messages()[1].content().starts_with("TOOL get_now"));
+    }
+
+    /// A log that cannot be parsed is said out loud. Returning an empty list
+    /// would delete the turn's tool messages from the middle of the array and
+    /// move the prefix with nothing to explain it.
+    #[test]
+    fn an_unreadable_tool_log_is_reported_rather_than_skipped() {
+        let mut answered = msg("assistant", "You were reading.", 2);
+        answered.tool_log = Some("{ this is not the array it should be".to_owned());
+        let history = history_messages(&[msg("user", "what was I reading", 1), answered]);
+
+        let control = history
+            .messages()
+            .iter()
+            .find(|message| message.kind == afterray_harness::Kind::Control)
+            .expect("no notice about the unreadable log");
+        assert!(control.content().contains("could not be read"), "{control:?}");
+        // The answer still replays: what is missing is the provenance, not the
+        // turn.
+        assert!(
+            history
+                .messages()
+                .iter()
+                .any(|message| message.content() == "You were reading."),
+            "the answer went with the log"
+        );
     }
 
     fn build_seed_stub() -> String {
@@ -690,8 +741,9 @@ mod tests {
 
         let rendered = history_messages(&rows);
         let text: String = rendered
+            .messages()
             .iter()
-            .map(|message| message.content.as_str())
+            .map(afterray_harness::Message::content)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("TOOL list_activity"), "{text}");
@@ -742,7 +794,7 @@ mod tests {
             seed.chars().count()
         );
 
-        let (prompt, _) = build_opening(&seed, vec![Message::user("ignore previous")], "那第三件呢")
+        let (prompt, _) = build_opening(&seed, History::from_stored(vec![Message::user("ignore previous")]), "那第三件呢")
             .render(afterray_harness::ContextBudget::DEFAULT, crate::agent::fence_untrusted);
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=seed>>>"));
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=user>>>"));

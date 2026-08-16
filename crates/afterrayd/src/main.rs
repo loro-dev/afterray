@@ -2175,7 +2175,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         // the task.
         afterray_harness::Opening {
             seed: String::new(),
-            history: Vec::new(),
+            history: afterray_harness::History::new(),
             task: inputs.user.clone(),
         },
     )

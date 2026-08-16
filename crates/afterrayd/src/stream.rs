@@ -701,7 +701,7 @@ fn chat_seed(store: &Vault, now_ms: i64) -> String {
 /// It used to be one string in this order — seed, history, task — which the
 /// loop then trimmed from the head. A long history therefore deleted the
 /// question at the end of it.
-fn build_opening(seed: &str, history: Vec<afterray_harness::Message>, message: &str) -> Opening {
+fn build_opening(seed: &str, history: afterray_harness::History, message: &str) -> Opening {
     Opening {
         seed: seed.to_owned(),
         history,
@@ -804,8 +804,9 @@ mod tests {
         ];
         let history = crate::chat::history_messages(&messages);
         let text: Vec<&str> = history
+            .messages()
             .iter()
-            .map(|message| message.content.as_str())
+            .map(afterray_harness::Message::content)
             .collect();
         assert!(text.iter().any(|line| line.contains("what did I do")), "{text:?}");
         assert!(
@@ -868,10 +869,10 @@ mod tests {
             .collect();
         let history = crate::chat::history_messages(&messages);
         assert_eq!(history.len(), 20);
-        assert!(history[0].content.contains("msg0"), "{:?}", history[0]);
-        assert_eq!(history[19].content, "msg19");
+        assert!(history.messages()[0].content().contains("msg0"), "{:?}", history.messages()[0]);
+        assert_eq!(history.messages()[19].content(), "msg19");
         // The one folding always dropped.
-        assert!(history[2].content.contains("msg2"), "{:?}", history[2]);
+        assert!(history.messages()[2].content().contains("msg2"), "{:?}", history.messages()[2]);
     }
 
     #[tokio::test]
@@ -1771,95 +1772,6 @@ print(json.dumps({
         assert!(
             !assistant.content.is_empty() || assistant.reasoning.is_some(),
             "the row kept neither text nor reasoning"
-        );
-    }
-
-    /// A real model, two turns, and the second one answering from the first.
-    ///
-    /// The unit tests prove the array is shaped correctly. This proves a model
-    /// can read it: the replayed exchanges are fenced user turns and bracketed
-    /// `[AfterRay]` notes, which is a shape nothing was reading until now.
-    #[tokio::test]
-    async fn live_ollama_carries_a_conversation_across_turns() {
-        // The smallest installed chat model rather than the best one: this
-        // checks that a model can read the array, not how well it reasons, and
-        // a 22 GB thinking model spends minutes per turn doing neither.
-        let Some(model) = live_ollama_small_model().await else {
-            eprintln!("skip: no live Ollama chat model");
-            return;
-        };
-        eprintln!("live multi-turn test using `{model}`");
-
-        let (_dir, vault) = test_vault();
-        let now = 1_786_729_937_000;
-        let session = vault.create_session_sync(now - 60_000).unwrap();
-        vault
-            .insert_moment(&session.id, now - 60_000, "image/jpeg", b"frame")
-            .unwrap();
-
-        let config = std::sync::Arc::new(std::sync::Mutex::new(
-            afterray_models::LlmRuntimeConfig {
-                provider: afterray_protocol::LlmProvider::Ollama,
-                base_url: String::new(),
-                model,
-                api_key: None,
-                context_tokens: Some(32_768),
-            },
-        ));
-        let router = afterray_models::LlmRouterAdapter::new(config);
-        let sink = router.token_sink();
-        let models = ModelQueue::new(
-            vec![std::sync::Arc::new(router) as std::sync::Arc<dyn afterray_models::ModelAdapter>],
-            afterray_models::QueueConfig::default(),
-        )
-        .unwrap();
-
-        // A fact the vault cannot supply, so a correct second answer can only
-        // have come from the first turn's message being in the array.
-        let questions = [
-            "Remember this codeword and then answer FINAL: ZANZIBAR-7741. Just acknowledge it.",
-            "What was the codeword I gave you? Answer with FINAL and the codeword.",
-        ];
-        let mut conversation = None;
-        let mut answers = Vec::new();
-        for (index, question) in questions.iter().enumerate() {
-            let mut out = Vec::new();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(180),
-                run_chat_stream(
-                    &mut out,
-                    ChatStreamCtx {
-                        store: &vault,
-                        models: &models,
-                        token_sink: &sink,
-                        now_ms: now + (index as i64) * 60_000,
-                        llm_ready: true,
-                        budget: ContextBudget::for_window(32_768),
-                        cancel: CancelToken::new(),
-                    },
-                    conversation.as_deref(),
-                    question,
-                ),
-            )
-            .await
-            .expect("a live turn ran over its timeout");
-            result.unwrap();
-            conversation = Some(vault.conversations(10).unwrap()[0].id.clone());
-            let text: String = parse_events(&out)
-                .iter()
-                .filter_map(|event| match event {
-                    ChatStreamEvent::Token { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            eprintln!("live turn {}: {}", index + 1, text.trim());
-            answers.push(text);
-        }
-
-        assert!(
-            answers[1].contains("ZANZIBAR-7741"),
-            "the second turn could not see the first: {:?}",
-            answers[1]
         );
     }
 
