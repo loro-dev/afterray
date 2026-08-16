@@ -550,7 +550,56 @@ private var settingsScenes: [SnapshotScene] {
             model: developer,
             initialPage: .developer
         ),
+    ] + modelDownloadScenes
+}
+
+/// The models page in its three download states. The queue is the most stateful
+/// chrome on the page and the one thing three separate surfaces used to render
+/// their own copy of, so it is worth checking in pixels rather than assuming.
+@MainActor
+private var modelDownloadScenes: [SnapshotScene] {
+    let idle = SettingsPreviewModel()
+    let downloading = SettingsPreviewModel()
+    let paused = SettingsPreviewModel()
+    downloading.stageDownloadQueue(state: .downloading, bytesPerSecond: 12_400_000)
+    paused.stageDownloadQueue(state: .paused, bytesPerSecond: nil)
+    return [
+        settingsScene(name: "21-settings-models-idle", model: idle, initialPage: .models),
+        settingsScene(
+            name: "22-settings-models-download-queue",
+            model: downloading,
+            initialPage: .models
+        ),
+        settingsScene(
+            name: "23-settings-models-download-paused",
+            model: paused,
+            initialPage: .models
+        ),
     ]
+}
+
+private extension SettingsPreviewModel {
+    /// Parks a fixed queue on the model: one pack part-transferred with two
+    /// waiting behind it. Set directly rather than by driving the simulation, so
+    /// the snapshot renders the same pixels every run.
+    @MainActor
+    func stageDownloadQueue(state: ModelPackState, bytesPerSecond: Double?) {
+        guard let library else { return }
+        self.library = ModelLibrary(
+            directory: library.directory,
+            packs: library.packs,
+            download: ModelDownloadProgress(
+                packId: "asr",
+                queuedPackIds: ["embedding", "llm_qwen35_9b_mlx4"],
+                state: state,
+                bytes: 1_400_000_000,
+                expectedBytes: 4_200_000_000,
+                completedFiles: 3,
+                totalFiles: 11
+            )
+        )
+        downloadRateBytesPerSecond = bytesPerSecond
+    }
 }
 
 /// The transcript caption with the summary panel open. The panel is the

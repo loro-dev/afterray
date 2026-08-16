@@ -430,6 +430,17 @@ final class DaemonWireTests: XCTestCase {
         }
     }
 
+    /// One character separates this from `cancel_model_downloads`, which tears
+    /// the whole queue down instead of dropping a single pack.
+    func testCancelOneModelDownloadRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "cancel_model_download", packID: "embedding")
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "cancel_model_download")
+        XCTAssertEqual(json["pack_id"] as? String, "embedding")
+    }
+
     func testRemoveModelRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "remove_model", packID: "llm_qwen35_4b_mlx4"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -556,7 +567,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 9)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 10)
     }
 
     func testCaptureSetPausedRequestMatchesRustShape() throws {

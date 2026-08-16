@@ -215,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         download_cancellation: std::sync::Mutex::new(None),
         download_paused: AtomicBool::new(false),
         download_cancel_requested: AtomicBool::new(false),
+        download_drop_pack: std::sync::Mutex::new(None),
         download_changed: tokio::sync::Notify::new(),
         capture_interval: Duration::from_secs(
             std::env::var("AFTERRAY_CAPTURE_INTERVAL_SECONDS")
@@ -425,6 +426,10 @@ struct AppState {
     download_cancellation: std::sync::Mutex<Option<Cancellation>>,
     download_paused: AtomicBool,
     download_cancel_requested: AtomicBool,
+    /// Pack id the user cancelled on its own. `download_cancel_requested` tears
+    /// the whole queue down; this drops exactly one pack and lets the worker
+    /// carry on with the rest.
+    download_drop_pack: std::sync::Mutex<Option<String>>,
     download_changed: tokio::sync::Notify,
     capture_interval: Duration,
     data_dir: PathBuf,
@@ -946,6 +951,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::PauseModelDownloads => pause_model_downloads(state).await,
         Request::ResumeModelDownloads => resume_model_downloads(state),
         Request::CancelModelDownloads => cancel_model_downloads(state).await,
+        Request::CancelModelDownload { pack_id } => cancel_model_download(state, &pack_id).await,
         Request::RemoveModel { pack_id } => remove_model(state, &pack_id).await,
         Request::Shutdown => {
             let _ = state.shutdown.send(true);
@@ -3087,6 +3093,154 @@ fn resume_download_worker(state: &Arc<AppState>) {
     state.download_changed.notify_waiters();
 }
 
+/// True while `pack_id` is the pack the user singled out for cancellation.
+fn download_drop_matches(slot: &std::sync::Mutex<Option<String>>, pack_id: &str) -> bool {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        == Some(pack_id)
+}
+
+/// Claims the single-pack cancellation for `pack_id`, clearing it so the worker
+/// cannot act on the same request twice.
+fn take_download_drop(slot: &std::sync::Mutex<Option<String>>, pack_id: &str) -> bool {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.as_deref() == Some(pack_id) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Lifts a not-yet-started pack out of the pending queue.
+///
+/// Order is load-bearing: the queue is what the app renders, and every waiting
+/// row's "starts after the current pack" estimate is the sum of everything
+/// ahead of it, so removing one entry must not disturb the others.
+fn take_queued_pack(
+    queue: &mut Vec<afterray_models::PackSpec>,
+    pack_id: &str,
+) -> Option<afterray_models::PackSpec> {
+    queue
+        .iter()
+        .position(|queued| queued.id == pack_id)
+        .map(|index| queue.remove(index))
+}
+
+/// Bins a singly-cancelled pack's partial files and wakes whoever asked for it.
+fn finish_dropped_pack(state: &AppState, pack: &afterray_models::PackSpec) {
+    if let Err(error) = remove_pack(pack) {
+        eprintln!("could not remove cancelled {} download: {error}", pack.name);
+    }
+    state.download_changed.notify_waiters();
+}
+
+fn download_queued_ids(state: &AppState) -> Vec<String> {
+    state
+        .download_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|queued| queued.id.clone())
+        .collect()
+}
+
+/// Cancels one pack without disturbing the rest of the queue.
+///
+/// A pack that has not started yet is simply lifted out of the queue here — the
+/// worker never sees it. The pack being downloaded right now has to go through
+/// the worker instead, so this only records the request and waits for the worker
+/// to acknowledge it; returning earlier would hand the app a snapshot that still
+/// lists the pack it just cancelled.
+async fn cancel_model_download(state: &Arc<AppState>, pack_id: &str) -> Response {
+    if spec_by_id(pack_id).is_none() {
+        return Response::failure(format!("unknown model pack `{pack_id}`"));
+    }
+
+    let queued_pack = take_queued_pack(
+        &mut state
+            .download_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        pack_id,
+    );
+    if let Some(pack) = queued_pack {
+        if let Err(error) = remove_pack(&pack) {
+            eprintln!("could not remove queued {} download: {error}", pack.name);
+        }
+        let queued_ids = download_queued_ids(state);
+        if let Some(progress) = state
+            .download
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            progress.queued_pack_ids = queued_ids;
+        }
+        state.download_changed.notify_waiters();
+        return Response::success(model_library(state));
+    }
+
+    let is_reported = state
+        .download
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|progress| progress.pack_id == pack_id);
+    if !is_reported {
+        return Response::success(model_library(state));
+    }
+    if !state.download_active.load(Ordering::Acquire) {
+        // A settled failure: the worker is gone and the row only survives so the
+        // user can read the error. Cancelling it is how they dismiss it.
+        *state
+            .download
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        state.download_changed.notify_waiters();
+        return Response::success(model_library(state));
+    }
+
+    *state
+        .download_drop_pack
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pack_id.to_owned());
+    // A paused pack is parked in the worker's wait loop rather than inside the
+    // transfer, so clear the pause too or the drop is never observed.
+    state.download_paused.store(false, Ordering::Release);
+    if let Some(cancellation) = state
+        .download_cancellation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        cancellation.cancel();
+    }
+    state.download_changed.notify_waiters();
+
+    // `notify_waiters` leaves no permit behind, so a wake that lands between the
+    // check and the await would be lost. Re-checking on a short tick keeps this
+    // responsive without letting the RPC hang on that race.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let changed = state.download_changed.notified();
+        if !download_drop_matches(&state.download_drop_pack, pack_id)
+            || !state.download_active.load(Ordering::Acquire)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("cancel of `{pack_id}` was not acknowledged in time");
+            break;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(100), changed).await;
+    }
+    Response::success(model_library(state))
+}
+
 async fn cancel_model_downloads(state: &Arc<AppState>) -> Response {
     if !state.download_active.load(Ordering::Acquire) {
         return Response::success(model_library(state));
@@ -3095,6 +3249,10 @@ async fn cancel_model_downloads(state: &Arc<AppState>) -> Response {
         .download_cancel_requested
         .store(true, Ordering::Release);
     state.download_paused.store(false, Ordering::Release);
+    *state
+        .download_drop_pack
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let queued = state
         .download_queue
         .lock()
@@ -3246,6 +3404,16 @@ async fn run_model_downloads(state: Arc<AppState>) {
             return;
         }
 
+        // Dropped on its own: bin this pack's partial files and pick up the
+        // next one. Checked before the pause branch because cancelling a paused
+        // pack clears the pause flag on its way in.
+        if matches!(result, Err(DownloadError::Cancelled))
+            && take_download_drop(&state.download_drop_pack, &pack.id)
+        {
+            finish_dropped_pack(&state, &pack);
+            continue;
+        }
+
         if matches!(result, Err(DownloadError::Cancelled))
             && state.download_paused.load(Ordering::Acquire)
         {
@@ -3277,6 +3445,7 @@ async fn run_model_downloads(state: Arc<AppState>) {
                 let changed = state.download_changed.notified();
                 if state.download_cancel_requested.load(Ordering::Acquire)
                     || !state.download_paused.load(Ordering::Acquire)
+                    || download_drop_matches(&state.download_drop_pack, &pack.id)
                 {
                     break;
                 }
@@ -3298,6 +3467,21 @@ async fn run_model_downloads(state: Arc<AppState>) {
                 state.download_active.store(false, Ordering::Release);
                 state.download_changed.notify_waiters();
                 return;
+            }
+            // Cancelled while parked. Lift the pack back out of the queue head
+            // it was parked in, then let the loop take whatever follows it.
+            if take_download_drop(&state.download_drop_pack, &pack.id) {
+                {
+                    let mut queue = state
+                        .download_queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if queue.first().is_some_and(|queued| queued.id == pack.id) {
+                        queue.remove(0);
+                    }
+                }
+                state.download_paused.store(false, Ordering::Release);
+                finish_dropped_pack(&state, &pack);
             }
             continue;
         }
@@ -3507,6 +3691,47 @@ mod tests {
 
         let unknown = requested_download_packs(None, &["not-a-model".to_owned()]).unwrap_err();
         assert!(unknown.contains("unknown model pack `not-a-model`"));
+    }
+
+    /// Cancelling one waiting pack must not reshuffle the others: the app draws
+    /// the queue in this order and estimates each row from everything above it.
+    #[test]
+    fn cancelling_a_queued_pack_leaves_the_rest_of_the_queue_in_order() {
+        let ids = ["asr", "embedding", QWEN35_4B_MLX_PACK_ID];
+        let mut queue = ids
+            .iter()
+            .map(|id| spec_by_id(id).expect("catalog pack"))
+            .collect::<Vec<_>>();
+
+        let taken = take_queued_pack(&mut queue, "embedding").expect("embedding was queued");
+
+        assert_eq!(taken.id, "embedding");
+        let remaining = queue
+            .iter()
+            .map(|pack| pack.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, ["asr", QWEN35_4B_MLX_PACK_ID]);
+        assert!(take_queued_pack(&mut queue, "embedding").is_none());
+        assert!(take_queued_pack(&mut queue, "not-a-model").is_none());
+    }
+
+    /// The worker acts on the drop flag once and clears it. A second read must
+    /// not fire, or resuming the queue would bin the pack that came next.
+    #[test]
+    fn a_single_pack_cancellation_is_claimed_exactly_once() {
+        let slot = std::sync::Mutex::new(Some("asr".to_owned()));
+
+        assert!(download_drop_matches(&slot, "asr"));
+        assert!(!download_drop_matches(&slot, "embedding"));
+        assert!(
+            !take_download_drop(&slot, "embedding"),
+            "a different pack must not claim the cancellation"
+        );
+
+        assert!(take_download_drop(&slot, "asr"));
+        assert!(!take_download_drop(&slot, "asr"), "claimed twice");
+        assert!(!download_drop_matches(&slot, "asr"));
+        assert!(slot.lock().unwrap().is_none());
     }
 
     #[tokio::test]

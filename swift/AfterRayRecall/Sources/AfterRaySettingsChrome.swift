@@ -8,9 +8,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var storage: AfterRayStorageSnapshot { get }
     var message: String? { get }
     var isRefreshing: Bool { get }
-    var downloadingID: String? { get }
-    var downloadProgress: Double? { get }
-    var downloadStatus: String? { get }
+    /// Measured transfer rate of the live download. The daemon reports bytes,
+    /// not speed, so the ETA in the queue is the app's own estimate.
+    var downloadRateBytesPerSecond: Double? { get }
     var isControllingDownload: Bool { get }
     var isUpdatingAudio: Bool { get }
     var isUpdatingStorageLimit: Bool { get }
@@ -58,6 +58,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func pauseModelDownloads() async
     func resumeModelDownloads() async
     func cancelModelDownloads() async
+    /// Drops one pack from the queue and discards its partial files.
+    func cancelModelDownload(packID: String) async
     func remove(packID: String) async
     func revealLogs()
     func copyDiagnostics()
@@ -837,6 +839,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var modelsPage: some View {
+        downloadQueueSection
+
         SettingsSection(
             title: "Assistant source",
             footnote: providerFootnote,
@@ -894,78 +898,181 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
     }
 
-    @ViewBuilder
     private var packsFooter: some View {
-        if model.downloadingID != nil, let status = model.downloadStatus {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    if model.library?.download?.isPaused == true {
-                        Image(systemName: "pause.circle.fill")
-                            .foregroundStyle(SettingsPalette.secondaryLabel)
-                    } else {
-                        ProgressView().controlSize(.small)
-                    }
-                    Text(status)
-                        .font(.settingsCaption)
-                        .foregroundStyle(SettingsPalette.secondaryLabel)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    if let percent = percentLabel(model.downloadProgress) {
-                        Text(percent)
-                            .font(.system(size: 11, weight: .semibold, design: .rounded))
-                            .foregroundStyle(SettingsPalette.label)
-                            .monospacedDigit()
-                    }
-                }
-                ProgressView(value: model.downloadProgress ?? 0)
-                    .progressViewStyle(.linear)
-                    .tint(SettingsPalette.accent)
-                HStack(spacing: 10) {
-                    Text(model.library?.download?.isPaused == true
-                        ? "Partial files are kept for resume."
-                        : "Pause keeps partial files; cancel removes them.")
-                        .font(.settingsCaption)
-                        .foregroundStyle(SettingsPalette.tertiaryLabel)
-                    Spacer(minLength: 8)
-                    if model.library?.download?.isPaused == true {
-                        Button("Resume") {
-                            Task { await model.resumeModelDownloads() }
-                        }
-                        .buttonStyle(SettingsButtonStyle(kind: .prominent))
-                    } else {
-                        Button("Pause") {
-                            Task { await model.pauseModelDownloads() }
-                        }
-                        .buttonStyle(SettingsButtonStyle())
-                    }
-                    Button("Cancel") {
-                        Task { await model.cancelModelDownloads() }
-                    }
-                    .buttonStyle(SettingsButtonStyle())
-                }
-                .disabled(model.isControllingDownload)
+        SettingsFooterBar {
+            Button(enqueueableCount > 0 ? "Download Missing (\(enqueueableCount))" : "All Packs Installed") {
+                Task { await model.download(packID: nil) }
             }
-            .padding(.horizontal, SettingsMetrics.rowInset)
-            .padding(.vertical, 12)
-        } else {
-            SettingsFooterBar {
-                Button(missingPackCount > 0 ? "Download Missing (\(missingPackCount))" : "All Packs Installed") {
-                    Task { await model.download(packID: nil) }
+            .buttonStyle(SettingsButtonStyle(kind: .prominent))
+            .disabled(enqueueableCount == 0)
+        }
+    }
+
+    // MARK: Download queue
+
+    /// The whole download story in one place at the top of the page. Progress
+    /// used to be scattered across the pack row, the assistant panel, and a
+    /// footer that replaced itself with a progress bar, so a queued pack had no
+    /// home and a second download had nowhere to appear.
+    @ViewBuilder
+    private var downloadQueueSection: some View {
+        let queue = downloadQueue
+        if !queue.isEmpty {
+            SettingsSection(
+                title: "Downloads",
+                footnote: "One pack transfers at a time. Pause keeps partial files so it resumes where it stopped; cancel discards them."
+            ) {
+                ForEach(Array(queue.enumerated()), id: \.element.id) { index, item in
+                    if index > 0 { SettingsSeparator() }
+                    downloadQueueRow(item)
                 }
-                .buttonStyle(SettingsButtonStyle(kind: .prominent))
-                .disabled(model.downloadingID != nil || missingPackCount == 0)
+                if queue.count > 1 {
+                    SettingsSeparator()
+                    SettingsFooterBar {
+                        Button("Cancel All") {
+                            Task { await model.cancelModelDownloads() }
+                        }
+                        .buttonStyle(SettingsButtonStyle(kind: .destructive))
+                        .disabled(model.isControllingDownload)
+                    }
+                }
             }
         }
     }
 
-    private var missingRequiredCount: Int {
-        model.library?.packs.filter { $0.required && !$0.present }.count ?? 0
+    private var downloadQueue: [ModelDownloadQueueItem] {
+        model.library?.downloadQueue(bytesPerSecond: model.downloadRateBytesPerSecond) ?? []
     }
 
-    /// Every absent pack, optional ones included: the daemon downloads those
-    /// too, so gating the button on required-only packs left it dead.
-    private var missingPackCount: Int {
-        model.library?.packs.filter { !$0.present }.count ?? 0
+    private func downloadQueueRow(_ item: ModelDownloadQueueItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if item.isRunning {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: queueStageIcon(item.stage))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(queueStageTone(item.stage).color)
+                }
+                Text(item.name)
+                    .font(.settingsRowTitle)
+                    .foregroundStyle(SettingsPalette.label)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                SettingsPill(item.stageLabel, tone: queueStageTone(item.stage))
+                if let percent = item.percent, item.stage != .waiting, item.stage != .failed {
+                    Text("\(percent)%")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(SettingsPalette.label)
+                        .monospacedDigit()
+                }
+            }
+
+            // No bar for a pack that has not started: an empty track reads as a
+            // stalled download rather than a queued one.
+            if item.stage != .waiting {
+                ProgressView(value: item.fraction ?? 0)
+                    .progressViewStyle(.linear)
+                    .tint(item.stage == .failed ? SettingsPalette.danger : SettingsPalette.accent)
+            }
+
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(queueDetail(item))
+                    .font(.settingsCaption)
+                    .foregroundStyle(item.stage == .failed
+                        ? SettingsPalette.danger
+                        : SettingsPalette.tertiaryLabel)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                downloadQueueControls(item)
+            }
+        }
+        .padding(.horizontal, SettingsMetrics.rowInset)
+        .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private func downloadQueueControls(_ item: ModelDownloadQueueItem) -> some View {
+        HStack(spacing: 8) {
+            if item.canRetry {
+                Button("Retry") {
+                    Task { await model.download(packID: item.id) }
+                }
+                .buttonStyle(SettingsButtonStyle(kind: .prominent))
+            }
+            if item.canResume {
+                Button("Resume") {
+                    Task { await model.resumeModelDownloads() }
+                }
+                .buttonStyle(SettingsButtonStyle(kind: .prominent))
+            }
+            if item.canPause {
+                Button("Pause") {
+                    Task { await model.pauseModelDownloads() }
+                }
+                .buttonStyle(SettingsButtonStyle())
+            }
+            Button(item.canRetry ? "Dismiss" : "Cancel") {
+                Task { await model.cancelModelDownload(packID: item.id) }
+            }
+            .buttonStyle(SettingsButtonStyle())
+        }
+        .disabled(model.isControllingDownload)
+    }
+
+    private func queueDetail(_ item: ModelDownloadQueueItem) -> String {
+        if item.stage == .failed {
+            return item.error ?? "The download failed."
+        }
+        var parts: [String] = []
+        if let size = item.sizeText { parts.append(size) }
+        switch item.stage {
+        case .downloading:
+            if let rate = model.downloadRateBytesPerSecond, rate >= 1 {
+                parts.append("\(AfterRayStorageSnapshot.byteCount(UInt64(rate)))/s")
+            }
+            if let eta = item.etaText { parts.append(eta) }
+        case .verifying:
+            parts.append("Checking each file against its checksum")
+        case .paused:
+            parts.append("Partial files kept")
+        case .waiting:
+            parts.append(item.etaText.map { "starts after the current pack · \($0)" }
+                ?? "starts after the current pack")
+        case .failed:
+            break
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func queueStageIcon(_ stage: ModelDownloadQueueItem.Stage) -> String {
+        switch stage {
+        case .downloading, .verifying: "arrow.down.circle"
+        case .paused: "pause.circle.fill"
+        case .waiting: "clock"
+        case .failed: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func queueStageTone(_ stage: ModelDownloadQueueItem.Stage) -> SettingsTone {
+        switch stage {
+        case .downloading, .verifying, .waiting: .neutral
+        case .paused: .warning
+        case .failed: .danger
+        }
+    }
+
+    /// Packs the Download Missing button would actually add. Anything already in
+    /// the queue is excluded, so the count never promises work that is under way.
+    private var enqueueableCount: Int {
+        guard let library = model.library else { return 0 }
+        return library.packs.filter { !$0.present && !library.isQueued(packID: $0.id) }.count
+    }
+
+    /// Sidebar badge: only the packs AfterRay cannot work without.
+    private var missingRequiredCount: Int {
+        model.library?.packs.filter { $0.required && !$0.present }.count ?? 0
     }
 
     /// Only where the choice carries a consequence the controls do not show.
@@ -1043,50 +1150,34 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                if let download = model.library?.download,
-                   download.packId == pack.id,
-                   download.state == .downloading || download.state == .verifying
-                {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(download.state == .verifying ? "Verifying files…" : "Downloading model…")
-                                .font(.settingsCaption)
-                                .foregroundStyle(SettingsPalette.secondaryLabel)
-                            Spacer()
-                            if let percent = download.percent {
-                                Text("\(percent)%")
-                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                                    .monospacedDigit()
-                            }
-                        }
-                        ProgressView(value: download.fraction ?? 0)
-                            .progressViewStyle(.linear)
-                            .tint(SettingsPalette.accent)
-                    }
-                } else if model.library?.download?.isActive == true,
-                          model.library?.download?.queuedPackIds.contains(pack.id) == true
-                {
-                    Label("Waiting to download", systemImage: "clock")
+                // Progress for this pack lives in the queue at the top of the
+                // page; the panel only says that it is on the list.
+                if model.library?.isQueued(packID: pack.id) == true {
+                    Label("In the download queue at the top of this page", systemImage: "arrow.up")
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                 }
 
                 HStack(spacing: 10) {
-                    switch pack.state {
-                    case .notDownloaded, .failed:
-                        Button(pack.state == .failed ? "Retry Download" : "Download \(mlxDownloadLabel(for: pack.id))") {
-                            Task { await model.download(packID: pack.id) }
+                    if model.library?.isQueued(packID: pack.id) != true {
+                        switch pack.state {
+                        case .notDownloaded, .failed:
+                            Button(pack.state == .failed
+                                ? "Retry Download"
+                                : "Download \(mlxDownloadLabel(for: pack.id))")
+                            {
+                                Task { await model.download(packID: pack.id) }
+                            }
+                            .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                        case .ready, .inUse:
+                            Button("Show Files") { model.reveal(pack.path) }
+                                .buttonStyle(SettingsButtonStyle())
+                            Button("Remove…") { confirmingMlxRemoval = true }
+                                .buttonStyle(SettingsButtonStyle())
+                                .disabled(pack.state == .inUse)
+                        case .downloading, .verifying, .paused, .incompatible:
+                            EmptyView()
                         }
-                        .buttonStyle(SettingsButtonStyle(kind: .prominent))
-                        .disabled(model.downloadingID != nil)
-                    case .ready, .inUse:
-                        Button("Show Files") { model.reveal(pack.path) }
-                            .buttonStyle(SettingsButtonStyle())
-                        Button("Remove…") { confirmingMlxRemoval = true }
-                            .buttonStyle(SettingsButtonStyle())
-                            .disabled(pack.state == .inUse || model.downloadingID != nil)
-                    case .downloading, .verifying, .paused, .incompatible:
-                        EmptyView()
                     }
                     Spacer()
                 }
@@ -1297,37 +1388,20 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         return [LlmRemoteModel(id: model.draftLlmModel)] + models
     }
 
+    /// Pack rows carry status and actions only. Anything in flight is rendered
+    /// once, in the queue at the top of the page — a row that grew its own
+    /// progress bar is how the page ended up with three of them.
     private func modelPackRow(_ pack: ModelPack) -> some View {
-        let downloading = model.library?.download?.isActive == true
-            && (model.downloadingID == pack.id || model.library?.download?.packId == pack.id)
-        let paused = model.library?.download?.isPaused == true
-            && model.library?.download?.packId == pack.id
-        let queued = model.library?.download?.isActive == true
-            && model.library?.download?.queuedPackIds.contains(pack.id) == true
+        let queued = model.library?.isQueued(packID: pack.id) == true
         return SettingsRow(
             title: pack.name,
             subtitle: packSubtitle(pack),
             subtitleLineLimit: 2
         ) {
             HStack(spacing: 8) {
-                if downloading {
-                    ProgressView().controlSize(.mini)
-                    Text(percentLabel(model.downloadProgress) ?? "Downloading")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(SettingsPalette.secondaryLabel)
-                        .monospacedDigit()
-                } else if paused {
-                    Image(systemName: "pause.circle.fill")
-                        .foregroundStyle(SettingsPalette.secondaryLabel)
-                    Text(percentLabel(model.downloadProgress).map { "Paused · \($0)" } ?? "Paused")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(SettingsPalette.secondaryLabel)
-                        .monospacedDigit()
-                } else if queued {
-                    Image(systemName: "clock")
-                        .foregroundStyle(SettingsPalette.secondaryLabel)
-                    Text("Waiting")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                if queued {
+                    Label("In the download queue", systemImage: "arrow.up")
+                        .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                 } else {
                     SettingsPill(packStatus(pack), tone: packTone(pack))
@@ -1339,7 +1413,6 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                             Task { await model.download(packID: pack.id) }
                         }
                         .buttonStyle(SettingsButtonStyle())
-                        .disabled(model.downloadingID != nil)
                     }
                 }
             }
@@ -1551,11 +1624,6 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     // MARK: Shared pieces
-
-    private func percentLabel(_ progress: Double?) -> String? {
-        guard let progress else { return nil }
-        return "\(Int((progress * 100).rounded(.down)))%"
-    }
 
     private func storageStat(
         _ title: String,

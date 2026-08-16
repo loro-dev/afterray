@@ -20,9 +20,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     )
     @Published public var message: String?
     @Published public var isRefreshing = false
-    @Published public var downloadingID: String?
-    @Published public var downloadProgress: Double?
-    @Published public var downloadStatus: String?
+    @Published public var downloadRateBytesPerSecond: Double?
     @Published public var isControllingDownload = false
     @Published public var isUpdatingAudio = false
     @Published public var isUpdatingStorageLimit = false
@@ -68,6 +66,8 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             state: "done"
         ),
     ]
+
+    private var previewDownloadTask: Task<Void, Never>?
 
     public var dataDirectoryPath: String { settings?.dataDir ?? "/tmp/afterray-data" }
     public var modelDirectoryPath: String { settings?.modelDir ?? "/tmp/afterray-models" }
@@ -218,52 +218,196 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         message = "Would reveal \(path)"
     }
 
+    /// Queues packs the way the daemon does — one transferring, the rest
+    /// waiting — so the lab exercises the real queue instead of a lone bar.
     public func download(packID: String?) async {
-        downloadingID = packID ?? "all"
-        downloadStatus = "Downloading \(packID ?? "models") · 15%"
-        downloadProgress = 0.15
-        try? await Task.sleep(for: .milliseconds(400))
-        downloadStatus = "Downloading \(packID ?? "models") · 70%"
-        downloadProgress = 0.7
-        try? await Task.sleep(for: .milliseconds(400))
-        if let packID, let current = library {
-            library = ModelLibrary(
-                directory: current.directory,
-                packs: current.packs.map { pack in
-                    guard pack.id == packID else { return pack }
-                    return ModelPack(
-                        id: pack.id,
-                        name: pack.name,
-                        capability: pack.capability,
-                        path: pack.path,
-                        present: true,
-                        bytes: pack.expectedBytes ?? pack.bytes,
-                        required: pack.required,
-                        note: pack.note,
-                        expectedBytes: pack.expectedBytes
-                    )
-                }
-            )
+        guard let current = library else { return }
+        let wanted = packID.map { [$0] } ?? current.packs.filter { !$0.present }.map(\.id)
+        var active = current.download
+        var queued = active?.queuedPackIds ?? []
+        for id in wanted where id != active?.packId && !queued.contains(id) {
+            if active == nil {
+                active = progress(packID: id, state: .downloading, bytes: 0)
+            } else {
+                queued.append(id)
+            }
         }
-        downloadingID = nil
-        downloadProgress = nil
-        downloadStatus = nil
-        message = "Preview marked \(packID ?? "models") as installed."
+        guard let active else {
+            message = "Preview has every pack installed."
+            return
+        }
+        library = ModelLibrary(
+            directory: current.directory,
+            packs: current.packs,
+            download: replacing(active, queuedPackIds: queued)
+        )
+        downloadRateBytesPerSecond = 12_400_000
+        message = nil
+        startPreviewDownload()
     }
 
     public func pauseModelDownloads() async {
-        downloadStatus = "Paused models"
+        guard let current = library, let active = current.download else { return }
+        library = ModelLibrary(
+            directory: current.directory,
+            packs: current.packs,
+            download: replacing(active, state: .paused)
+        )
+        downloadRateBytesPerSecond = nil
     }
 
     public func resumeModelDownloads() async {
-        downloadStatus = "Downloading models · 70%"
+        guard let current = library, let active = current.download else { return }
+        library = ModelLibrary(
+            directory: current.directory,
+            packs: current.packs,
+            download: replacing(active, state: .downloading)
+        )
+        downloadRateBytesPerSecond = 12_400_000
+        startPreviewDownload()
     }
 
     public func cancelModelDownloads() async {
-        downloadingID = nil
-        downloadProgress = nil
-        downloadStatus = nil
-        message = "Preview download cancelled."
+        previewDownloadTask?.cancel()
+        previewDownloadTask = nil
+        downloadRateBytesPerSecond = nil
+        guard let current = library else { return }
+        library = ModelLibrary(directory: current.directory, packs: current.packs)
+        message = "Preview cancelled every download."
+    }
+
+    public func cancelModelDownload(packID: String) async {
+        guard let current = library, let active = current.download else { return }
+        if active.packId == packID {
+            // Promote whatever was waiting behind it, exactly as the daemon does.
+            guard let next = active.queuedPackIds.first else {
+                await cancelModelDownloads()
+                message = "Preview cancelled the \(name(of: packID)) download."
+                return
+            }
+            library = ModelLibrary(
+                directory: current.directory,
+                packs: current.packs,
+                download: progress(
+                    packID: next,
+                    state: .downloading,
+                    bytes: 0,
+                    queuedPackIds: Array(active.queuedPackIds.dropFirst())
+                )
+            )
+        } else {
+            library = ModelLibrary(
+                directory: current.directory,
+                packs: current.packs,
+                download: replacing(
+                    active,
+                    queuedPackIds: active.queuedPackIds.filter { $0 != packID }
+                )
+            )
+        }
+        message = "Preview cancelled the \(name(of: packID)) download."
+    }
+
+    // MARK: Preview download simulation
+
+    private func startPreviewDownload() {
+        guard previewDownloadTask == nil else { return }
+        previewDownloadTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(300))
+                guard let self, !Task.isCancelled, stepPreviewDownload() else { break }
+            }
+            self?.previewDownloadTask = nil
+        }
+    }
+
+    /// Advances the transfer one tick. Returns false when there is nothing left
+    /// to drive, which retires the task.
+    private func stepPreviewDownload() -> Bool {
+        guard let current = library, let active = current.download else { return false }
+        guard active.state == .downloading else { return true }
+        let expected = active.expectedBytes ?? 1
+        let next = min(active.bytes + UInt64(Double(expected) * 0.05), expected)
+        guard next >= expected else {
+            library = ModelLibrary(
+                directory: current.directory,
+                packs: current.packs,
+                download: replacing(active, bytes: next)
+            )
+            return true
+        }
+        let packs = current.packs.map { pack -> ModelPack in
+            guard pack.id == active.packId else { return pack }
+            return ModelPack(
+                id: pack.id,
+                name: pack.name,
+                capability: pack.capability,
+                path: pack.path,
+                present: true,
+                bytes: pack.expectedBytes ?? pack.bytes,
+                required: pack.required,
+                note: pack.note,
+                expectedBytes: pack.expectedBytes,
+                state: .ready,
+                revision: pack.revision
+            )
+        }
+        guard let following = active.queuedPackIds.first else {
+            library = ModelLibrary(directory: current.directory, packs: packs)
+            downloadRateBytesPerSecond = nil
+            message = "Preview finished every download."
+            return false
+        }
+        library = ModelLibrary(
+            directory: current.directory,
+            packs: packs,
+            download: progress(
+                packID: following,
+                state: .downloading,
+                bytes: 0,
+                queuedPackIds: Array(active.queuedPackIds.dropFirst())
+            )
+        )
+        return true
+    }
+
+    private func name(of packID: String) -> String {
+        library?.packs.first { $0.id == packID }?.name ?? packID
+    }
+
+    private func progress(
+        packID: String,
+        state: ModelPackState,
+        bytes: UInt64,
+        queuedPackIds: [String] = []
+    ) -> ModelDownloadProgress {
+        ModelDownloadProgress(
+            packId: packID,
+            queuedPackIds: queuedPackIds,
+            state: state,
+            bytes: bytes,
+            expectedBytes: library?.packs.first { $0.id == packID }?.expectedBytes,
+            completedFiles: 0,
+            totalFiles: 10
+        )
+    }
+
+    private func replacing(
+        _ progress: ModelDownloadProgress,
+        state: ModelPackState? = nil,
+        bytes: UInt64? = nil,
+        queuedPackIds: [String]? = nil
+    ) -> ModelDownloadProgress {
+        ModelDownloadProgress(
+            packId: progress.packId,
+            queuedPackIds: queuedPackIds ?? progress.queuedPackIds,
+            state: state ?? progress.state,
+            bytes: bytes ?? progress.bytes,
+            expectedBytes: progress.expectedBytes,
+            completedFiles: progress.completedFiles,
+            totalFiles: progress.totalFiles,
+            error: progress.error
+        )
     }
 
     public func remove(packID: String) async {

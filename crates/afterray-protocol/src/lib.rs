@@ -13,8 +13,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// because a hang-up no longer cancels — the user presses stop and the model
 /// runs to completion with nothing said. 8 adds `ChatAbort` and the `started`,
 /// `usage`, `progress` and `compaction` stream events. 9 adds
-/// `CaptureSetPaused`.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// `CaptureSetPaused`. 10 adds `CancelModelDownload`, which drops one pack from
+/// the download queue instead of tearing the whole queue down.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +242,12 @@ pub enum Request {
     PauseModelDownloads,
     ResumeModelDownloads,
     CancelModelDownloads,
+    /// Drops a single pack — active or merely queued — and discards its partial
+    /// files. The rest of the queue keeps going, which is what separates this
+    /// from `CancelModelDownloads`.
+    CancelModelDownload {
+        pack_id: String,
+    },
     RemoveModel {
         pack_id: String,
     },
@@ -1519,9 +1526,27 @@ mod tests {
             r#"{"type":"cancel_model_downloads"}"#
         );
         assert_eq!(
+            serde_json::to_string(&Request::CancelModelDownload {
+                pack_id: "embedding".into()
+            })
+            .unwrap(),
+            r#"{"type":"cancel_model_download","pack_id":"embedding"}"#
+        );
+        assert_eq!(
             serde_json::to_string(&ModelPackState::Paused).unwrap(),
             r#""paused""#
         );
+    }
+
+    /// The singular and plural cancels differ by one character on the wire, so
+    /// a typo in either client would silently tear down the whole queue.
+    #[test]
+    fn single_and_whole_queue_cancels_are_distinct_requests() {
+        let single: Request =
+            serde_json::from_str(r#"{"type":"cancel_model_download","pack_id":"asr"}"#).unwrap();
+        assert!(matches!(single, Request::CancelModelDownload { pack_id } if pack_id == "asr"));
+        let all: Request = serde_json::from_str(r#"{"type":"cancel_model_downloads"}"#).unwrap();
+        assert!(matches!(all, Request::CancelModelDownloads));
     }
 
     #[test]

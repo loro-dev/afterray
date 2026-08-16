@@ -57,9 +57,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     )
     @Published var message: String?
     @Published var isRefreshing = false
-    @Published var downloadingID: String?
-    @Published var downloadProgress: Double?
-    @Published var downloadStatus: String?
+    @Published var downloadRateBytesPerSecond: Double?
     @Published var isControllingDownload = false
     @Published var isUpdatingAudio = false
     @Published var isUpdatingStorageLimit = false
@@ -85,6 +83,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         forKey: AfterRayPreferences.developerOptionsEnabledKey
     )
     private var modelDownloadMonitor: Task<Void, Never>?
+    private var downloadRateSample: (packID: String, bytes: UInt64, at: Date)?
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
     var excludedBundleIds: [String] {
@@ -412,13 +411,12 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         NSWorkspace.shared.open(folder)
     }
 
+    /// Adds packs to the daemon's queue. Deliberately not gated on an existing
+    /// download: the daemon queues what it cannot start yet, and the old guard
+    /// here silently swallowed the request instead, so a second pack could never
+    /// be queued at all.
     func download(packID: String?) async {
-        guard downloadingID == nil else { return }
-        downloadingID = packID ?? "all"
-        downloadProgress = 0
-        downloadStatus = packID == nil ? "Starting downloads…" : "Starting \(displayName(for: packID))…"
         message = nil
-
         let socket = DaemonSupervisor.shared.socketPath
         do {
             let next = try await UnixSocketDaemonClient(socketPath: socket).startModelDownloads(
@@ -426,19 +424,15 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             )
             library = next
             applyDownloadState(next.download)
-            if next.download?.isActive == true {
-                AfterRayLog.info("started \(packID ?? "missing model") download", source: "download")
-                startDownloadMonitor()
+            if next.download == nil {
+                message = packID == nil
+                    ? "All model packs are ready."
+                    : "\(displayName(for: packID)) is ready."
             } else {
-                downloadingID = nil
-                downloadProgress = nil
-                downloadStatus = nil
-                message = packID == nil ? "All model packs are ready." : "\(displayName(for: packID)) is ready."
+                AfterRayLog.info("queued \(packID ?? "missing model") download", source: "download")
+                startDownloadMonitor()
             }
         } catch {
-            downloadingID = nil
-            downloadProgress = nil
-            downloadStatus = nil
             message = error.localizedDescription
             AfterRayLog.error(error.localizedDescription, source: "download")
         }
@@ -462,6 +456,14 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         await controlModelDownloads { try await $0.cancelModelDownloads() }
     }
 
+    func cancelModelDownload(packID: String) async {
+        let name = displayName(for: packID)
+        await controlModelDownloads { try await $0.cancelModelDownload(packID: packID) }
+        // Cancelling the last item leaves nothing to poll for.
+        if library?.download == nil { pauseDownloadMonitoring() }
+        if message == nil { message = "Cancelled the \(name) download." }
+    }
+
     private func controlModelDownloads(
         _ operation: (UnixSocketDaemonClient) async throws -> ModelLibrary
     ) async {
@@ -480,7 +482,9 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func remove(packID: String) async {
-        guard downloadingID == nil else { return }
+        // Only this pack's own queue entry blocks removal — the daemon rejects
+        // it anyway, and a global gate meant one download froze every Remove.
+        guard library?.isQueued(packID: packID) != true else { return }
         do {
             library = try await UnixSocketDaemonClient(
                 socketPath: DaemonSupervisor.shared.socketPath
@@ -631,45 +635,45 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         library?.packs.first(where: { $0.id == packID })?.name ?? "model"
     }
 
+    /// The queue view renders the daemon's own state, so all this has to do is
+    /// keep the rate estimate fed and the poller running while there is work.
     private func applyDownloadState(_ download: ModelDownloadProgress?) {
-        guard let download else {
-            downloadingID = nil
-            downloadProgress = nil
-            downloadStatus = nil
+        updateDownloadRate(download)
+        guard let download else { return }
+        if download.state == .failed, let error = download.error, !error.isEmpty {
+            message = error
+        }
+        if download.isActive { startDownloadMonitor() }
+    }
+
+    /// Derives a transfer rate from the daemon's byte counter — the wire carries
+    /// bytes, never speed, so the queue's ETA has to be measured here.
+    private func updateDownloadRate(_ download: ModelDownloadProgress?) {
+        guard let download, download.state == .downloading else {
+            downloadRateSample = nil
+            downloadRateBytesPerSecond = nil
             return
         }
-        if download.isPaused {
-            downloadingID = download.packId
-            downloadProgress = download.fraction
-            downloadStatus = "Paused \(displayName(for: download.packId))"
+        let now = Date()
+        // A different pack, or a byte count that moved backwards (a restarted
+        // transfer), invalidates the baseline rather than producing a wild rate.
+        guard let previous = downloadRateSample,
+              previous.packID == download.packId,
+              download.bytes >= previous.bytes
+        else {
+            downloadRateSample = (download.packId, download.bytes, now)
+            downloadRateBytesPerSecond = nil
             return
         }
-        guard download.isActive else {
-            downloadingID = nil
-            downloadProgress = nil
-            downloadStatus = nil
-            if download.state == .failed, let error = download.error, !error.isEmpty {
-                message = error
-            }
-            return
-        }
-        downloadingID = download.packId
-        if let fraction = download.fraction {
-            downloadProgress = fraction
-        }
-        let name = displayName(for: download.packId)
-        if download.state == .verifying {
-            downloadStatus = "Verifying \(name)…"
-        } else if let error = download.error, !error.isEmpty {
-            downloadStatus = error
-        } else if let percent = download.percent {
-            downloadStatus = "Downloading \(name) · \(percent)%"
-        } else if download.totalFiles > 0 {
-            downloadStatus = "Downloading \(name) · \(download.completedFiles)/\(download.totalFiles) files"
-        } else {
-            downloadStatus = "Downloading \(name)…"
-        }
-        startDownloadMonitor()
+        let elapsed = now.timeIntervalSince(previous.at)
+        // The poller ticks every 350 ms; a shorter gap is mostly jitter, so keep
+        // the older baseline and measure across a longer window instead.
+        guard elapsed >= 0.3 else { return }
+        let sample = Double(download.bytes - previous.bytes) / elapsed
+        downloadRateSample = (download.packId, download.bytes, now)
+        // Smoothed, because a raw per-tick rate swings the ETA by whole minutes.
+        downloadRateBytesPerSecond = downloadRateBytesPerSecond
+            .map { $0 * 0.7 + sample * 0.3 } ?? sample
     }
 
     private func startDownloadMonitor() {

@@ -135,6 +135,8 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     func pauseModelDownloads() async throws -> ModelLibrary
     func resumeModelDownloads() async throws -> ModelLibrary
     func cancelModelDownloads() async throws -> ModelLibrary
+    /// Drops one pack from the queue; the rest keeps downloading.
+    func cancelModelDownload(packID: String) async throws -> ModelLibrary
     func removeModel(packID: String) async throws -> ModelLibrary
     func jobs() async throws -> [ModelJob]
     func clearHistory(scope: HistoryScope) async throws -> HistoryClearResult
@@ -147,6 +149,10 @@ public extension AfterRayDaemonServing {
 
     func removeModel(packID _: String) async throws -> ModelLibrary {
         throw DaemonClientError.rejected("model removal is not available")
+    }
+
+    func cancelModelDownload(packID _: String) async throws -> ModelLibrary {
+        throw DaemonClientError.rejected("cancelling one download is not available")
     }
 
     func updateSettings(recordAudio: Bool) async throws -> AppSettings {
@@ -166,7 +172,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 9
+    public static let protocolVersion = 10
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -282,6 +288,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func cancelModelDownloads() async throws -> ModelLibrary {
         try await request(WireRequest(type: "cancel_model_downloads"), as: ModelLibrary.self)
+    }
+
+    public func cancelModelDownload(packID: String) async throws -> ModelLibrary {
+        try await request(
+            WireRequest(type: "cancel_model_download", packID: packID),
+            as: ModelLibrary.self
+        )
     }
 
     public func removeModel(packID: String) async throws -> ModelLibrary {
