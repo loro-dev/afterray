@@ -878,6 +878,75 @@ private struct SendableAssetWriter: @unchecked Sendable {
     let value: AVAssetWriter
 }
 
+/// Keeps an excluded app's audio off disk while it is frontmost.
+///
+/// A screenshot can be deleted after the fact, because the accessibility
+/// snapshot that names the app arrives right behind it. Audio has no such
+/// snapshot, and a finished `m4a` segment covers five minutes that cannot be
+/// sliced apart afterwards — so the only place the exclusion can be honoured
+/// is here, before a sample buffer reaches the writer.
+///
+/// The frontmost app is polled rather than observed: the shim's main thread
+/// sits blocked in `readLine` between commands and never services a run loop,
+/// so `NSWorkspace` activation notifications would not be delivered. Polling
+/// costs one property read every `pollInterval` and reads the same source the
+/// capture path already trusts (`main.swift:781`).
+private final class ExcludedAudioGate: @unchecked Sendable {
+    /// A frontmost switch is honoured within this long, so up to this much
+    /// audio from an excluded app can still reach the tail of the segment that
+    /// was already open. Cheap enough to keep short.
+    private static let pollInterval = DispatchTimeInterval.milliseconds(100)
+
+    private let lock = NSLock()
+    private var excluded: Set<String> = []
+    private var suppressed = false
+    private var timer: DispatchSourceTimer?
+
+    var isSuppressed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return suppressed
+    }
+
+    /// The daemon sends the list once at startup and again on every change.
+    func setExcludedBundles(_ bundleIds: [String]) {
+        let normalized = Set(bundleIds.map { $0.lowercased() })
+        lock.lock()
+        excluded = normalized
+        lock.unlock()
+        refresh()
+    }
+
+    func start(queue: DispatchQueue) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: Self.pollInterval)
+        timer.setEventHandler { [weak self] in self?.refresh() }
+        timer.resume()
+        self.timer = timer
+    }
+
+    private func refresh() {
+        lock.lock()
+        let isEmpty = excluded.isEmpty
+        lock.unlock()
+        // Nothing excluded is the common case; skip the AppKit query entirely.
+        guard !isEmpty else {
+            lock.lock()
+            suppressed = false
+            lock.unlock()
+            return
+        }
+        let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.lowercased()
+        lock.lock()
+        let next = frontmost.map(excluded.contains) ?? false
+        if next != suppressed {
+            log("audio \(next ? "suppressed for" : "resumed after") \(frontmost ?? "unknown app")")
+        }
+        suppressed = next
+        lock.unlock()
+    }
+}
+
 private final class AudioSegmentWriter {
     private let kind: ArtifactKind
     private let outputDirectory: URL
@@ -917,6 +986,13 @@ private final class AudioSegmentWriter {
 
     func finish() {
         finishSegment(waitForCompletion: true)
+    }
+
+    /// Closes the open segment so that whatever comes next starts a new file.
+    /// Called when an excluded app takes the foreground: the audio recorded
+    /// from here on is dropped, and it must not extend a file already on disk.
+    func suspend() {
+        finishSegment()
     }
 
     private func beginSegment(sampleBuffer: CMSampleBuffer, timestamp: CMTime) throws {
@@ -1000,6 +1076,7 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
     private let events: EventWriter
     private let systemAudio: AudioSegmentWriter?
     private let microphone: AudioSegmentWriter?
+    let audioGate = ExcludedAudioGate()
 
     init(options: Options, events: EventWriter) {
         self.events = events
@@ -1027,12 +1104,23 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
         case .screen:
             break
         case .audio:
+            guard !audioGate.isSuppressed else { return suspendAudio() }
             systemAudio?.append(sampleBuffer)
         case .microphone:
+            guard !audioGate.isSuppressed else { return suspendAudio() }
             microphone?.append(sampleBuffer)
         @unknown default:
             break
         }
+    }
+
+    /// Both tracks are cut, not just the one whose buffer arrived: the
+    /// microphone can be silent while system audio plays, and a segment left
+    /// open across the excluded stretch would join the audio on either side of
+    /// it into one file.
+    private func suspendAudio() {
+        systemAudio?.suspend()
+        microphone?.suspend()
     }
 
     func stream(_: SCStream, didStopWithError error: any Error) {
@@ -1061,11 +1149,17 @@ private func captureScreen(
         outputDirectory: options.outputDirectory,
         events: events
     )
-    if case .privateBrowsing? = accessibility { return }
-    if case .foregroundChanged? = accessibility {
+    // No accessibility snapshot means no exclusion check: the daemon decides
+    // whether a frame may be kept from the bundle id and URL in that snapshot
+    // alone, so a screenshot sent without one can never be evaluated and would
+    // stay in the vault whatever the user excluded. Skipping the tick loses a
+    // frame; sending it loses the guarantee.
+    guard let accessibility else { return }
+    if case .privateBrowsing = accessibility { return }
+    if case .foregroundChanged = accessibility {
         return
     }
-    if case let .artifact(accessibilityURL, context)? = accessibility,
+    if case let .artifact(accessibilityURL, context) = accessibility,
        !foregroundCaptureContextIsCurrent(context)
     {
         try? FileManager.default.removeItem(at: accessibilityURL)
@@ -1079,7 +1173,7 @@ private func captureScreen(
             contentFilter: filter,
             configuration: configuration
         )
-        if case let .artifact(accessibilityURL, context)? = accessibility,
+        if case let .artifact(accessibilityURL, context) = accessibility,
            !foregroundCaptureContextIsCurrent(context)
         {
             try? FileManager.default.removeItem(at: accessibilityURL)
@@ -1098,7 +1192,7 @@ private func captureScreen(
             endedAtMs: now,
             requestId: requestId
         ))
-        if case let .artifact(accessibilityURL, _)? = accessibility {
+        if case let .artifact(accessibilityURL, _) = accessibility {
             events.send(.artifact(
                 kind: .accessibility,
                 url: accessibilityURL,
@@ -1109,7 +1203,7 @@ private func captureScreen(
         }
     } catch {
         try? FileManager.default.removeItem(at: screenURL)
-        if case let .artifact(accessibilityURL, _)? = accessibility {
+        if case let .artifact(accessibilityURL, _) = accessibility {
             try? FileManager.default.removeItem(at: accessibilityURL)
         }
         throw error
@@ -1119,10 +1213,12 @@ private func captureScreen(
 private struct InputCommand: Decodable {
     let command: String
     let requestId: String?
+    let bundleIds: [String]?
 
     enum CodingKeys: String, CodingKey {
         case command
         case requestId = "request_id"
+        case bundleIds = "bundle_ids"
     }
 }
 
@@ -1177,6 +1273,11 @@ private enum AfterRayCaptureShim {
             let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
             let callbackQueue = DispatchQueue(label: "dev.afterray.capture.samples", qos: .userInitiated)
             if options.recordAudio {
+                // Its own queue: the sample handler must never wait on this,
+                // and the main thread is blocked in `readLine` most of the time.
+                output.audioGate.start(
+                    queue: DispatchQueue(label: "dev.afterray.capture.foreground", qos: .utility)
+                )
                 try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: callbackQueue)
                 try stream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: callbackQueue)
             }
@@ -1203,6 +1304,8 @@ private enum AfterRayCaptureShim {
                             options: options,
                             events: events
                         )
+                    case "set_excluded_bundles":
+                        output.audioGate.setExcludedBundles(command.bundleIds ?? [])
                     case "stop":
                         try await stream.stopCapture()
                         callbackQueue.sync { output.finishAudio() }

@@ -983,6 +983,10 @@ async fn record_start(state: &Arc<AppState>) -> Response {
 async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Result<(), String> {
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
     state.capture_busy.store(true, Ordering::SeqCst);
+    // Before the helper exists, so it holds the list from its first sample
+    // buffer. A screenshot can be deleted once the accessibility snapshot
+    // names the app; audio cannot, so the helper has to drop it at the source.
+    push_audio_exclusions(state).await;
     if let Err(error) = state.capture.start_capture().await {
         state.capture_busy.store(false, Ordering::SeqCst);
         eprintln!("capture runtime: start_capture failed: {error}");
@@ -1332,6 +1336,7 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
                 .unwrap_or_else(|error| error.into_inner());
             *excluded = cleaned;
         }
+        push_audio_exclusions(state).await;
         if let Err(error) = persist_current_settings(state) {
             return Response::failure(format!("could not save settings: {error}"));
         }
@@ -1527,6 +1532,30 @@ fn is_protected_bundle(bundle_id: &str) -> bool {
     PROTECTED_BUNDLE_IDS
         .iter()
         .any(|protected| protected.eq_ignore_ascii_case(bundle_id))
+}
+
+/// Hands the capture helper the same set [`is_excluded_bundle`] enforces, so
+/// it can keep an excluded app's audio off disk while it is frontmost.
+///
+/// Screen exclusions stay here — only the accessibility snapshot carries a URL,
+/// and a moment can be deleted after the fact. A finished audio segment covers
+/// five minutes that cannot be sliced apart, so audio has to be dropped before
+/// it is written.
+async fn push_audio_exclusions(state: &Arc<AppState>) {
+    let mut bundle_ids = protected_bundle_ids();
+    bundle_ids.extend(
+        state
+            .excluded_bundle_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .cloned(),
+    );
+    bundle_ids.sort();
+    bundle_ids.dedup();
+    if let Err(error) = state.capture.set_excluded_bundle_ids(bundle_ids).await {
+        eprintln!("could not send the audio exclusion list to the capture helper: {error}");
+    }
 }
 
 fn is_excluded_bundle(state: &AppState, bundle_id: Option<&str>) -> bool {
@@ -1924,8 +1953,25 @@ async fn import_artifact(
             });
         }
         ArtifactKind::Accessibility => {
-            let metadata =
-                serde_json::from_slice::<AccessibilityMetadata>(&bytes).unwrap_or_default();
+            // A snapshot that will not parse names no app, and an unnamed app
+            // cannot be checked against the exclusion list. Treat it the way
+            // the helper treats a missing snapshot: drop the frame rather than
+            // keep one that might belong to an app the user excluded.
+            let metadata = match serde_json::from_slice::<AccessibilityMetadata>(&bytes) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    eprintln!(
+                        "accessibility snapshot did not parse, dropping the frame it describes: {error}"
+                    );
+                    if let Some(moment_id) =
+                        nearest_moment_id(&state.store, session_id, started_at_ms)
+                    {
+                        delete_excluded_moment(state, &moment_id).await;
+                    }
+                    tokio::fs::remove_file(path).await?;
+                    return Ok(());
+                }
+            };
             // The URL only exists in this snapshot, so a page on an excluded
             // host is identified here or not at all — the screen JPEG has
             // already landed by now and has to be deleted, not skipped.
@@ -1934,7 +1980,7 @@ async fn import_artifact(
             {
                 if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
                 {
-                    let _ = state.store.delete_moment_and_artifacts(&moment_id);
+                    delete_excluded_moment(state, &moment_id).await;
                 }
                 tokio::fs::remove_file(path).await?;
                 return Ok(());
@@ -2004,6 +2050,26 @@ fn nearest_moment_id(store: &Vault, session_id: &str, captured_at_ms: i64) -> Op
         .rev()
         .find(|moment| moment.captured_at_ms.abs_diff(captured_at_ms) <= 2_000)
         .map(|moment| moment.id)
+}
+
+/// Removing the frame an exclusion just matched *is* the guarantee, so a
+/// failure here is retried once and, if it still fails, said out loud.
+///
+/// A busy writer is the realistic failure and it clears in milliseconds.
+/// Anything that survives the retry has left a frame of an app or site the
+/// user asked never to record sitting in the vault, and nothing else in the
+/// daemon will ever come back to it.
+async fn delete_excluded_moment(state: &Arc<AppState>, moment_id: &str) {
+    const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+    let Err(error) = state.store.delete_moment_and_artifacts(moment_id) else {
+        return;
+    };
+    eprintln!("excluded moment {moment_id} could not be deleted, retrying once: {error}");
+    tokio::time::sleep(RETRY_DELAY).await;
+    if let Err(error) = state.store.delete_moment_and_artifacts(moment_id) {
+        eprintln!("excluded moment {moment_id} survived a retry and is still recorded: {error}");
+    }
 }
 
 async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: String) {

@@ -4,7 +4,8 @@ macOS platform glue for the daemon: owns the `AfterRayCaptureShim` child process
 
 ## Key anchors
 
-- `lib.rs:151 MacOsCaptureBackend` — spawns/owns the shim child; commands `capture_screen`/`stop` to stdin, `CaptureEvent` stream (`ready`/`artifact`/`warning`/`failed`/`stopped`) from stdout. Bounded channel of 128 (`EVENT_BUFFER_CAPACITY`, lib.rs:31) for backpressure; single-consumer `next_event`.
+- `lib.rs:151 MacOsCaptureBackend` — spawns/owns the shim child; commands `capture_screen`/`set_excluded_bundles`/`stop` to stdin, `CaptureEvent` stream (`ready`/`artifact`/`warning`/`failed`/`stopped`) from stdout. Bounded channel of 128 (`EVENT_BUFFER_CAPACITY`, lib.rs:31) for backpressure; single-consumer `next_event`.
+- `set_excluded_bundle_ids` — remembers the list and pushes it to a running shim; `start_capture` writes it into the child's stdin *before* returning, so the helper has it before the first audio sample buffer. Screen exclusions are not sent here — they stay in the daemon.
 - `lib.rs:108 ArtifactKind` — `screen | system_audio | microphone | accessibility`.
 - `power.rs` — `on_ac_power`, `battery_fraction`, `seconds_since_user_input`, `load_per_core`, `apply_background_qos` (used by the T2 gate and the GOP packer thread).
 - `locale.rs` — `preferred_languages`.

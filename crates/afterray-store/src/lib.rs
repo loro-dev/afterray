@@ -5208,6 +5208,90 @@ mod tests {
         assert_eq!(image_not_null, 0);
     }
 
+    /// The exclusion path deletes a moment that has already been captured,
+    /// while its OCR job is still in flight. Whichever order the two land in,
+    /// none of the excluded app's text may be left searchable.
+    #[test]
+    fn deleting_a_moment_leaves_no_text_behind() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"frame")
+            .unwrap();
+
+        // OCR won the race: the evidence is already indexed when the
+        // accessibility snapshot names an excluded app.
+        let evidence = vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&moment.id),
+                None,
+                "ocr",
+                "master password vault",
+                2,
+                None,
+                "test",
+                None,
+            )
+            .unwrap();
+        vault
+            .insert_embedding(&evidence, &[0.1, 0.2], "test")
+            .unwrap();
+        assert_eq!(vault.search("password", 10).unwrap().len(), 1);
+
+        vault.delete_moment_and_artifacts(&moment.id).unwrap();
+
+        assert!(vault.search("password", 10).unwrap().is_empty());
+        let connection = vault.connection.lock().unwrap();
+        let evidence_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM text_evidence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(evidence_rows, 0, "cascade must take the evidence row");
+        let fts_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM evidence_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 0, "a stale FTS row keeps the text searchable");
+        let embedding_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(embedding_rows, 0, "cascade must take the embedding");
+    }
+
+    /// The other order: the moment is deleted first and OCR finishes after.
+    /// The foreign key is what stops the text from landing, so it has to fail
+    /// loudly rather than write an orphan row that nothing will ever clean up.
+    #[test]
+    fn text_recognized_after_the_moment_was_deleted_is_refused() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"frame")
+            .unwrap();
+        vault.delete_moment_and_artifacts(&moment.id).unwrap();
+
+        let refused = vault.insert_text_evidence(
+            &session.id,
+            Some(&moment.id),
+            None,
+            "ocr",
+            "master password vault",
+            2,
+            None,
+            "test",
+            None,
+        );
+
+        assert!(refused.is_err(), "an orphan OCR row must not be accepted");
+        assert!(vault.search("password", 10).unwrap().is_empty());
+        let fts_rows: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM evidence_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 0, "the FTS insert must not run after the failure");
+    }
+
     #[test]
     fn insert_moment_stores_jpeg_dimensions() {
         let (_directory, vault) = test_vault(10);

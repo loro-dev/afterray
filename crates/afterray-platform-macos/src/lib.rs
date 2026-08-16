@@ -6,14 +6,12 @@
 
 #![allow(unsafe_code)]
 
-mod memory;
 mod locale;
+mod memory;
 mod power;
 
 pub use locale::preferred_languages;
-pub use memory::{
-    GIB, context_tokens_for_memory, local_context_tokens, total_memory_bytes,
-};
+pub use memory::{GIB, context_tokens_for_memory, local_context_tokens, total_memory_bytes};
 
 pub use power::{
     apply_background_qos, battery_fraction, load_per_core, on_ac_power, seconds_since_user_input,
@@ -74,7 +72,16 @@ impl CaptureConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum ShimCommand<'a> {
-    CaptureScreen { request_id: &'a str },
+    CaptureScreen {
+        request_id: &'a str,
+    },
+    /// Bundle identifiers whose audio the helper must not write to disk while
+    /// they are frontmost. Screen exclusions stay in the daemon (only the
+    /// accessibility snapshot carries a URL); audio has no such snapshot and
+    /// cannot be sliced after the fact, so it has to be suppressed at capture.
+    SetExcludedBundles {
+        bundle_ids: &'a [String],
+    },
     Stop,
 }
 
@@ -155,6 +162,7 @@ struct RunningShim {
 pub struct MacOsCaptureBackend {
     config: CaptureConfig,
     record_audio: AtomicBool,
+    excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
     running: Mutex<Option<RunningShim>>,
     events_tx: mpsc::Sender<Result<CaptureEvent, CaptureError>>,
     events_rx: Mutex<mpsc::Receiver<Result<CaptureEvent, CaptureError>>>,
@@ -168,6 +176,7 @@ impl MacOsCaptureBackend {
         Arc::new(Self {
             config,
             record_audio,
+            excluded_bundle_ids: std::sync::Mutex::new(Vec::new()),
             running: Mutex::new(None),
             events_tx,
             events_rx: Mutex::new(events_rx),
@@ -181,6 +190,51 @@ impl MacOsCaptureBackend {
     #[must_use]
     pub fn record_audio(&self) -> bool {
         self.record_audio.load(Ordering::Relaxed)
+    }
+
+    /// Replaces the audio exclusion list and pushes it to a running helper.
+    ///
+    /// The list is remembered so that [`Self::start_capture`] can hand it to
+    /// the next helper before any sample buffer is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the helper is running but the command could
+    /// not be written; a stopped helper is not an error.
+    pub async fn set_excluded_bundle_ids(
+        &self,
+        bundle_ids: Vec<String>,
+    ) -> Result<(), CaptureError> {
+        {
+            let mut excluded = self
+                .excluded_bundle_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *excluded == bundle_ids {
+                return Ok(());
+            }
+            *excluded = bundle_ids;
+        }
+        let mut running = self.running.lock().await;
+        let Some(process) = running.as_mut() else {
+            return Ok(());
+        };
+        self.write_excluded_bundles(&mut process.stdin).await
+    }
+
+    async fn write_excluded_bundles(&self, stdin: &mut ChildStdin) -> Result<(), CaptureError> {
+        let bundle_ids = self
+            .excluded_bundle_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        write_command(
+            stdin,
+            &ShimCommand::SetExcludedBundles {
+                bundle_ids: &bundle_ids,
+            },
+        )
+        .await
     }
 
     /// Starts the native helper and its bounded event reader.
@@ -225,9 +279,13 @@ impl MacOsCaptureBackend {
                 source,
             })?;
         eprintln!("capture: shim pid {:?}", child.id());
-        let stdin = child.stdin.take().ok_or_else(|| {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
             CaptureError::Io(std::io::Error::other("capture shim stdin was not piped"))
         })?;
+        // Written before the helper has even finished starting ScreenCaptureKit:
+        // the bytes wait in the pipe and are read on its first loop iteration,
+        // so audio from an excluded app is suppressed from the first segment.
+        self.write_excluded_bundles(&mut stdin).await?;
         let stdout = child.stdout.take().ok_or_else(|| {
             CaptureError::Io(std::io::Error::other("capture shim stdout was not piped"))
         })?;
@@ -393,6 +451,39 @@ mod tests {
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             r#"{"command":"capture_screen","request_id":"moment-1"}"#
+        );
+    }
+
+    /// The helper suppresses audio by bundle id, so the wire form has to stay
+    /// a single line with the ids exactly as the daemon normalized them.
+    #[test]
+    fn the_exclusion_command_is_one_json_line() {
+        let bundle_ids = vec![
+            "com.bitwarden.desktop".to_owned(),
+            "org.mozilla.firefox".to_owned(),
+        ];
+        let bytes = serde_json::to_vec(&ShimCommand::SetExcludedBundles {
+            bundle_ids: &bundle_ids,
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"command":"set_excluded_bundles","bundle_ids":["com.bitwarden.desktop","org.mozilla.firefox"]}"#
+        );
+    }
+
+    /// An empty list still has to be sent: it is how the daemon tells a helper
+    /// that the user just cleared the last exclusion.
+    #[test]
+    fn an_empty_exclusion_list_still_serializes() {
+        let bundle_ids: Vec<String> = Vec::new();
+        let bytes = serde_json::to_vec(&ShimCommand::SetExcludedBundles {
+            bundle_ids: &bundle_ids,
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"command":"set_excluded_bundles","bundle_ids":[]}"#
         );
     }
 
