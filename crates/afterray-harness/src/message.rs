@@ -61,12 +61,19 @@ pub enum Kind {
     Control,
 }
 
-/// One message. Immutable by convention: see the module note.
+/// One message. Immutable by construction, which is the point.
+///
+/// `content` is private and has no setter. A message is built whole and read
+/// whole; the only way to "change" one is to build a different one, and the
+/// only code allowed to swap one out is [`crate::history::History`]'s
+/// compaction path. A `pub content: String` behind a `&mut Vec<Message>` — what
+/// this was — meant any code anywhere could rewrite a message the model had
+/// already been shown, and nothing would notice until a cache stopped matching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub kind: Kind,
-    pub content: String,
+    content: String,
 }
 
 impl Message {
@@ -112,7 +119,22 @@ impl Message {
             content: content.into(),
         }
     }
+
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Estimated tokens this message occupies, role label included.
+    #[must_use]
+    pub fn tokens(&self) -> usize {
+        crate::tokens::estimate_tokens(&self.content) + ROLE_OVERHEAD_TOKENS
+    }
 }
+
+/// What a role label and the blank line joining messages cost, charged per
+/// message so a history of many short turns is not counted as free.
+pub const ROLE_OVERHEAD_TOKENS: usize = 4;
 
 /// Whether `earlier` is a strict prefix of `later`, message for message.
 ///
