@@ -372,6 +372,52 @@ Under the text protocol the array is one canonical thing, switching providers
 mid-conversation changes nothing about what the model sees of its own past, and
 the existing fence is already the right wrapper for a replayed result.
 
+## What holds the prefix, and what merely tested it
+
+Until this, "history is append-only" was a property the tests checked and the
+types permitted violating. `Message` had a `pub content: String`, history
+travelled as `&mut Vec<Message>`, and any code anywhere could rewrite a message
+the model had already been shown — with no error and no event, just a prompt
+that quietly stops matching anything cached.
+
+Worse, one place already did. `Opening::render_messages` had its own
+history-shrinking loop, and it used `continue` rather than `break`: a message
+too large for the remaining budget was **skipped**, and smaller older ones after
+it were kept. Rendered `[A, B(huge), C]` came back as `[A, C]` — a question with
+its answer removed from the middle, no marker where it went, and the surviving
+subset changing turn to turn as the seed and the question changed size. It was
+never a prefix relationship at all. No test caught it because the fixtures used
+uniform small messages that all fit.
+
+So the vector is now private, inside [`History`], and the vocabulary is exactly
+the legal moves: `push` at the end, `fold_result` to replace one result body
+with the standard marker, `drop_oldest`, and `mark` to leave a line where
+messages went. `Message::content` is private with no setter. There is no
+`messages_mut`, no `IndexMut`. A compaction policy — including one written later
+by someone else — can fold and drop, and cannot forge; two `compile_fail`
+doctests keep it that way.
+
+The renderer no longer removes anything at all. Fitting the conversation into
+the window is compaction's job and only compaction's, which is what makes the
+sentence true rather than aspirational. The consequence is stated rather than
+hidden: with `LoopConfig::compaction = None` nothing bounds the conversation,
+and a caller choosing that is asserting its history fits. An over-long prompt
+the server then cuts is bad; a renderer silently keeping a different subset
+every turn and never saying which is worse.
+
+Two smaller holes closed with it. A tool log that fails to parse used to yield
+an empty list, deleting a turn's tool messages from the middle of the array with
+nothing to explain the shift; it now leaves a visible line saying the record
+could not be read. And compaction identified an already-folded result by
+comparing content to a constant — now `Message::kind` carries it, so the rule
+applies to a boundary rather than to text a user could paste.
+
+One obligation the types still cannot enforce, so it is written on
+`History::from_stored`: the caller must render the same messages for the same
+stored rows. `history_messages` is deterministic — `ORDER BY created_at_ms, id`,
+a pure fence function, and stored bytes replayed verbatim — but nothing in the
+signature says so.
+
 ## Not started
 
 Phase 4 (steering) and phase 5 (`SummarizeOldest`), plus the plan's note about
