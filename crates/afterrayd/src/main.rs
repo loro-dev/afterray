@@ -201,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         gop_packer::GopPackerConfig::from_env(),
     ));
     let capture_busy = Arc::new(AtomicBool::new(false));
+    let capture_paused = Arc::new(AtomicBool::new(false));
     let last_capture_ms = Arc::new(AtomicI64::new(0));
     let recording_active = Arc::new(AtomicBool::new(false));
     let state = Arc::new(AppState {
@@ -225,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown: shutdown_tx,
         packer,
         capture_busy,
+        capture_paused,
         last_capture_ms,
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
@@ -429,6 +431,10 @@ struct AppState {
     shutdown: tokio::sync::watch::Sender<bool>,
     packer: Arc<gop_packer::GopPacker>,
     capture_busy: Arc<AtomicBool>,
+    /// Set by `CaptureSetPaused` while the app's overlay is frontmost. The
+    /// scheduler keeps ticking but skips the screenshot, so the recording
+    /// session — and the shim's audio — run on uninterrupted.
+    capture_paused: Arc<AtomicBool>,
     last_capture_ms: Arc<AtomicI64>,
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
@@ -712,6 +718,14 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         }
         Request::RecordStart => record_start(state).await,
         Request::RecordStop { reason } => record_stop(state, reason.as_deref()).await,
+        Request::CaptureSetPaused { paused, reason } => {
+            state.capture_paused.store(paused, Ordering::SeqCst);
+            eprintln!(
+                "capture_set_paused: paused={paused} reason={}",
+                reason.as_deref().unwrap_or("-")
+            );
+            Response::success(serde_json::json!({"capture_paused": paused}))
+        }
         Request::SessionsList => into_response(state.store.sessions_sync()),
         Request::TimelineList => run_store(state, |s| into_response(s.store.timeline_sync())).await,
         Request::TimelineSince { since_ms } => {
@@ -1033,11 +1047,15 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
     let capture = Arc::clone(&state.capture);
     let interval = state.capture_interval;
     let capture_busy = Arc::clone(&state.capture_busy);
+    let capture_paused = Arc::clone(&state.capture_paused);
     let last_capture_ms = Arc::clone(&state.last_capture_ms);
     let scheduler = tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
         loop {
             timer.tick().await;
+            if capture_paused.load(Ordering::SeqCst) {
+                continue;
+            }
             capture_busy.store(true, Ordering::SeqCst);
             last_capture_ms.store(now_ms(), Ordering::SeqCst);
             let request_id = Uuid::now_v7().to_string();

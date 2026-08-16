@@ -556,7 +556,22 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 8)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 9)
+    }
+
+    func testCaptureSetPausedRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "capture_set_paused", reason: "overlay", paused: true)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "capture_set_paused")
+        XCTAssertEqual(json["paused"] as? Bool, true)
+        XCTAssertEqual(json["reason"] as? String, "overlay")
+
+        let withoutReason = try JSONEncoder().encode(WireRequest(type: "capture_set_paused", paused: false))
+        let minimal = try XCTUnwrap(JSONSerialization.jsonObject(with: withoutReason) as? [String: Any])
+        XCTAssertEqual(minimal["paused"] as? Bool, false)
+        XCTAssertNil(minimal["reason"])
     }
 
     func testRecordResultsDecodeBothDaemonBranches() throws {

@@ -717,6 +717,18 @@ public struct RecordStopResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct CapturePauseResult: Codable, Equatable, Sendable {
+    public let capturePaused: Bool
+
+    public init(capturePaused: Bool) {
+        self.capturePaused = capturePaused
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case capturePaused = "capture_paused"
+    }
+}
+
 public struct AskCitation: Codable, Equatable, Identifiable, Sendable {
     public let momentId: String
     public let capturedAtMs: Int64

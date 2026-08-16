@@ -510,6 +510,25 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.makeFirstResponder(panel)
         AfterRayMenuBar.shared.setOverlayVisible(true)
         OverlayVisibility.shared.set(true)
+        setCapturePaused(true)
+    }
+
+    /// While the overlay is up it covers the screen, so anything the daemon
+    /// photographed would be pixels the user is no longer looking at — and the
+    /// search field's own keystrokes. Ask the daemon to skip screenshots
+    /// without ending the recording session; `hide` lifts it again.
+    private func setCapturePaused(_ paused: Bool) {
+        Task {
+            let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            do {
+                _ = try await client.setCapturePaused(paused: paused, reason: "overlay")
+            } catch {
+                AfterRayLog.error(
+                    "capture pause \(paused) failed: \(error.localizedDescription)",
+                    source: "overlay"
+                )
+            }
+        }
     }
 
     func hide(returnFocus: Bool) {
@@ -520,6 +539,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.alphaValue = 1
         AfterRayMenuBar.shared.setOverlayVisible(false)
         OverlayVisibility.shared.set(false)
+        setCapturePaused(false)
         application?.activate(options: [])
     }
 
@@ -1121,6 +1141,14 @@ private struct AfterRayRootView: View {
 
     private func bootstrap() async {
         guard await startDaemonOrReportFailure() != nil else { return }
+        // A daemon that outlived a crashed app may still carry the overlay's
+        // capture pause; a fresh launch always starts with the overlay hidden.
+        do {
+            let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            _ = try await client.setCapturePaused(paused: false, reason: "launch")
+        } catch {
+            AfterRayLog.info("bootstrap: clearing capture pause failed: \(error.localizedDescription)")
+        }
         // Let the welcome window have the screen to itself: stacking macOS
         // permission sheets on top of it makes the first launch a pile-up.
         await OnboardingController.shared.waitUntilFinished()

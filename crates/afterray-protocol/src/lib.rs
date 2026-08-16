@@ -12,8 +12,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// both claim 7, the handshake passes, the abort fails to deserialise, and —
 /// because a hang-up no longer cancels — the user presses stop and the model
 /// runs to completion with nothing said. 8 adds `ChatAbort` and the `started`,
-/// `usage`, `progress` and `compaction` stream events.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// `usage`, `progress` and `compaction` stream events. 9 adds
+/// `CaptureSetPaused`.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +33,15 @@ pub enum Request {
     Status,
     RecordStart,
     RecordStop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Suspends or resumes scheduled screen captures without tearing the
+    /// recording session down. The app sets this while its overlay is
+    /// frontmost, so whatever the overlay covers is never photographed;
+    /// unlike `RecordStop` the session, shim and audio keep running.
+    CaptureSetPaused {
+        paused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
@@ -1024,6 +1034,34 @@ mod tests {
     fn shutdown_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::Shutdown).unwrap();
         assert_eq!(json, r#"{"type":"shutdown"}"#);
+    }
+
+    #[test]
+    fn capture_set_paused_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::CaptureSetPaused {
+            paused: true,
+            reason: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"capture_set_paused","paused":true}"#);
+        let json = serde_json::to_string(&Request::CaptureSetPaused {
+            paused: false,
+            reason: Some("overlay".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"capture_set_paused","paused":false,"reason":"overlay"}"#
+        );
+        let decoded: Request =
+            serde_json::from_str(r#"{"type":"capture_set_paused","paused":true}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::CaptureSetPaused {
+                paused: true,
+                reason: None
+            }
+        ));
     }
 
     #[test]

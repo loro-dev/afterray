@@ -4,7 +4,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 
 ## Key files
 
-- `Sources/DaemonClient.swift:148` `UnixSocketDaemonClient` (actor) — JSON-line requests over a Unix socket; `protocolVersion = 8` (:149), checked on every response. Protocols `RecallDaemonServing` (:22), `AfterRayChatServing` (:67), `AfterRayDaemonServing` (:99) are the injection seam; `WireRequest` (:442) is the snake_case wire shape.
+- `Sources/DaemonClient.swift:148` `UnixSocketDaemonClient` (actor) — JSON-line requests over a Unix socket; `protocolVersion = 9` (:149), checked on every response. Protocols `RecallDaemonServing` (:22), `AfterRayChatServing` (:67), `AfterRayDaemonServing` (:99) are the injection seam; `WireRequest` (:442) is the snake_case wire shape.
 - `Sources/RecallStore.swift:4` `RecallStore` — `@MainActor` timeline/playhead state; `Sources/RecallStore.swift:302` `RecallImageRepository` (actor) — NSCache + in-flight dedup of artifact bytes.
 - `Sources/RecallModels.swift` — `RecallSession` (:3), `RecallMoment` (:21), `RecallGopRef` (:133), `ArtifactPayload` (:163); all `Codable` with explicit snake_case `CodingKeys`.
 - `Sources/RecallView.swift:9` `RecallView` — the main recall surface (2396 lines; `RecallPalette` at :2205).
@@ -16,7 +16,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 ## Invariants
 
 - The UI never opens the database or reads encryption keys (`docs/development.md:112-113`) — everything arrives via `UnixSocketDaemonClient`.
-- `protocolVersion` must stay in lockstep with `PROTOCOL_VERSION: u32 = 8` (`crates/afterray-protocol/src/lib.rs:8`); bump both on any wire change or every request fails with `protocolMismatch`.
+- `protocolVersion` must stay in lockstep with `PROTOCOL_VERSION: u32 = 9` (`crates/afterray-protocol/src/lib.rs:8`); bump both on any wire change or every request fails with `protocolMismatch`.
 - Concurrency: stores are `@MainActor` `ObservableObject`s; the socket client and image repository are actors; daemon I/O runs in `Task.detached(priority: .userInitiated)` (`DaemonClient.swift:394,416`). Never block the main thread — the HangWatchdog kills the app.
 - Unary socket reads have a 30s receive deadline (`DaemonClient.swift:587`, postmortem in the comment above); streaming reads deliberately stay deadline-free. Do not remove.
 - Every async load guards completion with a generation counter (`sensitiveGeneration`, `RecallStore.swift:16`); new load paths must follow the same capture-and-compare pattern.

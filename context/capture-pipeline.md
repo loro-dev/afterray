@@ -20,7 +20,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 
 ## 3. Import — afterrayd
 
-- Capture scheduler: a tokio interval task spawned in `start_capture_runtime` (`crates/afterrayd/src/main.rs:902`; the spawn is at :956), default 10s via `AFTERRAY_CAPTURE_INTERVAL_SECONDS`, calling `capture_screen(request_id)`.
+- Capture scheduler: a tokio interval task spawned in `start_capture_runtime` (`crates/afterrayd/src/main.rs:902`; the spawn is at :956), default 10s via `AFTERRAY_CAPTURE_INTERVAL_SECONDS`, calling `capture_screen(request_id)`. While `capture_paused` is set (`CaptureSetPaused` — the app raises it whenever its overlay is frontmost) the scheduler ticks but skips the screenshot; the session, shim and audio keep running, unlike `RecordStop`.
 - `main.rs:1553 consume_capture_events` → `main.rs:1616 import_artifact`:
   - screen → `Vault::insert_moment` (store lib.rs:819) + OCR job;
   - audio → `insert_audio_segment` (lib.rs:871) + ASR job;

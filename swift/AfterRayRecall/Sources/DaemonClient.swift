@@ -110,6 +110,9 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     func status() async throws -> DaemonStatus
     func recordStart() async throws -> RecordStartResult
     func recordStop(reason: String?) async throws -> RecordStopResult
+    /// Suspends/resumes scheduled screenshots without ending the recording
+    /// session. The app sets this while its overlay is frontmost.
+    func setCapturePaused(paused: Bool, reason: String?) async throws -> CapturePauseResult
     func search(query: String, limit: Int) async throws -> [RecallSearchHit]
     func ask(question: String, fromMs: Int64?, toMs: Int64?) async throws -> AskAnswer
     func shutdown() async throws -> DaemonShutdownResult
@@ -138,6 +141,10 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
 }
 
 public extension AfterRayDaemonServing {
+    func setCapturePaused(paused _: Bool, reason _: String?) async throws -> CapturePauseResult {
+        throw DaemonClientError.rejected("capture pause is not available")
+    }
+
     func removeModel(packID _: String) async throws -> ModelLibrary {
         throw DaemonClientError.rejected("model removal is not available")
     }
@@ -159,7 +166,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 8
+    public static let protocolVersion = 9
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -193,6 +200,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func recordStop(reason: String? = nil) async throws -> RecordStopResult {
         try await request(WireRequest(type: "record_stop", reason: reason), as: RecordStopResult.self)
+    }
+
+    public func setCapturePaused(paused: Bool, reason: String? = nil) async throws -> CapturePauseResult {
+        try await request(
+            WireRequest(type: "capture_set_paused", reason: reason, paused: paused),
+            as: CapturePauseResult.self
+        )
     }
 
     public func shutdown() async throws -> DaemonShutdownResult {
@@ -489,6 +503,7 @@ struct WireRequest: Encodable, Equatable {
     var beforeMs: Int64?
     var recordAudio: Bool?
     var reason: String?
+    var paused: Bool?
     var packID: String?
     var packIDs: [String]?
     var segmentID: String?
@@ -527,6 +542,7 @@ struct WireRequest: Encodable, Equatable {
         case beforeMs = "before_ms"
         case recordAudio = "record_audio"
         case reason
+        case paused
         case packID = "pack_id"
         case packIDs = "pack_ids"
         case segmentID = "segment_id"
@@ -567,6 +583,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(beforeMs, forKey: .beforeMs)
         try container.encodeIfPresent(recordAudio, forKey: .recordAudio)
         try container.encodeIfPresent(reason, forKey: .reason)
+        try container.encodeIfPresent(paused, forKey: .paused)
         try container.encodeIfPresent(packID, forKey: .packID)
         if let packIDs, !packIDs.isEmpty {
             try container.encode(packIDs, forKey: .packIDs)
