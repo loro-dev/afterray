@@ -13,6 +13,7 @@
 //! nothing here is allowed to drop it.
 
 use crate::budget::ContextBudget;
+use crate::history::History;
 use crate::message::{Message, flatten};
 use crate::tokens::estimate_tokens;
 use crate::truncate::truncate_head;
@@ -39,11 +40,12 @@ const TASK_SHARE: usize = 3;
 /// provider cache and no local prefill could ever match a previous turn.
 #[derive(Debug, Clone, Default)]
 pub struct Opening {
-    /// Prior turns, oldest first, already rendered as messages.
+    /// Prior turns, oldest first.
     ///
-    /// Append-only by contract: the caller must produce the same messages for
-    /// the same past, so each turn extends the last instead of rewriting it.
-    pub history: Vec<Message>,
+    /// A [`History`], not a vector: nothing here — including this renderer —
+    /// can rewrite a message the model has already been shown, and the only
+    /// thing that can remove one is a compaction pass, which announces itself.
+    pub history: History,
     /// Clock, epoch anchors, and any cheap sketch of the day.
     ///
     /// Changes every turn, so it rides with the question at the end rather than
@@ -58,7 +60,6 @@ pub struct Opening {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpeningTrim {
     pub seed_dropped: usize,
-    pub history_dropped: usize,
     /// Non-zero only when the question alone exceeds its budget, which is a
     /// different and much louder situation than a long history.
     pub task_dropped: usize,
@@ -67,7 +68,7 @@ pub struct OpeningTrim {
 impl OpeningTrim {
     #[must_use]
     pub fn happened(self) -> bool {
-        self.seed_dropped > 0 || self.history_dropped > 0 || self.task_dropped > 0
+        self.seed_dropped > 0 || self.task_dropped > 0
     }
 
     /// A sentence naming what actually went, for the thread.
@@ -78,12 +79,6 @@ impl OpeningTrim {
     #[must_use]
     pub fn describe(self) -> String {
         let mut parts = Vec::new();
-        if self.history_dropped > 0 {
-            parts.push(format!(
-                "~{} tokens of earlier conversation",
-                self.history_dropped
-            ));
-        }
         if self.seed_dropped > 0 {
             parts.push(format!("~{} tokens of the clock sketch", self.seed_dropped));
         }
@@ -144,23 +139,12 @@ impl Opening {
             self.seed.clone()
         };
 
-        // Whole messages, newest first, until the budget runs out. A message is
-        // the smallest thing that can be dropped without rewriting one — and
-        // rewriting is what breaks the prefix for every turn that follows.
-        let history_budget = left.saturating_sub(estimate_tokens(&seed));
-        let mut kept = Vec::new();
-        let mut used = 0_usize;
-        for message in self.history.iter().rev() {
-            let cost = estimate_tokens(&message.content) + ROLE_OVERHEAD_TOKENS;
-            if used + cost > history_budget {
-                trim.history_dropped += cost;
-                continue;
-            }
-            used += cost;
-            kept.push(message.clone());
-        }
-        kept.reverse();
-
+        // History is passed through untouched. Fitting it inside the window is
+        // compaction's job and only compaction's: this used to keep "whatever
+        // fits, newest first", which skipped an oversized message and kept
+        // older ones after it — a conversation with a hole in the middle, a
+        // different subset every turn as the seed and question changed size,
+        // and not one word to the user about which turns had gone.
         let mut turn = String::new();
         if !seed.trim().is_empty() {
             turn.push_str("Clock and what the vault holds:\n");
@@ -170,7 +154,7 @@ impl Opening {
         turn.push_str("User task:\n");
         turn.push_str(&fence("user", task.trim()));
 
-        let mut messages = kept;
+        let mut messages = self.history.messages().to_vec();
         messages.push(Message::user(turn));
         (messages, trim)
     }
@@ -187,10 +171,6 @@ impl Opening {
         (format!("{}\n", flatten(&messages)), trim)
     }
 }
-
-/// What a role label and the joining blank line cost, charged per message so a
-/// history of many short turns is not counted as free.
-const ROLE_OVERHEAD_TOKENS: usize = 4;
 
 #[cfg(test)]
 mod tests {
@@ -211,9 +191,11 @@ mod tests {
     fn a_long_history_never_costs_the_question() {
         let opening = Opening {
             seed: "now_ms: 1786729937000".to_owned(),
-            history: (0..4_000)
-                .map(|index| Message::user(format!("这是第 {index} 轮的旧对话")))
-                .collect(),
+            history: History::from_stored(
+                    (0..4_000)
+                        .map(|index| Message::user(format!("这是第 {index} 轮的旧对话")))
+                        .collect(),
+                ),
             task: "我昨天下午在读什么".to_owned(),
         };
         let (rendered, trim) = opening.render(budget(), fence);
@@ -223,24 +205,31 @@ mod tests {
             "the question was trimmed away"
         );
         assert!(rendered.contains("now_ms: 1786729937000"), "the clock went");
-        assert!(trim.history_dropped > 0);
         assert_eq!(trim.task_dropped, 0);
-        assert!(estimate_tokens(&rendered) <= budget().opening_allowance());
+        // And the history is all still there. Fitting it is compaction's job:
+        // this renderer used to drop "whatever does not fit", which is how a
+        // conversation ended up with a hole in the middle and nobody was told.
+        assert!(rendered.contains("这是第 0 轮的旧对话"), "the oldest turn went");
+        assert!(rendered.contains("这是第 3999 轮的旧对话"), "the newest turn went");
     }
 
-    /// History is trimmed from the front: a follow-up refers to the recent end.
+    /// Rendering never removes anything. Only compaction may, and it says so.
     #[test]
-    fn history_gives_up_its_oldest_turns_first() {
+    fn rendering_a_history_too_large_for_the_window_still_keeps_all_of_it() {
+        let history: Vec<Message> = (0..3_000)
+            .map(|index| Message::user(format!("turn {index}")))
+            .collect();
         let opening = Opening {
             seed: "clock".to_owned(),
-            history: (0..3_000)
-                .map(|index| Message::user(format!("turn {index}")))
-                .collect(),
+            history: History::from_stored(history.clone()),
             task: "and then?".to_owned(),
         };
-        let (rendered, _) = opening.render(budget(), fence);
-        assert!(rendered.contains("turn 2999"), "the newest turn went");
-        assert!(!rendered.contains("turn 0\n"), "the oldest turn survived");
+        let (rendered, trim) = opening.render_messages(budget(), fence);
+
+        // One message per stored message, plus the turn's own tail.
+        assert_eq!(rendered.len(), history.len() + 1);
+        assert_eq!(rendered[..history.len()], history[..]);
+        assert!(!trim.happened(), "the renderer trimmed something: {trim:?}");
     }
 
     /// A question longer than one turn can hold is cut, but the cut is its own
@@ -249,7 +238,7 @@ mod tests {
     fn an_enormous_question_is_cut_and_named() {
         let opening = Opening {
             seed: "clock".to_owned(),
-            history: Vec::new(),
+            history: History::new(),
             task: "please summarise this pasted log. ".repeat(20_000),
         };
         let (rendered, trim) = opening.render(budget(), fence);
@@ -271,7 +260,7 @@ mod tests {
             Message::assistant("Safari, mostly"),
         ];
         let first = Opening {
-            history: history.clone(),
+            history: History::from_stored(history.clone()),
             seed: "now_ms: 1786729937000".to_owned(),
             task: "and before that?".to_owned(),
         };
@@ -282,7 +271,7 @@ mod tests {
         history.push(turn_two.last().unwrap().clone());
         history.push(Message::assistant("Mail, briefly"));
         let second = Opening {
-            history: history.clone(),
+            history: History::from_stored(history.clone()),
             seed: "now_ms: 1786729999000".to_owned(),
             task: "and the day before?".to_owned(),
         };
@@ -295,8 +284,8 @@ mod tests {
             first_divergence(stable, &turn_three)
         );
         // And the moving parts really are at the end.
-        assert!(turn_three.last().unwrap().content.contains("1786729999000"));
-        assert!(!turn_three[0].content.contains("now_ms"));
+        assert!(turn_three.last().unwrap().content().contains("1786729999000"));
+        assert!(!turn_three[0].content().contains("now_ms"));
     }
 
     /// Nothing is touched when it all fits.
@@ -304,7 +293,7 @@ mod tests {
     fn a_small_opening_is_left_alone() {
         let opening = Opening {
             seed: "clock".to_owned(),
-            history: vec![Message::user("hi"), Message::assistant("hello")],
+            history: History::from_stored(vec![Message::user("hi"), Message::assistant("hello")]),
             task: "what did I do".to_owned(),
         };
         let (rendered, trim) = opening.render(budget(), fence);
@@ -319,9 +308,11 @@ mod tests {
     fn trimming_never_breaks_a_fence() {
         let opening = Opening {
             seed: "clock ".repeat(4_000),
-            history: (0..2_000)
-                .map(|index| Message::user(format!("old turn {index}. ").repeat(10)))
-                .collect(),
+            history: History::from_stored(
+                    (0..2_000)
+                        .map(|index| Message::user(format!("old turn {index}. ").repeat(10)))
+                        .collect(),
+                ),
             task: "what did I do".to_owned(),
         };
         let (rendered, trim) = opening.render(budget(), fence);
@@ -340,11 +331,11 @@ mod tests {
     #[test]
     fn the_description_names_the_right_casualty() {
         let trim = OpeningTrim {
-            history_dropped: 900,
+            task_dropped: 900,
             ..OpeningTrim::default()
         };
         let text = trim.describe();
-        assert!(text.contains("earlier conversation"), "{text}");
+        assert!(text.contains("your question"), "{text}");
         assert!(!text.contains("tool result"), "{text}");
     }
 }

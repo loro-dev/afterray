@@ -16,8 +16,7 @@
 //!    inside one hands the model a fragment it has no way to recognise as one.
 
 use crate::budget::ContextBudget;
-use crate::message::{Kind, Message};
-use crate::tokens::estimate_tokens;
+use crate::history::History;
 use crate::transcript::Transcript;
 
 /// One compaction pass, for the log and for the UI.
@@ -59,15 +58,13 @@ pub trait CompactionStrategy: Send + Sync {
     /// running out of room across turns are the same problem, and until this
     /// existed they were handled differently: the in-turn path announced what
     /// it dropped and showed it in the UI, while the cross-turn path silently
-    /// deleted the middle of the conversation and left a bare "(earlier turns
-    /// omitted)" in a prompt nobody could inspect.
+    /// deleted the middle of the conversation.
     ///
-    /// `limit` is what the history may occupy, in estimated tokens.
-    fn compact_history(
-        &self,
-        history: &mut Vec<Message>,
-        limit: usize,
-    ) -> Vec<CompactionNotice>;
+    /// `limit` is what the history may occupy, in estimated tokens. The
+    /// operations [`History`] offers are the only ones available — fold a
+    /// result, drop from the front, leave a marker — so no implementation of
+    /// this trait can rewrite a message the model has already been shown.
+    fn compact_history(&self, history: &mut History, limit: usize) -> Vec<CompactionNotice>;
 }
 
 /// Drops the oldest tool-result bodies until the transcript fits.
@@ -88,19 +85,6 @@ impl PruneToolResults {
     /// that says "dropped earlier tool results" when half the conversation
     /// went is worse than no line at all.
     pub const HISTORY_NAME: &'static str = "drop_earlier_turns";
-
-    /// What replaces the dropped exchanges.
-    ///
-    /// A marker rather than a silent gap: the model can otherwise see a
-    /// question of its own with no answer behind it, and the user can see a
-    /// thin answer with no explanation. The vault still holds every turn — this
-    /// is what fits in the window, not what exists.
-    fn history_marker(dropped: usize) -> Message {
-        Message::user(format!(
-            "[AfterRay] {dropped} earlier message(s) in this conversation were dropped to fit \
-             the context window. They are still in the thread; ask about them again if needed."
-        ))
-    }
 }
 
 impl CompactionStrategy for PruneToolResults {
@@ -140,45 +124,44 @@ impl CompactionStrategy for PruneToolResults {
         }]
     }
 
-    fn compact_history(
-        &self,
-        history: &mut Vec<Message>,
-        limit: usize,
-    ) -> Vec<CompactionNotice> {
-        let tokens_before = history_tokens(history);
+    fn compact_history(&self, history: &mut History, limit: usize) -> Vec<CompactionNotice> {
+        let tokens_before = history.tokens();
         if tokens_before <= limit {
             return Vec::new();
         }
 
-        // Tool results first, and in the same shape as the in-turn pass: the
-        // body goes, the call stays, and the replacement says so. They are the
-        // largest thing in a conversation, the most stale, and the only part
-        // that can be fetched again on demand — where a question or an answer,
-        // once gone, is gone.
+        // Tool results first, oldest first, in the same shape as the in-turn
+        // pass: the body goes, the call stays, and the replacement says so.
+        // They are the largest thing a conversation holds, the most stale, and
+        // the only part that can be fetched again on demand — where a question
+        // or an answer, once gone, is gone.
         let mut folded = 0;
         let mut total = tokens_before;
-        for message in history.iter_mut() {
-            if total <= limit {
+        while total > limit {
+            let Some(index) = history.oldest_intact_result() else {
                 break;
-            }
-            if message.kind == Kind::ToolResult && message.content != DROPPED_RESULT {
-                total = total.saturating_sub(estimate_tokens(&message.content));
-                message.content.clear();
-                message.content.push_str(DROPPED_RESULT);
-                total += estimate_tokens(DROPPED_RESULT);
-                folded += 1;
-            }
+            };
+            let Some(freed) = history.fold_result(index) else {
+                break;
+            };
+            total = total.saturating_sub(freed);
+            folded += 1;
         }
 
         // Still over: whole messages from the oldest end, which is the point at
-        // which a conversation really does start losing turns.
+        // which a conversation really does start losing turns. It may go all
+        // the way to nothing — the question being asked right now is not in
+        // here, so there is no case where this loses what the turn is about.
         let mut dropped = 0;
-        while history_tokens(history) > limit && history.len() > 1 {
-            history.remove(0);
+        while history.tokens() > limit && !history.is_empty() {
+            history.drop_oldest();
             dropped += 1;
         }
         if dropped > 0 {
-            history.insert(0, Self::history_marker(dropped));
+            history.mark(format!(
+                "{dropped} earlier message(s) in this conversation were dropped to fit the \
+                 context window. They are still in the thread; ask about them again if needed."
+            ));
         }
         if folded == 0 && dropped == 0 {
             return Vec::new();
@@ -190,22 +173,9 @@ impl CompactionStrategy for PruneToolResults {
             from_round: 0,
             to_round: 0,
             tokens_before,
-            tokens_after: history_tokens(history),
+            tokens_after: history.tokens(),
         }]
     }
-}
-
-/// What replaces a folded result. The same sentence the in-turn pass uses, so
-/// the model reads one story about missing evidence rather than two.
-const DROPPED_RESULT: &str =
-    "Tool result: dropped to make room. Call it again if you still need it.";
-
-fn history_tokens(history: &[Message]) -> usize {
-    history.iter().map(history_tokens_of).sum()
-}
-
-fn history_tokens_of(message: &Message) -> usize {
-    estimate_tokens(&message.content)
 }
 
 #[cfg(test)]
@@ -294,17 +264,20 @@ mod tests {
 #[cfg(test)]
 mod history_tests {
     use super::*;
-    use crate::message::is_prefix_of;
+    use crate::history::DROPPED_RESULT;
+    use crate::message::{Message, is_prefix_of};
 
-    fn conversation(turns: usize) -> Vec<Message> {
-        (0..turns)
-            .flat_map(|index| {
-                [
-                    Message::user(format!("question {index} {}", "x".repeat(200))),
-                    Message::assistant(format!("answer {index} {}", "y".repeat(200))),
-                ]
-            })
-            .collect()
+    fn conversation(turns: usize) -> History {
+        History::from_stored(
+            (0..turns)
+                .flat_map(|index| {
+                    [
+                        Message::user(format!("question {index} {}", "x".repeat(200))),
+                        Message::assistant(format!("answer {index} {}", "y".repeat(200))),
+                    ]
+                })
+                .collect(),
+        )
     }
 
     /// Order of loss: results before words. A tool result can be looked up
@@ -313,7 +286,7 @@ mod history_tests {
     /// sense.
     #[test]
     fn tool_results_are_folded_before_anything_a_person_said() {
-        let mut history = vec![
+        let mut history = History::from_stored(vec![
             Message::user("what was I reading"),
             Message::tool_call("TOOL get_ocr\nARGS {}"),
             Message::tool_result("x".repeat(4_000)),
@@ -322,36 +295,36 @@ mod history_tests {
             Message::tool_call("TOOL list_activity\nARGS {}"),
             Message::tool_result("y".repeat(4_000)),
             Message::assistant("Mail"),
-        ];
+        ]);
         let notices = PruneToolResults.compact_history(&mut history, 200);
 
         assert_eq!(notices.len(), 1);
         // Every word a person said is still there, in order.
         assert_eq!(history.len(), 8, "a message was dropped: {history:?}");
-        assert_eq!(history[0].content, "what was I reading");
-        assert_eq!(history[3].content, "the AV1 spec");
-        assert_eq!(history[4].content, "and before that");
-        assert_eq!(history[7].content, "Mail");
+        assert_eq!(history.messages()[0].content(), "what was I reading");
+        assert_eq!(history.messages()[3].content(), "the AV1 spec");
+        assert_eq!(history.messages()[4].content(), "and before that");
+        assert_eq!(history.messages()[7].content(), "Mail");
         // And both results went, oldest first.
-        assert_eq!(history[2].content, DROPPED_RESULT);
-        assert_eq!(history[6].content, DROPPED_RESULT);
+        assert_eq!(history.messages()[2].content(), DROPPED_RESULT);
+        assert_eq!(history.messages()[6].content(), DROPPED_RESULT);
         // The calls survive their results: that is what stops the model simply
         // running them again.
-        assert!(history[1].content.starts_with("TOOL get_ocr"));
+        assert!(history.messages()[1].content().starts_with("TOOL get_ocr"));
     }
 
     /// Only as many as it takes. A conversation two hundred tokens over budget
     /// should not lose every result it has.
     #[test]
     fn folding_stops_as_soon_as_it_fits() {
-        let mut history = vec![
+        let mut history = History::from_stored(vec![
             Message::tool_result("x".repeat(4_000)),
             Message::tool_result("y".repeat(40)),
             Message::assistant("done"),
-        ];
+        ]);
         PruneToolResults.compact_history(&mut history, 60);
-        assert_eq!(history[0].content, DROPPED_RESULT);
-        assert_eq!(history[1].content, "y".repeat(40), "folded more than it had to");
+        assert_eq!(history.messages()[0].content(), DROPPED_RESULT);
+        assert_eq!(history.messages()[1].content(), "y".repeat(40), "folded more than it had to");
     }
 
     /// The cross-turn pass keeps the same contract as the in-turn one: whole
@@ -365,12 +338,12 @@ mod history_tests {
         assert_eq!(notices[0].strategy, PruneToolResults::HISTORY_NAME);
         assert!(notices[0].tokens_after < notices[0].tokens_before);
         assert!(
-            history[0].content.starts_with("[AfterRay]"),
+            history.messages()[0].content().starts_with("[AfterRay]"),
             "no marker where the conversation was cut: {:?}",
-            history[0]
+            history.messages()[0]
         );
         // The newest exchange survives: it is what a follow-up refers to.
-        assert!(history.last().unwrap().content.contains("answer 19"));
+        assert!(history.messages().last().unwrap().content().contains("answer 19"));
     }
 
     /// A compaction moves the prefix once — that is the price — and then the
@@ -388,12 +361,12 @@ mod history_tests {
             let before = history.clone();
             PruneToolResults.compact_history(&mut history, 5_000);
             assert!(
-                is_prefix_of(&before, &history),
+                is_prefix_of(before.messages(), history.messages()),
                 "a pass that did not need to drop anything still rewrote the history"
             );
         }
         assert!(
-            is_prefix_of(&after_first, &history),
+            is_prefix_of(after_first.messages(), history.messages()),
             "the settled prefix moved again without pressure"
         );
     }

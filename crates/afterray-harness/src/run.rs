@@ -195,9 +195,13 @@ pub struct LoopConfig<'a> {
     pub budget: ContextBudget,
     /// Stops the turn. [`CancelToken::new`] for a caller that never cancels.
     pub cancel: CancelToken,
-    /// How the transcript is kept inside the window. `None` runs append-only:
-    /// a prefix-caching runtime then re-prefills only each round's delta, and
-    /// rewriting an earlier round would invalidate the whole cached prefix.
+    /// How the transcript and the conversation are kept inside the window.
+    ///
+    /// `None` means nothing removes anything: the turn runs append-only, and a
+    /// caller choosing it is asserting that its conversation fits. Nothing else
+    /// bounds the history — the renderer deliberately cannot, because a
+    /// renderer that drops "whatever does not fit" keeps a different subset
+    /// every turn and never says which.
     pub compaction: Option<&'a dyn CompactionStrategy>,
 }
 
@@ -395,10 +399,7 @@ where
                 strategy: "trim_opening",
                 from_round: 0,
                 to_round: 0,
-                tokens_before: after
-                    + trim.seed_dropped
-                    + trim.history_dropped
-                    + trim.task_dropped,
+                tokens_before: after + trim.seed_dropped + trim.task_dropped,
                 tokens_after: after,
             }),
         )
@@ -1515,30 +1516,30 @@ mod tests {
     }
 
     /// An opening larger than the window must be cut before the first round,
-    /// and the cut must be announced. Compaction never touches the opening, so
-    /// nothing else would have caught it.
+    /// the question must survive it, and the cut must be announced.
     #[tokio::test]
     async fn an_oversized_opening_is_trimmed_before_the_first_round() {
         let model = ScriptedModel::new(&["FINAL\nok"], false);
         let tools = EchoTools { body: String::new() };
         let mut sink = Recorder::default();
+        let strategy = PruneToolResults;
+        let config = LoopConfig {
+            budget: ContextBudget::DEFAULT,
+            cancel: CancelToken::new(),
+            compaction: Some(&strategy),
+        };
         let huge = Opening {
             seed: "clock".to_owned(),
-            history: (0..4_000)
-                .map(|index| crate::message::Message::user(format!("a long folded turn {index}")))
-                .collect(),
+            history: crate::history::History::from_stored(
+                (0..4_000)
+                    .map(|index| Message::user(format!("a long folded turn {index}")))
+                    .collect(),
+            ),
             task: "CURRENT_TASK_SENTINEL".to_owned(),
         };
-        let turn = run_turn(
-            &model,
-            &tools,
-            &mut sink,
-            &config(),
-            "system",
-            huge,
-        )
-        .await
-        .unwrap();
+        let turn = run_turn(&model, &tools, &mut sink, &config, "system", huge)
+            .await
+            .unwrap();
         let prompt = model.seen.lock().unwrap()[0].clone();
         assert!(
             prompt.contains("CURRENT_TASK_SENTINEL"),
@@ -1553,9 +1554,44 @@ mod tests {
         assert!(
             sink.events.iter().any(|event| matches!(
                 event,
-                HarnessEvent::Compaction(notice) if notice.strategy == "trim_opening"
+                HarnessEvent::Compaction(notice)
+                    if notice.strategy == PruneToolResults::HISTORY_NAME
             )),
-            "the trim was silent"
+            "the conversation was cut without a word: {:?}",
+            sink.events
+        );
+    }
+
+    /// The other half of "only compaction may remove": without a strategy,
+    /// nothing does. The prompt then overflows, which is the caller's
+    /// declaration that it would fit — and is still better than the renderer
+    /// quietly keeping a different subset of the conversation every turn.
+    #[tokio::test]
+    async fn without_a_strategy_the_conversation_is_left_whole() {
+        let model = ScriptedModel::new(&["FINAL\nok"], false);
+        let tools = EchoTools { body: String::new() };
+        let mut sink = Recorder::default();
+        let stored: Vec<Message> = (0..2_000)
+            .map(|index| Message::user(format!("turn {index}")))
+            .collect();
+        let opening = Opening {
+            seed: "clock".to_owned(),
+            history: crate::history::History::from_stored(stored.clone()),
+            task: "and then?".to_owned(),
+        };
+        run_turn(&model, &tools, &mut sink, &config(), "system", opening)
+            .await
+            .unwrap();
+
+        let prompt = model.seen.lock().unwrap()[0].clone();
+        assert!(prompt.contains("turn 0"), "the oldest turn went silently");
+        assert!(prompt.contains("turn 1999"));
+        assert!(
+            !sink.events.iter().any(|event| matches!(
+                event,
+                HarnessEvent::Compaction(_)
+            )),
+            "nothing was configured to compact, so nothing should have"
         );
     }
 
