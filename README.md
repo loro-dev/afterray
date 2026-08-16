@@ -32,7 +32,7 @@ not need to build AfterRay or run separate first-launch setup commands.
 Choose local models, such as your own Ollama, or any AI provider with an
 OpenAI-compatible API.
 
-## What is cool about it
+## What you can do
 
 - **Rewind your work.** Browse a native timeline back to the exact screen,
   words, app context, and audio around a moment.
