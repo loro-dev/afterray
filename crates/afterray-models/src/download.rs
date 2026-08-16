@@ -1,5 +1,7 @@
 use crate::Cancellation;
-use crate::catalog::{ManifestFile, PackSource, PackSpec, READY_MARKER, inspect_model_path};
+use crate::catalog::{
+    ManifestFile, PackSource, PackSpec, READY_MARKER, SnapshotPin, inspect_model_path,
+};
 use afterray_protocol::ModelPackState;
 use futures_util::StreamExt as _;
 use serde::Deserialize;
@@ -108,16 +110,22 @@ pub async fn download_pack_with_cancellation(
         return Ok(());
     }
     match &pack.source {
-        PackSource::HuggingFaceFile { repository, file } => {
+        PackSource::HuggingFaceFile {
+            repository,
+            file,
+            revision,
+            sha256,
+        } => {
             if let Some(parent) = pack.path.parent() {
                 fs::create_dir_all(parent)?;
             }
             download_huggingface_file(
                 repository,
-                "main",
+                revision,
                 file,
                 &pack.path,
-                None,
+                sha256.as_ref().map(|_| pack.expected_bytes),
+                sha256.as_deref(),
                 &cancellation,
                 |bytes, expected| {
                     on_progress(DownloadProgress {
@@ -139,7 +147,17 @@ pub async fn download_pack_with_cancellation(
                 expected_bytes: Some(bytes.max(pack.expected_bytes)),
             });
         }
-        PackSource::HuggingFaceSnapshot { repository } => {
+        PackSource::HuggingFaceSnapshot {
+            repository,
+            pin: Some(pin),
+        } => {
+            download_snapshot_with_pin(pack, repository, pin, &cancellation, &mut on_progress)
+                .await?;
+        }
+        PackSource::HuggingFaceSnapshot {
+            repository,
+            pin: None,
+        } => {
             fs::create_dir_all(&pack.path)?;
             let files = list_huggingface_files(repository, &cancellation).await?;
             let total_files = files.len();
@@ -180,6 +198,7 @@ pub async fn download_pack_with_cancellation(
                     &file.path,
                     &destination,
                     file.size,
+                    None,
                     &cancellation,
                     |written, _| {
                         on_progress(DownloadProgress {
@@ -249,6 +268,98 @@ fn remove_path_if_present(path: &Path) -> Result<(), DownloadError> {
     Ok(())
 }
 
+/// Downloads a pinned snapshot into the pack's plain directory layout.
+///
+/// Unlike [`download_pinned_snapshot`] there is no staging directory or ready
+/// marker — files land where the unpinned flow always put them, so packs
+/// installed before pinning existed remain valid. What the pin adds: the file
+/// list comes from the manifest instead of a live (spoofable) listing, every
+/// file resolves at the pinned revision, and a final SHA-256 pass rejects —
+/// and bins — any file whose bytes differ from Hugging Face's own hashes.
+async fn download_snapshot_with_pin(
+    pack: &PackSpec,
+    repository: &str,
+    pin: &SnapshotPin,
+    cancellation: &Cancellation,
+    on_progress: &mut impl FnMut(DownloadProgress),
+) -> Result<(), DownloadError> {
+    ensure_not_cancelled(cancellation)?;
+    fs::create_dir_all(&pack.path)?;
+    let total_files = pin.files.len();
+    let expected = Some(pack.expected_bytes);
+    let mut finished_bytes = 0_u64;
+    for (index, file) in pin.files.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        let destination = pack.path.join(&file.path);
+        if destination
+            .metadata()
+            .ok()
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() == file.bytes)
+        {
+            finished_bytes = finished_bytes.saturating_add(file.bytes);
+            on_progress(DownloadProgress {
+                state: ModelPackState::Downloading,
+                completed_files: index + 1,
+                total_files,
+                bytes: finished_bytes,
+                expected_bytes: expected,
+            });
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        download_huggingface_file(
+            repository,
+            &pin.revision,
+            &file.path,
+            &destination,
+            Some(file.bytes),
+            None, // the verification pass below hashes every file once
+            cancellation,
+            |written, _| {
+                on_progress(DownloadProgress {
+                    state: ModelPackState::Downloading,
+                    completed_files: index,
+                    total_files,
+                    bytes: finished_bytes.saturating_add(written),
+                    expected_bytes: expected,
+                });
+            },
+        )
+        .await?;
+        finished_bytes = finished_bytes.saturating_add(file.bytes);
+    }
+
+    on_progress(DownloadProgress {
+        state: ModelPackState::Verifying,
+        completed_files: 0,
+        total_files,
+        bytes: 0,
+        expected_bytes: expected,
+    });
+    let verification_path = pack.path.clone();
+    let verification_files = pin.files.clone();
+    let verification_cancellation = cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        verify_files_removing_corrupt(
+            &verification_path,
+            &verification_files,
+            &verification_cancellation,
+        )
+    })
+    .await
+    .map_err(|error| DownloadError::message(format!("verification task failed: {error}")))??;
+    on_progress(DownloadProgress {
+        state: ModelPackState::Ready,
+        completed_files: total_files,
+        total_files,
+        bytes: pack.expected_bytes,
+        expected_bytes: expected,
+    });
+    Ok(())
+}
+
 async fn download_pinned_snapshot(
     pack: &PackSpec,
     repository: &str,
@@ -303,6 +414,7 @@ async fn download_pinned_snapshot(
             &file.path,
             &destination,
             Some(file.bytes),
+            None,
             cancellation,
             |written, _| {
                 on_progress(DownloadProgress {
@@ -382,40 +494,71 @@ fn verify_files_with_cancellation(
     files: &[ManifestFile],
     cancellation: &Cancellation,
 ) -> Result<(), DownloadError> {
-    let mut buffer = vec![0_u8; 1024 * 1024];
     for expected in files {
-        ensure_not_cancelled(cancellation)?;
-        let file_path = path.join(&expected.path);
-        let metadata = fs::metadata(&file_path).map_err(|error| {
-            DownloadError::message(format!("{} is missing: {error}", expected.path))
-        })?;
-        if metadata.len() != expected.bytes {
-            return Err(DownloadError::message(format!(
-                "{} has {} bytes; expected {}",
-                expected.path,
-                metadata.len(),
-                expected.bytes
-            )));
-        }
-        let mut source = fs::File::open(&file_path)?;
-        let mut digest = Sha256::new();
-        loop {
-            ensure_not_cancelled(cancellation)?;
-            let read = source.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        verify_one_file(path, expected, cancellation)?;
+    }
+    Ok(())
+}
+
+/// Like [`verify_files`], but bins a file whose bytes do not match before
+/// erroring, so the next attempt re-downloads that file instead of failing
+/// forever on the same corrupt bytes. Cancellation deletes nothing.
+fn verify_files_removing_corrupt(
+    path: &Path,
+    files: &[ManifestFile],
+    cancellation: &Cancellation,
+) -> Result<(), DownloadError> {
+    for expected in files {
+        if let Err(error) = verify_one_file(path, expected, cancellation) {
+            if !matches!(error, DownloadError::Cancelled) {
+                let _ = fs::remove_file(path.join(&expected.path));
             }
-            digest.update(&buffer[..read]);
-        }
-        let actual = format!("{:x}", digest.finalize());
-        if actual != expected.sha256 {
-            return Err(DownloadError::message(format!(
-                "{} failed SHA-256 verification (expected {}, got {})",
-                expected.path, expected.sha256, actual
-            )));
+            return Err(error);
         }
     }
     Ok(())
+}
+
+fn verify_one_file(
+    path: &Path,
+    expected: &ManifestFile,
+    cancellation: &Cancellation,
+) -> Result<(), DownloadError> {
+    ensure_not_cancelled(cancellation)?;
+    let file_path = path.join(&expected.path);
+    let metadata = fs::metadata(&file_path)
+        .map_err(|error| DownloadError::message(format!("{} is missing: {error}", expected.path)))?;
+    if metadata.len() != expected.bytes {
+        return Err(DownloadError::message(format!(
+            "{} has {} bytes; expected {}",
+            expected.path,
+            metadata.len(),
+            expected.bytes
+        )));
+    }
+    let actual = sha256_of_file(&file_path, cancellation)?;
+    if actual != expected.sha256 {
+        return Err(DownloadError::message(format!(
+            "{} failed SHA-256 verification (expected {}, got {})",
+            expected.path, expected.sha256, actual
+        )));
+    }
+    Ok(())
+}
+
+fn sha256_of_file(path: &Path, cancellation: &Cancellation) -> Result<String, DownloadError> {
+    let mut source = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        ensure_not_cancelled(cancellation)?;
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +621,7 @@ async fn download_huggingface_file(
     file: &str,
     destination: &Path,
     expected_file_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
     cancellation: &Cancellation,
     mut on_chunk: impl FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadError> {
@@ -551,6 +695,22 @@ async fn download_huggingface_file(
             )));
         }
     }
+    if let Some(expected_sha256) = expected_sha256 {
+        let actual = {
+            let partial = partial.clone();
+            let cancellation = cancellation.clone();
+            tokio::task::spawn_blocking(move || sha256_of_file(&partial, &cancellation))
+                .await
+                .map_err(|error| DownloadError::message(format!("hash task failed: {error}")))??
+        };
+        if actual != expected_sha256 {
+            // Keeping the bytes would resume into the same failure forever.
+            let _ = fs::remove_file(&partial);
+            return Err(DownloadError::message(format!(
+                "download `{repository}/{file}` failed SHA-256 verification (expected {expected_sha256}, got {actual}); the file was discarded, retry the download"
+            )));
+        }
+    }
     fs::rename(partial, destination)?;
     Ok(())
 }
@@ -563,11 +723,37 @@ fn ensure_not_cancelled(cancellation: &Cancellation) -> Result<(), DownloadError
     }
 }
 
-/// Base URL for every Hugging Face request. `HF_ENDPOINT` — the same variable
-/// the official CLI honours — points downloads at a mirror such as
-/// `https://hf-mirror.com` for users whose route to huggingface.co is blocked
-/// or unreliable. Note that `HF_TOKEN` is sent to whatever endpoint is set.
+/// Endpoint chosen in the app's settings. It outranks `HF_ENDPOINT` because
+/// the GUI app never sees shell environment variables — the setting is the
+/// only mirror control a packaged install actually has.
+static CONFIGURED_ENDPOINT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Points model downloads at a Hugging Face mirror, or back at the official
+/// endpoint with `None`/empty. Content integrity does not depend on the
+/// endpoint: pinned packs are verified against SHA-256 hashes recorded in the
+/// catalog. Note that `HF_TOKEN` is sent to whatever endpoint is in effect.
+pub fn set_huggingface_endpoint(endpoint: Option<String>) {
+    let cleaned = endpoint
+        .as_deref()
+        .map(|value| value.trim().trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    *CONFIGURED_ENDPOINT
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = cleaned;
+}
+
+/// Base URL for every Hugging Face request: the configured setting, else
+/// `HF_ENDPOINT` — the same variable the official CLI honours — else the
+/// official endpoint.
 fn huggingface_endpoint() -> String {
+    if let Some(configured) = CONFIGURED_ENDPOINT
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return configured;
+    }
     endpoint_or_default(std::env::var("HF_ENDPOINT").ok())
 }
 
@@ -644,6 +830,8 @@ mod tests {
             source: PackSource::HuggingFaceFile {
                 repository: "example/test".into(),
                 file: "weights.bin".into(),
+                revision: "main".into(),
+                sha256: None,
             },
         }
     }
@@ -711,6 +899,52 @@ mod tests {
         assert!(verify_files(&directory, &manifest).is_err());
         fs::remove_file(&file).unwrap();
         assert!(verify_files(&directory, &manifest).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A pinned-snapshot file that fails verification must be deleted — kept
+    /// bytes would satisfy the size-based resume skip and fail identically on
+    /// every retry. Good files stay; cancellation deletes nothing.
+    #[test]
+    fn corrupt_snapshot_file_is_binned_so_a_retry_redownloads_it() {
+        const GOOD_SHA: &str = "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c";
+        let directory = std::env::temp_dir().join(format!(
+            "afterray-corrupt-bin-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("good.json"), b"good").unwrap();
+        fs::write(directory.join("bad.bin"), b"bad!").unwrap();
+        let manifest = [
+            ManifestFile {
+                path: "good.json".into(),
+                bytes: 4,
+                sha256: GOOD_SHA.into(),
+            },
+            ManifestFile {
+                path: "bad.bin".into(),
+                bytes: 4,
+                sha256: GOOD_SHA.into(),
+            },
+        ];
+
+        let error =
+            verify_files_removing_corrupt(&directory, &manifest, &Cancellation::default())
+                .unwrap_err();
+        assert!(error.to_string().contains("bad.bin"));
+        assert!(directory.join("good.json").is_file(), "good file kept");
+        assert!(!directory.join("bad.bin").exists(), "corrupt file binned");
+
+        fs::write(directory.join("bad.bin"), b"bad!").unwrap();
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let result = verify_files_removing_corrupt(&directory, &manifest, &cancellation);
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert!(
+            directory.join("bad.bin").is_file(),
+            "cancellation must not delete"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

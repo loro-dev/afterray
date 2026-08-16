@@ -457,6 +457,7 @@ async fn request_from_command(
             llm_base_url: None,
             llm_model: None,
             llm_api_key: None,
+            model_download_endpoint: None,
         },
         Command::Models => Request::ModelsStatus,
         Command::Jobs {

@@ -2,6 +2,9 @@ import AppKit
 import SwiftUI
 
 @MainActor
+private let settingsMirrorEndpoint = "https://hf-mirror.com"
+private let settingsCustomEndpointTag = "custom"
+
 public protocol AfterRaySettingsModeling: ObservableObject {
     var settings: AppSettings? { get }
     var library: ModelLibrary? { get }
@@ -60,6 +63,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func cancelModelDownloads() async
     /// Drops one pack from the queue and discards its partial files.
     func cancelModelDownload(packID: String) async
+    /// Points model downloads at a mirror; empty restores huggingface.co.
+    func updateModelDownloadEndpoint(_ endpoint: String) async
     func remove(packID: String) async
     func revealLogs()
     func copyDiagnostics()
@@ -322,6 +327,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @State private var copied = false
     @State private var confirmingMlxRemoval = false
     @State private var domainDraft = ""
+    @State private var customEndpointDraft = ""
+    @State private var isEditingCustomEndpoint = false
     @FocusState private var domainFieldFocused: Bool
 
     public init(
@@ -886,6 +893,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             packsFooter
         }
 
+        downloadSourceSection
+
         if !model.recentJobs.isEmpty {
             SettingsSection(title: "Recent inference") {
                 ForEach(Array(model.recentJobs.enumerated()), id: \.element.id) { index, job in
@@ -1061,6 +1070,78 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         case .paused: .warning
         case .failed: .danger
         }
+    }
+
+    // MARK: Download source
+
+    private var currentDownloadEndpoint: String {
+        model.settings?.modelDownloadEndpoint ?? ""
+    }
+
+    /// Where pack bytes come from — never what they may contain: every pack is
+    /// checked against SHA-256 hashes pinned in the daemon, so a mirror can
+    /// only serve or refuse the download, not alter it.
+    private var downloadSourceSection: some View {
+        SettingsSection(
+            title: "Download source",
+            footnote: "Packs are verified against checksums pinned inside AfterRay, so a mirror changes where bytes come from — never what installs. Pick the mirror if huggingface.co is slow or unreachable from your network."
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                SettingsMenuPicker(
+                    options: [
+                        .init(id: "", title: "huggingface.co · official"),
+                        .init(id: settingsMirrorEndpoint, title: "hf-mirror.com · mirror"),
+                        .init(id: settingsCustomEndpointTag, title: "Custom endpoint…"),
+                    ],
+                    selection: downloadSourceBinding,
+                    disabled: model.isControllingDownload
+                )
+                if downloadSourceBinding.wrappedValue == settingsCustomEndpointTag {
+                    HStack(spacing: 10) {
+                        TextField("https://mirror.example.com", text: $customEndpointDraft)
+                            .settingsFieldStyle()
+                            .onSubmit { applyCustomEndpoint() }
+                        Button("Apply") { applyCustomEndpoint() }
+                            .buttonStyle(SettingsButtonStyle(kind: .prominent))
+                            .disabled(
+                                customEndpointDraft
+                                    .trimmingCharacters(in: .whitespaces).isEmpty
+                            )
+                    }
+                }
+            }
+            .padding(.horizontal, SettingsMetrics.rowInset)
+            .padding(.vertical, 12)
+        }
+    }
+
+    private var downloadSourceBinding: Binding<String> {
+        Binding(
+            get: {
+                if isEditingCustomEndpoint { return settingsCustomEndpointTag }
+                let current = currentDownloadEndpoint
+                if current.isEmpty { return "" }
+                if current == settingsMirrorEndpoint { return settingsMirrorEndpoint }
+                return settingsCustomEndpointTag
+            },
+            set: { choice in
+                if choice == settingsCustomEndpointTag {
+                    // Nothing is applied until the user submits the field.
+                    customEndpointDraft = currentDownloadEndpoint
+                    isEditingCustomEndpoint = true
+                } else {
+                    isEditingCustomEndpoint = false
+                    Task { await model.updateModelDownloadEndpoint(choice) }
+                }
+            }
+        )
+    }
+
+    private func applyCustomEndpoint() {
+        let endpoint = customEndpointDraft.trimmingCharacters(in: .whitespaces)
+        guard !endpoint.isEmpty else { return }
+        isEditingCustomEndpoint = false
+        Task { await model.updateModelDownloadEndpoint(endpoint) }
     }
 
     /// Packs the Download Missing button would actually add. Anything already in

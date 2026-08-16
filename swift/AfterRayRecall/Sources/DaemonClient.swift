@@ -130,6 +130,9 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
         uiLanguage: String?,
         summaryLanguage: String?
     ) async throws -> AppSettings
+    /// Points model downloads at a mirror; an empty string restores the
+    /// official huggingface.co endpoint.
+    func updateModelDownloadEndpoint(_ endpoint: String) async throws -> AppSettings
     func probeLlm(provider: LlmProvider?, baseUrl: String?) async throws -> LlmEndpointStatus
     func startModelDownloads(packIDs: [String]) async throws -> ModelLibrary
     func pauseModelDownloads() async throws -> ModelLibrary
@@ -153,6 +156,10 @@ public extension AfterRayDaemonServing {
 
     func cancelModelDownload(packID _: String) async throws -> ModelLibrary {
         throw DaemonClientError.rejected("cancelling one download is not available")
+    }
+
+    func updateModelDownloadEndpoint(_: String) async throws -> AppSettings {
+        throw DaemonClientError.rejected("changing the download endpoint is not available")
     }
 
     func updateSettings(recordAudio: Bool) async throws -> AppSettings {
@@ -253,6 +260,13 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 uiLanguage: uiLanguage,
                 summaryLanguage: summaryLanguage
             ),
+            as: AppSettings.self
+        )
+    }
+
+    public func updateModelDownloadEndpoint(_ endpoint: String) async throws -> AppSettings {
+        try await request(
+            WireRequest(type: "update_settings", modelDownloadEndpoint: endpoint),
             as: AppSettings.self
         )
     }
@@ -533,6 +547,7 @@ struct WireRequest: Encodable, Equatable {
     var storageLimitBytes: UInt64?
     var uiLanguage: String?
     var summaryLanguage: String?
+    var modelDownloadEndpoint: String?
     var provider: String?
     var baseUrl: String?
     var conversationID: String? = nil
@@ -572,6 +587,7 @@ struct WireRequest: Encodable, Equatable {
         case storageLimitBytes = "storage_limit_bytes"
         case uiLanguage = "ui_language"
         case summaryLanguage = "summary_language"
+        case modelDownloadEndpoint = "model_download_endpoint"
         case provider
         case baseUrl = "base_url"
         case conversationID = "conversation_id"
@@ -615,6 +631,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(storageLimitBytes, forKey: .storageLimitBytes)
         try container.encodeIfPresent(uiLanguage, forKey: .uiLanguage)
         try container.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
+        try container.encodeIfPresent(modelDownloadEndpoint, forKey: .modelDownloadEndpoint)
         try container.encodeIfPresent(provider, forKey: .provider)
         try container.encodeIfPresent(baseUrl, forKey: .baseUrl)
         try container.encodeIfPresent(conversationID, forKey: .conversationID)

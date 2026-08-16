@@ -9,7 +9,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - `Sources/RecallModels.swift` — `RecallSession` (:3), `RecallMoment` (:21), `RecallGopRef` (:133), `ArtifactPayload` (:163); all `Codable` with explicit snake_case `CodingKeys`.
 - `Sources/RecallView.swift:9` `RecallView` — the main recall surface (`RecallPalette` at :2211).
 - `Sources/AfterRayControlModel.swift:4` — recording/search state; `Sources/AfterRayChatModel.swift:46` chat model behind `AfterRayChatModeling` (:4).
-- `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:327) — settings UI generic over the protocol, so mock and real models share it; `downloadQueueSection` draws the models page's downloads.
+- `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:327) — settings UI generic over the protocol, so mock and real models share it; `downloadQueueSection` draws the models page's downloads; `downloadSourceSection` picks the Hugging Face mirror (official / hf-mirror / custom).
 - `Sources/ModelDownloadQueue.swift:116` `ModelLibrary.downloadQueue` — the daemon's active-pack + waiting-ids report flattened into queue rows; `isQueued` (:160) gates per-pack buttons.
 - `Sources/AppIconLookup.swift:8` — cached bundle-id → icon; `AppIconView` (:54) for rows naming an app.
 - `Sources/HangWatchdog.swift:36` `HangJudge` + `OverlayVisibility` (:6) — terminates the process if the main thread stalls ~12s while the overlay is visible.

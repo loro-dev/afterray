@@ -596,6 +596,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public let uiLanguage: String
     public let summaryLanguage: String
     public let languageOptions: [LanguageOption]
+    /// Mirror model downloads resolve against; empty means huggingface.co.
+    public let modelDownloadEndpoint: String
 
     public init(
         dataDir: String,
@@ -612,7 +614,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         llmApiKeySet: Bool = false,
         uiLanguage: String = defaultLanguage,
         summaryLanguage: String = defaultLanguage,
-        languageOptions: [LanguageOption] = []
+        languageOptions: [LanguageOption] = [],
+        modelDownloadEndpoint: String = ""
     ) {
         self.dataDir = dataDir
         self.modelDir = modelDir
@@ -629,6 +632,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.uiLanguage = uiLanguage
         self.summaryLanguage = summaryLanguage
         self.languageOptions = languageOptions
+        self.modelDownloadEndpoint = modelDownloadEndpoint
     }
 
     enum CodingKeys: String, CodingKey {
@@ -647,6 +651,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case uiLanguage = "ui_language"
         case summaryLanguage = "summary_language"
         case languageOptions = "language_options"
+        case modelDownloadEndpoint = "model_download_endpoint"
     }
 
     public init(from decoder: Decoder) throws {
@@ -668,6 +673,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         summaryLanguage = try container.decodeIfPresent(String.self, forKey: .summaryLanguage)
             ?? Self.defaultLanguage
         languageOptions = try container.decodeIfPresent([LanguageOption].self, forKey: .languageOptions) ?? []
+        modelDownloadEndpoint = try container.decodeIfPresent(
+            String.self, forKey: .modelDownloadEndpoint
+        ) ?? ""
     }
 
     /// Rows for a language picker. The catalogue itself is never hardcoded here;

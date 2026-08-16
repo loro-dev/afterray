@@ -464,6 +464,20 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         if message == nil { message = "Cancelled the \(name) download." }
     }
 
+    func updateModelDownloadEndpoint(_ endpoint: String) async {
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateModelDownloadEndpoint(endpoint)
+            let applied = settings?.modelDownloadEndpoint ?? ""
+            message = applied.isEmpty
+                ? "Model downloads use huggingface.co."
+                : "Model downloads use \(applied)."
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
     private func controlModelDownloads(
         _ operation: (UnixSocketDaemonClient) async throws -> ModelLibrary
     ) async {

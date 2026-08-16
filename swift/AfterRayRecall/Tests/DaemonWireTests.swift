@@ -441,6 +441,27 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["pack_id"] as? String, "embedding")
     }
 
+    func testUpdateModelDownloadEndpointRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", modelDownloadEndpoint: "https://hf-mirror.com")
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["model_download_endpoint"] as? String, "https://hf-mirror.com")
+        XCTAssertEqual(json.count, 2, "a partial settings patch must not carry stray fields")
+    }
+
+    func testAppSettingsDecodesTheDownloadEndpoint() throws {
+        let base = #"{"data_dir":"/d","model_dir":"/m","record_audio":true,"capture_interval_seconds":10"#
+        let withEndpoint = try JSONDecoder().decode(
+            AppSettings.self,
+            from: Data((base + #","model_download_endpoint":"https://hf-mirror.com"}"#).utf8)
+        )
+        XCTAssertEqual(withEndpoint.modelDownloadEndpoint, "https://hf-mirror.com")
+        let without = try JSONDecoder().decode(AppSettings.self, from: Data((base + "}").utf8))
+        XCTAssertEqual(without.modelDownloadEndpoint, "", "an old daemon means the official endpoint")
+    }
+
     func testRemoveModelRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "remove_model", packID: "llm_qwen35_4b_mlx4"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

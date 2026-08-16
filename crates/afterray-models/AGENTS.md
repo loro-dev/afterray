@@ -10,7 +10,7 @@ The model-layer hub for `afterrayd`: an in-memory priority-aware job queue (`Mod
 - `src/persistent_mlx.rs` — `MLX_WORKER_PROTOCOL_VERSION = 1` (`:17`); `PersistentMlxAdapter` (`:69`): NDJSON, `load`/`generate`/`cancel` → `ready`/`delta`/`final`/`cancelled`/`error`; `verify_model` (`:274`) re-checks the pinned manifest + ready marker before every spawn; `normalize_model_output` (`:530`) strips `<think>`/control tokens.
 - `src/remote.rs` — `LlmRouterAdapter` (`:127`) routes LLM jobs to a per-pack MLX adapter or Ollama/OpenAI-compatible HTTP; `check_origin` (`:484`) allows https or loopback-http only; reqwest clients disable redirects so prompts/API keys can't leak to a redirect target.
 - `src/catalog.rs` — pack specs; `READY_MARKER` (`:4`); pinned MLX revisions + SHA-256 manifests (`QWEN35_4B/9B_MLX_REVISION`); `model_directory()` (`:97`, `AFTERRAY_MODEL_DIR` override).
-- `src/download.rs` — pure-Rust/reqwest downloads; `.partial` resume + `<name>.download/` staging, SHA-256 `verify_files` (`:328`), atomic rename. Never half-populate `pack.path`. `HF_ENDPOINT` overrides the Hugging Face base URL (mirrors); proxies come from env vars + macOS system settings via reqwest's `system-proxy` feature — root `Cargo.toml` must keep that feature or every request silently goes direct.
+- `src/download.rs` — pure-Rust/reqwest downloads; `.partial` resume + `<name>.download/` staging, SHA-256 `verify_files`, atomic rename. Never half-populate `pack.path`. Endpoint order: settings (`set_huggingface_endpoint`, fed by the daemon) → `HF_ENDPOINT` env → huggingface.co; proxies come from env vars + macOS system settings via reqwest's `system-proxy` feature — root `Cargo.toml` must keep that feature or every request silently goes direct.
 
 ## Invariants
 
@@ -18,6 +18,7 @@ The model-layer hub for `afterrayd`: an in-memory priority-aware job queue (`Mod
 - Workers signal failures via `retryable` in `WorkerResponse`: `true` → `AdapterError::Process` (retried), `false` → `MissingModel` (`process.rs:180`). Never fabricate inference output; fail with an actionable `MissingModel`.
 - LLM lane fairness: background submitters must use `JobPriority::Background{..}`; multi-round agent loops must take `hold_llm_lease()` and pass the lease id, or every round re-queues behind rivals (measured 8-minute stalls, `queue.rs:104`).
 - Pinned MLX snapshots are verified three times: at download, at spawn, and inside the Swift worker. Revision constants live in both `catalog.rs` and `swift/AfterRayMlxVlmWorker/Sources/WorkerCore.swift` — change together; bump `MLX_WORKER_PROTOCOL_VERSION` in lockstep with the Swift `mlxWorkerProtocolVersion`.
+- **Every pack is SHA-256-pinned**, which is what makes download mirrors safe: MLX via `HuggingFacePinnedSnapshot`, asr via `SnapshotPin` on `HuggingFaceSnapshot`, embedding via `sha256` on `HuggingFaceFile` (plain layout, no ready marker — installed packs stay valid). To bump a revision: LFS hashes come from the HF tree API (`lfs.oid`); small non-LFS files must be fetched at that commit and hashed by hand. An `AFTERRAY_*` repo override drops the pin — custom content is knowingly unverified.
 - `LlmRuntimeConfig::mlx_pack_id()` (`remote.rs:61`) accepts only the managed pack ids, never free-form paths.
 
 ## Watch out

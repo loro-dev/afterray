@@ -159,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         load_persisted_settings(&vault_config.data_dir),
     );
     vault_config.max_storage_bytes = persisted.storage_limit_bytes;
+    afterray_models::set_huggingface_endpoint(Some(persisted.model_download_endpoint.clone()));
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
     let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
@@ -232,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
         excluded_domains: std::sync::Mutex::new(persisted.excluded_domains.clone()),
+        model_download_endpoint: std::sync::Mutex::new(persisted.model_download_endpoint.clone()),
         memories: std::sync::Mutex::new(memory::MemoryRuntime::default()),
         languages: std::sync::Mutex::new((
             persisted.ui_language.clone(),
@@ -444,6 +446,10 @@ struct AppState {
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
     excluded_domains: std::sync::Mutex<Vec<String>>,
+    /// Mirror model downloads resolve against; empty means huggingface.co.
+    /// The live value lives in `afterray_models` (`set_huggingface_endpoint`);
+    /// this copy only feeds settings responses and persistence.
+    model_download_endpoint: std::sync::Mutex<String>,
     memories: std::sync::Mutex<memory::MemoryRuntime>,
     /// (ui_language, summary_language) as stored preferences; `auto` until
     /// the user picks, resolved against the system locale at prompt time.
@@ -483,6 +489,8 @@ struct PersistedSettings {
     ui_language: String,
     #[serde(default = "default_language")]
     summary_language: String,
+    #[serde(default)]
+    model_download_endpoint: String,
 }
 
 fn default_language() -> String {
@@ -539,6 +547,7 @@ impl Default for PersistedSettings {
             legacy_llm_api_key: String::new(),
             ui_language: default_language(),
             summary_language: default_language(),
+            model_download_endpoint: String::new(),
         }
     }
 }
@@ -904,6 +913,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             llm_base_url,
             llm_model,
             llm_api_key,
+            model_download_endpoint,
         } => {
             update_settings(
                 state,
@@ -918,6 +928,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     llm_base_url,
                     llm_model,
                     llm_api_key,
+                    model_download_endpoint,
                 },
             )
             .await
@@ -1242,6 +1253,11 @@ fn current_settings(state: &AppState) -> AppSettings {
             .lock()
             .map_or_else(|_| default_language(), |langs| langs.1.clone()),
         language_options: afterray_protocol::summary_language_options(),
+        model_download_endpoint: state
+            .model_download_endpoint
+            .lock()
+            .map(|endpoint| endpoint.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1277,6 +1293,11 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
             .languages
             .lock()
             .map_or_else(|_| default_language(), |langs| langs.1.clone()),
+        model_download_endpoint: state
+            .model_download_endpoint
+            .lock()
+            .map(|endpoint| endpoint.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1293,6 +1314,7 @@ struct SettingsPatch {
     llm_base_url: Option<String>,
     llm_model: Option<String>,
     llm_api_key: Option<String>,
+    model_download_endpoint: Option<String>,
 }
 
 async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Response {
@@ -1307,7 +1329,30 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         llm_base_url,
         llm_model,
         llm_api_key,
+        model_download_endpoint,
     } = patch;
+    if let Some(endpoint) = model_download_endpoint {
+        let cleaned = endpoint.trim().trim_end_matches('/').to_owned();
+        // Same origin policy as the LLM endpoint: https, or plain http only to
+        // this machine. Pinned packs are hash-verified regardless, but the asr
+        // and embedding downloads carry `HF_TOKEN` if one is set.
+        if !cleaned.is_empty()
+            && let Err(error) = afterray_models::check_origin(&cleaned)
+        {
+            return Response::failure(error);
+        }
+        {
+            let mut endpoint = state
+                .model_download_endpoint
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            endpoint.clone_from(&cleaned);
+        }
+        afterray_models::set_huggingface_endpoint(Some(cleaned));
+        if let Err(error) = persist_current_settings(state) {
+            return Response::failure(format!("could not save the download endpoint: {error}"));
+        }
+    }
     if ui_language.is_some() || summary_language.is_some() {
         let mut pending = persisted_settings(state);
         if let Some(value) = ui_language.clone() {
@@ -3852,6 +3897,24 @@ mod tests {
                 .iter()
                 .any(|id| is_protected_bundle(id))
         );
+    }
+
+    /// The endpoint must survive a daemon restart and default to empty (the
+    /// official huggingface.co) on files written before the field existed.
+    #[test]
+    fn download_endpoint_round_trips_and_defaults_to_official() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = PersistedSettings {
+            model_download_endpoint: "https://hf-mirror.com".to_owned(),
+            ..PersistedSettings::default()
+        };
+        save_persisted_settings(directory.path(), &settings).unwrap();
+        let reloaded = load_persisted_settings(directory.path());
+        assert_eq!(reloaded.model_download_endpoint, "https://hf-mirror.com");
+
+        std::fs::write(settings_path(directory.path()), br#"{"record_audio":true}"#).unwrap();
+        let legacy = load_persisted_settings(directory.path());
+        assert!(legacy.model_download_endpoint.is_empty());
     }
 
     /// The field is gone from what we write but has to survive what we read,

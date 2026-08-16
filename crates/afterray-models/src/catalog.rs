@@ -12,6 +12,15 @@ pub const QWEN35_9B_MLX_REVISION: &str = "938d8919941c6e7efd3c7150eff7fe9d12afa6
 pub const QWEN35_9B_MLX_EXPECTED_BYTES: u64 = 5_977_071_067;
 pub const QWEN35_9B_MLX_PACK_ID: &str = "llm_qwen35_9b_mlx4";
 
+pub const QWEN3_ASR_REPOSITORY: &str = "Qwen/Qwen3-ASR-1.7B";
+pub const QWEN3_ASR_REVISION: &str = "7278e1e70fe206f11671096ffdd38061171dd6e5";
+pub const QWEN3_ASR_EXPECTED_BYTES: u64 = 4_703_114_308;
+pub const NOMIC_EMBED_REPOSITORY: &str = "nomic-ai/nomic-embed-text-v1.5-GGUF";
+pub const NOMIC_EMBED_FILE: &str = "nomic-embed-text-v1.5.Q4_K_M.gguf";
+pub const NOMIC_EMBED_REVISION: &str = "0188c9bf409793f810680a5a431e7b899c46104c";
+pub const NOMIC_EMBED_EXPECTED_BYTES: u64 = 84_106_624;
+const NOMIC_EMBED_SHA256: &str = "d4e388894e09cf3816e8b0896d81d265b55e7a9fff9ab03fe8bf4ef5e11295ac";
+
 /// The architectural context window of a managed MLX pack, in tokens.
 ///
 /// Both packs are Qwen3.5, which declares 262 144 at 4B and at 9B. It lives
@@ -33,11 +42,25 @@ pub struct ManifestFile {
     pub sha256: String,
 }
 
+/// Exact content pin for a snapshot that keeps the plain on-disk layout: the
+/// commit plus a SHA-256 per file, so bytes from any endpoint — a mirror
+/// included — are checked against hashes recorded here, not against whatever
+/// the server claims. Unlike `HuggingFacePinnedSnapshot` it adds no staging
+/// directory or ready marker, so already-installed packs stay valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPin {
+    pub revision: String,
+    pub files: Vec<ManifestFile>,
+}
+
 /// Hugging Face snapshot (many files) or a single downloadable weight file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackSource {
     HuggingFaceSnapshot {
         repository: String,
+        /// `None` only when an `AFTERRAY_*` override points at a custom
+        /// repository — unknown content, nothing to verify against.
+        pin: Option<SnapshotPin>,
     },
     HuggingFacePinnedSnapshot {
         repository: String,
@@ -47,6 +70,10 @@ pub enum PackSource {
     HuggingFaceFile {
         repository: String,
         file: String,
+        /// Git revision the file is resolved at; `main` when unpinned.
+        revision: String,
+        /// Expected SHA-256; `None` only for env-overridden custom files.
+        sha256: Option<String>,
     },
 }
 
@@ -102,7 +129,12 @@ impl PackSpec {
     pub fn revision(&self) -> Option<&str> {
         match &self.source {
             PackSource::HuggingFacePinnedSnapshot { revision, .. } => Some(revision),
-            PackSource::HuggingFaceSnapshot { .. } | PackSource::HuggingFaceFile { .. } => None,
+            PackSource::HuggingFaceSnapshot { pin, .. } => {
+                pin.as_ref().map(|pin| pin.revision.as_str())
+            }
+            PackSource::HuggingFaceFile {
+                revision, sha256, ..
+            } => sha256.is_some().then_some(revision.as_str()),
         }
     }
 }
@@ -133,6 +165,22 @@ pub fn default_catalog() -> Vec<PackSpec> {
 
 #[must_use]
 pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
+    // An env override points at content this catalog knows nothing about, so
+    // the pin — and with it verification — only applies to the default source.
+    let asr_repository = env_or("AFTERRAY_ASR_REPOSITORY", QWEN3_ASR_REPOSITORY);
+    let asr_pin = (asr_repository == QWEN3_ASR_REPOSITORY).then(|| SnapshotPin {
+        revision: QWEN3_ASR_REVISION.into(),
+        files: qwen3_asr_manifest(),
+    });
+    let asr_expected = if asr_pin.is_some() {
+        QWEN3_ASR_EXPECTED_BYTES
+    } else {
+        4_200_000_000
+    };
+    let embedding_repository = env_or("AFTERRAY_EMBEDDING_REPOSITORY", NOMIC_EMBED_REPOSITORY);
+    let embedding_file = env_or("AFTERRAY_EMBEDDING_FILE", NOMIC_EMBED_FILE);
+    let embedding_pinned =
+        embedding_repository == NOMIC_EMBED_REPOSITORY && embedding_file == NOMIC_EMBED_FILE;
     vec![
         PackSpec {
             id: "asr".into(),
@@ -140,41 +188,117 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
             capability: "asr".into(),
             path: env_or_join("AFTERRAY_ASR_MODEL", directory, "Qwen3-ASR-1.7B"),
             required: true,
-            note: format!(
-                "{} · official safetensors · ZH/EN/JA · Rust/Candle",
-                env_or("AFTERRAY_ASR_REPOSITORY", "Qwen/Qwen3-ASR-1.7B")
-            ),
-            expected_bytes: 4_200_000_000,
+            note: format!("{asr_repository} · official safetensors · ZH/EN/JA · Rust/Candle"),
+            expected_bytes: asr_expected,
             source: PackSource::HuggingFaceSnapshot {
-                repository: env_or("AFTERRAY_ASR_REPOSITORY", "Qwen/Qwen3-ASR-1.7B"),
+                repository: asr_repository,
+                pin: asr_pin,
             },
         },
         PackSpec {
             id: "embedding".into(),
             name: "Text embeddings".into(),
             capability: "embedding".into(),
-            path: env_or_join(
-                "AFTERRAY_EMBEDDING_MODEL",
-                directory,
-                "nomic-embed-text-v1.5.Q4_K_M.gguf",
-            ),
+            path: env_or_join("AFTERRAY_EMBEDDING_MODEL", directory, NOMIC_EMBED_FILE),
             required: true,
             note: "nomic-embed-text v1.5 Q4 · llama.cpp".into(),
-            expected_bytes: 84_000_000,
+            expected_bytes: if embedding_pinned {
+                NOMIC_EMBED_EXPECTED_BYTES
+            } else {
+                84_000_000
+            },
             source: PackSource::HuggingFaceFile {
-                repository: env_or(
-                    "AFTERRAY_EMBEDDING_REPOSITORY",
-                    "nomic-ai/nomic-embed-text-v1.5-GGUF",
-                ),
-                file: env_or(
-                    "AFTERRAY_EMBEDDING_FILE",
-                    "nomic-embed-text-v1.5.Q4_K_M.gguf",
-                ),
+                repository: embedding_repository,
+                file: embedding_file,
+                revision: if embedding_pinned {
+                    NOMIC_EMBED_REVISION.into()
+                } else {
+                    "main".into()
+                },
+                sha256: embedding_pinned.then(|| NOMIC_EMBED_SHA256.into()),
             },
         },
         qwen35_mlx_pack(directory),
         qwen35_9b_mlx_pack(directory),
     ]
+}
+
+/// Everything `Qwen/Qwen3-ASR-1.7B` ships at [`QWEN3_ASR_REVISION`] — the same
+/// set the unpinned listing used to return, so behaviour only gains the hash
+/// check. LFS hashes come from Hugging Face's own LFS records; the small JSON
+/// and tokenizer files were fetched at that commit and hashed directly.
+#[must_use]
+pub fn qwen3_asr_manifest() -> Vec<ManifestFile> {
+    const FILES: &[(&str, u64, &str)] = &[
+        (
+            ".gitattributes",
+            1_519,
+            "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
+        ),
+        (
+            "README.md",
+            57_456,
+            "5058416891bc47a2051557765997e8c42f8eb78a0e33c3e775bd17d4b0ba4d50",
+        ),
+        (
+            "chat_template.json",
+            1_161,
+            "75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff",
+        ),
+        (
+            "config.json",
+            6_194,
+            "2e74a751548b8ad7d7526d29365ad8144c345d8b412b1152d25dc6698452712f",
+        ),
+        (
+            "generation_config.json",
+            142,
+            "1da527824d81e07118facff437e03f2e24a23311e3bdeb2368973fe77e5f275c",
+        ),
+        (
+            "merges.txt",
+            1_671_853,
+            "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        ),
+        (
+            "model-00001-of-00002.safetensors",
+            4_220_320_824,
+            "a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6",
+        ),
+        (
+            "model-00002-of-00002.safetensors",
+            478_200_688,
+            "6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc",
+        ),
+        (
+            "model.safetensors.index.json",
+            64_821,
+            "f994739fe38e5210b9e3e8ce6c6307315e2ceac3cb630e7b7414d69dce520f60",
+        ),
+        (
+            "preprocessor_config.json",
+            330,
+            "45e120a4eda2c20c5d7f2ea9354e63536bf35e27aa573fb7cdf78017b378770d",
+        ),
+        (
+            "tokenizer_config.json",
+            12_487,
+            "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+        ),
+        (
+            "vocab.json",
+            2_776_833,
+            "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        ),
+    ];
+    FILES
+        .iter()
+        .map(|(path, bytes, sha256)| ManifestFile {
+            path: (*path).into(),
+            bytes: *bytes,
+            sha256: (*sha256).into(),
+        })
+        .collect()
 }
 
 #[must_use]
@@ -548,6 +672,40 @@ fn env_or_join(key: &str, directory: &Path, file_name: &str) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The pins are what make third-party download mirrors safe to use:
+    /// sizes and hashes are recorded here, never taken from the server.
+    #[test]
+    fn asr_and_embedding_are_pinned_with_matching_totals() {
+        let catalog = catalog_in(Path::new("/tmp/afterray-models"));
+
+        let asr = catalog.iter().find(|pack| pack.id == "asr").unwrap();
+        let PackSource::HuggingFaceSnapshot { pin: Some(pin), .. } = &asr.source else {
+            panic!("the default asr pack must carry a pin");
+        };
+        assert_eq!(pin.revision, QWEN3_ASR_REVISION);
+        assert_eq!(
+            pin.files.iter().map(|file| file.bytes).sum::<u64>(),
+            asr.expected_bytes,
+            "expected_bytes must equal the manifest total or progress lies"
+        );
+        assert!(pin.files.iter().all(|file| file.sha256.len() == 64));
+        assert_eq!(asr.revision(), Some(QWEN3_ASR_REVISION));
+
+        let embedding = catalog.iter().find(|pack| pack.id == "embedding").unwrap();
+        let PackSource::HuggingFaceFile {
+            revision,
+            sha256: Some(sha256),
+            ..
+        } = &embedding.source
+        else {
+            panic!("the default embedding pack must carry a pinned hash");
+        };
+        assert_eq!(revision, NOMIC_EMBED_REVISION);
+        assert_eq!(sha256.len(), 64);
+        assert_eq!(embedding.expected_bytes, NOMIC_EMBED_EXPECTED_BYTES);
+        assert_eq!(embedding.revision(), Some(NOMIC_EMBED_REVISION));
+    }
 
     #[test]
     fn catalog_has_asr_embedding_and_the_managed_mlx_packs() {

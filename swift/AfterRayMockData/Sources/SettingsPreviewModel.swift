@@ -308,6 +308,32 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         message = "Preview cancelled the \(name(of: packID)) download."
     }
 
+    public func updateModelDownloadEndpoint(_ endpoint: String) async {
+        guard let current = settings else { return }
+        let cleaned = endpoint.trimmingCharacters(in: .whitespaces)
+        settings = AppSettings(
+            dataDir: current.dataDir,
+            modelDir: current.modelDir,
+            recordAudio: current.recordAudio,
+            captureIntervalSeconds: current.captureIntervalSeconds,
+            storageLimitBytes: current.storageLimitBytes,
+            excludedBundleIds: current.excludedBundleIds,
+            protectedBundleIds: current.protectedBundleIds,
+            excludedDomains: current.excludedDomains,
+            llmProvider: current.llmProvider,
+            llmBaseUrl: current.llmBaseUrl,
+            llmModel: current.llmModel,
+            llmApiKeySet: current.llmApiKeySet,
+            uiLanguage: current.uiLanguage,
+            summaryLanguage: current.summaryLanguage,
+            languageOptions: current.languageOptions,
+            modelDownloadEndpoint: cleaned
+        )
+        message = cleaned.isEmpty
+            ? "Preview: downloads use huggingface.co."
+            : "Preview: downloads use \(cleaned)."
+    }
+
     // MARK: Preview download simulation
 
     private func startPreviewDownload() {

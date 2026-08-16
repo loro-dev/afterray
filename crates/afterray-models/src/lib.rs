@@ -30,7 +30,7 @@ pub use context::{
 pub use delta::{LlmDelta, LlmDeltaKind};
 pub use download::{
     DownloadError, DownloadProgress, download_pack, download_packs,
-    download_packs_with_cancellation, remove_pack, verify_files,
+    download_packs_with_cancellation, remove_pack, set_huggingface_endpoint, verify_files,
 };
 pub use persistent_mlx::{
     MLX_WORKER_PROTOCOL_VERSION, MlxWorkerHealth, PersistentMlxAdapter, PersistentMlxConfig,
