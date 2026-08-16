@@ -10,7 +10,7 @@ The model-layer hub for `afterrayd`: an in-memory priority-aware job queue (`Mod
 - `src/persistent_mlx.rs` — `MLX_WORKER_PROTOCOL_VERSION = 1` (`:17`); `PersistentMlxAdapter` (`:69`): NDJSON, `load`/`generate`/`cancel` → `ready`/`delta`/`final`/`cancelled`/`error`; `verify_model` (`:274`) re-checks the pinned manifest + ready marker before every spawn; `normalize_model_output` (`:530`) strips `<think>`/control tokens.
 - `src/remote.rs` — `LlmRouterAdapter` (`:127`) routes LLM jobs to a per-pack MLX adapter or Ollama/OpenAI-compatible HTTP; `check_origin` (`:484`) allows https or loopback-http only; reqwest clients disable redirects so prompts/API keys can't leak to a redirect target.
 - `src/catalog.rs` — pack specs; `READY_MARKER` (`:4`); pinned MLX revisions + SHA-256 manifests (`QWEN35_4B/9B_MLX_REVISION`); `model_directory()` (`:97`, `AFTERRAY_MODEL_DIR` override).
-- `src/download.rs` — pure-Rust/reqwest downloads; `.partial` resume + `<name>.download/` staging, SHA-256 `verify_files` (`:328`), atomic rename. Never half-populate `pack.path`.
+- `src/download.rs` — pure-Rust/reqwest downloads; `.partial` resume + `<name>.download/` staging, SHA-256 `verify_files` (`:328`), atomic rename. Never half-populate `pack.path`. `HF_ENDPOINT` overrides the Hugging Face base URL (mirrors); proxies come from env vars + macOS system settings via reqwest's `system-proxy` feature — root `Cargo.toml` must keep that feature or every request silently goes direct.
 
 ## Invariants
 

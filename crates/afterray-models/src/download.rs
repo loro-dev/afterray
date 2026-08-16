@@ -443,7 +443,10 @@ async fn list_huggingface_files(
     cancellation: &Cancellation,
 ) -> Result<Vec<HfFile>, DownloadError> {
     ensure_not_cancelled(cancellation)?;
-    let url = format!("https://huggingface.co/api/models/{repository}/tree/main?recursive=1");
+    let url = format!(
+        "{}/api/models/{repository}/tree/main?recursive=1",
+        huggingface_endpoint()
+    );
     let request = huggingface_client()?.get(url).send();
     let response = tokio::select! {
         () = cancellation.cancelled() => return Err(DownloadError::Cancelled),
@@ -479,7 +482,10 @@ async fn download_huggingface_file(
     mut on_chunk: impl FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadError> {
     ensure_not_cancelled(cancellation)?;
-    let url = format!("https://huggingface.co/{repository}/resolve/{revision}/{file}");
+    let url = format!(
+        "{}/{repository}/resolve/{revision}/{file}",
+        huggingface_endpoint()
+    );
     let partial = partial_path(destination);
     let resume_from = fs::metadata(&partial)
         .map(|metadata| metadata.len())
@@ -557,6 +563,22 @@ fn ensure_not_cancelled(cancellation: &Cancellation) -> Result<(), DownloadError
     }
 }
 
+/// Base URL for every Hugging Face request. `HF_ENDPOINT` — the same variable
+/// the official CLI honours — points downloads at a mirror such as
+/// `https://hf-mirror.com` for users whose route to huggingface.co is blocked
+/// or unreliable. Note that `HF_TOKEN` is sent to whatever endpoint is set.
+fn huggingface_endpoint() -> String {
+    endpoint_or_default(std::env::var("HF_ENDPOINT").ok())
+}
+
+fn endpoint_or_default(configured: Option<String>) -> String {
+    let trimmed = configured.as_deref().map_or("", str::trim);
+    if trimmed.is_empty() {
+        return "https://huggingface.co".to_owned();
+    }
+    trimmed.trim_end_matches('/').to_owned()
+}
+
 fn huggingface_client() -> Result<reqwest::Client, DownloadError> {
     let mut headers = reqwest::header::HeaderMap::new();
     if let Ok(token) =
@@ -624,6 +646,22 @@ mod tests {
                 file: "weights.bin".into(),
             },
         }
+    }
+
+    /// `HF_ENDPOINT` is pure prefix substitution: a mirror serves the same
+    /// paths, so the override must not grow a double slash or lose the default.
+    #[test]
+    fn hf_endpoint_override_trims_and_falls_back() {
+        assert_eq!(endpoint_or_default(None), "https://huggingface.co");
+        assert_eq!(endpoint_or_default(Some("  ".into())), "https://huggingface.co");
+        assert_eq!(
+            endpoint_or_default(Some("https://hf-mirror.com/".into())),
+            "https://hf-mirror.com"
+        );
+        assert_eq!(
+            endpoint_or_default(Some(" https://hf-mirror.com ".into())),
+            "https://hf-mirror.com"
+        );
     }
 
     #[test]
