@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 /// Both halves of an app icon lookup — resolving the bundle id to a URL and
 /// reading the icon — go through Launch Services and the disk. Uncached,
@@ -42,5 +43,41 @@ public enum AppIconLookup {
         return await Task.detached(priority: .utility) {
             icon(bundleIdentifier: bundleIdentifier)
         }.value
+    }
+}
+
+/// An app's icon by bundle id, for lists that name apps. Draws the cached icon
+/// on the first frame when there is one and fills in off the main thread
+/// otherwise, so a row never blocks on Launch Services. An uninstalled app —
+/// or one only known from the protected-apps catalog — keeps the placeholder
+/// rather than leaving a hole where every other row has a square.
+public struct AppIconView: View {
+    private let bundleIdentifier: String
+    private let size: CGFloat
+    @State private var icon: NSImage?
+
+    public init(bundleIdentifier: String, size: CGFloat = 20) {
+        self.bundleIdentifier = bundleIdentifier
+        self.size = size
+        _icon = State(initialValue: AppIconLookup.cachedIcon(bundleIdentifier: bundleIdentifier))
+    }
+
+    public var body: some View {
+        Group {
+            if let icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                Image(systemName: "app.dashed")
+                    .font(.system(size: size * 0.62))
+                    .foregroundStyle(.white.opacity(0.28))
+            }
+        }
+        .frame(width: size, height: size)
+        .task(id: bundleIdentifier) {
+            let resolved = await AppIconLookup.iconAsync(bundleIdentifier: bundleIdentifier)
+            if resolved !== icon { icon = resolved }
+        }
     }
 }

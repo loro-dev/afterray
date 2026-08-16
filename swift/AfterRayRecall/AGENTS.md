@@ -7,9 +7,10 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - `Sources/DaemonClient.swift:148` `UnixSocketDaemonClient` (actor) — JSON-line requests over a Unix socket; `protocolVersion = 7` (:149), checked on every response. Protocols `RecallDaemonServing` (:22), `AfterRayChatServing` (:67), `AfterRayDaemonServing` (:99) are the injection seam; `WireRequest` (:442) is the snake_case wire shape.
 - `Sources/RecallStore.swift:4` `RecallStore` — `@MainActor` timeline/playhead state; `Sources/RecallStore.swift:302` `RecallImageRepository` (actor) — NSCache + in-flight dedup of artifact bytes.
 - `Sources/RecallModels.swift` — `RecallSession` (:3), `RecallMoment` (:21), `RecallGopRef` (:133), `ArtifactPayload` (:163); all `Codable` with explicit snake_case `CodingKeys`.
-- `Sources/RecallView.swift:9` `RecallView` — the main recall surface (2396 lines; `RecallPalette` at :2205).
+- `Sources/RecallView.swift:9` `RecallView` — the main recall surface (`RecallPalette` at :2211).
 - `Sources/AfterRayControlModel.swift:4` — recording/search state; `Sources/AfterRayChatModel.swift:46` chat model behind `AfterRayChatModeling` (:4).
-- `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:276) — settings UI generic over the protocol, so mock and real models share it.
+- `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:327) — settings UI generic over the protocol, so mock and real models share it.
+- `Sources/AppIconLookup.swift:8` — cached bundle-id → icon; `AppIconView` (:54) for rows naming an app.
 - `Sources/HangWatchdog.swift:36` `HangJudge` + `OverlayVisibility` (:6) — terminates the process if the main thread stalls ~12s while the overlay is visible.
 - `Tests/` (XCTest, `@testable import AfterRayRecall`) — `DaemonWireTests.swift` and `ChatWireTests.swift` pin the wire shape against the Rust daemon.
 
@@ -23,6 +24,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - On lock/sleep the app calls `clearSensitiveState()`/`clearSensitiveData()` (zeroes cached bytes) — hook any new decrypted-content cache into that teardown (`apps/AfterRay/Sources/AfterRayApp.swift:1097`).
 - Decode artifact bytes by `contentType`, never by assumption (`DaemonClient.swift:34-35`): moments packed before thumbnails existed answer with raw IVF/AV1 frames.
 - Every surface must stay drivable by `AfterRayMockData`; `RecallView` hides daemon-only chrome when callbacks are nil.
+- Panels with their own `ScrollView` inside the overlay must mount `.background(ScrollFenceView())`, or the global scroll monitor (`RecallView.swift:1597`) eats their gesture phases and kills momentum.
 
 ## Build / test
 

@@ -49,7 +49,6 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func setSummaryLanguage(_ code: String) async
     func excludeBundle(_ bundleID: String) async
     func includeBundle(_ bundleID: String) async
-    func excludeFrontmostApp() async
     func excludeChosenApp() async
     func excludeDomain(_ input: String) async
     func includeDomain(_ domain: String) async
@@ -180,18 +179,6 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .advanced: "Advanced"
         case .developer: "Developer Options"
         case .diagnostics: "Diagnostics"
-        }
-    }
-
-    /// One line under the page title. Replaces the loose paragraphs that used
-    /// to float above the first card on every page.
-    var summary: String {
-        switch self {
-        case .general: "How you open AfterRay, what it captures, and how much room it takes."
-        case .models: "Pick where Ask runs, and manage on-device model packs."
-        case .advanced: "Capture cadence and where AfterRay keeps its files."
-        case .developer: "Development-only controls and first-run testing."
-        case .diagnostics: "Logs and a copyable report for bug reports."
         }
     }
 
@@ -333,6 +320,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @State private var copied = false
     @State private var confirmingMlxRemoval = false
     @State private var domainDraft = ""
+    @FocusState private var domainFieldFocused: Bool
 
     public init(
         model: Model,
@@ -354,6 +342,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
         .frame(width: SettingsMetrics.panelWidth, height: SettingsMetrics.panelHeight)
         .background(SettingsPalette.panel)
+        // Settings sits inside the recall overlay, where a global scroll-wheel
+        // monitor claims events for the timeline. Fencing the whole panel hands
+        // every phase of the gesture — including the zero-delta `began`/`ended`
+        // events AppKit needs to run momentum — straight to the page's own
+        // scroll view. Without it the page tracks the finger and then stops
+        // dead on release.
+        .background(ScrollFenceView())
         .preferredColorScheme(.dark)
         .clipShape(RoundedRectangle(cornerRadius: SettingsMetrics.panelRadius, style: .continuous))
         .overlay {
@@ -446,16 +441,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(page.title)
-                    .font(.settingsPageTitle)
-                    .foregroundStyle(SettingsPalette.label)
-                Text(page.summary)
-                    .font(.settingsBody)
-                    .foregroundStyle(SettingsPalette.secondaryLabel)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        HStack(alignment: .center, spacing: 12) {
+            Text(page.title)
+                .font(.settingsPageTitle)
+                .foregroundStyle(SettingsPalette.label)
             Spacer(minLength: 12)
             HStack(spacing: 6) {
                 if model.isRefreshing {
@@ -509,11 +498,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var generalPage: some View {
+        // Footnote only when something is wrong with the shortcut. What a
+        // global shortcut is for needs no caption.
         SettingsSection(
             title: "Opening AfterRay",
-            footnote: hotKeys.failure
-                ?? hotKeys.hotKey.systemConflictNote
-                ?? "Press it from any app to bring your timeline back."
+            footnote: hotKeys.failure ?? hotKeys.hotKey.systemConflictNote
         ) {
             SettingsRow(
                 title: "Global shortcut",
@@ -552,13 +541,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
-        SettingsSection(
-            title: "Language",
-            footnote: "Interface language is stored for later localization. Summaries use their own language."
-        ) {
+        SettingsSection(title: "Language") {
             SettingsRow(
                 title: "Interface",
-                subtitle: "AfterRay's own chrome. Not applied yet."
+                subtitle: "Not applied yet."
             ) {
                 languageMenu(
                     title: "Interface language",
@@ -567,10 +553,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 )
             }
             SettingsSeparator()
-            SettingsRow(
-                title: "Summaries",
-                subtitle: "Language for generated memory cards."
-            ) {
+            SettingsRow(title: "Summaries") {
                 languageMenu(
                     title: "Summary language",
                     selection: summaryLanguageBinding,
@@ -579,24 +562,22 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
-        SettingsSection(
-            title: "Excluded apps",
-            footnote: "AfterRay skips a moment when an excluded app is in front."
-        ) {
+        SettingsSection(title: "Excluded apps") {
             if model.excludedBundleIds.isEmpty {
                 // Empty state carries the action itself: a lone footer bar under
                 // an empty row leaves a separator floating over dead space.
-                SettingsRow(
-                    title: "Nothing excluded",
-                    subtitle: "Every app you use is captured."
-                ) {
+                SettingsRow(title: "Nothing excluded") {
                     excludeAppButtons
                 }
             } else {
                 ForEach(Array(model.excludedBundleIds.enumerated()), id: \.element) { index, bundleID in
                     if index > 0 { SettingsSeparator() }
                     let name = appName(for: bundleID)
-                    SettingsRow(title: name, subtitle: name == bundleID ? nil : bundleID) {
+                    SettingsRow(
+                        title: name,
+                        subtitle: name == bundleID ? nil : bundleID,
+                        iconBundleID: bundleID
+                    ) {
                         if model.settings?.protectedBundleIds.contains(bundleID) == true {
                             Label("Always excluded", systemImage: "lock.fill")
                                 .font(.settingsRowSubtitle)
@@ -615,17 +596,9 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
-        SettingsSection(
-            title: "Excluded websites",
-            footnote: "Nothing on these hosts is recorded, subdomains included. "
-                + "A page is identified by the address the browser reports, so this "
-                + "only covers browsers that publish one."
-        ) {
+        SettingsSection(title: "Excluded websites") {
             if model.excludedDomains.isEmpty {
-                SettingsRow(
-                    title: "Nothing excluded",
-                    subtitle: "Every site you visit is captured."
-                ) {
+                SettingsRow(title: "Nothing excluded") {
                     addDomainField
                 }
             } else {
@@ -650,10 +623,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             title: "Delete history",
             footnote: "Deleted moments are removed from this Mac and cannot be recovered."
         ) {
-            SettingsRow(
-                title: "Remove captured moments",
-                subtitle: "Pick a range to delete from the vault."
-            ) {
+            SettingsRow(title: "Remove captured moments") {
                 HStack(spacing: 7) {
                     Button("Last hour") { Task { await model.clearHistory(.lastHour) } }
                         .buttonStyle(SettingsButtonStyle())
@@ -667,39 +637,32 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
     }
 
-    /// Two ways in, because they answer different questions. "Frontmost" is for
-    /// the app you are looking at right now; the picker is for the one you know
-    /// you want excluded but are not currently in — and during onboarding the
-    /// frontmost app is AfterRay itself, so the picker is the only one that works.
+    /// A picker rather than a "use the frontmost app" shortcut: while Settings
+    /// is open the frontmost app is AfterRay itself, so the shortcut could only
+    /// ever name the wrong app.
     private var excludeAppButtons: some View {
-        HStack(spacing: 7) {
-            Button("Choose App…") {
-                Task { await model.excludeChosenApp() }
-            }
-            .buttonStyle(SettingsButtonStyle())
-            .disabled(model.isUpdatingExclusions)
-
-            excludeFrontmostButton
-        }
-    }
-
-    private var excludeFrontmostButton: some View {
-        Button("Exclude Frontmost App") {
-            Task { await model.excludeFrontmostApp() }
+        Button("Choose App…") {
+            Task { await model.excludeChosenApp() }
         }
         .buttonStyle(SettingsButtonStyle())
         .disabled(model.isUpdatingExclusions)
     }
 
+    /// The same boxed field the rest of Settings uses. Unstyled it read as a
+    /// disabled caption next to a greyed-out button — an input nobody could
+    /// tell was an input, which is the same as having no way to add a site.
     private var addDomainField: some View {
         HStack(spacing: 7) {
             TextField("example.com", text: $domainDraft)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12, design: .rounded))
-                .frame(width: 170)
+                .settingsFieldStyle()
+                .frame(width: 150)
+                .focused($domainFieldFocused)
                 .onSubmit { submitDomain() }
             Button("Exclude", action: submitDomain)
                 .buttonStyle(SettingsButtonStyle())
+                // Without this the empty-state row's long subtitle wins the
+                // squeeze and the button reads "Ex…".
+                .fixedSize()
                 .disabled(
                     model.isUpdatingExclusions
                         || domainDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -707,11 +670,17 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
     }
 
+    /// The first entry moves the field out of the empty-state row and into the
+    /// section's footer bar, which is a different view — so focus is asked for
+    /// again, or excluding a second site means reaching for the mouse.
     private func submitDomain() {
         let typed = domainDraft
         guard !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         domainDraft = ""
-        Task { await model.excludeDomain(typed) }
+        Task { @MainActor in
+            await model.excludeDomain(typed)
+            domainFieldFocused = true
+        }
     }
 
     private var storageSection: some View {
@@ -999,14 +968,16 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         model.library?.packs.filter { !$0.present }.count ?? 0
     }
 
-    private var providerFootnote: String {
+    /// Only where the choice carries a consequence the controls do not show.
+    /// The local pack's own picker already names both models.
+    private var providerFootnote: String? {
         switch model.settings?.llmProvider ?? .mlxLocal {
         case .mlxLocal:
-            "Choose Qwen3.5 4B or the optional higher-quality 9B pack. Both run inside AfterRay through MLX."
+            nil
         case .ollama:
-            "AfterRay talks to Ollama over HTTP on this Mac. Nothing leaves the machine."
+            "Nothing leaves this Mac."
         case .openaiCompatible:
-            "Any server that speaks OpenAI chat completions. Use this for a hosted Qwen 3.7."
+            "Any server that speaks OpenAI chat completions."
         }
     }
 
@@ -1158,11 +1129,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         packID == qwen35Mlx9BPackID ? "~5.97 GB" : "~3.06 GB"
     }
 
+    /// Only the memory caveat. The picker names the model, the pill line gives
+    /// the license, and the download button carries the size — repeating all
+    /// three underneath them is a paragraph that says nothing new.
     private func mlxDescription(for packID: String) -> String {
-        if packID == qwen35Mlx9BPackID {
-            return "Pinned Qwen3.5-9B 4-bit VLM. It is the higher-quality option and downloads approximately 5.97 GB. Requires Apple Silicon and macOS 14 or later; check unified-memory headroom before downloading."
-        }
-        return "Pinned Qwen3.5-4B 4-bit VLM. Requires Apple Silicon and macOS 14 or later; download size is approximately 3.06 GB. On M2, 8 GB is experimental; 16 GB and 24 GB remain subject to real-device validation."
+        packID == qwen35Mlx9BPackID
+            ? "Check your free unified memory before downloading."
+            : "Experimental on an 8 GB Mac."
     }
 
     private func mlxStateLabel(_ state: ModelPackState) -> String {
@@ -1444,10 +1417,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private var advancedPage: some View {
         if model.developerOptionsUnlocked {
             SettingsSection(title: "Developer Options") {
-                SettingsRow(
-                    title: "Show developer settings",
-                    subtitle: "Adds a development-only page to the sidebar."
-                ) {
+                SettingsRow(title: "Show developer settings") {
                     Toggle("", isOn: Binding(
                         get: { model.developerOptionsEnabled },
                         set: { model.setDeveloperOptionsEnabled($0) }
@@ -1462,7 +1432,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         if model.updatesSupported {
             SettingsSection(
                 title: "Updates",
-                footnote: "AfterRay downloads updates in the background and installs them the next time you quit, so a recording is never interrupted."
+                footnote: "Updates install the next time you quit, so a recording is never interrupted."
             ) {
                 SettingsRow(
                     title: "Check automatically",
@@ -1486,7 +1456,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
         SettingsSection(
             title: "CLI for agents",
-            footnote: "Installs `afterray` to ~/.local/bin so Claude Code, Codex, Cursor, and other tools can search your local history. V0 installs the full developer CLI, which can also change settings and delete history."
+            footnote: "Installs `afterray` to ~/.local/bin so coding agents can search your history. V0 installs the full developer CLI, which can also change settings and delete history."
         ) {
             SettingsRow(
                 title: model.cliInstalled ? "afterray is installed" : "afterray CLI",
@@ -1512,14 +1482,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
-        SettingsSection(
-            title: "Capture cadence",
-            footnote: "A selectable cadence is not available yet."
-        ) {
-            SettingsRow(
-                title: captureCadenceTitle,
-                subtitle: "AfterRay saves one still on this interval while it is recording."
-            ) {
+        // The title states the interval and the pill states that it cannot be
+        // changed. A footnote and a subtitle saying both again is three of one.
+        SettingsSection(title: "Capture cadence") {
+            SettingsRow(title: captureCadenceTitle) {
                 SettingsPill("Fixed", tone: .neutral)
             }
         }
@@ -1550,10 +1516,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             title: "Onboarding",
             footnote: "Reopens the first-run flow without changing downloads or other settings."
         ) {
-            SettingsRow(
-                title: "Replay onboarding",
-                subtitle: "Close Settings and start again from the shortcut lesson."
-            ) {
+            SettingsRow(title: "Replay onboarding") {
                 Button("Replay") { model.replayOnboarding() }
                     .buttonStyle(SettingsButtonStyle(kind: .prominent))
             }
@@ -1566,7 +1529,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private var diagnosticsPage: some View {
         SettingsSection(
             title: "Logs",
-            footnote: "AfterRay appends app and daemon output here. Attach this file when reporting a bug."
+            footnote: "Attach this file when reporting a bug."
         ) {
             SettingsPathRow(title: "Log file", path: model.logFilePath, action: nil)
             SettingsSeparator()
@@ -1692,22 +1655,30 @@ private struct SettingsRow<Trailing: View>: View {
     let title: String
     var subtitle: String?
     var subtitleLineLimit: Int?
+    /// Rows that name an app carry its icon: a list of bundle ids is a list of
+    /// strings to read, while a list of icons is one to recognise.
+    var iconBundleID: String?
     var trailing: Trailing
 
     init(
         title: String,
         subtitle: String? = nil,
         subtitleLineLimit: Int? = nil,
+        iconBundleID: String? = nil,
         @ViewBuilder trailing: () -> Trailing
     ) {
         self.title = title
         self.subtitle = subtitle
         self.subtitleLineLimit = subtitleLineLimit
+        self.iconBundleID = iconBundleID
         self.trailing = trailing()
     }
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
+            if let iconBundleID {
+                AppIconView(bundleIdentifier: iconBundleID, size: 26)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.settingsRowTitle)
@@ -1726,12 +1697,6 @@ private struct SettingsRow<Trailing: View>: View {
         .padding(.horizontal, SettingsMetrics.rowInset)
         .padding(.vertical, 11)
         .frame(minHeight: SettingsMetrics.rowMinHeight)
-    }
-}
-
-private extension SettingsRow where Trailing == EmptyView {
-    init(title: String, subtitle: String? = nil) {
-        self.init(title: title, subtitle: subtitle) { EmptyView() }
     }
 }
 
@@ -2098,6 +2063,9 @@ private struct SettingsIconButton: View {
         .buttonStyle(SettingsPressStyle())
         .onHover { isHovering = $0 }
         .help(help)
+        // `help` is only a tooltip; without this VoiceOver announces the
+        // header's two controls as unlabelled buttons.
+        .accessibilityLabel(help)
     }
 }
 

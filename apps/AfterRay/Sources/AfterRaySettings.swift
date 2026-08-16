@@ -282,18 +282,6 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         await excludeBundle(bundleID)
     }
 
-    func excludeFrontmostApp() async {
-        guard
-            let application = NSWorkspace.shared.frontmostApplication,
-            let bundleID = application.bundleIdentifier,
-            bundleID != "dev.afterray.app"
-        else {
-            message = "Could not read the frontmost app."
-            return
-        }
-        await excludeBundle(bundleID)
-    }
-
     func clearHistory(_ scope: HistoryScope) async {
         isClearingHistory = true
         defer { isClearingHistory = false }

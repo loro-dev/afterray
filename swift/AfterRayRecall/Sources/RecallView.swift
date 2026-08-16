@@ -1604,7 +1604,13 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 if ScrollFenceRegistry.shared.contains(windowPoint: location, in: window) {
                     return event
                 }
-                let horizontal = abs(event.scrollingDeltaX) >= abs(event.scrollingDeltaY)
+                // Strictly greater, not `>=`: a trackpad gesture's `began` and
+                // `ended` events carry no delta at all, and calling those
+                // horizontal skipped the defer check below and swallowed them.
+                // A scroll view that never sees the start or the end of a
+                // gesture cannot glide, which is what made a settings or panel
+                // scroll feel like it was catching on something.
+                let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
                 // Horizontal scrubs always belong to the timeline. A trailing
                 // details/search NSScrollView was swallowing those events and
                 // doing nothing with them — the right side felt dead.

@@ -176,10 +176,6 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         excludedBundleIds.removeAll { $0 == bundleID }
     }
 
-    public func excludeFrontmostApp() async {
-        await excludeBundle("com.apple.Safari")
-    }
-
     /// No file picker in a preview — the lab stands in with the next app that
     /// is not already on the list, so the button still visibly does something.
     public func excludeChosenApp() async {
