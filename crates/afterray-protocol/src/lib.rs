@@ -16,8 +16,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// `CaptureSetPaused`. 10 adds `CancelModelDownload`, which drops one pack from
 /// the download queue instead of tearing the whole queue down. 11 streams the
 /// model's reasoning so the chat UI can show thinking as it happens. 12 adds
-/// the privacy-bounded parsed summary export.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// the privacy-bounded parsed summary export. 13 adds the compute dashboard
+/// (`compute_status`, `compute_set_mode`, `compute_pause`).
+pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -164,6 +165,29 @@ pub enum Request {
     JobsList,
     JobRetry {
         job_id: String,
+    },
+    /// Everything the local-computation dashboard shows: what is running, what
+    /// is held back and why, and what it costs.
+    ComputeStatus,
+    /// How much background computation the daemon may do from now on.
+    ComputeSetMode {
+        mode: ComputeMode,
+    },
+    /// Runs one workload's outstanding work now, overriding the machine
+    /// conditions it normally waits for.
+    ///
+    /// Returns as soon as the work is kicked off — a summary backlog can take
+    /// half an hour, and the socket must not be held open for it.
+    ComputeRunNow {
+        workload: ComputeWorkload,
+    },
+    /// Hold background computation off for `seconds`. `0` resumes now.
+    ///
+    /// A duration rather than a deadline: the client and the daemon do not
+    /// share a clock, and "an hour from when I pressed it" is what the user
+    /// means.
+    ComputePause {
+        seconds: u64,
     },
     Summarize {
         session_id: String,
@@ -370,6 +394,327 @@ pub struct Status {
     /// that the socket is still owned by the daemon it just replaced.
     #[serde(default)]
     pub host_build: Option<String>,
+}
+
+/// How much local computation the daemon may do when nobody is waiting on it.
+///
+/// Interactive work — a chat turn the user is watching stream — is never
+/// governed by this. A switch that silently broke the chat panel would be read
+/// as a bug, not as a power setting.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeMode {
+    /// Everything, subject to the usual power and load gates.
+    #[default]
+    Full,
+    /// Only what keeps history searchable: screen text, transcripts,
+    /// embeddings. No summaries, no archive compression.
+    Essential,
+    /// No background computation at all, including screen text. New frames
+    /// stay unindexed while this is set, and nothing backfills them.
+    Off,
+}
+
+impl ComputeMode {
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Essential => "essential",
+            Self::Off => "off",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" | "all" => Some(Self::Full),
+            "essential" | "minimal" => Some(Self::Essential),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Lenient like [`LlmProvider`]: this lands in `settings.json`, and an
+/// unreadable value must not cost the user every other setting in the file.
+impl<'de> Deserialize<'de> for ComputeMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw).unwrap_or_default())
+    }
+}
+
+/// One kind of background computation the daemon performs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeWorkload {
+    /// Screen text, via Apple Vision.
+    Ocr,
+    /// Speech to text over recorded audio.
+    Asr,
+    /// Search vectors for text evidence.
+    Embedding,
+    /// The T2 pass: a local language model over one slot's card.
+    Summary,
+    /// AV1 compression of cold stills into closed GOPs.
+    Archive,
+}
+
+impl ComputeWorkload {
+    /// Every workload, in the order the dashboard lists them: cheapest and most
+    /// essential first, so the rows the user is most likely to switch off are
+    /// at the bottom.
+    pub const ALL: [Self; 5] = [
+        Self::Ocr,
+        Self::Asr,
+        Self::Embedding,
+        Self::Summary,
+        Self::Archive,
+    ];
+
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Ocr => "ocr",
+            Self::Asr => "asr",
+            Self::Embedding => "embedding",
+            Self::Summary => "summary",
+            Self::Archive => "archive",
+        }
+    }
+
+
+    /// The resource this workload contends for.
+    #[must_use]
+    pub const fn lane(self) -> ComputeLane {
+        match self {
+            // Vision, Qwen3-ASR, the embedder and the local LLM all run on the
+            // GPU/ANE through their worker processes.
+            Self::Ocr | Self::Asr | Self::Embedding | Self::Summary => ComputeLane::Gpu,
+            // rav1e is pure CPU, and the reason a packing machine feels slow.
+            Self::Archive => ComputeLane::Cpu,
+        }
+    }
+}
+
+/// Which resource a task competes for.
+///
+/// This is what the dashboard shows instead of a GPU percentage: macOS has no
+/// public per-process GPU accounting, and the only machine-wide number lives
+/// behind a private framework. Naming the lane is true; a per-task percentage
+/// would not be.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeLane {
+    Gpu,
+    Cpu,
+}
+
+
+/// Why a workload is or is not allowed to start right now.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeGateCode {
+    Allowed,
+    /// Local computation is switched off.
+    ModeOff,
+    /// The mode keeps only essential work running.
+    ModeEssential,
+    /// Temporarily suspended by the user.
+    Paused,
+    /// Running on battery.
+    OnBattery,
+    /// Battery too low to spend on this.
+    BatteryLow,
+    /// The user is at the keyboard.
+    InUse,
+    /// Something else already wants the machine.
+    MachineBusy,
+    /// A probe the gate depends on could not be read, so the gate fails closed.
+    Unavailable,
+    /// Disabled by an environment variable at launch.
+    DisabledByEnv,
+}
+
+/// One workload's current standing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeGate {
+    pub workload: ComputeWorkload,
+    pub allowed: bool,
+    pub code: ComputeGateCode,
+    /// A sentence naming the measurement that closed the gate — "battery at
+    /// 18% is below 30%", not "conditions not met". This is the single most
+    /// useful thing in the panel: it answers "why has nothing summarised?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Work already queued for this workload and waiting.
+    #[serde(default)]
+    pub pending: usize,
+    /// Outstanding work counted from the vault, which survives restarts and is
+    /// what "run now" promises to drain. `pending` is the few seconds of it that
+    /// have reached the job queue; this is the pile behind that.
+    #[serde(default)]
+    pub backlog: usize,
+    /// When a user-requested override for this workload expires, if one is
+    /// running. While set, the machine conditions below are bypassed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_until_ms: Option<i64>,
+    /// Whether offering "run now" here would change anything.
+    ///
+    /// Decided by the daemon, because the answer depends on which workloads have
+    /// a machine gate or a throttle of their own — something only the gate
+    /// knows. A client that re-derived it would drift the moment that changed.
+    #[serde(default)]
+    pub can_run_now: bool,
+}
+
+/// The thresholds the automatic triggers compare against.
+///
+/// On the wire rather than hardcoded in the UI so the "why isn't this running?"
+/// explanation cannot drift from the gate that actually decides. The client
+/// pairs each one with the live value in [`ComputeMachine`] to show which
+/// condition is the one holding work back.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ComputeThresholds {
+    /// Charge a summary pass needs, even on AC.
+    pub summary_min_battery_fraction: f64,
+    /// How long the machine must have been untouched before a summary starts.
+    pub summary_min_idle_seconds: f64,
+    /// One-minute load average per core a summary will not add to.
+    pub summary_max_load_per_core: f64,
+    /// How long a "run now" override lasts.
+    pub force_window_seconds: u64,
+}
+
+/// A unit of computation running at this instant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeTask {
+    pub id: String,
+    pub workload: ComputeWorkload,
+    pub lane: ComputeLane,
+    /// Which model or engine is doing the work, for the second line of the row.
+    pub detail: String,
+    pub started_at_ms: i64,
+    /// Share of one core, so a four-thread encoder honestly reads above 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_bytes: Option<u64>,
+}
+
+/// A model process that stays loaded between jobs.
+///
+/// Worth its own section: a resident MLX pack holds gigabytes of unified
+/// memory whether or not it is generating, which explains far more "my Mac got
+/// slow" than any percentage does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeResidentModel {
+    pub pack_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<f64>,
+}
+
+/// The machine as the gates see it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ComputeMachine {
+    pub on_ac: bool,
+    /// `None` on a machine with no battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_fraction: Option<f64>,
+    pub idle_seconds: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_per_core: Option<f64>,
+    /// Higher is hotter; the scale is undocumented, so only compare to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal_level: Option<u32>,
+    /// The daemon's own cost, which is where in-process AV1 packing shows up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_cpu_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_footprint_bytes: Option<u64>,
+}
+
+/// One finished summary pass and what it cost.
+///
+/// Summaries are the one workload whose single run is long enough that the user
+/// feels it start and wonders when it ends. A history of durations is what turns
+/// "my Mac is slow" into "this ends in about a minute".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComputeRun {
+    /// The slot this pass summarised, so a run lines up with the timeline.
+    pub slot_start_ms: i64,
+    pub finished_at_ms: i64,
+    pub duration_ms: i64,
+    /// A failed pass still cost its duration, so it is reported, not hidden.
+    pub ok: bool,
+}
+
+/// The whole dashboard in one reply, so the client never has to aggregate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeStatusReport {
+    pub mode: ComputeMode,
+    /// When the current suspension lifts. `None` means nothing is suspended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_until_ms: Option<i64>,
+    pub running: Vec<ComputeTask>,
+    pub gates: Vec<ComputeGate>,
+    pub machine: ComputeMachine,
+    /// The numbers the automatic triggers compare against.
+    #[serde(default = "default_compute_thresholds")]
+    pub thresholds: ComputeThresholds,
+    pub resident_models: Vec<ComputeResidentModel>,
+    /// Recent summary passes, newest first.
+    #[serde(default)]
+    pub recent_summaries: Vec<ComputeRun>,
+    /// Median duration of the recent successful passes — the basis for "how
+    /// much longer?". A median rather than a mean: one 20-minute outlier must
+    /// not move the estimate the user is shown for every later run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_typical_ms: Option<i64>,
+    /// True while the app's own overlay is suppressing capture.
+    ///
+    /// The panel needs this to avoid a circular reading: an open overlay resets
+    /// the idle timer, so "the user is at the keyboard" is partly the panel's
+    /// own fault and should be said that way.
+    pub capture_paused: bool,
+}
+
+fn default_compute_thresholds() -> ComputeThresholds {
+    ComputeThresholds {
+        summary_min_battery_fraction: 0.30,
+        summary_min_idle_seconds: 30.0,
+        summary_max_load_per_core: 0.7,
+        force_window_seconds: 1800,
+    }
+}
+
+
+/// Median duration of the successful runs in `runs`.
+///
+/// Failed passes are excluded from the estimate but kept in the list: a pass
+/// that died after ten seconds says nothing about how long a real one takes,
+/// while still being a cost the user paid.
+#[must_use]
+pub fn typical_run_ms(runs: &[ComputeRun]) -> Option<i64> {
+    let mut durations: Vec<i64> = runs
+        .iter()
+        .filter(|run| run.ok && run.duration_ms > 0)
+        .map(|run| run.duration_ms)
+        .collect();
+    if durations.is_empty() {
+        return None;
+    }
+    durations.sort_unstable();
+    Some(durations[durations.len() / 2])
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
@@ -1132,6 +1477,105 @@ mod tests {
             json,
             r#"{"type":"summary_history","before_ms":42,"limit":7}"#
         );
+    }
+
+    #[test]
+    fn compute_wire_shapes_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::ComputeStatus).unwrap(),
+            r#"{"type":"compute_status"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ComputeSetMode {
+                mode: ComputeMode::Essential
+            })
+            .unwrap(),
+            r#"{"type":"compute_set_mode","mode":"essential"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ComputePause { seconds: 3600 }).unwrap(),
+            r#"{"type":"compute_pause","seconds":3600}"#
+        );
+    }
+
+    #[test]
+    fn run_now_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::ComputeRunNow {
+                workload: ComputeWorkload::Summary
+            })
+            .unwrap(),
+            r#"{"type":"compute_run_now","workload":"summary"}"#
+        );
+    }
+
+    #[test]
+    fn an_unreadable_compute_mode_degrades_to_full() {
+        assert_eq!(
+            serde_json::from_str::<ComputeMode>(r#""nonsense""#).unwrap(),
+            ComputeMode::Full
+        );
+        assert_eq!(ComputeMode::parse("OFF"), Some(ComputeMode::Off));
+    }
+
+    #[test]
+    fn the_typical_duration_is_a_median_of_successful_runs() {
+        let run = |duration_ms: i64, ok: bool| ComputeRun {
+            slot_start_ms: 0,
+            finished_at_ms: 0,
+            duration_ms,
+            ok,
+        };
+        // One pathological pass must not move the number the user is shown.
+        let runs = [
+            run(120_000, true),
+            run(150_000, true),
+            run(1_200_000, true),
+            run(140_000, true),
+            run(130_000, true),
+        ];
+        assert_eq!(typical_run_ms(&runs), Some(140_000));
+
+        // A failure says nothing about how long a real pass takes.
+        assert_eq!(
+            typical_run_ms(&[run(9_000, false), run(200_000, true)]),
+            Some(200_000)
+        );
+        assert_eq!(typical_run_ms(&[run(9_000, false)]), None);
+        assert_eq!(typical_run_ms(&[]), None);
+    }
+
+    #[test]
+    fn a_report_without_summary_history_still_decodes() {
+        // The field is additive: an older daemon sends no `recent_summaries`.
+        let json = r#"{
+            "mode": "full",
+            "running": [],
+            "gates": [],
+            "machine": {"on_ac": true, "idle_seconds": 1.0},
+            "resident_models": [],
+            "capture_paused": false
+        }"#;
+        let report: ComputeStatusReport = serde_json::from_str(json).unwrap();
+        assert!(report.recent_summaries.is_empty());
+        assert_eq!(report.summary_typical_ms, None);
+        // The thresholds default to the gate's real numbers, so an older
+        // daemon's report still explains the trigger rather than showing zeroes.
+        assert!((report.thresholds.summary_min_idle_seconds - 30.0).abs() < f64::EPSILON);
+        assert!((report.thresholds.summary_max_load_per_core - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn every_workload_declares_a_lane_and_a_name() {
+        for workload in ComputeWorkload::ALL {
+            assert!(!workload.as_label().is_empty());
+            // Archive is the CPU one; everything else the user can free by
+            // pausing runs on the GPU.
+            let lane = workload.lane();
+            if matches!(workload, ComputeWorkload::Archive) {
+                assert_eq!(lane, ComputeLane::Cpu);
+            }
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@ private enum LabSurface: String, CaseIterable, Identifiable {
     case recall
     case settings
     case chat
+    case compute
     case onboarding
 
     var id: String { rawValue }
@@ -27,6 +28,7 @@ private enum LabSurface: String, CaseIterable, Identifiable {
         case .recall: "Recall"
         case .settings: "Settings"
         case .chat: "Chat"
+        case .compute: "Compute"
         case .onboarding: "Welcome"
         }
     }
@@ -35,6 +37,7 @@ private enum LabSurface: String, CaseIterable, Identifiable {
         if CommandLine.arguments.contains("--onboarding") { return .onboarding }
         if CommandLine.arguments.contains("--settings") { return .settings }
         if CommandLine.arguments.contains("--chat") { return .chat }
+        if CommandLine.arguments.contains("--compute") { return .compute }
         return .recall
     }
 }
@@ -66,6 +69,15 @@ private struct VisualLabView: View {
     @StateObject private var chat = ChatPreviewModel(scenario: CommandLine.arguments.contains("--stream")
         ? .streaming
         : .markdown)
+    /// Starts on the awkward fixture — unplugged, summaries held — because that
+    /// is the state the panel has to read well in.
+    @StateObject private var computeModel = ComputePreviewModel(
+        status: {
+            if CommandLine.arguments.contains("--archiving") { return ComputeFixtures.archiving }
+            if CommandLine.arguments.contains("--summarising") { return ComputeFixtures.summarising }
+            return ComputeFixtures.onBattery
+        }()
+    )
 
     @MainActor
     init() {
@@ -105,6 +117,8 @@ private struct VisualLabView: View {
                 settingsLab
             case .chat:
                 chatLab
+            case .compute:
+                computeLab
             case .onboarding:
                 onboardingLab
             }
@@ -346,6 +360,25 @@ private struct VisualLabView: View {
                 }
             )
             return library
+        }
+    }
+
+    /// The compute dashboard over a dim backdrop, the way the overlay hosts it.
+    private var computeLab: some View {
+        ZStack {
+            Color(red: 0.025, green: 0.022, blue: 0.026).ignoresSafeArea()
+            VStack(spacing: 18) {
+                HStack(spacing: 10) {
+                    // The two entry points, side by side, so their states can be
+                    // compared at a glance.
+                    ComputeActivityButton(indicator: computeModel.indicator) {}
+                    Text(computeModel.indicator.help)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                ComputeActivityPanel(model: computeModel, onClose: {})
+            }
+            .padding(40)
         }
     }
 

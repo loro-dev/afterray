@@ -58,6 +58,18 @@ afterray chat list --json
 afterray chat history <conversation-id> --json
 ```
 
+### Is the machine busy
+
+```sh
+afterray compute --json
+```
+
+Also carries `gates[].backlog` (work still waiting, counted from the vault), `thresholds` (what the automatic triggers compare against), `recent_summaries` (how long recent summary passes took) and `summary_typical_ms`, which is how to answer "how much longer will this be slow?". What local computation is running, what is held back and the reason why
+(`gates[].reason` names the measurement, e.g. "on battery"), plus per-task CPU
+and the resident model footprint. There is no GPU percentage — macOS does not
+publish per-process GPU use, so each task reports its lane instead. Read-only:
+changing the compute mode or suspending work is done in the app.
+
 ## How to answer
 
 1. Search or `ask` first. Follow a hit with `moment` / `evidence` only when the user needs the original screen or transcript.

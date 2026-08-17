@@ -174,7 +174,8 @@ public enum StreamingMarkdown {
     }
 
     /// Any complete `![label](afterray://moment/ID)` becomes a citation card.
-    /// Leading list/quote markers and surrounding prose stay as Markdown.
+    /// Models often wrap that in a link (`[![label](url)](url)`); the wrapper
+    /// is the same citation, not leftover markdown.
     private static func firstMomentImage(
         in line: String
     ) -> (range: Range<String.Index>, label: String, momentID: String)? {
@@ -187,7 +188,24 @@ public enum StreamingMarkdown {
               let labelRange = Range(match.range(at: 1), in: line),
               let momentRange = Range(match.range(at: 2), in: line)
         else { return nil }
-        return (full, String(line[labelRange]), String(line[momentRange]))
+        let span = wrappingLinkSpan(around: full, in: line) ?? full
+        return (span, String(line[labelRange]), String(line[momentRange]))
+    }
+
+    /// `[![alt](img)](href)` is one CommonMark image-link. If we only lift
+    /// the inner image, the leftover `](href)` renders as broken prose.
+    private static func wrappingLinkSpan(
+        around image: Range<String.Index>,
+        in line: String
+    ) -> Range<String.Index>? {
+        guard image.lowerBound > line.startIndex else { return nil }
+        let before = line.index(before: image.lowerBound)
+        guard line[before] == "[" else { return nil }
+        let after = line[image.upperBound...]
+        guard after.hasPrefix("]("),
+              let close = after.firstIndex(of: ")")
+        else { return nil }
+        return before..<line.index(after: close)
     }
 
     /// A citation that has started but is still missing `)`.

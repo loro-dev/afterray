@@ -16,6 +16,9 @@ The encrypted vault (`lib.rs`, ~6400 lines): a SQLCipher database plus per-artif
 - `gop.rs` — `PackPolicy` (hot window 2h, keyint 30; defaults gop.rs:22-25), `fold_pack_runs` (:111), `commit_gop` (:284, can fail `StoreError::GopStale` when retention races), `rollback_orphan_gops`, `drop_unpinned_stills` (:546).
 - `infoscore.rs` (IDF scoring against `text_df`), `activity.rs` (AX parsing/activity spans), `memory.rs` (AX digests), `pipeline_bench.rs` (`#[ignore]`d manual bench).
 
+- `compute_backlog(now, policy)` counts the durable background pile for the dashboard, reusing `gop::PACK_CANDIDATE_PREDICATE` and `AUDIO_CLAIMABLE_PREDICATE` — **share those consts, never hand-copy a selection rule**: both copies drifted (missing loginwindow exclusions, missing retry backoff) and the "start now" count could not reach zero. Only *drainable* work counts: packed moments are excluded (their JPEG is gone) and `unindexed_moments` looks back one day. Cache the result; these are range scans with per-row probes.
+- `recent_summary_runs(limit)` reads the `latency_ms` already persisted on `slot_summaries` so the compute dashboard can say how long summaries usually take. There is no index on `produced_at_ms`: the daemon reads it **once at startup**, never on a polling path.
+
 ## Build / test
 
 - `cargo test -p afterray-store`; manual bench: `cargo test -p afterray-store -- --ignored --nocapture`.

@@ -5,7 +5,7 @@ The model-layer hub for `afterrayd`: an in-memory priority-aware job queue (`Mod
 ## Key files
 
 - `src/lib.rs` — `ModelCapability` (`:51`); `ModelInput` (`:73`) / `ModelOutput` (`:124`), serde `tag="type"`, snake_case; `OcrRegion` (`:112`) — Apple Vision bottom-left origin, screen consumers must flip Y; `ModelAdapter` trait (`:221`); `AdapterError` (`:195`) with `retryable()` (`:215` — only `Process`/`Io`/`Timeout` retry).
-- `src/queue.rs` — `ModelQueue` (`:299`, in-memory by design); `CapabilityConcurrency` (`:40`); `JobPriority` (`:106`); `LlmGate` (`:131`, LLM-only priority admission); `hold_llm_lease()` (`:351`) RAII lane reservation.
+- `src/queue.rs` — `ModelQueue` (`:299`, in-memory by design); `CapabilityConcurrency` (`:40`); `JobPriority` (`:106`); `LlmGate` (`:131`, LLM-only priority admission); `hold_llm_lease()` (`:351`) RAII lane reservation; `activity()` → `QueueActivity` (what the compute dashboard polls — never `list()`, which carries every job's output); `prune_terminal` caps finished jobs at 200 outside a 60s grace window `wait()` depends on.
 - `src/process.rs` — one-shot protocol: `WORKER_PROTOCOL_VERSION = 1` (`:7`); `ProcessAdapter` (`:64`): one child per inference, one JSON request on stdin, one JSON response on stdout, stderr = logs only; 300s timeout, 16 MiB stdout cap.
 - `src/persistent_mlx.rs` — `MLX_WORKER_PROTOCOL_VERSION = 1` (`:17`); `PersistentMlxAdapter` (`:69`): NDJSON, `load`/`generate`/`cancel` → `ready`/`delta`/`final`/`cancelled`/`error`; `verify_model` (`:274`) re-checks the pinned manifest + ready marker before every spawn; `normalize_model_output` (`:530`) strips `<think>`/control tokens.
 - `src/remote.rs` — `LlmRouterAdapter` (`:127`) routes LLM jobs to a per-pack MLX adapter or Ollama/OpenAI-compatible HTTP; `check_origin` (`:484`) allows https or loopback-http only; reqwest clients disable redirects so prompts/API keys can't leak to a redirect target.
@@ -15,6 +15,7 @@ The model-layer hub for `afterrayd`: an in-memory priority-aware job queue (`Mod
 
 ## Invariants
 
+- `ModelAdapter::worker_pid(job_id)` is the only route from a running job to a pid, and so to an honest per-task cost; adapters with no child answer `None` rather than something plausible ([why](../../context/compute-governance.md)).
 - Worker stdout is protocol-only — a stray print kills the job as `InvalidOutput` (pinned by `rejects_non_json_stdout`, `persistent_mlx.rs:738`). Logs go to stderr.
 - Workers signal failures via `retryable` in `WorkerResponse`: `true` → `AdapterError::Process` (retried), `false` → `MissingModel` (`process.rs:180`). Never fabricate inference output; fail with an actionable `MissingModel`.
 - LLM lane fairness: background submitters must use `JobPriority::Background{..}`; multi-round agent loops must take `hold_llm_lease()` and pass the lease id, or every round re-queues behind rivals (measured 8-minute stalls, `queue.rs:104`).

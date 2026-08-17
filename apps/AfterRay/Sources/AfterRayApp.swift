@@ -262,6 +262,13 @@ private final class AfterRayMenuBar: NSObject {
         pauseItem.target = self
         menu.addItem(pauseItem)
         self.pauseItem = pauseItem
+        let computeItem = NSMenuItem(
+            title: "Local Computation…",
+            action: #selector(openComputeActivity),
+            keyEquivalent: ""
+        )
+        computeItem.target = self
+        menu.addItem(computeItem)
         let clearHour = NSMenuItem(
             title: "Delete Last Hour",
             action: #selector(deleteLastHour),
@@ -313,6 +320,10 @@ private final class AfterRayMenuBar: NSObject {
 
     @objc private func openSettings() {
         AfterRaySettingsController.shared.show()
+    }
+
+    @objc private func openComputeActivity() {
+        ComputeActivityController.shared.show()
     }
 
     @objc private func toggleCapture() {
@@ -605,6 +616,10 @@ final class RecallOverlayController: RecallHotKeyBinding {
     fileprivate func closeFromKeyboard() {
         if AfterRaySettingsController.shared.isPresented {
             AfterRaySettingsController.shared.hide()
+            return
+        }
+        if ComputeActivityController.shared.isPresented {
+            ComputeActivityController.shared.hide()
             return
         }
         if PermissionGuideController.shared.isVisible {
@@ -951,6 +966,8 @@ private struct AfterRayRootView: View {
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
     @ObservedObject private var settings = AfterRaySettingsController.shared
+    @ObservedObject private var compute = ComputeActivityController.shared
+    @ObservedObject private var computeModel = AfterRayServices.shared.compute
     // Chat lives in its own window (`ChatWindowController`) so a token
     // never rebuilds the recall surface. The model is shared so lock/sleep
     // can still wipe it here.
@@ -985,6 +1002,8 @@ private struct AfterRayRootView: View {
             playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
+            onOpenCompute: { ComputeActivityController.shared.toggle() },
+            computeIndicator: computeModel.indicator,
             recordingState: control.status?.recordingState,
             isChangingRecording: control.isChangingRecording,
             onToggleRecording: toggleRecording,
@@ -1052,7 +1071,27 @@ private struct AfterRayRootView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
         }
+        .overlay {
+            if compute.isPresented {
+                ComputeActivityOverlay(
+                    model: computeModel,
+                    onClose: { compute.hide() }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            }
+        }
         .animation(.easeOut(duration: 0.16), value: settings.isPresented)
+        .animation(.easeOut(duration: 0.16), value: compute.isPresented)
+        // Tied to the overlay being *visible*, not to this view's lifetime: the
+        // panel is `orderOut`-ed rather than torn down, so `onDisappear` never
+        // fires and an `onAppear` watcher would poll for the life of the process
+        // — the exact background load this dashboard exists to report on.
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
+            computeModel.startWatching()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
+            computeModel.stopWatching()
+        }
         .onExitCommand {
             audioPlayer.stop()
             RecallOverlayController.shared.hide(returnFocus: true)
@@ -1301,13 +1340,21 @@ private struct AfterRayRootView: View {
             let question = control.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !question.isEmpty else { return }
             control.searchQuery = ""
-            openChat(draft: question, send: true)
+            openChat(draft: question, send: true, startsNewConversation: true)
         }
     }
 
-    private func openChat(draft: String = "", send: Bool = false) {
+    private func openChat(
+        draft: String = "",
+        send: Bool = false,
+        startsNewConversation: Bool = false
+    ) {
         control.dismissSearch()
-        ChatWindowController.shared.show(draft: draft, send: send)
+        ChatWindowController.shared.show(
+            draft: draft,
+            send: send,
+            startsNewConversation: startsNewConversation
+        )
     }
 
     /// A citation from the standalone chat window. The overlay comes up on
@@ -1338,13 +1385,11 @@ private struct PermissionPanel: View {
                             .tracking(1.1)
                     }
                     .foregroundStyle(RecallPalette.ray)
-                    Text(coordinator.recordsAudio
+                    Text(coordinator.microphoneRequired
                          ? "Three local permissions are required"
                          : "Two local permissions are required")
                         .font(.title2.weight(.semibold))
-                    Text(coordinator.recordsAudio
-                         ? "AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded."
-                         : "Audio recording is off, so the microphone is optional. Screen and Accessibility are still required.")
+                    Text(permissionSummary)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1389,16 +1434,31 @@ private struct PermissionPanel: View {
         }
     }
 
+    private var permissionSummary: String {
+        if !coordinator.recordsAudio {
+            return "Audio recording is off, so the microphone is optional. Screen and Accessibility are still required."
+        }
+        if !coordinator.hasMicrophoneInput {
+            return "No microphone input is connected. AfterRay can still record screen and system audio, so microphone access is not required."
+        }
+        return "AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded."
+    }
+
     private func permissionRow(_ permission: RequiredPermission) -> some View {
         let granted = isGranted(permission)
+        let unavailable = permission == .microphone && !coordinator.hasMicrophoneInput
         return HStack(spacing: 12) {
             Image(systemName: permission.icon)
                 .frame(width: 22)
-                .foregroundStyle(granted ? Color.green : Color.red)
+                .foregroundStyle(unavailable ? Color.secondary : (granted ? Color.green : Color.red))
             Text(permission.title)
                 .font(.callout.weight(.medium))
             Spacer()
-            if granted {
+            if unavailable {
+                Label("No input device", systemImage: "minus.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if granted {
                 Label("Allowed", systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.green)

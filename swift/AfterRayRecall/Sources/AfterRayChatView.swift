@@ -12,6 +12,9 @@ private enum ChatMetrics {
     /// Close / miniaturize / zoom sit in the first ~72pt; leave a gap after.
     static let trafficLightClearance: CGFloat = 80
     static let conversationRowHeight: CGFloat = 32
+    static let composerFieldHeight: CGFloat = 30
+    static let composerActionSize: CGFloat = 24
+    static let composerTextInset: CGFloat = 7
     static let bottomAnchorID = "afterray-chat-bottom-anchor"
 }
 
@@ -42,9 +45,10 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     var momentLoader: RecallMomentLoader?
     var fillsAvailableSpace: Bool
     var occupiesWindowTitlebar: Bool
+    var showsHeader: Bool
+    @StateObject private var sidebarState: ChatSidebarState
     @State private var autoScrollState = ChatAutoScrollState()
     @State private var scrollToLatestRequest: UInt64 = 0
-    @State private var sidebarCollapsed = false
     @State private var conversationQuery = ""
     @State private var modelPickerOpen = false
     @State private var moreMenuOpen = false
@@ -59,7 +63,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         previewLoader: RecallChatPreviewLoader? = nil,
         momentLoader: RecallMomentLoader? = nil,
         fillsAvailableSpace: Bool = false,
-        occupiesWindowTitlebar: Bool = false
+        occupiesWindowTitlebar: Bool = false,
+        showsHeader: Bool = true,
+        sidebarState: ChatSidebarState? = nil
     ) {
         self.model = model
         self.onClose = onClose
@@ -69,6 +75,8 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         self.momentLoader = momentLoader
         self.fillsAvailableSpace = fillsAvailableSpace
         self.occupiesWindowTitlebar = occupiesWindowTitlebar
+        self.showsHeader = showsHeader
+        _sidebarState = StateObject(wrappedValue: sidebarState ?? ChatSidebarState())
     }
 
     public var body: some View {
@@ -84,7 +92,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 .allowsHitTesting(false)
             }
             HStack(spacing: 0) {
-                if !sidebarCollapsed {
+                if !sidebarState.isCollapsed {
                     sidebar
                 }
                 thread
@@ -97,13 +105,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             minHeight: fillsAvailableSpace ? 480 : ChatMetrics.panelHeight,
             maxHeight: fillsAvailableSpace ? .infinity : ChatMetrics.panelHeight
         )
-        .background {
-            if fillsAvailableSpace {
-                Color.white.opacity(0.04)
-            } else {
-                ChatPalette.panel
-            }
-        }
+        .background(Color.clear)
         .preferredColorScheme(.dark)
         .modifier(ChatSurfaceChrome(isPanel: !fillsAvailableSpace))
         .environment(\.openURL, OpenURLAction { url in
@@ -117,7 +119,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             return .systemAction
         })
         .task { await model.refresh() }
-        .animation(.easeOut(duration: 0.16), value: sidebarCollapsed)
+        .animation(.easeOut(duration: 0.16), value: sidebarState.isCollapsed)
         .onChange(of: model.selectedID) { _, _ in
             conversationCopied = false
         }
@@ -142,7 +144,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sidebarTitlebar
+            if showsHeader {
+                sidebarTitlebar
+            }
 
             if !model.conversations.isEmpty {
                 conversationSearchField
@@ -214,7 +218,8 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             ChatIconButton(
                 symbol: "sidebar.left",
                 help: "Hide sidebar",
-                action: { sidebarCollapsed = true }
+                identifier: "chat-sidebar-toggle",
+                action: { sidebarState.isCollapsed = true }
             )
             Spacer(minLength: 0)
         }
@@ -260,7 +265,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
 
     private var thread: some View {
         VStack(spacing: 0) {
-            header
+            if showsHeader {
+                header
+            }
             messageList
             statusStrip
             composer
@@ -276,30 +283,49 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 .lineLimit(1)
                 .padding(.horizontal, 120)
                 .frame(maxWidth: .infinity)
+                // This full-width title is visual chrome only; the controls
+                // layered above it remain the header's mouse targets.
+                .allowsHitTesting(false)
 
             HStack(spacing: 4) {
-                if occupiesWindowTitlebar && sidebarCollapsed {
+                if occupiesWindowTitlebar && sidebarState.isCollapsed {
                     Color.clear
                         .frame(width: max(0, ChatMetrics.trafficLightClearance - 14))
                 }
-                if sidebarCollapsed {
+                if sidebarState.isCollapsed {
                     ChatIconButton(
                         symbol: "sidebar.left",
                         help: "Show sidebar",
-                        action: { sidebarCollapsed = false }
+                        identifier: "chat-sidebar-toggle",
+                        action: { sidebarState.isCollapsed = false }
                     )
                 }
                 if model.isLoadingHistory {
                     ProgressView().controlSize(.small).tint(ChatPalette.accent)
                 }
                 Spacer(minLength: 8)
-                ChatIconButton(symbol: "plus", help: "New conversation", action: model.startNew)
-                ChatIconButton(symbol: "ellipsis", help: "More", action: { moreMenuOpen.toggle() })
+                ChatIconButton(
+                    symbol: "plus",
+                    help: "New conversation",
+                    identifier: "chat-new-conversation",
+                    action: model.startNew
+                )
+                ChatIconButton(
+                    symbol: "ellipsis",
+                    help: "More",
+                    identifier: "chat-more",
+                    action: { moreMenuOpen.toggle() }
+                )
                     .popover(isPresented: $moreMenuOpen, arrowEdge: .bottom) {
                         moreMenu
                     }
                 if !fillsAvailableSpace {
-                    ChatIconButton(symbol: "xmark", help: "Close chat", action: onClose)
+                    ChatIconButton(
+                        symbol: "xmark",
+                        help: "Close chat",
+                        identifier: "chat-close",
+                        action: onClose
+                    )
                 }
             }
         }
@@ -307,6 +333,12 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         .frame(height: chromeHeight)
         .padding(.top, occupiesWindowTitlebar ? 0 : 8)
         .padding(.bottom, occupiesWindowTitlebar ? 0 : 4)
+        .background {
+            ZStack {
+                Rectangle().fill(.thinMaterial)
+                Color.black.opacity(0.24)
+            }
+        }
     }
 
     private var messageList: some View {
@@ -383,6 +415,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(ChatPalette.panel)
     }
 
     private var pinsToBottom: Bool {
@@ -454,7 +487,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
             .padding(.horizontal, ChatMetrics.gutter)
             .padding(.vertical, 10)
-            .background(Color.black.opacity(0.22))
+            .background(ChatPalette.panel)
             .overlay(alignment: .top) {
                 Rectangle().fill(ChatPalette.separator).frame(height: 1)
             }
@@ -462,15 +495,15 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .center, spacing: 8) {
                 ChatComposerField(text: $model.draft, isEnabled: !model.isSending, onSend: model.send)
-                    .frame(height: 36)
+                    .frame(height: ChatMetrics.composerFieldHeight)
                 composerAction
             }
             .padding(.leading, 12)
             .padding(.trailing, 6)
-            .padding(.vertical, 5)
+            .padding(.vertical, 4)
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(Color.white.opacity(0.06))
@@ -489,8 +522,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
         }
         .padding(.horizontal, 20)
-        .padding(.top, 8)
-        .padding(.bottom, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .background(ChatPalette.panel)
     }
 
     @ViewBuilder
@@ -498,9 +532,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         if model.isSending {
             Button(action: model.stop) {
                 Image(systemName: "stop.fill")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(.white)
-                    .frame(width: 28, height: 28)
+                    .frame(width: ChatMetrics.composerActionSize, height: ChatMetrics.composerActionSize)
                     .background(ChatPalette.accent, in: Circle())
             }
             .buttonStyle(ChatPressStyle())
@@ -508,9 +542,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         } else {
             Button(action: model.send) {
                 Image(systemName: "arrow.up")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(.white)
-                    .frame(width: 28, height: 28)
+                    .frame(width: ChatMetrics.composerActionSize, height: ChatMetrics.composerActionSize)
                     .background(
                         ChatPalette.accent.opacity(model.canSend ? 0.95 : 0.38),
                         in: Circle()
@@ -1304,6 +1338,7 @@ private struct ChatStreamCaret: View {
 private struct ChatIconButton: View {
     let symbol: String
     let help: String
+    let identifier: String
     let action: () -> Void
     @State private var isHovering = false
 
@@ -1317,10 +1352,13 @@ private struct ChatIconButton: View {
                     isHovering ? Color.white.opacity(0.075) : Color.clear,
                     in: RoundedRectangle(cornerRadius: 7, style: .continuous)
                 )
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(ChatPressStyle())
         .onHover { isHovering = $0 }
         .help(help)
+        .accessibilityLabel(help)
+        .accessibilityIdentifier(identifier)
     }
 }
 
@@ -1363,12 +1401,15 @@ private struct ChatComposerField: NSViewRepresentable {
         textView.backgroundColor = .clear
         textView.drawsBackground = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.textContainerInset = NSSize(width: 2, height: 6)
-        textView.minSize = NSSize(width: 0, height: 22)
+        // The composer is a compact, single-row control. Filling the scroll
+        // view and deriving the inset from its 30pt height keeps the first
+        // baseline centered instead of pinning the document view to the top.
+        textView.textContainerInset = NSSize(width: 2, height: ChatMetrics.composerTextInset)
+        textView.minSize = .zero
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.isVerticallyResizable = true
+        textView.isVerticallyResizable = false
         textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
+        textView.autoresizingMask = [.width, .height]
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.lineFragmentPadding = 4
         textView.string = text

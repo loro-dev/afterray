@@ -42,6 +42,14 @@ public protocol AfterRayChatModeling: ObservableObject {
 }
 
 public extension AfterRayChatModeling {
+    /// Clears any selected conversation before placing a launch-time prompt
+    /// in the composer. Top-level Ask uses this so it can never append to the
+    /// thread that happened to be selected the last time chat was open.
+    func startNew(draft: String) {
+        startNew()
+        self.draft = draft
+    }
+
     var selectedTitle: String {
         conversations.first(where: { $0.id == selectedID })?.title ?? "New conversation"
     }

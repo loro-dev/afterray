@@ -132,6 +132,19 @@ final class StreamingMarkdownTests: XCTestCase {
         )
     }
 
+    func testLinkedMomentImageDoesNotLeaveBrokenBrackets() {
+        let source = """
+        - [![2:14 Safari](afterray://moment/1786936000000)](afterray://moment/1786936000000) - 有 X.com/Twitter 页面
+        """
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: source),
+            [
+                .momentImage(label: "2:14 Safari", momentID: "1786936000000"),
+                .markdown(" - 有 X.com/Twitter 页面"),
+            ]
+        )
+    }
+
     func testEmbeddedMomentImageBecomesMediaAndKeepsSurroundingProse() {
         XCTAssertEqual(
             StreamingMarkdown.blocks(from: "See ![frame](afterray://moment/abc) here"),

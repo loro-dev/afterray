@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 pub const IDLE_GAP_MS: i64 = 30_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackPolicy {
     pub hot_window_ms: i64,
     pub hot_min_stills: usize,
@@ -135,6 +135,32 @@ pub fn fold_pack_runs(candidates: &[PackCandidate], keyint: u16) -> Vec<Vec<Pack
     runs
 }
 
+/// Which stills may be packed, as one predicate over `moments m`.
+///
+/// Shared with `Vault::compute_backlog`'s count so the number on the
+/// dashboard's "start now" button is the number this query will hand the
+/// packer. Two hand-copies drifted once — the count was missing the
+/// loginwindow exclusions below, so it could never reach zero.
+///
+/// Bind order: `?1` hot-window cutoff, `?2` hot-still floor, `?3` OCR grace
+/// cutoff.
+pub(crate) const PACK_CANDIDATE_PREDICATE: &str = "m.gop_segment_id IS NULL
+            AND m.image_artifact_id IS NOT NULL
+            AND m.width IS NOT NULL AND m.height IS NOT NULL
+            AND lower(coalesce(m.application_name, '')) != 'loginwindow'
+            AND lower(coalesce(m.bundle_identifier, '')) NOT LIKE '%loginwindow%'
+            AND m.captured_at_ms <= ?1
+            AND m.id NOT IN (
+                SELECT id FROM moments ORDER BY captured_at_ms DESC, id DESC LIMIT ?2
+            )
+            AND (
+                EXISTS (
+                    SELECT 1 FROM text_evidence te
+                     WHERE te.moment_id = m.id AND te.source = 'ocr'
+                )
+                OR m.captured_at_ms <= ?3
+            )";
+
 impl Vault {
     pub fn rollback_orphan_gops(&self) -> Result<usize, StoreError> {
         let mut connection = self.connection.lock().unwrap();
@@ -197,26 +223,13 @@ impl Vault {
         let ocr_cutoff = now_ms.saturating_sub(policy.ocr_grace_ms);
         let floor = i64::try_from(policy.hot_min_stills).unwrap_or(i64::MAX);
         let mut statement = connection.prepare(
-            "SELECT m.id, m.captured_at_ms, m.image_artifact_id,
-                    m.bundle_identifier, m.application_name, m.width, m.height
-               FROM moments m
-              WHERE m.gop_segment_id IS NULL
-                AND m.image_artifact_id IS NOT NULL
-                AND m.width IS NOT NULL AND m.height IS NOT NULL
-                AND lower(coalesce(m.application_name, '')) != 'loginwindow'
-                AND lower(coalesce(m.bundle_identifier, '')) NOT LIKE '%loginwindow%'
-                AND m.captured_at_ms <= ?1
-                AND m.id NOT IN (
-                    SELECT id FROM moments ORDER BY captured_at_ms DESC, id DESC LIMIT ?2
-                )
-                AND (
-                    EXISTS (
-                        SELECT 1 FROM text_evidence te
-                         WHERE te.moment_id = m.id AND te.source = 'ocr'
-                    )
-                    OR m.captured_at_ms <= ?3
-                )
-              ORDER BY m.captured_at_ms ASC, m.id ASC",
+            &format!(
+                "SELECT m.id, m.captured_at_ms, m.image_artifact_id,
+                        m.bundle_identifier, m.application_name, m.width, m.height
+                   FROM moments m
+                  WHERE {PACK_CANDIDATE_PREDICATE}
+                  ORDER BY m.captured_at_ms ASC, m.id ASC"
+            ),
         )?;
         let rows = statement.query_map(params![cutoff, floor, ocr_cutoff], |row| {
             Ok(PackCandidate {

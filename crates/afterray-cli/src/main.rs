@@ -112,6 +112,12 @@ enum Command {
         summary_language: Option<String>,
     },
     Models,
+    /// What local computation is running, and what is held back and why.
+    ///
+    /// Read-only on purpose: changing the compute mode or suspending work is a
+    /// deliberate, reversible choice that belongs with the panel that explains
+    /// what it costs, not in a shell one-liner.
+    Compute,
     Download {
         #[arg(long)]
         pack: Option<String>,
@@ -460,6 +466,7 @@ async fn request_from_command(
             model_download_endpoint: None,
         },
         Command::Models => Request::ModelsStatus,
+        Command::Compute => Request::ComputeStatus,
         Command::Jobs {
             command: JobsCommand::List,
         } => Request::JobsList,

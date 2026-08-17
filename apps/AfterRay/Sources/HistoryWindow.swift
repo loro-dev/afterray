@@ -18,6 +18,10 @@ final class AfterRayServices {
     let control: AfterRayControlModel
     let chat: AfterRayChatModel
     let audioPlayer: ArtifactAudioPlayer
+    /// Shared, because the overlay button, the menu bar and the panel itself
+    /// must agree about what is running. Three pollers would also mean three
+    /// times the sampling the panel exists to report on.
+    let compute: ComputeActivityModel
 
     private init() {
         let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
@@ -28,6 +32,7 @@ final class AfterRayServices {
         control = AfterRayControlModel(daemon: daemon)
         chat = AfterRayChatModel(daemon: daemon)
         audioPlayer = ArtifactAudioPlayer(repository: repository)
+        compute = ComputeActivityModel(daemon: daemon)
     }
 }
 

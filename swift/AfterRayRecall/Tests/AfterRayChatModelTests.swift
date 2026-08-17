@@ -87,6 +87,41 @@ final class AfterRayChatModelTests: XCTestCase {
         XCTAssertEqual(sent, "hello")
     }
 
+    func testLaunchDraftStartsWithoutThePreviouslySelectedConversation() async {
+        let daemon = ChatDaemon()
+        await daemon.seed(
+            conversations: [
+                ChatConversation(id: "old", title: "Old", createdAtMs: 1, updatedAtMs: 2, messageCount: 1)
+            ],
+            history: [
+                "old": [
+                    ChatMessage(id: "u-old", conversationId: "old", role: .user, content: "earlier", createdAtMs: 1)
+                ],
+            ]
+        )
+        await daemon.setEvents([
+            .done(messageId: "a-new", conversationId: "new"),
+        ])
+        await daemon.setHistory("new", [
+            ChatMessage(id: "u-new", conversationId: "new", role: .user, content: "fresh question", createdAtMs: 3),
+        ])
+
+        let model = AfterRayChatModel(daemon: daemon, clock: { 3 })
+        await model.select("old")
+        model.startNew(draft: "fresh question")
+        XCTAssertNil(model.selectedID)
+        XCTAssertTrue(model.messages.isEmpty)
+
+        model.send()
+        await waitUntil { !model.isSending }
+
+        let streamedConversationID = await daemon.lastStreamedConversationID
+        let streamedMessage = await daemon.lastStreamedMessage
+        XCTAssertNil(streamedConversationID)
+        XCTAssertEqual(streamedMessage, "fresh question")
+        XCTAssertEqual(model.selectedID, "new")
+    }
+
     /// Stopping used to leave a local assistant message with an invented id,
     /// which no reload could match — switch away and back and the answer was
     /// gone. The daemon now owns the partial, so the app shows what it stored.
@@ -378,6 +413,7 @@ private actor ChatDaemon: AfterRayChatServing {
     var events: [ChatStreamEvent] = []
     var sendResult = ChatSendResult(conversationId: "c-new")
     var lastStreamedMessage: String?
+    var lastStreamedConversationID: String?
     var lastSentMessage: String?
     var listShouldFail = false
     var blockAfterFirstEvent = false
@@ -424,10 +460,13 @@ private actor ChatDaemon: AfterRayChatServing {
         )
     }
 
-    nonisolated func chatStream(conversationID _: String?, message: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+    nonisolated func chatStream(conversationID: String?, message: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
-                let snapshot = await self.streamSnapshot(message: message)
+                let snapshot = await self.streamSnapshot(
+                    conversationID: conversationID,
+                    message: message
+                )
                 for (index, event) in snapshot.events.enumerated() {
                     continuation.yield(event)
                     if snapshot.block, index == 0 {
@@ -442,7 +481,11 @@ private actor ChatDaemon: AfterRayChatServing {
         }
     }
 
-    private func streamSnapshot(message: String) -> (events: [ChatStreamEvent], block: Bool, hold: Bool) {
+    private func streamSnapshot(
+        conversationID: String?,
+        message: String
+    ) -> (events: [ChatStreamEvent], block: Bool, hold: Bool) {
+        lastStreamedConversationID = conversationID
         lastStreamedMessage = message
         return (events, blockAfterFirstEvent, holdOpen)
     }

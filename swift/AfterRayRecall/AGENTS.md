@@ -11,6 +11,7 @@ SwiftUI library holding everything cross-app: the recall surface, the Unix-socke
 - `Sources/AfterRayControlModel.swift:4` — recording/search state; `Sources/AfterRayChatModel.swift` + `ChatModels.swift` — chat model; `ChatMessagePart` keeps think/tool arrival order; `ChatConversationGrouping.days` is O(n log n) and the only grouping path.
 - `Sources/StreamingMarkdown.swift` + `Sources/ChatMarkdownView.swift` + `Sources/ChatMomentCitationView.swift` — MarkdownUI splitter + citations. Thumb first (`RecallThumbnailCache`), then `RecallChatPreviewCache` via `MomentGet` + still/exact GOP; time from `captured_at_ms`. Image providers refuse http/file/data.
 - `Sources/ChatAutoScrollState.swift` + `Sources/ChatScrollObserver.swift` — macOS 14 chat bottom-follow state machine and the narrow AppKit live-scroll/geometry bridge; content growth follows only until the user scrolls away.
+- `Sources/ComputeActivity*.swift` — the compute dashboard: wire models + `ComputeIndicator` (button state) + `ComputeFormat` (all rounding, so it is testable); `ComputeActivityPresenting` + a 2s poller that runs only while watched; the panel and `ComputeActivityButton`. Design notes: [context/compute-governance.md](../../context/compute-governance.md).
 - `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:327) — settings UI generic over the protocol, so mock and real models share it; `downloadQueueSection` draws the models page's downloads; `downloadSourceSection` picks the Hugging Face mirror (official / hf-mirror / custom).
 - `Sources/ModelDownloadQueue.swift:116` `ModelLibrary.downloadQueue` — the daemon's active-pack + waiting-ids report flattened into queue rows; `isQueued` (:160) gates per-pack buttons.
 - `Sources/AppIconLookup.swift:8` — cached bundle-id → icon; `AppIconView` (:54) for rows naming an app.
@@ -20,7 +21,10 @@ SwiftUI library holding everything cross-app: the recall surface, the Unix-socke
 ## Invariants
 
 - The UI never opens the database or reads encryption keys (`docs/development.md:112-113`) — everything arrives via `UnixSocketDaemonClient`.
-- `protocolVersion` must stay in lockstep with `PROTOCOL_VERSION: u32 = 12`; bump both on any wire change or every request fails with `protocolMismatch`.
+- `protocolVersion` must stay in lockstep with `PROTOCOL_VERSION: u32 = 13`; bump both on any wire change or every request fails with `protocolMismatch`.
+- Compute policy is the daemon's: the Info popover's numbers come from `ComputeThresholds` on the wire and whether "Start now" appears comes from `ComputeGate.can_run_now`. Never re-derive either in Swift — the explanation and the button must not be able to drift from the gate that decides. A row shows `max(pending, backlog)` as remaining, because the queue count is a subset of the vault count.
+- One duration formatter (`ComputeFormat.duration`) and one byte formatter (`AfterRayStorageSnapshot.byteCount`) across the panel, matching `human_duration` in the daemon log — the same pass must not read as two different numbers in two places.
+- The dashboard shows a task's **lane** (GPU/CPU), never a per-task GPU percentage — macOS publishes no per-process GPU accounting. CPU/memory come from the worker's pid and are absent, not zero, when there is no child process.
 - Concurrency: stores are `@MainActor` `ObservableObject`s; socket client and image repository are actors; daemon I/O runs in `Task.detached(priority: .userInitiated)` (`DaemonClient.swift:394,416`). Never block the main thread — the HangWatchdog kills the app.
 - Unary socket reads have a 30s receive deadline (`DaemonClient.swift:587`, postmortem in the comment above); streaming reads deliberately stay deadline-free. Do not remove.
 - Every async load guards completion with a generation counter (`sensitiveGeneration`, `RecallStore.swift:16`); new load paths must follow the same capture-and-compare pattern.

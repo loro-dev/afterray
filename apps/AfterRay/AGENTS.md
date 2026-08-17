@@ -1,6 +1,6 @@
 # AGENTS.md — apps/AfterRay
 
-The shipped macOS app (`AfterRayApp` executable target in the root `Package.swift`, product `afterray-app`). It owns everything the recall library deliberately does not: the app delegate, menu-bar item, full-screen overlay `NSPanel`, daemon process supervision, onboarding/permissions, and Sparkle updates. All UI and wire logic lives in `swift/AfterRayRecall`; this target wires it to a live daemon.
+The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns the app delegate, menu bar, overlay, daemon supervision, permissions, and updates; shared UI and wire logic lives in `swift/AfterRayRecall`.
 
 ## Key files
 
@@ -13,20 +13,22 @@ The shipped macOS app (`AfterRayApp` executable target in the root `Package.swif
 
 ## Invariants
 
-- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 12, which must match `afterray-protocol`.
-- Sensitive-state teardown on screen lock/sleep: `.afterRaySystemSessionWillSuspend` → `store`/`control`/`chat.clearSensitiveState()` + close the chat window + `RecallThumbnailCache` / `RecallChatPreviewCache` / `images.clearSensitiveData()`. Hook any new decrypted-content cache into this.
+- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 13, which must match `afterray-protocol`.
+- On lock/sleep, `.afterRaySystemSessionWillSuspend` clears store/control/chat, closes chat, and clears image/thumbnail/preview caches. Hook every decrypted-content cache into this.
 - The overlay, history window, and chat window must share `AfterRayServices.shared` stores — never construct a private `RecallStore` or `AfterRayChatModel`.
-- `RecallView` exclusively owns the opaque history backdrop because it sees transient scrub state. `AfterRayRootView` must stay transparent; an outer backdrop lags a fast flick to NOW and produces a black screen after the still unmounts.
-- Pop-out controllers retain their `NSWindow`. Every `show()`, including reuse, must ensure the daemon and force-refresh. A first-open connection refusal must not strand the window on `.empty`. Chat hosting must use `sizingOptions = [.minSize]` or resize snaps back.
-- Chat is a standalone window. Overlay hide / Escape must not call `chat.stop()` or close it. A moment citation may show the overlay (`OverlayOpenIntent.moment`) without destroying the chat window.
+- `RecallView` alone owns the opaque history backdrop; `AfterRayRootView` stays transparent. An outer backdrop lags a fast flick to NOW and can leave a black screen.
+- Pop-outs retain their `NSWindow`; every `show()` ensures daemon/refresh. Chat uses `sizingOptions = [.minSize]` or resize snaps back.
+- Native chat toolbar owns sidebar/title/new/more in the traffic-light row with standard `.unified` margins; hosted chat sets `showsHeader: false` to prevent duplicate chrome.
+- Chat is standalone: overlay hide does not stop it; citations may reopen moments; top-bar Ask calls `startNew(draft:)` before send.
 - `AfterRayStandardWindowPresence`: `.regular` while History or Chat is visible/miniaturized; `.accessory` only when the last one closes.
 - `AfterRaySettingsController.show()` forces the overlay visible first (`AfterRaySettings.swift:33-38`); settings render inside the recall panel.
-- `AfterRayPreferences.recordAudio` (UserDefaults, `AfterRaySettings.swift:9-22`) is only a pre-daemon fallback; the daemon's `AppSettings` overwrites it on refresh.
+- `ComputeActivityController.show()` (`Sources/ComputeActivityPresentation.swift`) presents the compute dashboard the same way. Two entry points — the overlay cluster left of the gear, and the menu bar's "Local Computation…" — share one `AfterRayServices.shared.compute` ([why both](../../context/compute-governance.md)).
+- Daemon refresh overwrites `AfterRayPreferences.recordAudio`. Require microphone TCC only when an audio input exists; no input must not block Screen & System Audio.
 
 ## Build / run
 
 - `swift build --product afterray-app` / `make swift-app`; watch-mode signed dev app: `make dev`; one-shot signed bundle: `make v0`
-- `swift run afterray-app` is a bare binary — the `.app` bundle (Info.plist, Sparkle.framework, helper binaries in `Contents/Helpers`) is assembled by `scripts/build-release.sh` / `scripts/run-v0.sh` (see the linker rpath note in root `Package.swift:52-57`)
+- `swift run afterray-app` is bare; `scripts/build-release.sh` / `run-v0.sh` assemble the `.app` with Info.plist, Sparkle and helpers (rpath note: root `Package.swift:52-57`).
 
 ## Watch out
 

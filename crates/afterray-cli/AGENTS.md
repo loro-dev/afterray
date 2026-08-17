@@ -11,6 +11,7 @@ The `afterray` binary: a thin clap front-end that maps subcommands 1:1 onto `aft
 
 ## Watch out
 
+- `afterray compute` is read-only by design. Changing the compute mode or suspending work is a reversible choice that belongs next to the copy explaining what it costs — the app's panel — not in a shell one-liner.
 - `afterray download` does NOT talk to the daemon — `run_local_download` (`main.rs:597`) drives `afterray-models` directly. Intentional, not a bug.
 - `afterray daemon start` spawns `afterrayd` from `PATH` with `AFTERRAY_SOCKET` set (`main.rs:299`).
 - Some commands (`frame`, `slot prompt --user-only`) do their own multi-request dances and return early — don't assume one command = one request.

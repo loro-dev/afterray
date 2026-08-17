@@ -7,9 +7,10 @@ Single source of truth for the wire contract between `afterrayd` and its clients
 - `Request` enum (`src/lib.rs:22`): `#[serde(tag = "type", rename_all = "snake_case")]`, ~50 variants (`ping`, `status`, `timeline_since`, `search`, `chat_stream`, `shutdown`, …).
 - `Response` envelope (`src/lib.rs:275`): `{protocol_version, ok, data?, error?}`; `Response::success`/`failure` always stamp `PROTOCOL_VERSION` (`src/lib.rs:8`).
 - Three framings: single JSON line (default); artifact reads = JSON header line + exactly `byte_length` raw bytes (`ArtifactMeta`/`ArtifactPayload`, `src/lib.rs:742`); `ChatStreamEvent` (`src/lib.rs:826`) = NDJSON lines tagged `kind` until `done`/`error`. New binary/streaming requests must be intercepted in afterrayd's `handle` loop before `dispatch`, like the existing ones — `dispatch` rejects them.
-- `PROTOCOL_VERSION` (`src/lib.rs:8`) and `UnixSocketDaemonClient.protocolVersion` (`swift/AfterRayRecall/Sources/DaemonClient.swift`) must bump together — the Swift client hard-rejects any mismatch; there is no negotiation.
+- `PROTOCOL_VERSION` is **13** (`src/lib.rs:8`); it and `UnixSocketDaemonClient.protocolVersion` (`swift/AfterRayRecall/Sources/DaemonClient.swift`) must bump together — the Swift client hard-rejects any mismatch; there is no negotiation.
 - Evolve additively only: new optional fields with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Never rename variants/fields — the `*_wire_shape_is_stable` tests (`src/lib.rs:890+`) pin exact JSON bytes and will fail. Add a wire-shape test for every new/changed request, and mirror new request fields in Swift's `WireRequest` (manual snake_case CodingKeys in `DaemonClient.swift`).
 - Enums persisted in settings follow `LlmProvider` (`src/lib.rs:323`): lenient custom `Deserialize` degrading unknown/retired labels (`builtin`, `local`) to the default; strict serialization.
+- Compute dashboard types (`ComputeMode`, `ComputeWorkload`, `ComputeLane`, `ComputeGateCode`, `ComputeStatusReport`) sit next to `LlmProvider`. `ComputeLane` exists because macOS publishes no per-process GPU accounting — name the lane, never invent a percentage.
 - Shared helpers both daemon and clients rely on: `local_calendar_day_bounds_ms` (`src/lib.rs:864`), `summary_language_options()` (`src/lib.rs:436`).
 
 ## Socket paths (`src/socket.rs`)
