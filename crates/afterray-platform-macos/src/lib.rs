@@ -196,6 +196,15 @@ pub enum ArtifactKind {
     SystemAudio,
     Microphone,
     Accessibility,
+    /// An R3 edge snapshot (`docs/input-events-and-t1-acts-plan.md`): the same
+    /// accessibility payload as [`Self::Accessibility`], walked because the user
+    /// changed scope rather than because the heartbeat came round.
+    ///
+    /// Deliberately **unpaired**: it carries no screenshot, and the pairing
+    /// invariant that binds `Screen` to `Accessibility` does not apply to it. It
+    /// still needs the same exclusion check, because it is a whole window's
+    /// worth of text.
+    AccessibilityEdge,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -503,6 +512,29 @@ mod tests {
                 ended_at_ms: 100,
                 byte_count: 42,
                 request_id: Some("moment-1".into()),
+            }
+        );
+    }
+
+    /// R3 edge snapshots ride the ordinary artifact event, with the same
+    /// content type as a heartbeat tree and no `request_id`: nothing pulled
+    /// them, and no screenshot is paired with them.
+    #[test]
+    fn parses_accessibility_edge_artifact_event() {
+        let event: CaptureEvent = serde_json::from_str(
+            r#"{"event":"artifact","kind":"accessibility_edge","path":"/tmp/accessibility-edge-1.json","content_type":"application/vnd.afterray.ax+json","started_at_ms":1786698000000,"ended_at_ms":1786698000000,"byte_count":8192}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            CaptureEvent::Artifact {
+                kind: ArtifactKind::AccessibilityEdge,
+                path: PathBuf::from("/tmp/accessibility-edge-1.json"),
+                content_type: "application/vnd.afterray.ax+json".into(),
+                started_at_ms: 1_786_698_000_000,
+                ended_at_ms: 1_786_698_000_000,
+                byte_count: 8192,
+                request_id: None,
             }
         );
     }

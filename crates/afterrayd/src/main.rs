@@ -2169,6 +2169,11 @@ async fn import_artifact(
                 if let Err(error) = s.store.prune_input_events(now_ms()) {
                     eprintln!("input event retention failed: {error}");
                 }
+                // Edge snapshots expire with the events that triggered them, so
+                // they expire here, on the same tick, from the same clock.
+                if let Err(error) = s.store.prune_edge_snapshots(now_ms()) {
+                    eprintln!("edge snapshot retention failed: {error}");
+                }
                 Ok::<_, StoreError>(moment)
             })
             .await?;
@@ -2226,9 +2231,10 @@ async fn import_artifact(
         ArtifactKind::SystemAudio | ArtifactKind::Microphone => {
             let track = match kind {
                 ArtifactKind::Microphone => afterray_protocol::AudioTrack::Microphone,
-                ArtifactKind::SystemAudio | ArtifactKind::Screen | ArtifactKind::Accessibility => {
-                    afterray_protocol::AudioTrack::System
-                }
+                ArtifactKind::SystemAudio
+                | ArtifactKind::Screen
+                | ArtifactKind::Accessibility
+                | ArtifactKind::AccessibilityEdge => afterray_protocol::AudioTrack::System,
             };
             let session_id = session_id.to_owned();
             let content_type = content_type.to_owned();
@@ -2325,6 +2331,31 @@ async fn import_artifact(
             }
             tokio::fs::remove_file(path).await?;
         }
+        ArtifactKind::AccessibilityEdge => {
+            // Same exclusion posture as the accessibility branch, and for the
+            // same reason: this is a whole window's worth of text, and the app
+            // that owns it is named nowhere else. There is no moment to delete
+            // alongside it — an edge snapshot is unpaired — so an unjudgeable
+            // one is simply never stored.
+            let Some((bundle_identifier, url)) = edge_snapshot_identity(&bytes) else {
+                eprintln!("edge snapshot did not parse or named no app, dropping it unstored");
+                tokio::fs::remove_file(path).await?;
+                return Ok(());
+            };
+            if is_excluded_bundle(state, Some(&bundle_identifier))
+                || is_excluded_url(state, url.as_deref())
+            {
+                tokio::fs::remove_file(path).await?;
+                return Ok(());
+            }
+            // No moment, no thumbnail, no OCR job: an edge snapshot is not a
+            // frame of the screen, it is extra tree for the T1 join.
+            run_store(state, move |s| {
+                s.store.insert_edge_snapshot(started_at_ms, &bytes)
+            })
+            .await?;
+            tokio::fs::remove_file(path).await?;
+        }
     }
     Ok(())
 }
@@ -2337,6 +2368,19 @@ struct AccessibilityMetadata {
     /// area's `AXURL`. This is the structured address used for activity spans
     /// and website exclusions.
     url: Option<String>,
+}
+
+/// The app an R3 edge snapshot belongs to, plus the URL it exposes.
+///
+/// `None` means "do not store this": unparseable and unnamed are the same answer
+/// here, because the exclusion list is keyed by bundle identifier and a snapshot
+/// naming no app cannot be checked against it. Stricter than the heartbeat
+/// branch, which has a screenshot already on disk and must decide what to delete;
+/// an edge snapshot loses nothing by being dropped — the next trigger is one
+/// interaction away.
+fn edge_snapshot_identity(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    let metadata = serde_json::from_slice::<AccessibilityMetadata>(bytes).ok()?;
+    Some((metadata.bundle_identifier?, metadata.url))
 }
 
 fn attach_accessibility_artifact(
@@ -4146,6 +4190,36 @@ mod tests {
     use super::*;
 
     use tokio::io::AsyncReadExt;
+
+    /// The import path for an R3 edge snapshot is fail-closed: it stores the
+    /// tree only when the snapshot names the app it came from, because that name
+    /// is the only thing the exclusion list can be checked against.
+    #[test]
+    fn an_edge_snapshot_is_only_storable_once_it_names_its_app() {
+        assert_eq!(edge_snapshot_identity(b"not json at all"), None);
+        assert_eq!(edge_snapshot_identity(b"{}"), None, "parsed but unnamed");
+        assert_eq!(
+            edge_snapshot_identity(br#"{"application_name":"Safari"}"#),
+            None,
+            "a display name is not an exclusion key"
+        );
+        assert_eq!(
+            edge_snapshot_identity(
+                br#"{"bundle_identifier":"com.electron.lark","window_title":"Lody Team","root":{}}"#
+            ),
+            Some(("com.electron.lark".to_owned(), None))
+        );
+        assert_eq!(
+            edge_snapshot_identity(
+                br#"{"bundle_identifier":"com.apple.Safari","url":"https://example.com/x"}"#
+            ),
+            Some((
+                "com.apple.Safari".to_owned(),
+                Some("https://example.com/x".to_owned())
+            )),
+            "the URL must reach the domain exclusion check"
+        );
+    }
 
     #[test]
     fn model_download_request_rejects_ambiguous_or_unknown_pack_ids() {
