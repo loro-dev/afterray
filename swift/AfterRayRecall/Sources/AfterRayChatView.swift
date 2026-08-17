@@ -202,23 +202,21 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        if model.bubbles.isEmpty, !model.isSending {
-                            emptyState
-                                .padding(.top, 48)
-                        }
-                        ForEach(model.bubbles) { bubble in
-                            if bubble.role == .compaction {
-                                ChatCompactionRule(text: bubble.text)
-                                    .id(bubble.id)
-                            } else {
-                                ChatBubbleView(
-                                    bubble: bubble,
-                                    thumbnailLoader: thumbnailLoader,
-                                    onOpenMoment: onOpenMoment
-                                )
-                                    .id(bubble.id)
+                    // History is lazy; the tail (last bubble + sentinel) stays
+                    // mounted so a stream-end identity swap cannot unload the
+                    // visible answer when we refuse to scrollTo across a collapse.
+                    VStack(alignment: .leading, spacing: 14) {
+                        LazyVStack(alignment: .leading, spacing: 14) {
+                            if model.bubbles.isEmpty, !model.isSending {
+                                emptyState
+                                    .padding(.top, 48)
                             }
+                            ForEach(historyBubbles) { bubble in
+                                messageRow(bubble)
+                            }
+                        }
+                        if let bubble = tailBubble {
+                            messageRow(bubble)
                         }
                         Color.clear
                             .frame(height: 1)
@@ -231,6 +229,10 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .padding(.vertical, 16)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                // macOS 14: pin growing content only while a turn is streaming
+                // and the user still wants latest. Idle size changes must not
+                // consult a bottom anchor — that is the old re-stick trap.
+                .defaultScrollAnchor(pinsToBottom ? .bottom : nil)
                 .background(ScrollFenceView())
                 .task(id: scrollToLatestRequest) {
                     guard scrollToLatestRequest > 0 else { return }
@@ -245,14 +247,26 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                         .transition(.opacity)
                 }
             }
+            .onAppear {
+                if !model.isLoadingHistory, !model.bubbles.isEmpty {
+                    applyScrollAction(autoScrollState.noteConversationContentReady())
+                }
+            }
             .onChange(of: model.bubbles.last?.text) { _, _ in
                 requestLatestScrollIfFollowing()
             }
-            .onChange(of: model.isSending) { _, isSending in
-                if isSending {
-                    autoScrollState.followLatest()
+            .onChange(of: model.bubbles.count) { _, count in
+                if count > 0, !model.isSending {
+                    applyScrollAction(autoScrollState.noteConversationContentReady())
                 }
-                requestLatestScrollIfFollowing()
+            }
+            .onChange(of: model.isLoadingHistory) { _, loading in
+                if !loading {
+                    applyScrollAction(autoScrollState.noteConversationContentReady())
+                }
+            }
+            .onChange(of: model.isSending) { _, isSending in
+                applyScrollAction(autoScrollState.noteSendingChanged(isSending))
             }
             .onChange(of: model.selectedID) { _, _ in
                 autoScrollState.resetForConversation()
@@ -262,25 +276,52 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func handleScrollMetrics(_ metrics: ChatScrollMetrics) {
-        autoScrollState.observe(
-            distanceFromBottom: metrics.distanceFromBottom,
-            isUserScrolling: metrics.isUserScrolling
-        )
-        if autoScrollState.isFollowingLatest,
-           metrics.distanceFromBottom > 1 {
-            requestLatestScroll()
+    private var historyBubbles: [ChatBubble] {
+        guard model.bubbles.count > 1 else { return [] }
+        return Array(model.bubbles.dropLast())
+    }
+
+    private var tailBubble: ChatBubble? {
+        model.bubbles.last
+    }
+
+    private var pinsToBottom: Bool {
+        autoScrollState.isFollowingLatest && model.isSending
+    }
+
+    @ViewBuilder
+    private func messageRow(_ bubble: ChatBubble) -> some View {
+        if bubble.role == .compaction {
+            ChatCompactionRule(text: bubble.text)
+                .id(bubble.id)
+        } else {
+            ChatBubbleView(
+                bubble: bubble,
+                thumbnailLoader: thumbnailLoader,
+                onOpenMoment: onOpenMoment
+            )
+            .id(bubble.id)
         }
     }
 
+    private func handleScrollMetrics(_ metrics: ChatScrollMetrics) {
+        applyScrollAction(autoScrollState.decide(metrics: metrics, isSending: model.isSending))
+    }
+
     private func requestLatestScrollIfFollowing() {
-        guard autoScrollState.isFollowingLatest else { return }
+        guard autoScrollState.isFollowingLatest, model.isSending else { return }
         requestLatestScroll()
     }
 
     private func followLatest() {
         autoScrollState.followLatest()
         requestLatestScroll()
+    }
+
+    private func applyScrollAction(_ action: ChatScrollAction) {
+        if action == .scrollToLatest {
+            requestLatestScroll()
+        }
     }
 
     private func requestLatestScroll() {
