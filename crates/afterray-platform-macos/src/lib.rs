@@ -14,7 +14,8 @@ mod power;
 pub use locale::preferred_languages;
 pub use memory::{GIB, context_tokens_for_memory, local_context_tokens, total_memory_bytes};
 pub use peer::{
-    APP_BUNDLE_IDENTIFIER, DEV_TRUST_IDENTIFIER_ENV, app_peer_is_trusted, peer_is_afterray_app,
+    APP_BUNDLE_IDENTIFIER, CodeIdentity, app_peer_is_trusted, parent_app_anchor,
+    peer_is_afterray_app,
 };
 
 pub use power::{

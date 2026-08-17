@@ -19,7 +19,7 @@ use afterray_models::{
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
-    apply_background_qos, peer_is_afterray_app,
+    apply_background_qos, parent_app_anchor, peer_is_afterray_app,
 };
 use afterray_protocol::{
     AppSettings, ArtifactPayload, CLI_EVIDENCE_WINDOW_MS, DEFAULT_STORAGE_LIMIT_BYTES, GopReadMode,
@@ -225,6 +225,12 @@ async fn async_main() -> anyhow::Result<()> {
     let capture_paused = Arc::new(AtomicBool::new(false));
     let last_capture_ms = Arc::new(AtomicI64::new(0));
     let recording_active = Arc::new(AtomicBool::new(false));
+    let app_anchor = parent_app_anchor();
+    if app_anchor.is_none() {
+        eprintln!(
+            "no AfterRay parent to pin; socket clients stay on the CLI query surface"
+        );
+    }
     let state = Arc::new(AppState {
         store,
         capture,
@@ -261,6 +267,7 @@ async fn async_main() -> anyhow::Result<()> {
             persisted.summary_language.clone(),
         )),
         cli_evidence_until_ms: std::sync::Mutex::new(persisted.cli_evidence_until_ms),
+        app_anchor,
         llm_config,
         llm_token_sink,
         mlx_adapters,
@@ -480,6 +487,9 @@ struct AppState {
     languages: std::sync::Mutex<(String, String)>,
     /// Close of the CLI evidence window. `None` or a past instant is off.
     cli_evidence_until_ms: std::sync::Mutex<Option<i64>>,
+    /// AfterRay.app that spawned us (Team ID and/or cdhash). Absent when
+    /// afterrayd was started from a shell — then nobody is privileged.
+    app_anchor: Option<afterray_platform_macos::CodeIdentity>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     llm_token_sink: LlmTokenSink,
     mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
@@ -600,7 +610,7 @@ fn recording_state_of(runtime: &RecordingRuntime) -> RecordingState {
 }
 
 async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> {
-    let privileged = client_is_privileged(&stream);
+    let privileged = client_is_privileged(&stream, &state);
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
@@ -632,9 +642,9 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn client_is_privileged(stream: &UnixStream) -> bool {
+fn client_is_privileged(stream: &UnixStream, state: &AppState) -> bool {
     use std::os::fd::AsRawFd as _;
-    peer_is_afterray_app(stream.as_raw_fd())
+    peer_is_afterray_app(stream.as_raw_fd(), state.app_anchor.as_ref())
 }
 
 fn cli_evidence_until_ms(state: &AppState) -> Option<i64> {

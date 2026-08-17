@@ -6,7 +6,7 @@ AfterRay has **three separate JSON protocols**: the versioned control socket bet
 
 ## 1. Control socket: afterrayd ↔ CLI / SwiftUI app
 
-- Single source of truth: `crates/afterray-protocol`. `Request` is tagged snake_case; responses use `{protocol_version, ok, data?, error?}`; `PROTOCOL_VERSION = 13`. Unprivileged peers (CLI/agents) are gated in the daemon: Query always, Evidence only while `cli_evidence_until_ms` is in the future, Privileged (writes/ask/chat) never. The app is identified by socket audit token + code signature (Team ID + `dev.afterray.app`), not by path.
+- Single source of truth: `crates/afterray-protocol`. `Request` is tagged snake_case; responses use `{protocol_version, ok, data?, error?}`; `PROTOCOL_VERSION = 13`. Unprivileged peers (CLI/agents) are gated in the daemon: Query always, Evidence only while `cli_evidence_until_ms` is in the future, Privileged (writes/ask/chat) never. The app is identified by socket audit token + a valid `dev.afterray.app` signature whose Team ID matches, or whose cdhash matches the AfterRay process that spawned the daemon. Identifier-only ad-hoc signatures are not enough.
 - Framing: one request = one JSON object + `\n` over a Unix socket. Three response shapes:
   - single JSON line — the default, served by `dispatch` (`crates/afterrayd/src/main.rs:625`);
   - artifact reads (`ReadArtifact` / `ReadGopSegment` / `ReadGopFrame` / `ReadThumbnail`) — a JSON header line (`ArtifactMeta`) followed by exactly `byte_length` raw bytes;
