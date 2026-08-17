@@ -12,8 +12,23 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Legacy wall-clock length used before the persisted 10-minute cutover.
 pub const SLOT_DURATION_MS: i64 = 30 * 60 * 1000;
-/// Wall-clock length used by new vaults and after an upgraded vault's cutover.
+/// Wall-clock length a vault starts with, and the one an upgraded vault
+/// switches to at its cutover. The user may change it from here.
 pub const CURRENT_SLOT_DURATION_MS: i64 = 10 * 60 * 1000;
+
+/// Slot lengths the user may choose, in minutes. Every one divides an hour, so
+/// whichever is picked, slots start on clock times a person recognises.
+pub const SLOT_DURATION_CHOICES_MINUTES: [i64; 4] = [10, 20, 30, 60];
+
+/// Milliseconds for an offered slot length, or `None` for one not offered.
+/// The catalogue is the validation — a free-form minute count would let a
+/// client persist a geometry no other client can render or reason about.
+#[must_use]
+pub fn slot_duration_ms_for_minutes(minutes: i64) -> Option<i64> {
+    SLOT_DURATION_CHOICES_MINUTES
+        .contains(&minutes)
+        .then(|| minutes * 60 * 1000)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotBounds {
@@ -21,7 +36,63 @@ pub struct SlotBounds {
     pub end_ms: i64,
 }
 
-/// Bounds for the slot containing `at_ms`.
+/// One stretch of wall-clock over which every slot had the same length.
+///
+/// Slot geometry is a history, not a single setting: cards already written
+/// keep the shape they were summarised at, and a change only governs the time
+/// after it. The first segment always reaches back to `i64::MIN`, so every
+/// instant lands in exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotSegment {
+    pub from_ms: i64,
+    pub duration_ms: i64,
+}
+
+impl SlotSegment {
+    #[must_use]
+    pub const fn new(from_ms: i64, duration_ms: i64) -> Self {
+        Self {
+            from_ms,
+            duration_ms,
+        }
+    }
+}
+
+/// Bounds for the slot containing `at_ms` under a geometry history.
+///
+/// Segments must be sorted by `from_ms`. A slot never crosses a segment
+/// boundary: the stretch in progress when the length changed is clipped at the
+/// change rather than straddling two geometries, which would put one moment in
+/// two slots — or, read from the other side, in none.
+#[must_use]
+pub fn slot_bounds_in(at_ms: i64, segments: &[SlotSegment]) -> SlotBounds {
+    let index = segments
+        .iter()
+        .rposition(|segment| segment.from_ms <= at_ms)
+        .unwrap_or(0);
+    let Some(segment) = segments.get(index) else {
+        let start_ms = slot_start_for_duration(at_ms, CURRENT_SLOT_DURATION_MS);
+        return SlotBounds {
+            start_ms,
+            end_ms: start_ms.saturating_add(CURRENT_SLOT_DURATION_MS),
+        };
+    };
+    let duration_ms = segment.duration_ms.max(1);
+    // Both ends are clipped against the segment, but the length is measured
+    // from the *grid* start, not from the clip. Measuring from the clip would
+    // push the first slot after a change past the next boundary, and the slot
+    // after that — cut on the grid — would start inside it.
+    let grid_start_ms = slot_start_for_duration(at_ms, duration_ms);
+    let start_ms = grid_start_ms.max(segment.from_ms);
+    let end_ms = segments
+        .get(index + 1)
+        .map_or(i64::MAX, |next| next.from_ms)
+        .min(grid_start_ms.saturating_add(duration_ms))
+        .max(start_ms.saturating_add(1));
+    SlotBounds { start_ms, end_ms }
+}
+
+/// Bounds for the slot containing `at_ms` under the pre-settings geometry.
 ///
 /// `cutover_ms == None` is a new vault and therefore uses 10-minute slots
 /// everywhere. Upgraded vaults retain 30-minute slots before the persisted
@@ -29,15 +100,19 @@ pub struct SlotBounds {
 /// gap or overlap.
 #[must_use]
 pub fn slot_bounds_for(at_ms: i64, cutover_ms: Option<i64>) -> SlotBounds {
-    let duration_ms = if cutover_ms.is_some_and(|cutover| at_ms < cutover) {
-        SLOT_DURATION_MS
-    } else {
-        CURRENT_SLOT_DURATION_MS
-    };
-    let start_ms = slot_start_for_duration(at_ms, duration_ms);
-    SlotBounds {
-        start_ms,
-        end_ms: start_ms.saturating_add(duration_ms),
+    slot_bounds_in(at_ms, &legacy_segments(cutover_ms))
+}
+
+/// The geometry an upgraded vault carried before slot length became a setting,
+/// expressed as segments. Seeds the persisted history on migration.
+#[must_use]
+pub fn legacy_segments(cutover_ms: Option<i64>) -> Vec<SlotSegment> {
+    match cutover_ms {
+        Some(cutover) => vec![
+            SlotSegment::new(i64::MIN, SLOT_DURATION_MS),
+            SlotSegment::new(cutover, CURRENT_SLOT_DURATION_MS),
+        ],
+        None => vec![SlotSegment::new(i64::MIN, CURRENT_SLOT_DURATION_MS)],
     }
 }
 
@@ -1996,6 +2071,68 @@ mod tests {
     #[test]
     fn new_vault_uses_ten_minute_slots_from_the_start() {
         let bounds = slot_bounds_for(1_786_699_244_105, None);
+        assert_eq!(bounds.end_ms - bounds.start_ms, CURRENT_SLOT_DURATION_MS);
+    }
+
+    #[test]
+    fn chosen_slot_lengths_are_the_only_ones_accepted() {
+        for minutes in SLOT_DURATION_CHOICES_MINUTES {
+            assert_eq!(
+                slot_duration_ms_for_minutes(minutes),
+                Some(minutes * 60_000)
+            );
+        }
+        for rejected in [0, 1, 7, 15, 45, 90, -10] {
+            assert_eq!(slot_duration_ms_for_minutes(rejected), None);
+        }
+    }
+
+    /// The property every consumer depends on: whatever the geometry history,
+    /// the slots tile time — no instant is in two of them, and none is in
+    /// zero. Walking forward from a slot's end must land on the next start.
+    #[test]
+    fn changed_slot_length_tiles_time_without_gap_or_overlap() {
+        let base = slot_start_for_duration(1_786_699_244_105, 60 * 60 * 1000);
+        // A change landing mid-slot, which is what pressing the control does.
+        let changed_at = base + 25 * 60_000;
+        let segments = [
+            SlotSegment::new(i64::MIN, 10 * 60_000),
+            SlotSegment::new(changed_at, 30 * 60_000),
+        ];
+
+        let clipped = slot_bounds_in(changed_at - 1, &segments);
+        assert_eq!(clipped.start_ms, base + 20 * 60_000);
+        assert_eq!(clipped.end_ms, changed_at, "old slot is clipped, not extended");
+
+        let first = slot_bounds_in(changed_at, &segments);
+        assert_eq!(first.start_ms, changed_at, "new slot starts at the change");
+        assert_eq!(first.end_ms, base + 30 * 60_000);
+
+        let mut at = base - 40 * 60_000;
+        for _ in 0..20 {
+            let bounds = slot_bounds_in(at, &segments);
+            assert!(bounds.start_ms <= at && at < bounds.end_ms);
+            let next = slot_bounds_in(bounds.end_ms, &segments);
+            assert_eq!(next.start_ms, bounds.end_ms);
+            at = bounds.end_ms;
+        }
+    }
+
+    #[test]
+    fn hour_long_slots_start_on_the_hour() {
+        let segments = [SlotSegment::new(i64::MIN, 60 * 60_000)];
+        let bounds = slot_bounds_in(1_786_699_244_105, &segments);
+        assert_eq!(bounds.end_ms - bounds.start_ms, 60 * 60_000);
+        assert_eq!(bounds.start_ms % 60_000, 0);
+        assert_eq!(
+            slot_bounds_in(bounds.start_ms, &segments).start_ms,
+            bounds.start_ms
+        );
+    }
+
+    #[test]
+    fn empty_geometry_falls_back_to_the_default_length() {
+        let bounds = slot_bounds_in(1_786_699_244_105, &[]);
         assert_eq!(bounds.end_ms - bounds.start_ms, CURRENT_SLOT_DURATION_MS);
     }
 

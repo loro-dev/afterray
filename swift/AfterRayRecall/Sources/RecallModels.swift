@@ -582,12 +582,21 @@ public struct LanguageOption: Codable, Equatable, Identifiable, Sendable {
 public struct AppSettings: Codable, Equatable, Sendable {
     public static let defaultStorageLimitBytes: UInt64 = 100_000_000_000
     public static let defaultLanguage = LanguageOption.autoCode
+    /// What one summary covers when the daemon does not say. Matches the
+    /// daemon's own default; an older daemon that omits the field is on it.
+    public static let defaultSummarySlotMinutes: UInt32 = 10
 
     public let dataDir: String
     public let modelDir: String
     public let recordAudio: Bool
     public let captureIntervalSeconds: UInt64
     public let storageLimitBytes: UInt64
+    /// Wall-clock minutes one summary card covers. Changing it governs future
+    /// summaries only; days already summarised keep the shape they were read at.
+    public let summarySlotMinutes: UInt32
+    /// Lengths the picker offers. Empty means an older daemon, and the UI
+    /// falls back to the length in force so the control still reads true.
+    public let summarySlotMinutesOptions: [UInt32]
     public let excludedBundleIds: [String]
     /// Credential-bearing and system apps the daemon never captures.
     public let protectedBundleIds: [String]
@@ -611,6 +620,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         recordAudio: Bool,
         captureIntervalSeconds: UInt64,
         storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
+        summarySlotMinutes: UInt32 = Self.defaultSummarySlotMinutes,
+        summarySlotMinutesOptions: [UInt32] = [],
         excludedBundleIds: [String] = [],
         protectedBundleIds: [String] = [],
         excludedDomains: [String] = [],
@@ -629,6 +640,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.recordAudio = recordAudio
         self.captureIntervalSeconds = captureIntervalSeconds
         self.storageLimitBytes = storageLimitBytes
+        self.summarySlotMinutes = summarySlotMinutes
+        self.summarySlotMinutesOptions = summarySlotMinutesOptions
         self.excludedBundleIds = excludedBundleIds
         self.protectedBundleIds = protectedBundleIds
         self.excludedDomains = excludedDomains
@@ -649,6 +662,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case recordAudio = "record_audio"
         case captureIntervalSeconds = "capture_interval_seconds"
         case storageLimitBytes = "storage_limit_bytes"
+        case summarySlotMinutes = "summary_slot_minutes"
+        case summarySlotMinutesOptions = "summary_slot_minutes_options"
         case excludedBundleIds = "excluded_bundle_ids"
         case protectedBundleIds = "protected_bundle_ids"
         case excludedDomains = "excluded_domains"
@@ -671,6 +686,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
         captureIntervalSeconds = try container.decode(UInt64.self, forKey: .captureIntervalSeconds)
         storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
             ?? Self.defaultStorageLimitBytes
+        summarySlotMinutes = try container.decodeIfPresent(UInt32.self, forKey: .summarySlotMinutes)
+            ?? Self.defaultSummarySlotMinutes
+        summarySlotMinutesOptions = try container.decodeIfPresent(
+            [UInt32].self, forKey: .summarySlotMinutesOptions
+        ) ?? []
         excludedBundleIds = try container.decodeIfPresent([String].self, forKey: .excludedBundleIds) ?? []
         protectedBundleIds = try container.decodeIfPresent([String].self, forKey: .protectedBundleIds) ?? []
         excludedDomains = try container.decodeIfPresent([String].self, forKey: .excludedDomains) ?? []
@@ -691,6 +711,28 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public func cliEvidenceIsActive(at now: Date = Date()) -> Bool {
         guard let until = cliEvidenceUntilMs else { return false }
         return until > Int64(now.timeIntervalSince1970 * 1000)
+    }
+
+    /// Whole hours read as hours. "60 minutes" sitting in a menu beside
+    /// "30 minutes" makes the reader do arithmetic to spot the option they
+    /// came for.
+    public static func summaryLengthLabel(_ minutes: UInt32) -> String {
+        guard minutes >= 60, minutes % 60 == 0 else {
+            return "\(minutes) minutes"
+        }
+        let hours = minutes / 60
+        return hours == 1 ? "1 hour" : "\(hours) hours"
+    }
+
+    /// Rows for the summary-length picker, always including the length in
+    /// force. A daemon that offers no catalogue still gets a control that
+    /// reads true rather than one showing a length nobody chose.
+    public var summarySlotMinutesPickerOptions: [UInt32] {
+        var options = summarySlotMinutesOptions
+        if !options.contains(summarySlotMinutes) {
+            options.append(summarySlotMinutes)
+        }
+        return options.sorted()
     }
 
     /// Rows for a language picker. The catalogue itself is never hardcoded here;

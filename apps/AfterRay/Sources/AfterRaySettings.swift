@@ -61,6 +61,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var isControllingDownload = false
     @Published var isUpdatingAudio = false
     @Published var isUpdatingStorageLimit = false
+    @Published var isUpdatingSummarySlot = false
     @Published var isUpdatingLanguage = false
     @Published var isUpdatingExclusions = false
     @Published var isClearingHistory = false
@@ -422,6 +423,25 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
             )
             message = "Memory limit set to \(AfterRayStorageSnapshot.byteCount(bytes))."
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func setSummarySlotMinutes(_ minutes: UInt32) async {
+        guard minutes != settings?.summarySlotMinutes else { return }
+        isUpdatingSummarySlot = true
+        defer { isUpdatingSummarySlot = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: nil,
+                summarySlotMinutes: minutes
+            )
+            message = "New summaries will cover \(AppSettings.summaryLengthLabel(minutes))."
         } catch {
             message = error.localizedDescription
         }

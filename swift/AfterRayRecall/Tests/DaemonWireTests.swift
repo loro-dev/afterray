@@ -286,6 +286,46 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["summary_language"] as? String, "ja")
     }
 
+    func testUpdateSettingsRequestIncludesSummarySlotMinutes() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", summarySlotMinutes: 30)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["summary_slot_minutes"] as? UInt32, 30)
+        XCTAssertNil(json["storage_limit_bytes"])
+    }
+
+    func testAppSettingsDecodesTheSummaryLengthAndItsCatalogue() throws {
+        let json = """
+        {"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,\
+        "summary_slot_minutes":30,"summary_slot_minutes_options":[10,20,30,60]}
+        """
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.summarySlotMinutes, 30)
+        XCTAssertEqual(settings.summarySlotMinutesPickerOptions, [10, 20, 30, 60])
+    }
+
+    /// An older daemon sends neither field. The control must still show the
+    /// length actually in force rather than an empty menu.
+    func testSummaryLengthFallsBackToTheLengthInForce() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.summarySlotMinutes, AppSettings.defaultSummarySlotMinutes)
+        XCTAssertEqual(
+            settings.summarySlotMinutesPickerOptions,
+            [AppSettings.defaultSummarySlotMinutes]
+        )
+    }
+
+    func testSummaryLengthLabelReadsHoursAsHours() {
+        XCTAssertEqual(AppSettings.summaryLengthLabel(10), "10 minutes")
+        XCTAssertEqual(AppSettings.summaryLengthLabel(30), "30 minutes")
+        XCTAssertEqual(AppSettings.summaryLengthLabel(60), "1 hour")
+        XCTAssertEqual(AppSettings.summaryLengthLabel(120), "2 hours")
+        XCTAssertEqual(AppSettings.summaryLengthLabel(90), "90 minutes")
+    }
+
     func testUpdateSettingsRequestIncludesStorageLimit() throws {
         let data = try JSONEncoder().encode(
             WireRequest(type: "update_settings", storageLimitBytes: 250_000_000_000)
@@ -606,7 +646,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 13)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 14)
     }
 
     func testCaptureSetPausedRequestMatchesRustShape() throws {
