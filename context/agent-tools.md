@@ -138,7 +138,10 @@ the redesign arrives; nothing irreversible was given up by stopping.
 ## Narrowing happens in SQL
 
 `SearchFilter` (time range + application) is applied inside the query, before
-ranking. Ranked-then-filtered answers a different question than the caller
+ranking, and `search_summaries` matches JSON *values* through `json_each`
+rather than the serialised card — `LIKE` on the raw text also matched serde's
+key names, so searching for `text` or `name` filled the candidate window with
+rows the exact matcher then discarded. Ranked-then-filtered answers a different question than the caller
 asked, and answers it with silence: ask for last month's work on a term you
 also used this week, and the global ranking fills with recent hits, the
 post-filter drops all of them, and the tool reports nothing while the evidence

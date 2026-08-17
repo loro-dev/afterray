@@ -1736,34 +1736,40 @@ impl Vault {
         // one old summary that recorded it as a grounded entity fell outside
         // the window and became unreachable, however small the limit.
         //
-        // This `CASE` is prefilter-grade, like the `LIKE` it reuses — it reads
-        // raw JSON, so it can call a row an entity match that
-        // `match_slot_mention` later classifies as prose. That direction is
-        // harmless: it only decides which rows are read, and the classification
-        // below is what the caller sees.
-        let mut statement = connection.prepare(
+        // Both the test and the rank read **values**, through `json_each`, not
+        // the serialised JSON around them. `entities_json LIKE '%text%'`
+        // matched the `"text"` key on every card that had any entity at all,
+        // and `threads_json` did the same for `"name"` and `"prose"`: ordinary
+        // words to search for, and each one filled the window with rows that
+        // `match_slot_mention` then discarded — reaching nothing while
+        // reporting nothing, for exactly the terms a person would try.
+        let mut statement = connection.prepare(&format!(
             "SELECT slot_start_ms, slot_end_ms, local_day, title,
                     threads_json, entities_json, decisions_json
                FROM slot_summaries
               WHERE schema_version >= ?1
                 AND (?2 IS NULL OR slot_start_ms >= ?2)
                 AND (?3 IS NULL OR slot_start_ms <= ?3)
+                -- Cheap superset gate, so the per-value tests below only run
+                -- on rows that could possibly match: a value containing the
+                -- pattern implies the raw JSON does too.
                 AND (title LIKE ?4 ESCAPE '\\'
                      OR threads_json LIKE ?4 ESCAPE '\\'
                      OR entities_json LIKE ?4 ESCAPE '\\')
+                AND (title LIKE ?4 ESCAPE '\\' OR {ENTITY_VALUE_MATCH} OR {THREAD_VALUE_MATCH})
                 AND (?6 IS NULL OR EXISTS (
                       SELECT 1 FROM moments frame
                        WHERE frame.captured_at_ms >= slot_start_ms
                          AND frame.captured_at_ms < slot_end_ms
                          AND frame.application_name = ?6 COLLATE NOCASE))
               ORDER BY CASE
-                         WHEN entities_json LIKE ?4 ESCAPE '\\' THEN 2
+                         WHEN {ENTITY_VALUE_MATCH} THEN 2
                          WHEN title LIKE ?4 ESCAPE '\\' THEN 1
                          ELSE 0
                        END DESC,
                        slot_start_ms DESC
-              LIMIT ?5",
-        )?;
+              LIMIT ?5"
+        ))?;
         let rows = statement.query_map(
             params![
                 slot::SLOT_SUMMARY_SCHEMA_VERSION,
@@ -3840,6 +3846,20 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
 /// silently, so this one is deliberately looser.
 ///
 /// `None` when the query has nothing to match on.
+/// Whether a stored entity's `text` contains the searched pattern.
+///
+/// Reads the value, not the JSON it sits in. `entities_json LIKE ?` also
+/// matches the field names serde writes — `"text"`, `"kind"`, `"moment_id"` —
+/// so searching for any of those matched every card that had an entity.
+const ENTITY_VALUE_MATCH: &str = "EXISTS (SELECT 1 FROM json_each(entities_json) entity \
+     WHERE json_extract(entity.value, '$.text') LIKE ?4 ESCAPE '\\')";
+
+/// The same for a thread's name and prose, whose keys are `"name"`, `"prose"`
+/// and `"moment_ids"`.
+const THREAD_VALUE_MATCH: &str = "EXISTS (SELECT 1 FROM json_each(threads_json) thread \
+     WHERE json_extract(thread.value, '$.name') LIKE ?4 ESCAPE '\\' \
+        OR json_extract(thread.value, '$.prose') LIKE ?4 ESCAPE '\\')";
+
 fn like_prefilter(query: &str) -> Option<String> {
     let token = query.split_whitespace().max_by_key(|part| part.len())?;
     if token.is_empty() {
@@ -7906,6 +7926,106 @@ mod tests {
             "the entity match was buried under newer prose: {hits:?}"
         );
         assert_eq!(hits[0].matched_entities, vec!["lody".to_owned()]);
+    }
+
+    /// A field name is not a hit.
+    ///
+    /// The candidate query ran `LIKE` against the serialised card, so the keys
+    /// serde writes — `"text"`, `"kind"`, `"name"`, `"prose"` — matched every
+    /// card that had an entity or a thread. `match_slot_mention` discarded them
+    /// afterwards, so nothing wrong was ever printed; what they did was fill
+    /// the candidate window, which put the real older match out of reach. That
+    /// is the same unreachability as ranking after truncation, arriving by a
+    /// different road.
+    #[test]
+    fn find_slot_mentions_does_not_match_the_json_field_names() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (day_start, _) = local_day_bounds(1_786_698_000_000);
+
+        // The oldest card genuinely records `text` as an entity: a real hit
+        // that has to survive everything below.
+        let oldest = day_start;
+        insert_named_moment(&vault, &session.id, oldest, "Zed", "dev.zed.Zed", "a.rs");
+        let card = vault.slot_card(oldest, 10_000).unwrap();
+        vault
+            .put_t2_summary_v2(
+                &card,
+                &T2CardV2 {
+                    title: "Wrote the parser".into(),
+                    description: String::new(),
+                    threads: vec![],
+                    entities: vec![T2Entity {
+                        text: "text".into(),
+                        kind: Some("crate".into()),
+                        moment_id: None,
+                    }],
+                    decisions: vec![],
+                    not_captured: vec![],
+                    category: None,
+                    confidence: Some(0.9),
+                },
+                "test",
+                oldest,
+                None,
+            )
+            .unwrap();
+
+        // Then 401 newer cards that mention it nowhere — but whose serialised
+        // entities and threads all contain the literal keys.
+        for index in 1..=401_i64 {
+            let at_ms = day_start + index * SLOT_DURATION_MS;
+            insert_named_moment(&vault, &session.id, at_ms, "Zed", "dev.zed.Zed", "b.rs");
+            let card = vault.slot_card(at_ms, 10_000).unwrap();
+            vault
+                .put_t2_summary_v2(
+                    &card,
+                    &T2CardV2 {
+                        title: format!("Unrelated {index}"),
+                        description: String::new(),
+                        threads: vec![T2Thread {
+                            name: "review".into(),
+                            prose: "read a diff".into(),
+                            moment_ids: vec![],
+                        }],
+                        entities: vec![T2Entity {
+                            text: "rav1e".into(),
+                            kind: Some("crate".into()),
+                            moment_id: None,
+                        }],
+                        decisions: vec![],
+                        not_captured: vec![],
+                        category: None,
+                        confidence: Some(0.3),
+                    },
+                    "test",
+                    at_ms,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Every key that appears in the serialised card, searched for by name.
+        for key in ["text", "kind", "name", "prose", "moment_ids"] {
+            let hits = vault
+                .find_slot_mentions(key, &SearchFilter::default(), 20)
+                .unwrap();
+            let expected: Vec<i64> = if key == "text" { vec![oldest] } else { vec![] };
+            assert_eq!(
+                hits.iter().map(|hit| hit.slot_start_ms).collect::<Vec<_>>(),
+                expected,
+                "`{key}` matched field names rather than values"
+            );
+        }
+
+        // And the real entity is reachable at a limit of one, which it cannot
+        // be if four hundred false candidates are read ahead of it.
+        let hits = vault
+            .find_slot_mentions("text", &SearchFilter::default(), 1)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slot_start_ms, oldest);
+        assert_eq!(hits[0].matched_entities, vec!["text".to_owned()]);
     }
 
     /// The matching rule itself, without a database: `LIKE` is the prefilter,
