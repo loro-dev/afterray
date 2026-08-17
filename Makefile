@@ -1,4 +1,4 @@
-.PHONY: check test test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile settings-lab chat-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
+.PHONY: check test test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile settings-lab chat-lab compute-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
 
 # `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
 # `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
@@ -61,6 +61,11 @@ settings-lab:
 
 chat-lab:
 	swift run afterray-visual-lab -- --chat
+
+# The local-computation dashboard on fixtures. Opens on the awkward state
+# (on battery, summaries held) because that is what it has to read well in.
+compute-lab:
+	swift run afterray-visual-lab -- --compute
 
 # Offscreen PNGs of the recall surfaces on mock data. No daemon, no capture,
 # no window on screen. Override the destination: make snapshots OUT=/tmp/x

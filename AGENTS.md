@@ -20,7 +20,7 @@ Before editing, read every `AGENTS.md` along the path from root to leaf. Every `
 - [scripts/](scripts/AGENTS.md) — dev loop, signing/notarization/Sparkle release, publish; the root `Makefile` is the entry point
 - [site/](site/AGENTS.md) — afterray.com: React+Vite, Cloudflare Pages, R2-backed appcast/download functions
 - [docs/](docs/AGENTS.md) — specs and plans (some plans are historical; code wins)
-- [context/](context/) — navigation articles: [capture-pipeline](context/capture-pipeline.md), [wire-protocol](context/wire-protocol.md), [agent-tools](context/agent-tools.md); [CONTEXT-GAPS.md](context/CONTEXT-GAPS.md) — gaps backlog
+- [context/](context/) — navigation articles: [capture-pipeline](context/capture-pipeline.md), [wire-protocol](context/wire-protocol.md), [compute-governance](context/compute-governance.md), [agent-tools](context/agent-tools.md); [CONTEXT-GAPS.md](context/CONTEXT-GAPS.md) — gaps backlog
 - `skills/afterray/` — the shipped Agent Skill for the read-only CLI surface; keep in sync with `afterray-cli`
 
 ## Working agreements

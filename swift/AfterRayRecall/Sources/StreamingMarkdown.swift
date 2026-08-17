@@ -1,17 +1,17 @@
 import Foundation
 
-/// Line-oriented markdown so a half-finished stream cannot collapse the
-/// whole assistant bubble. Each block is complete enough to render; an
-/// unclosed fence stays a code block instead of poisoning later paragraphs.
+/// Streaming-safe slices of assistant Markdown.
+///
+/// Closed prose, lists, tables, and quotes are coalesced into one
+/// `.markdown` value so MarkdownUI owns structure. The splitter only
+/// isolates the things a full re-parse would get wrong mid-stream:
+/// unclosed fences, `afterray://moment` image citations, and unfinished
+/// image syntax. Block identity is prefix-stable: completed leading slices
+/// do not change as later tokens arrive.
 public enum MarkdownBlock: Equatable, Sendable {
-    case heading(level: Int, text: String)
-    case paragraph(String)
+    case markdown(String)
     case momentImage(label: String, momentID: String)
-    case bulletedList([String])
-    case numberedList([String])
     case code(language: String?, text: String, closed: Bool)
-    case quote(String)
-    case rule
 }
 
 public enum StreamingMarkdown {
@@ -19,12 +19,28 @@ public enum StreamingMarkdown {
         let normalized = source.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         let rawLines = normalized.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init)
         var blocks: [MarkdownBlock] = []
+        var markdownLines: [String] = []
         var index = 0
+
+        func flushMarkdown(closeDangling: Bool) {
+            var text = trimBlankEdges(markdownLines.joined(separator: "\n"))
+            markdownLines.removeAll(keepingCapacity: true)
+            guard !isBlank(text) else { return }
+            text = rewriteMomentLinks(text)
+            text = escapeUntrustedImages(text)
+            if closeDangling {
+                text = closeDanglingInlineMarkup(text)
+            }
+            text = trimBlankEdges(text)
+            guard !isBlank(text) else { return }
+            blocks.append(.markdown(text))
+        }
 
         while index < rawLines.count {
             let line = rawLines[index]
 
             if let fence = fenceMatch(line) {
+                flushMarkdown(closeDangling: false)
                 var body: [String] = []
                 index += 1
                 var closed = false
@@ -41,77 +57,43 @@ public enum StreamingMarkdown {
                 continue
             }
 
-            if let heading = headingMatch(line) {
-                var text = heading.text
-                let level = heading.level
+            if firstMomentImage(in: line) != nil {
+                var rest = line
+                while let image = firstMomentImage(in: rest) {
+                    let prefix = String(rest[..<image.range.lowerBound])
+                    if !isIgnorableCitationPrefix(prefix) {
+                        markdownLines.append(prefix)
+                    }
+                    flushMarkdown(closeDangling: false)
+                    blocks.append(.momentImage(label: image.label, momentID: image.momentID))
+                    rest = String(rest[image.range.upperBound...])
+                }
+                if !isIgnorableCitationPrefix(rest) {
+                    markdownLines.append(rest)
+                }
                 index += 1
-                while index < rawLines.count, !isStructural(rawLines[index]), !rawLines[index].isEmpty {
-                    text += "\n" + rawLines[index]
+                continue
+            }
+
+            if isIncompleteMomentImage(line) {
+                flushMarkdown(closeDangling: false)
+                markdownLines.append(line)
+                index += 1
+                while index < rawLines.count {
+                    markdownLines.append(rawLines[index])
                     index += 1
                 }
-                blocks.append(.heading(level: level, text: text))
+                // Leave the unfinished `![...](afterray://moment/` line raw so
+                // closeDangling cannot strip the URL before `)` arrives.
+                flushMarkdown(closeDangling: false)
                 continue
             }
 
-            if let image = momentImageMatch(line) {
-                blocks.append(.momentImage(label: image.label, momentID: image.momentID))
-                index += 1
-                continue
-            }
-
-            if isRule(line) {
-                blocks.append(.rule)
-                index += 1
-                continue
-            }
-
-            if let item = bulletMatch(line) {
-                var items = [item]
-                index += 1
-                while index < rawLines.count, let next = bulletMatch(rawLines[index]) {
-                    items.append(next)
-                    index += 1
-                }
-                blocks.append(.bulletedList(items))
-                continue
-            }
-
-            if let item = numberedMatch(line) {
-                var items = [item]
-                index += 1
-                while index < rawLines.count, let next = numberedMatch(rawLines[index]) {
-                    items.append(next)
-                    index += 1
-                }
-                blocks.append(.numberedList(items))
-                continue
-            }
-
-            if let quoted = quoteMatch(line) {
-                var lines = [quoted]
-                index += 1
-                while index < rawLines.count, let next = quoteMatch(rawLines[index]) {
-                    lines.append(next)
-                    index += 1
-                }
-                blocks.append(.quote(lines.joined(separator: "\n")))
-                continue
-            }
-
-            if line.isEmpty {
-                index += 1
-                continue
-            }
-
-            var paragraph = line
+            markdownLines.append(line)
             index += 1
-            while index < rawLines.count, !rawLines[index].isEmpty, !isStructural(rawLines[index]) {
-                paragraph += "\n" + rawLines[index]
-                index += 1
-            }
-            blocks.append(.paragraph(paragraph))
         }
 
+        flushMarkdown(closeDangling: true)
         return blocks
     }
 
@@ -143,6 +125,14 @@ public enum StreamingMarkdown {
         return result
     }
 
+    public static func momentID(from url: URL) -> String? {
+        guard url.scheme == "afterray", url.host == "moment" else { return nil }
+        let id = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !id.isEmpty else { return nil }
+        guard id.unicodeScalars.allSatisfy({ momentIDCharacters.contains($0) }) else { return nil }
+        return id
+    }
+
     public static func rewriteMomentLinks(_ text: String) -> String {
         if text.contains("](afterray://moment/") { return text }
         guard let regex = try? NSRegularExpression(pattern: #"afterray://moment/([A-Za-z0-9\-]+)"#) else {
@@ -156,30 +146,93 @@ public enum StreamingMarkdown {
         )
     }
 
-    private static func isStructural(_ line: String) -> Bool {
-        fenceMatch(line) != nil
-            || headingMatch(line) != nil
-            || momentImageMatch(line) != nil
-            || isRule(line)
-            || bulletMatch(line) != nil
-            || numberedMatch(line) != nil
-            || quoteMatch(line) != nil
+    /// Turns leftover `![alt](url)` into literal text so MarkdownUI cannot
+    /// treat an http/file/data image as media. Trusted `afterray://moment`
+    /// citations are left alone — the splitter should already have lifted
+    /// them, and this keeps a stray one renderable.
+    public static func escapeUntrustedImages(_ text: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: #"!\[([^\]\n]{0,160})\]\(([^)\n]*)\)"#) else {
+            return text
+        }
+        let nsText = text as NSString
+        let range = NSRange(location: 0, length: nsText.length)
+        let matches = regex.matches(in: text, range: range)
+        var result = text
+        for match in matches.reversed() {
+            guard let full = Range(match.range, in: result) else { continue }
+            if match.numberOfRanges >= 3,
+               let destRange = Range(match.range(at: 2), in: result),
+               isTrustedMomentDestination(String(result[destRange]))
+            {
+                continue
+            }
+            let original = String(result[full])
+            guard original.hasPrefix("!") else { continue }
+            result.replaceSubrange(full, with: "\\!\\" + original.dropFirst())
+        }
+        return result
     }
 
-    /// Agent-authored images are deliberately narrower than general Markdown.
-    /// Only a standalone, protocol-backed moment reference becomes media; an
-    /// http/file/data image stays ordinary selectable text and never triggers
-    /// a resource read.
-    private static func momentImageMatch(_ line: String) -> (label: String, momentID: String)? {
+    /// Any complete `![label](afterray://moment/ID)` becomes a citation card.
+    /// Models often wrap that in a link (`[![label](url)](url)`); the wrapper
+    /// is the same citation, not leftover markdown.
+    private static func firstMomentImage(
+        in line: String
+    ) -> (range: Range<String.Index>, label: String, momentID: String)? {
         guard let regex = try? NSRegularExpression(
-            pattern: #"^!\[([^\]\n]{0,160})\]\(afterray://moment/([A-Za-z0-9-]+)\)\s*$"#
+            pattern: #"!\[([^\]\n]{0,160})\]\(afterray://moment/([A-Za-z0-9-]+)\)"#
         ) else { return nil }
         let range = NSRange(line.startIndex..<line.endIndex, in: line)
-        guard let match = regex.firstMatch(in: line, range: range), match.range == range,
+        guard let match = regex.firstMatch(in: line, range: range),
+              let full = Range(match.range, in: line),
               let labelRange = Range(match.range(at: 1), in: line),
               let momentRange = Range(match.range(at: 2), in: line)
         else { return nil }
-        return (String(line[labelRange]), String(line[momentRange]))
+        let span = wrappingLinkSpan(around: full, in: line) ?? full
+        return (span, String(line[labelRange]), String(line[momentRange]))
+    }
+
+    /// `[![alt](img)](href)` is one CommonMark image-link. If we only lift
+    /// the inner image, the leftover `](href)` renders as broken prose.
+    private static func wrappingLinkSpan(
+        around image: Range<String.Index>,
+        in line: String
+    ) -> Range<String.Index>? {
+        guard image.lowerBound > line.startIndex else { return nil }
+        let before = line.index(before: image.lowerBound)
+        guard line[before] == "[" else { return nil }
+        let after = line[image.upperBound...]
+        guard after.hasPrefix("]("),
+              let close = after.firstIndex(of: ")")
+        else { return nil }
+        return before..<line.index(after: close)
+    }
+
+    /// A citation that has started but is still missing `)`.
+    /// Flushed separately so the preceding closed Markdown keeps its identity.
+    private static func isIncompleteMomentImage(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("](afterray://moment/") else { return false }
+        return firstMomentImage(in: line) == nil
+    }
+
+    /// Whitespace, a list marker, or a blockquote sigil before a citation.
+    /// Those wrappers are not content — dropping them keeps the card.
+    private static func isIgnorableCitationPrefix(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return true }
+        if trimmed == "-" || trimmed == "*" || trimmed == ">" { return true }
+        if trimmed.hasSuffix("."), trimmed.dropLast().allSatisfy(\.isNumber) {
+            return true
+        }
+        return false
+    }
+
+    private static func isTrustedMomentDestination(_ destination: String) -> Bool {
+        guard let url = URL(string: destination.trimmingCharacters(in: .whitespaces)) else {
+            return false
+        }
+        return momentID(from: url) != nil
     }
 
     private static func fenceMatch(_ line: String) -> String? {
@@ -189,52 +242,20 @@ public enum StreamingMarkdown {
         return language.isEmpty ? "" : language
     }
 
-    private static func headingMatch(_ line: String) -> (level: Int, text: String)? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.first == "#" else { return nil }
-        var level = 0
-        for character in trimmed {
-            if character == "#" { level += 1 } else { break }
-        }
-        guard (1...6).contains(level) else { return nil }
-        let rest = trimmed.dropFirst(level)
-        guard rest.first == " " || rest.first == "\t" else { return nil }
-        return (level, rest.trimmingCharacters(in: .whitespaces))
+    private static func isBlank(_ text: String) -> Bool {
+        text.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
     }
 
-    private static func isRule(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        let marks: [Character] = ["-", "*", "_"]
-        return marks.contains { mark in
-            trimmed.count >= 3 && trimmed.allSatisfy { $0 == mark }
-        }
+    /// Drop leading/trailing blank lines so a closed prefix keeps the same
+    /// identity whether the next token is a fence, a citation, or more prose.
+    private static func trimBlankEdges(_ text: String) -> String {
+        var lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init)
+        while let first = lines.first, isBlank(first) { lines.removeFirst() }
+        while let last = lines.last, isBlank(last) { lines.removeLast() }
+        return lines.joined(separator: "\n")
     }
 
-    private static func bulletMatch(_ line: String) -> String? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard let mark = trimmed.first, mark == "-" || mark == "*" || mark == "+" else { return nil }
-        let rest = trimmed.dropFirst()
-        guard rest.first == " " || rest.first == "\t" || rest.isEmpty else { return nil }
-        return rest.trimmingCharacters(in: .whitespaces)
-    }
-
-    private static func numberedMatch(_ line: String) -> String? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        var digits = 0
-        for character in trimmed {
-            if character.isNumber { digits += 1 } else { break }
-        }
-        guard digits > 0 else { return nil }
-        let rest = trimmed.dropFirst(digits)
-        guard rest.hasPrefix(". ") || rest == "." else { return nil }
-        return rest.dropFirst().trimmingCharacters(in: .whitespaces)
-    }
-
-    private static func quoteMatch(_ line: String) -> String? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix(">") else { return nil }
-        return trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
-    }
+    private static let momentIDCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-"))
 
     private static func unpairedCount(of mark: Character, in text: String) -> Int {
         text.filter { $0 == mark }.count
@@ -267,14 +288,23 @@ public enum StreamingMarkdown {
         guard let open = text.lastIndex(of: "[") else { return text }
         let afterOpen = text[open...]
         if afterOpen.contains("](") {
-            if afterOpen.last != ")" {
-                return String(text[..<open]) + String(afterOpen.dropFirst().prefix { $0 != "]" })
+            if linkDestinationIsClosed(afterOpen) {
+                return text
             }
-            return text
+            return String(text[..<open]) + String(afterOpen.dropFirst().prefix { $0 != "]" })
         }
         if !afterOpen.contains("]") {
             return String(text[..<open]) + String(afterOpen.dropFirst())
         }
         return text
+    }
+
+    /// `[label](url)` is complete once a `)` closes the destination, even if
+    /// more prose follows on the same line.
+    private static func linkDestinationIsClosed(_ afterOpen: Substring) -> Bool {
+        guard let closeBracket = afterOpen.firstIndex(of: "]") else { return false }
+        let rest = afterOpen[closeBracket...]
+        guard rest.hasPrefix("](") else { return false }
+        return rest.contains(")")
     }
 }

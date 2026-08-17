@@ -36,6 +36,8 @@ public protocol RecallDaemonServing: Sendable {
     /// always decode by `contentType`, never by assumption.
     func thumbnail(momentID: String, maxEdge: Int?) async throws -> ArtifactPayload
     func evidenceOcr(momentID: String) async throws -> OcrEvidence
+    /// One moment by id. Existing `moment_get` request; no protocol bump.
+    func moment(id: String) async throws -> RecallMoment
     func setFavorite(momentID: String, favorite: Bool) async throws
 }
 
@@ -66,6 +68,10 @@ public extension RecallDaemonServing {
 
     func evidenceOcr(momentID _: String) async throws -> OcrEvidence {
         throw DaemonClientError.rejected("ocr evidence is not available")
+    }
+
+    func moment(id _: String) async throws -> RecallMoment {
+        throw DaemonClientError.rejected("moment reads are not available")
     }
 }
 
@@ -148,6 +154,15 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     func cancelModelDownload(packID: String) async throws -> ModelLibrary
     func removeModel(packID: String) async throws -> ModelLibrary
     func jobs() async throws -> [ModelJob]
+    /// What local computation is running, and what is held back and why.
+    func computeStatus() async throws -> ComputeStatus
+    /// How much background computation the daemon may do from now on.
+    func setComputeMode(_ mode: ComputeMode) async throws -> ComputeStatus
+    /// Holds background work off for `seconds`; `0` resumes immediately.
+    func pauseCompute(seconds: Int) async throws -> ComputeStatus
+    /// Runs one workload's outstanding work now, overriding the machine
+    /// conditions it would otherwise wait for.
+    func runComputeNow(workload: ComputeWorkload) async throws -> ComputeStatus
     func clearHistory(scope: HistoryScope) async throws -> HistoryClearResult
 }
 
@@ -166,6 +181,22 @@ public extension AfterRayDaemonServing {
 
     func updateModelDownloadEndpoint(_: String) async throws -> AppSettings {
         throw DaemonClientError.rejected("changing the download endpoint is not available")
+    }
+
+    func computeStatus() async throws -> ComputeStatus {
+        throw DaemonClientError.rejected("the compute dashboard is not available")
+    }
+
+    func setComputeMode(_: ComputeMode) async throws -> ComputeStatus {
+        throw DaemonClientError.rejected("the compute dashboard is not available")
+    }
+
+    func pauseCompute(seconds _: Int) async throws -> ComputeStatus {
+        throw DaemonClientError.rejected("the compute dashboard is not available")
+    }
+
+    func runComputeNow(workload _: ComputeWorkload) async throws -> ComputeStatus {
+        throw DaemonClientError.rejected("the compute dashboard is not available")
     }
 
     func updateSettings(recordAudio: Bool) async throws -> AppSettings {
@@ -239,6 +270,31 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func settings() async throws -> AppSettings {
         try await request(WireRequest(type: "settings"), as: AppSettings.self)
+    }
+
+    public func computeStatus() async throws -> ComputeStatus {
+        try await request(WireRequest(type: "compute_status"), as: ComputeStatus.self)
+    }
+
+    public func setComputeMode(_ mode: ComputeMode) async throws -> ComputeStatus {
+        try await request(
+            WireRequest(type: "compute_set_mode", mode: mode.rawValue),
+            as: ComputeStatus.self
+        )
+    }
+
+    public func pauseCompute(seconds: Int) async throws -> ComputeStatus {
+        try await request(
+            WireRequest(type: "compute_pause", pauseSeconds: max(0, seconds)),
+            as: ComputeStatus.self
+        )
+    }
+
+    public func runComputeNow(workload: ComputeWorkload) async throws -> ComputeStatus {
+        try await request(
+            WireRequest(type: "compute_run_now", computeWorkload: workload.rawValue),
+            as: ComputeStatus.self
+        )
     }
 
     public func updateSettings(
@@ -459,7 +515,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
 
     public func gopFrame(segmentID: String, index: UInt16, mode: String) async throws -> ArtifactPayload {
         try await framed(
-            WireRequest(type: "read_gop_frame", segmentID: segmentID, gopIndex: index, gopMode: mode)
+            WireRequest(type: "read_gop_frame", segmentID: segmentID, gopIndex: index, mode: mode)
         )
     }
 
@@ -474,6 +530,10 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
             WireRequest(type: "evidence_ocr", momentID: momentID),
             as: OcrEvidence.self
         )
+    }
+
+    public func moment(id: String) async throws -> RecallMoment {
+        try await request(WireRequest(type: "moment_get", momentID: id), as: RecallMoment.self)
     }
 
     private func framed(_ request: WireRequest) async throws -> ArtifactPayload {
@@ -552,7 +612,9 @@ struct WireRequest: Encodable, Equatable {
     var packIDs: [String]?
     var segmentID: String?
     var gopIndex: UInt16?
-    var gopMode: String?
+    /// The wire key `mode`, shared by `read_gop_frame` (a GOP read mode) and
+    /// `compute_set_mode` (a compute mode). One key, one field.
+    var mode: String?
     var maxEdge: Int?
     var excludedBundleIds: [String]?
     var excludedDomains: [String]?
@@ -569,6 +631,8 @@ struct WireRequest: Encodable, Equatable {
     var baseUrl: String?
     var conversationID: String? = nil
     var message: String? = nil
+    var pauseSeconds: Int?
+    var computeWorkload: String?
     var cliEvidenceAccess: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
@@ -594,7 +658,7 @@ struct WireRequest: Encodable, Equatable {
         case packIDs = "pack_ids"
         case segmentID = "segment_id"
         case gopIndex = "index"
-        case gopMode = "mode"
+        case mode
         case maxEdge = "max_edge"
         case excludedBundleIds = "excluded_bundle_ids"
         case excludedDomains = "excluded_domains"
@@ -611,6 +675,8 @@ struct WireRequest: Encodable, Equatable {
         case baseUrl = "base_url"
         case conversationID = "conversation_id"
         case message
+        case pauseSeconds = "seconds"
+        case computeWorkload = "workload"
         case cliEvidenceAccess = "cli_evidence_access"
     }
 
@@ -640,7 +706,7 @@ struct WireRequest: Encodable, Equatable {
         }
         try container.encodeIfPresent(segmentID, forKey: .segmentID)
         try container.encodeIfPresent(gopIndex, forKey: .gopIndex)
-        try container.encodeIfPresent(gopMode, forKey: .gopMode)
+        try container.encodeIfPresent(mode, forKey: .mode)
         try container.encodeIfPresent(maxEdge, forKey: .maxEdge)
         try container.encodeIfPresent(excludedBundleIds, forKey: .excludedBundleIds)
         try container.encodeIfPresent(excludedDomains, forKey: .excludedDomains)
@@ -657,6 +723,8 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(baseUrl, forKey: .baseUrl)
         try container.encodeIfPresent(conversationID, forKey: .conversationID)
         try container.encodeIfPresent(message, forKey: .message)
+        try container.encodeIfPresent(pauseSeconds, forKey: .pauseSeconds)
+        try container.encodeIfPresent(computeWorkload, forKey: .computeWorkload)
         try container.encodeIfPresent(cliEvidenceAccess, forKey: .cliEvidenceAccess)
     }
 }

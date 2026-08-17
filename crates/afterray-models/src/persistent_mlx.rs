@@ -1,5 +1,6 @@
 use crate::{
-    AdapterError, Cancellation, LlmDelta, ManifestFile, ModelInput, ModelOutput, READY_MARKER,
+    AdapterError, Cancellation, LlmDelta, LlmUsage, ManifestFile, ModelInput, ModelOutput,
+    READY_MARKER,
 };
 use afterray_protocol::ModelPackState;
 use serde::{Deserialize, Serialize};
@@ -195,7 +196,10 @@ impl PersistentMlxAdapter {
         {
             self.fail_worker(&mut runtime, error.to_string()).await;
         }
-        result.map(|text| ModelOutput::Llm { text })
+        result.map(|(text, usage)| match usage {
+            Some(usage) => ModelOutput::llm_with_usage(text, usage),
+            None => ModelOutput::llm(text),
+        })
     }
 
     async fn ensure_started(&self, runtime: &mut Runtime) -> Result<(), AdapterError> {
@@ -371,7 +375,7 @@ impl PersistentMlxAdapter {
                                 if final_text.is_empty() {
                                     return Err(AdapterError::InvalidOutput("MLX worker returned empty text".into()));
                                 }
-                                return Ok(final_text);
+                                return Ok((final_text, response.usage.and_then(MlxUsage::into_llm)));
                             }
                             "error" => return Err(response_error(&response, "MLX generation failed")),
                             other => return Err(AdapterError::InvalidOutput(format!(
@@ -465,7 +469,7 @@ struct MlxMessage<'a> {
 }
 
 struct GenerateAttempt {
-    result: Result<String, AdapterError>,
+    result: Result<(String, Option<LlmUsage>), AdapterError>,
     emitted_delta: bool,
 }
 
@@ -489,6 +493,33 @@ struct MlxResponse {
     runtime: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    usage: Option<MlxUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MlxUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    generation_ms: Option<u64>,
+}
+
+impl MlxUsage {
+    fn into_llm(self) -> Option<LlmUsage> {
+        let prompt_tokens = usize::try_from(self.prompt_tokens.unwrap_or(0)).unwrap_or(0);
+        let completion_tokens = usize::try_from(self.completion_tokens.unwrap_or(0)).unwrap_or(0);
+        if prompt_tokens == 0 && completion_tokens == 0 {
+            return None;
+        }
+        Some(LlmUsage {
+            prompt_tokens,
+            completion_tokens,
+            generation_ms: self.generation_ms.unwrap_or(0),
+        })
+    }
 }
 
 async fn write_request(
@@ -650,9 +681,7 @@ done
             .unwrap();
         assert_eq!(
             output,
-            ModelOutput::Llm {
-                text: "fresh prefill".into()
-            }
+            ModelOutput::llm("fresh prefill")
         );
         assert!(matches!(adapter.health().state, ModelPackState::Ready));
         adapter.shutdown().await;
@@ -710,7 +739,7 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(next, ModelOutput::Llm { text: "ok".into() });
+        assert_eq!(next, ModelOutput::llm("ok"));
         adapter.shutdown().await;
     }
 
@@ -746,12 +775,7 @@ done
             .execute_streaming("retry", &prompt("two"), None, Cancellation::default())
             .await
             .unwrap();
-        assert_eq!(
-            output,
-            ModelOutput::Llm {
-                text: "recovered".into()
-            }
-        );
+        assert_eq!(output, ModelOutput::llm("recovered"));
         adapter.shutdown().await;
         let _ = std::fs::remove_file(marker);
     }

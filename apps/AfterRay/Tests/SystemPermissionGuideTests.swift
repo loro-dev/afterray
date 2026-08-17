@@ -2,6 +2,36 @@ import XCTest
 @testable import AfterRayApp
 
 final class SystemPermissionGuideTests: XCTestCase {
+    func testMissingMicrophoneDoesNotBlockOtherwiseGrantedPermissions() {
+        XCTAssertTrue(SystemPermissionPolicy.allGranted(
+            screenRecording: true,
+            microphone: false,
+            hasMicrophoneInput: false,
+            accessibility: true,
+            recordsAudio: true
+        ))
+    }
+
+    func testAvailableMicrophoneStillRequiresAuthorizationWhenAudioIsEnabled() {
+        XCTAssertFalse(SystemPermissionPolicy.allGranted(
+            screenRecording: true,
+            microphone: false,
+            hasMicrophoneInput: true,
+            accessibility: true,
+            recordsAudio: true
+        ))
+    }
+
+    func testDisabledAudioDoesNotRequireAnAvailableMicrophone() {
+        XCTAssertTrue(SystemPermissionPolicy.allGranted(
+            screenRecording: true,
+            microphone: false,
+            hasMicrophoneInput: true,
+            accessibility: true,
+            recordsAudio: false
+        ))
+    }
+
     func testMicrophoneGuideUsesTheExistingSystemSettingsEntry() {
         let guide = RequiredPermission.microphone.settingsGuide
 

@@ -84,6 +84,16 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertNil(json["artifact_id"])
     }
 
+    func testMomentGetRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(WireRequest(type: "moment_get", momentID: "m1"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["type"] as? String, "moment_get")
+        XCTAssertEqual(json["moment_id"] as? String, "m1")
+        XCTAssertNil(json["artifact_id"])
+        XCTAssertNil(json["max_edge"])
+    }
+
     func testMomentDecodesCurrentRustShapeWithoutAudio() throws {
         let json = #"{"id":"m1","session_id":"s1","captured_at_ms":123,"image_artifact_id":"a1","is_favorite":false,"ocr_text":"hello","transcript_text":null}"#
         let moment = try JSONDecoder().decode(RecallMoment.self, from: Data(json.utf8))

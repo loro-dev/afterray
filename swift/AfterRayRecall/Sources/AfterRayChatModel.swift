@@ -12,6 +12,9 @@ public protocol AfterRayChatModeling: ObservableObject {
     var streamText: String { get }
     var streamTools: [ChatToolCall] { get }
     var streamReasoning: [ChatReasoningRound] { get }
+    /// Think / tool segments in arrival order for the turn in flight.
+    /// Prefer this over `streamReasoning` + `streamTools`, which flatten it.
+    var streamParts: [ChatMessagePart] { get }
     var errorMessage: String? { get }
     var statusMessage: String? { get }
     /// Context occupancy for the turn in progress, or the last one in this
@@ -23,6 +26,9 @@ public protocol AfterRayChatModeling: ObservableObject {
     /// Set while the turn is alive but has nothing to show yet. Nil the rest of
     /// the time, including before a turn starts.
     var streamProgress: ChatProgress? { get }
+    /// Elapsed work for the last finished turn, while this session still
+    /// remembers it. History reloads fall back to the user→assistant gap.
+    var lastWorkElapsedMs: Int? { get }
 
     func refresh() async
     func select(_ id: String) async
@@ -30,9 +36,20 @@ public protocol AfterRayChatModeling: ObservableObject {
     func deleteConversation(_ id: String) async
     func send()
     func stop()
+    var chatModels: [ChatModelChoice] { get }
+    var selectedChatModelID: String? { get }
+    func selectChatModel(_ id: String)
 }
 
 public extension AfterRayChatModeling {
+    /// Clears any selected conversation before placing a launch-time prompt
+    /// in the composer. Top-level Ask uses this so it can never append to the
+    /// thread that happened to be selected the last time chat was open.
+    func startNew(draft: String) {
+        startNew()
+        self.draft = draft
+    }
+
     var selectedTitle: String {
         conversations.first(where: { $0.id == selectedID })?.title ?? "New conversation"
     }
@@ -41,16 +58,41 @@ public extension AfterRayChatModeling {
         !isSending && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var streamParts: [ChatMessagePart] {
+        ChatMessagePart.reconstruct(reasoning: streamReasoning, tools: streamTools)
+    }
+
+    var lastWorkElapsedMs: Int? { nil }
+
+    var selectedConversation: ChatConversation? {
+        conversations.first(where: { $0.id == selectedID })
+    }
+
+    var chatModels: [ChatModelChoice] { ChatModelChoice.previewCatalog }
+
+    var selectedChatModelID: String? { chatModels.first?.id }
+
+    func selectChatModel(_ id: String) {}
+
+    var selectedChatModelTitle: String {
+        chatModels.first(where: { $0.id == selectedChatModelID })?.title
+            ?? chatModels.first?.title
+            ?? "Model"
+    }
+
     var bubbles: [ChatBubble] {
         ChatTranscript.bubbles(
             messages: messages,
             streamingText: streamText,
             streamingTools: streamTools,
             streamingReasoning: streamReasoning,
+            streamingParts: streamParts,
             isSending: isSending,
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
             liveCompactions: isSending ? compactionNotices : [],
-            progress: streamProgress
+            progress: streamProgress,
+            lastWorkElapsedMs: lastWorkElapsedMs,
+            liveUsage: contextUsage
         )
     }
 }
@@ -67,11 +109,15 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var streamText = ""
     @Published public private(set) var streamTools: [ChatToolCall] = []
     @Published public private(set) var streamReasoning: [ChatReasoningRound] = []
+    @Published public private(set) var streamParts: [ChatMessagePart] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
     @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
     @Published public private(set) var streamProgress: ChatProgress?
+    @Published public private(set) var lastWorkElapsedMs: Int?
+    @Published public private(set) var chatModels: [ChatModelChoice] = ChatModelChoice.previewCatalog
+    @Published public private(set) var selectedChatModelID: String? = ChatModelChoice.previewCatalog.first?.id
 
     private let daemon: any AfterRayChatServing
     private var sendTask: Task<Void, Never>?
@@ -102,6 +148,23 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             statusMessage = Self.disconnectedNote(from: error)
             errorMessage = error.localizedDescription
         }
+        await refreshChatModels()
+    }
+
+    private func refreshChatModels() async {
+        guard let host = daemon as? any AfterRayDaemonServing else { return }
+        let library = try? await host.modelLibrary()
+        let settings = try? await host.settings()
+        let ollama = (try? await host.probeLlm(provider: .ollama, baseUrl: nil))?.models ?? []
+        let catalog = ChatModelChoice.catalog(
+            packs: library?.packs ?? [],
+            ollamaModels: ollama,
+            settings: settings
+        )
+        if !catalog.models.isEmpty {
+            chatModels = catalog.models
+            selectedChatModelID = catalog.selectedID
+        }
     }
 
     public func select(_ id: String) async {
@@ -115,6 +178,47 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         await loadHistory(id)
     }
 
+    public func selectChatModel(_ id: String) {
+        guard chatModels.contains(where: { $0.id == id }) else { return }
+        selectedChatModelID = id
+        Task { await persistChatModel(id) }
+    }
+
+    private func persistChatModel(_ id: String) async {
+        guard let host = daemon as? any AfterRayDaemonServing else { return }
+        let provider: LlmProvider
+        let modelName: String
+        if id.hasPrefix(ChatModelChoice.ollamaPrefix) {
+            provider = .ollama
+            modelName = String(id.dropFirst(ChatModelChoice.ollamaPrefix.count))
+        } else if id.hasPrefix(ChatModelChoice.builtinPrefix) {
+            provider = .mlxLocal
+            modelName = String(id.dropFirst(ChatModelChoice.builtinPrefix.count))
+        } else if id.hasPrefix(ChatModelChoice.remotePrefix) {
+            provider = .openaiCompatible
+            modelName = String(id.dropFirst(ChatModelChoice.remotePrefix.count))
+        } else {
+            return
+        }
+        do {
+            _ = try await host.updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: nil,
+                llmProvider: provider,
+                llmBaseUrl: nil,
+                llmModel: modelName,
+                llmApiKey: nil,
+                storageLimitBytes: nil,
+                uiLanguage: nil,
+                summaryLanguage: nil,
+                cliEvidenceAccess: nil
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     public func startNew() {
         if isSending { stop() }
         cancelStreamPresentation()
@@ -123,7 +227,9 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
+        lastWorkElapsedMs = nil
         errorMessage = nil
         contextUsage = nil
         compactionNotices = []
@@ -155,7 +261,9 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
+        lastWorkElapsedMs = nil
         cancelStreamPresentation()
         // A new turn starts from this conversation's stored history, not from
         // the last turn's live notices.
@@ -188,11 +296,13 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
         errorMessage = nil
         statusMessage = nil
         contextUsage = nil
         compactionNotices = []
+        lastWorkElapsedMs = nil
     }
 
     private func performSend(_ text: String) async {
@@ -286,7 +396,11 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
+        if state.lastElapsedMs > 0 {
+            lastWorkElapsedMs = state.lastElapsedMs
+        }
     }
 
     /// Settle a turn that ended early.
@@ -300,6 +414,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
         guard let conversationId = selectedID, !conversationId.isEmpty else { return }
         await loadHistory(conversationId)
@@ -307,7 +422,12 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
 
     private func finalizePartialStream(_ state: ChatStreamState? = nil) {
         cancelStreamPresentation()
-        let snapshot = state ?? ChatStreamState(text: streamText, tools: streamTools)
+        let snapshot = state ?? ChatStreamState(
+            text: streamText,
+            tools: streamTools,
+            reasoning: streamReasoning,
+            parts: streamParts
+        )
         if !snapshot.text.isEmpty || !snapshot.tools.isEmpty {
             messages.append(
                 .localAssistant(
@@ -321,6 +441,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
     }
 
@@ -357,10 +478,14 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         if streamText != state.text { streamText = state.text }
         if streamTools != state.tools { streamTools = state.tools }
         if streamReasoning != state.reasoning { streamReasoning = state.reasoning }
+        if streamParts != state.parts { streamParts = state.parts }
         if streamProgress != state.progress { streamProgress = state.progress }
         if let usage = state.usage, contextUsage != usage { contextUsage = usage }
         if !state.compactions.isEmpty, compactionNotices != state.compactions {
             compactionNotices = state.compactions
+        }
+        if state.lastElapsedMs > 0, lastWorkElapsedMs != state.lastElapsedMs {
+            lastWorkElapsedMs = state.lastElapsedMs
         }
     }
 
