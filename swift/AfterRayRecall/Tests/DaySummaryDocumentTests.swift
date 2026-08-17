@@ -149,6 +149,41 @@ final class DaySummaryDocumentTests: XCTestCase {
         XCTAssertTrue(document.string.contains("Summary failed"))
     }
 
+    /// Idle half-hours stay on the wire but never become document rows —
+    /// the feed is only activity worth reading.
+    func testIdleSlotsAreNotRendered() {
+        let idleStart = DaySummaryLayout.slotDurationMs
+        let summary = DaySummary(
+            day: "1970-01-01",
+            dayStartMs: 0,
+            dayEndMs: dayMs,
+            slots: [
+                DaySlotSummary(
+                    slotStartMs: 0,
+                    slotEndMs: DaySummaryLayout.slotDurationMs,
+                    state: "done",
+                    facts: DaySlotFacts(apps: [DayAppFact(name: "Zed", ms: 600_000)]),
+                    title: "Real work"
+                ),
+                DaySlotSummary(
+                    slotStartMs: idleStart,
+                    slotEndMs: idleStart + DaySummaryLayout.slotDurationMs,
+                    state: "skipped_idle",
+                    facts: DaySlotFacts(apps: [])
+                ),
+            ]
+        )
+        let (document, layout) = DaySummaryDocument.build(
+            summaries: [summary],
+            nowMs: dayMs,
+            timeZone: utc
+        )
+        XCTAssertTrue(document.string.contains("Real work"))
+        XCTAssertFalse(document.string.contains("Idle"))
+        XCTAssertNil(layout.slotRanges[idleStart])
+        XCTAssertNil(layout.timeRanges[idleStart])
+    }
+
     /// All-caps runs read as shouting in a dense list; the document is
     /// Title case throughout, headings included.
     func testDocumentNeverShouts() {

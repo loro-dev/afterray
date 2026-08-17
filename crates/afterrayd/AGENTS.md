@@ -1,27 +1,25 @@
 # crates/afterrayd — the daemon
 
-Single-binary tokio daemon (`main.rs`, ~4100 lines — dispatch, capture loop, and T2 machinery all live here). It binds a hardened `0600` Unix socket, spawns the Swift capture shim, imports artifacts into `afterray-store`'s vault, submits OCR/ASR/embedding jobs to `afterray-models`' `ModelQueue`, and runs background GOP packing and T2 slot summaries. The socket is the security boundary: plaintext history leaves the vault only over this uid-checked socket — never add unauthenticated endpoints.
+Single-binary tokio daemon: socket/RPC, capture import, model jobs, GOP packing, T2 summaries. The `0600` Unix socket is the security boundary — never add unauthenticated endpoints.
 
 ## Key anchors
 
-- `main.rs:57 bind_control_socket` — rejects symlinks/non-sockets, chmod `0600`, uid check; peer-uid re-check per connection at main.rs:251.
-- `main.rs:529 handle` — artifact reads (`ReadArtifact`/`ReadGopSegment`/`ReadGopFrame`/`ReadThumbnail`, header line + raw bytes) and `ChatStream` (NDJSON events) bypass `dispatch`.
-- `main.rs:625 dispatch` — one match arm per `Request` variant (protocol version lives in `afterray-protocol`, not here).
-- `main.rs:614 run_store` — **the** way to call sync `Vault` methods from async (`spawn_blocking` wrapper).
-- Capture flow: interval scheduler (default 10s, `AFTERRAY_CAPTURE_INTERVAL_SECONDS`) → `consume_capture_events` (main.rs:1767) → `import_artifact` (main.rs:1830; screen→`insert_moment`+OCR, audio→encrypted `insert_audio_segment`, AX→exclusion check + `attach_accessibility_snapshot`) → `insert_text_evidence`, then `submit_embedding` (main.rs:2075). Audio rows are the durable ASR backlog: a sweeper claims them, materializes one private `0600` staging file, commits transcript + queue completion atomically, and reclaims stale work after restart.
-- `main.rs:1956` — screen exclusions delete the already-stored moment (`delete_excluded_moment`), because only the AX snapshot carries the URL; keep that ordering. The delete *is* the guarantee, so it is logged and retried once (main.rs:2055). An unparseable AX snapshot takes the same path — an unnamed app cannot be checked.
-- `main.rs:1537 push_audio_exclusions` — audio cannot be deleted afterwards (a 5-min `m4a` cannot be sliced), so the bundle list goes to the shim, which drops audio while an excluded app is frontmost.
-- `main.rs:1944 run_slot_t2` — T2 pass: `agent.rs:run_agent_loop` over a T1 card with `T2_MAX_ROUNDS = 8` (main.rs:1948), then `parse_t2_card_v2` + `verify_t2_card` grounding, persisted via `put_t2_summary_v2`.
-- `compute.rs ComputeGovernor` — **the** gate for background computation; every background loop consults it (OCR in `import_artifact`, `spawn_asr_sweeper`, `submit_embedding`, `spawn_slot_summarizer`, `spawn_gop_packer`) and `compute_status` reports it. `t2_may_run` lives here now. Full map: [context/compute-governance.md](../../context/compute-governance.md).
-- `main.rs spawn_slot_summarizer` — 5-min sweeper, gated through the governor; yields to in-flight OCR. Every T2 caller goes through `run_slot_t2_recording`, which times the whole pass (queue wait included), logs it as `in 2m 41s`, and files it with the governor for the dashboard's "about N left" estimate.
-- `ComputeRunNow` → `ComputeGovernor::force_now` — a 30-minute per-workload override of the machine conditions, plus `t2_changed.notify_one()` so the sweeper starts within a second. Ends early when the backlog drains. `backlog_counts` (main.rs) caches the vault-side pile for 5s because the panel polls every 2s.
-- `gop_packer.rs:114 GopPacker::pack_one` — packs cold stills into closed AV1 GOPs: `commit_gop` → verify → `mark_gop_ready` → `drop_unpinned_stills`; yields within 2s of the next capture tick (`should_yield_to_capture`, gop_packer.rs:71).
-- Agent surfaces: `agent.rs` (read-only tool loop), `tools.rs:18 ToolHost` (allowlisted read-only history tools), `ask.rs` (single-shot), `chat.rs` + `stream.rs` (persisted multi-turn NDJSON), `memory.rs` (deterministic episode segmentation — deliberately no model spend).
+- `main` — Tokio multi-thread runtime (`2 × cores`, min 8 workers, 512 blocking threads) keeps UI accepts free under load.
+- `bind_control_socket` — rejects symlinks/non-sockets, chmod `0600`, uid check; peer-uid re-check after `accept`.
+- `handle` — artifact reads + `ChatStream` bypass `dispatch`; every vault/decrypt path still uses `run_store`. Unprivileged peers are authorized via `afterray_protocol::authorize_cli_request` and have query payloads redacted. The app is identified by audit token + signature (Team ID or the AfterRay parent cdhash snapshotted at spawn).
+- `dispatch` — one arm per `Request` (protocol version lives in `afterray-protocol`).
+- `run_store` — **only** way to call sync `Vault` from async (`spawn_blocking`). UI RPC, capture import, OCR/ASR writes all use it.
+- Capture: interval scheduler → `consume_capture_events` → `import_artifact` (screen→moment+OCR, audio→encrypted segment, AX→exclusion + attach) → evidence. Audio rows are the durable ASR backlog. (Embedding submission is switched off — see the tools article.)
+- Screen exclusions delete the stored moment after AX names the URL (`delete_excluded_moment`, retried once). Unparseable AX takes the same path. Audio exclusions are pushed to the shim (`push_audio_exclusions`) — a finished `m4a` cannot be sliced.
+- `compute.rs ComputeGovernor` — the gate for background OCR, ASR, summary, and archive work; `compute_status` reports it. Full map: [context/compute-governance.md](../../context/compute-governance.md).
+- T2: `run_slot_t2` (`T2_MAX_ROUNDS = 8`) + 5-min sweeper through `run_slot_t2_recording`; queue-inclusive durations feed the dashboard estimate. `ComputeRunNow` forces one workload for up to 30 minutes and wakes its sweeper.
+- `GopPacker::pack_one` — cold stills → closed AV1 GOP; yields within 2s of the next capture tick.
+- Agent surfaces: `agent`/`tools`/`ask`/`chat`/`stream`/`memory` (memory is model-free).
+- `tools.rs` — the model's whole read surface: **8 read-only tools** in two groups (find a stretch / read one) plus `get_now`. Times are epoch ms **copied, never computed**; there is **no seed** (the clock is a tool, the question carries `[asked at …]`). `RECALL_SYSTEM_PROMPT` lives in `agent.rs` and may not name a tool. Embeddings are **switched off** read and write; search narrowing happens **in SQL**, before ranking. Full design and the numbers behind each choice: [context/agent-tools.md](../../context/agent-tools.md).
 
 ## Build / test
 
-- `make v0-daemon` (scripts/run-v0.sh); `make daemon` for dev. Tests: `cargo test -p afterrayd`.
-- Needs the shim binary (`make capture-shim`) or `AFTERRAY_CAPTURE_SHIM` set.
+- `make v0-daemon` / `make daemon`. Tests: `cargo test -p afterrayd`. Needs shim (`make capture-shim` or `AFTERRAY_CAPTURE_SHIM`).
 
 ## Watch out
 

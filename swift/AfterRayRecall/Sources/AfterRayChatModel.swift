@@ -211,7 +211,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
                 llmApiKey: nil,
                 storageLimitBytes: nil,
                 uiLanguage: nil,
-                summaryLanguage: nil
+                summaryLanguage: nil,
+                cliEvidenceAccess: nil
             )
         } catch {
             errorMessage = error.localizedDescription

@@ -211,6 +211,7 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
     /// daemon started before this field existed, or from one started outside
     /// the app.
     public let hostBuild: String?
+    public let cliEvidenceUntilMs: Int64?
 
     public init(
         daemonVersion: String,
@@ -218,7 +219,8 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
         schemaVersion: Int,
         recordingState: DaemonRecordingState,
         activeSessionId: String? = nil,
-        hostBuild: String? = nil
+        hostBuild: String? = nil,
+        cliEvidenceUntilMs: Int64? = nil
     ) {
         self.daemonVersion = daemonVersion
         self.protocolVersion = protocolVersion
@@ -226,6 +228,7 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
         self.recordingState = recordingState
         self.activeSessionId = activeSessionId
         self.hostBuild = hostBuild
+        self.cliEvidenceUntilMs = cliEvidenceUntilMs
     }
 
     enum CodingKeys: String, CodingKey {
@@ -235,6 +238,7 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
         case recordingState = "recording_state"
         case activeSessionId = "active_session_id"
         case hostBuild = "host_build"
+        case cliEvidenceUntilMs = "cli_evidence_until_ms"
     }
 }
 
@@ -598,6 +602,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public let languageOptions: [LanguageOption]
     /// Mirror model downloads resolve against; empty means huggingface.co.
     public let modelDownloadEndpoint: String
+    /// Close of the CLI evidence window. Nil or in the past means off.
+    public let cliEvidenceUntilMs: Int64?
 
     public init(
         dataDir: String,
@@ -615,7 +621,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         uiLanguage: String = defaultLanguage,
         summaryLanguage: String = defaultLanguage,
         languageOptions: [LanguageOption] = [],
-        modelDownloadEndpoint: String = ""
+        modelDownloadEndpoint: String = "",
+        cliEvidenceUntilMs: Int64? = nil
     ) {
         self.dataDir = dataDir
         self.modelDir = modelDir
@@ -633,6 +640,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.summaryLanguage = summaryLanguage
         self.languageOptions = languageOptions
         self.modelDownloadEndpoint = modelDownloadEndpoint
+        self.cliEvidenceUntilMs = cliEvidenceUntilMs
     }
 
     enum CodingKeys: String, CodingKey {
@@ -652,6 +660,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case summaryLanguage = "summary_language"
         case languageOptions = "language_options"
         case modelDownloadEndpoint = "model_download_endpoint"
+        case cliEvidenceUntilMs = "cli_evidence_until_ms"
     }
 
     public init(from decoder: Decoder) throws {
@@ -676,6 +685,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
         modelDownloadEndpoint = try container.decodeIfPresent(
             String.self, forKey: .modelDownloadEndpoint
         ) ?? ""
+        cliEvidenceUntilMs = try container.decodeIfPresent(Int64.self, forKey: .cliEvidenceUntilMs)
+    }
+
+    public func cliEvidenceIsActive(at now: Date = Date()) -> Bool {
+        guard let until = cliEvidenceUntilMs else { return false }
+        return until > Int64(now.timeIntervalSince1970 * 1000)
     }
 
     /// Rows for a language picker. The catalogue itself is never hardcoded here;

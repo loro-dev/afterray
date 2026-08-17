@@ -32,15 +32,22 @@ impl ContextBudget {
     /// ```text
     ///  16_384  window
     /// - 2_048  generation headroom
-    /// - 1_024  system prompt + tool catalog (measured at ~900)
-    /// = 13_312 transcript
-    ///        → 6 rounds × 2_048 per tool result = 12_288, leaving 1_024 for
+    /// - 1_792  system prompt + tool catalog (measured at ~1_650)
+    /// = 12_544 transcript
+    ///        → 6 rounds × 1_792 per tool result = 10_752, leaving 1_792 for
     ///          the task text and the per-round scaffolding
     /// ```
+    ///
+    /// `system_tokens` is a **measurement**, not a share. It rose from `1_024`
+    /// when the catalog began documenting every argument and return shape of
+    /// every tool: a model that has to discover a parameter by trial spends a
+    /// round on it, and a round costs more than the tokens the prose saves.
+    /// `afterrayd::tools` has the test that re-measures it — when that fails,
+    /// move this number rather than shaving the catalog to fit.
     pub const DEFAULT: Self = Self {
         window_tokens: 16_384,
         reserve_tokens: 2_048,
-        system_tokens: 1_024,
+        system_tokens: 1_792,
         max_rounds: 6,
     };
 
@@ -141,7 +148,12 @@ impl Default for ContextBudget {
 
 /// A window smaller than this cannot hold the system prompt, one tool result
 /// and a question at once, so honouring it would only mean failing differently.
-pub const MINIMUM_WINDOW_TOKENS: usize = 2_048;
+///
+/// It doubled when the tool catalog began documenting every argument and
+/// return shape: the system side alone measures ~1 650 tokens, and a 2 048
+/// window has nothing left after it. A model that small cannot run this agent,
+/// and planning against a floor it cannot meet only moves where it breaks.
+pub const MINIMUM_WINDOW_TOKENS: usize = 4_096;
 
 /// `usize::clamp` is not `const`, and `for_window` needs to be.
 const fn clamp(value: usize, low: usize, high: usize) -> usize {
@@ -164,7 +176,7 @@ const _: () = assert!(matches!(
     ContextBudget {
         window_tokens: 16_384,
         reserve_tokens: 2_048,
-        system_tokens: 1_024,
+        system_tokens: 1_792,
         max_rounds: 6,
     }
 ));

@@ -20,16 +20,16 @@ use afterray_models::{
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
-    apply_background_qos,
+    apply_background_qos, parent_app_anchor, peer_is_afterray_app,
 };
 use afterray_protocol::{
-    AppSettings, ArtifactPayload, DEFAULT_STORAGE_LIMIT_BYTES, GopReadMode, HistoryScope,
-    LlmProvider, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState, Request,
-    Response, SearchHit, Status, local_calendar_day_bounds_ms,
+    AppSettings, ArtifactPayload, CLI_EVIDENCE_WINDOW_MS, DEFAULT_STORAGE_LIMIT_BYTES, GopReadMode,
+    HistoryScope, LlmProvider, ModelDownloadProgress, PROTOCOL_VERSION, PackStatus, RecordingState,
+    Request, Response, SearchHit, Status, authorize_cli_request, local_calendar_day_bounds_ms,
+    redact_cli_response_data,
 };
 use afterray_store::{
     LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig,
-    fuse_search_results,
 };
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -140,8 +140,27 @@ fn clear_stale_capture_files(staging_dir: &Path) -> std::io::Result<usize> {
     Ok(removed)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// UI traffic (socket accepts, chat streams, artifact scrubbing) must never
+/// share a tiny worker pool with capture import, day-summary builds, or other
+/// long CPU work. Default `#[tokio::main]` sizes workers to one per core; we
+/// oversubscribe so a few blocked tasks cannot starve the accept loop.
+fn main() -> anyhow::Result<()> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2).max(8))
+        .unwrap_or(8);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        // Default is 512; keep it high so spawn_blocking UI reads never queue
+        // behind capture encrypt / T2 / GOP-adjacent store work.
+        .max_blocking_threads(512)
+        .thread_name("afterrayd-worker")
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let socket =
         afterray_protocol::socket::default_socket_path().context("resolve daemon socket path")?;
     let (listener, owner_uid) = bind_control_socket(&socket)?;
@@ -227,6 +246,12 @@ async fn main() -> anyhow::Result<()> {
     let capture_paused = Arc::new(AtomicBool::new(false));
     let last_capture_ms = Arc::new(AtomicI64::new(0));
     let recording_active = Arc::new(AtomicBool::new(false));
+    let app_anchor = parent_app_anchor();
+    if app_anchor.is_none() {
+        eprintln!(
+            "no AfterRay parent to pin; socket clients stay on the CLI query surface"
+        );
+    }
     let state = Arc::new(AppState {
         store,
         capture,
@@ -262,6 +287,8 @@ async fn main() -> anyhow::Result<()> {
             persisted.ui_language.clone(),
             persisted.summary_language.clone(),
         )),
+        cli_evidence_until_ms: std::sync::Mutex::new(persisted.cli_evidence_until_ms),
+        app_anchor,
         llm_config,
         llm_token_sink,
         mlx_adapters,
@@ -491,6 +518,11 @@ struct AppState {
     /// (ui_language, summary_language) as stored preferences; `auto` until
     /// the user picks, resolved against the system locale at prompt time.
     languages: std::sync::Mutex<(String, String)>,
+    /// Close of the CLI evidence window. `None` or a past instant is off.
+    cli_evidence_until_ms: std::sync::Mutex<Option<i64>>,
+    /// AfterRay.app that spawned us (Team ID and/or cdhash). Absent when
+    /// afterrayd was started from a shell — then nobody is privileged.
+    app_anchor: Option<afterray_platform_macos::CodeIdentity>,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     llm_token_sink: LlmTokenSink,
     mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
@@ -548,6 +580,8 @@ struct PersistedSettings {
     /// twice during the hour must not extend the hour twice.
     #[serde(default)]
     compute_paused_until_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cli_evidence_until_ms: Option<i64>,
 }
 
 /// How often the T2 sweeper wakes. `0` disables it, which the dashboard reports
@@ -618,6 +652,7 @@ impl Default for PersistedSettings {
             model_download_endpoint: String::new(),
             compute_mode: afterray_protocol::ComputeMode::Full,
             compute_paused_until_ms: 0,
+            cli_evidence_until_ms: None,
         }
     }
 }
@@ -641,66 +676,25 @@ fn recording_state_of(runtime: &RecordingRuntime) -> RecordingState {
 }
 
 async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> {
+    let privileged = client_is_privileged(&stream, &state);
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Request>(&line) {
-            Ok(Request::ReadArtifact { artifact_id }) => {
-                write_artifact_response(&mut write, read_still_artifact(&state, &artifact_id))
-                    .await?;
-            }
-            Ok(Request::ReadGopSegment { segment_id }) => {
-                write_artifact_response(&mut write, state.store.read_gop_artifact(&segment_id))
-                    .await?;
-            }
-            Ok(Request::ReadGopFrame {
-                segment_id,
-                index,
-                mode,
-            }) => {
-                write_artifact_response(
-                    &mut write,
-                    gop_packer::read_gop_frame(&state.store, &segment_id, index, mode),
-                )
-                .await?;
-            }
-            Ok(Request::ChatStream {
-                conversation_id,
-                message,
-            }) => {
-                // A hang-up no longer cancels. Closing the panel means "I will
-                // read it later": the turn runs on and writes itself into its
-                // row, so coming back finds the finished answer. Only an
-                // explicit ChatAbort stops a turn — see Request::ChatAbort.
-                let cancel = afterray_harness::CancelToken::new();
-                let (result, peer_present) = stream::run_watching_for_hangup(
-                    stream::handle_chat_stream(
-                        &mut write,
-                        &state,
-                        conversation_id,
-                        message,
-                        cancel.clone(),
-                    ),
-                    &mut lines,
-                )
-                .await;
-                result?;
-                if !peer_present {
-                    break;
+            Ok(request) if !privileged => {
+                if let Err(message) = authorize_cli_request(
+                    &request,
+                    cli_evidence_until_ms(&state),
+                    now_ms(),
+                ) {
+                    write_json_response(&mut write, &Response::failure(message)).await?;
+                    continue;
                 }
-            }
-            Ok(Request::ReadThumbnail {
-                moment_id,
-                max_edge,
-            }) => {
-                write_artifact_response(
-                    &mut write,
-                    read_moment_thumbnail(&state.store, &moment_id, max_edge),
-                )
-                .await?;
+                handle_authorized_request(request, &state, &mut write, &mut lines, false)
+                    .await?;
             }
             Ok(request) => {
-                write_json_response(&mut write, &dispatch(request, &state).await).await?;
+                handle_authorized_request(request, &state, &mut write, &mut lines, true).await?;
             }
             Err(error) => {
                 write_json_response(
@@ -711,6 +705,97 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
             }
         }
     }
+    Ok(())
+}
+
+fn client_is_privileged(stream: &UnixStream, state: &AppState) -> bool {
+    use std::os::fd::AsRawFd as _;
+    peer_is_afterray_app(stream.as_raw_fd(), state.app_anchor.as_ref())
+}
+
+fn cli_evidence_until_ms(state: &AppState) -> Option<i64> {
+    state
+        .cli_evidence_until_ms
+        .lock()
+        .map(|until| *until)
+        .unwrap_or(None)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_authorized_request(
+    request: Request,
+    state: &Arc<AppState>,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    privileged: bool,
+) -> anyhow::Result<()> {
+    match request {
+            // Artifact / thumbnail reads decrypt on the blocking pool. Doing
+            // that on a worker used to freeze accepts and chat streams while
+            // the filmstrip scrubbed.
+            Request::ReadArtifact { artifact_id } => {
+                let result =
+                    run_store(state, move |s| read_still_artifact(s, &artifact_id)).await;
+                write_artifact_response(write, result).await?;
+            }
+            Request::ReadGopSegment { segment_id } => {
+                let result =
+                    run_store(state, move |s| s.store.read_gop_artifact(&segment_id)).await;
+                write_artifact_response(write, result).await?;
+            }
+            Request::ReadGopFrame {
+                segment_id,
+                index,
+                mode,
+            } => {
+                let result = run_store(state, move |s| {
+                    gop_packer::read_gop_frame(&s.store, &segment_id, index, mode)
+                })
+                .await;
+                write_artifact_response(write, result).await?;
+            }
+            Request::ChatStream {
+                conversation_id,
+                message,
+            } => {
+                // A hang-up no longer cancels. Closing the panel means "I will
+                // read it later": the turn runs on and writes itself into its
+                // row, so coming back finds the finished answer. Only an
+                // explicit ChatAbort stops a turn — see Request::ChatAbort.
+                let cancel = afterray_harness::CancelToken::new();
+                let (result, _peer_present) = stream::run_watching_for_hangup(
+                    stream::handle_chat_stream(
+                        write,
+                        state,
+                        conversation_id,
+                        message,
+                        cancel.clone(),
+                    ),
+                    lines,
+                )
+                .await;
+                result?;
+            }
+            Request::ReadThumbnail {
+                moment_id,
+                max_edge,
+            } => {
+                let result = run_store(state, move |s| {
+                    read_moment_thumbnail(&s.store, &moment_id, max_edge)
+                })
+                .await;
+                write_artifact_response(write, result).await?;
+            }
+            other => {
+                let mut response = dispatch(other.clone(), state).await;
+                if !privileged
+                    && let Some(data) = response.data.as_mut()
+                {
+                    redact_cli_response_data(&other, data);
+                }
+                write_json_response(write, &response).await?;
+            }
+        }
     Ok(())
 }
 
@@ -798,6 +883,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 host_build: std::env::var("AFTERRAY_HOST_BUILD")
                     .ok()
                     .filter(|v| !v.is_empty()),
+                cli_evidence_until_ms: cli_evidence_until_ms(state),
             })
         }
         Request::RecordStart => record_start(state).await,
@@ -810,7 +896,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             );
             Response::success(serde_json::json!({"capture_paused": paused}))
         }
-        Request::SessionsList => into_response(state.store.sessions_sync()),
+        // Every Vault touch below goes through `run_store`. The async surface
+        // (accepts, Status/Ping, chat stream IO) stays on workers; SQLite and
+        // decrypt stay on the blocking pool.
+        Request::SessionsList => {
+            run_store(state, |s| into_response(s.store.sessions_sync())).await
+        }
         Request::TimelineList => run_store(state, |s| into_response(s.store.timeline_sync())).await,
         Request::TimelineSince { since_ms } => {
             run_store(state, move |s| {
@@ -828,15 +919,18 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             session_id,
             center_ms,
             limit,
-        } => match state.store.moments_sync(&session_id) {
-            Ok(mut moments) => {
-                moments.sort_by_key(|moment| moment.captured_at_ms.abs_diff(center_ms));
-                moments.truncate(limit.clamp(1, 500));
-                moments.sort_by_key(|moment| moment.captured_at_ms);
-                Response::success(moments)
-            }
-            Err(error) => Response::failure(error.to_string()),
-        },
+        } => {
+            run_store(state, move |s| match s.store.moments_sync(&session_id) {
+                Ok(mut moments) => {
+                    moments.sort_by_key(|moment| moment.captured_at_ms.abs_diff(center_ms));
+                    moments.truncate(limit.clamp(1, 500));
+                    moments.sort_by_key(|moment| moment.captured_at_ms);
+                    Response::success(moments)
+                }
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
+        }
         Request::ReadArtifact { .. }
         | Request::ReadGopSegment { .. }
         | Request::ReadGopFrame { .. }
@@ -847,36 +941,55 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             Response::failure("chat streams are framed as NDJSON events and are handled separately")
         }
         Request::ChatAbort { conversation_id } => abort_turn(state, &conversation_id),
-        Request::PackStatus => pack_status(state),
-        Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
+        Request::PackStatus => run_store(state, |s| pack_status(s)).await,
+        Request::GopShow { segment_id } => {
+            run_store(state, move |s| into_response(s.store.gop_segment_view(&segment_id))).await
+        }
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
         Request::Search {
             query,
             limit,
             from_ms,
             to_ms,
-        } => match text_hits(&state.store, &query, limit.clamp(1, 100)) {
-            Ok(mut hits) => {
-                if let (Some(from), Some(to)) = (from_ms, to_ms) {
-                    let (from, to) = if from <= to { (from, to) } else { (to, from) };
-                    hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
+        } => {
+            run_store(state, move |s| match text_hits(&s.store, &query, limit.clamp(1, 100)) {
+                Ok(mut hits) => {
+                    if let (Some(from), Some(to)) = (from_ms, to_ms) {
+                        let (from, to) = if from <= to { (from, to) } else { (to, from) };
+                        hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
+                    }
+                    Response::success(hits)
                 }
-                Response::success(hits)
-            }
-            Err(error) => Response::failure(error.to_string()),
-        },
-        Request::MomentGet { moment_id } => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
-            Ok(moment) => Response::success(moment),
-            Err(error) => Response::failure(error),
-        },
-        Request::MomentAt { at_ms } => match state.store.moment_nearest(at_ms) {
-            Ok(Some(moment_id)) => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
-                Ok(moment) => Response::success(moment),
-                Err(error) => Response::failure(error),
-            },
-            Ok(None) => Response::failure("no moment has been captured yet"),
-            Err(error) => Response::failure(error.to_string()),
-        },
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
+        }
+        Request::MomentGet { moment_id } => {
+            run_store(state, move |s| {
+                match tools::moment_detail(afterray_store::ReadOnlyVault::new(&s.store), &moment_id)
+                {
+                    Ok(moment) => Response::success(moment),
+                    Err(error) => Response::failure(error),
+                }
+            })
+            .await
+        }
+        Request::MomentAt { at_ms } => {
+            run_store(state, move |s| match s.store.moment_nearest(at_ms) {
+                Ok(Some(moment_id)) => {
+                    match tools::moment_detail(
+                        afterray_store::ReadOnlyVault::new(&s.store),
+                        &moment_id,
+                    ) {
+                        Ok(moment) => Response::success(moment),
+                        Err(error) => Response::failure(error),
+                    }
+                }
+                Ok(None) => Response::failure("no moment has been captured yet"),
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
+        }
         Request::SlotCard { at_ms } => {
             run_store(state, move |s| into_response(slot_card_for(s, at_ms))).await
         }
@@ -912,26 +1025,41 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             })
             .await
         }
-        Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
-            Ok(evidence) => Response::success(evidence),
-            Err(error) => Response::failure(error),
-        },
+        Request::EvidenceOcr { moment_id } => {
+            run_store(state, move |s| {
+                match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&s.store), &moment_id) {
+                    Ok(evidence) => Response::success(evidence),
+                    Err(error) => Response::failure(error),
+                }
+            })
+            .await
+        }
         Request::EvidenceAx {
             moment_id,
             digest_only,
-        } => match tools::ax_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id, digest_only) {
-            Ok(evidence) => Response::success(evidence),
-            Err(error) => Response::failure(error),
-        },
+        } => {
+            run_store(state, move |s| {
+                match tools::ax_evidence(
+                    afterray_store::ReadOnlyVault::new(&s.store),
+                    &moment_id,
+                    digest_only,
+                ) {
+                    Ok(evidence) => Response::success(evidence),
+                    Err(error) => Response::failure(error),
+                }
+            })
+            .await
+        }
         Request::ActivitySpans {
             from_ms,
             to_ms,
             limit,
-        } => into_response(
-            state
-                .store
-                .activity_spans(from_ms, to_ms, limit.clamp(1, 500)),
-        ),
+        } => {
+            run_store(state, move |s| {
+                into_response(s.store.activity_spans(from_ms, to_ms, limit.clamp(1, 500)))
+            })
+            .await
+        }
         Request::ModelsStatus => Response::success(model_library(state)),
         Request::ComputeStatus => Response::success(compute_status(state).await),
         Request::ComputeSetMode { mode } => {
@@ -1026,12 +1154,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             )
             .await
         }
-        Request::ChatList => chat::handle_list(&state.store),
+        Request::ChatList => run_store(state, |s| chat::handle_list(&s.store)).await,
         Request::ChatHistory { conversation_id } => {
-            chat::handle_history(&state.store, &conversation_id)
+            run_store(state, move |s| chat::handle_history(&s.store, &conversation_id)).await
         }
         Request::ChatDelete { conversation_id } => {
-            chat::handle_delete(&state.store, &conversation_id)
+            run_store(state, move |s| chat::handle_delete(&s.store, &conversation_id)).await
         }
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
@@ -1046,6 +1174,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             llm_model,
             llm_api_key,
             model_download_endpoint,
+            cli_evidence_access,
         } => {
             update_settings(
                 state,
@@ -1061,6 +1190,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     llm_model,
                     llm_api_key,
                     model_download_endpoint,
+                    cli_evidence_access,
                 },
             )
             .await
@@ -1087,7 +1217,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             from_ms,
             to_ms,
             limit,
-        } => into_response(state.store.memories(from_ms, to_ms, limit.clamp(1, 200))),
+        } => {
+            run_store(state, move |s| {
+                into_response(s.store.memories(from_ms, to_ms, limit.clamp(1, 200)))
+            })
+            .await
+        }
         Request::DownloadModels { pack_id, pack_ids } => {
             start_model_downloads(state, pack_id.as_deref(), &pack_ids)
         }
@@ -1107,13 +1242,13 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
 }
 
 async fn record_start(state: &Arc<AppState>) -> Response {
-    let _ = state.store.end_open_idle_spans(now_ms());
+    let _ = run_store(state, |s| s.store.end_open_idle_spans(now_ms())).await;
     let mut recording = state.recording.lock().await;
     if let Some(id) = &recording.active_session_id {
         eprintln!("record_start: already recording session {id}");
         return Response::success(serde_json::json!({"session_id": id, "already_recording": true}));
     }
-    let session = match state.store.create_session_sync(now_ms()) {
+    let session = match run_store(state, |s| s.store.create_session_sync(now_ms())).await {
         Ok(session) => session,
         Err(error) => {
             eprintln!("record_start: failed to create session: {error}");
@@ -1131,7 +1266,8 @@ async fn record_start(state: &Arc<AppState>) -> Response {
     drop(recording);
     if let Err(error) = start_capture_runtime(state, session.id.clone()).await {
         eprintln!("record_start: capture runtime failed: {error}");
-        let _ = state.store.end_session_sync(&session.id, now_ms());
+        let session_id = session.id.clone();
+        let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
         let mut recording = state.recording.lock().await;
         if recording.active_session_id.as_deref() == Some(session.id.as_str()) {
             recording.active_session_id = None;
@@ -1390,11 +1526,28 @@ fn current_settings(state: &AppState) -> AppSettings {
             .lock()
             .map(|endpoint| endpoint.clone())
             .unwrap_or_default(),
+        cli_evidence_until_ms: cli_evidence_until_ms(state),
     }
 }
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
     save_persisted_settings(&state.data_dir, &persisted_settings(state))
+}
+
+/// Disk first, then memory. A failed write must not leave the live window
+/// open (or closed) against a settings.json that still has the old value.
+fn persist_then_store_cli_evidence(
+    data_dir: &Path,
+    mut pending: PersistedSettings,
+    slot: &std::sync::Mutex<Option<i64>>,
+    until: Option<i64>,
+) -> std::io::Result<()> {
+    pending.cli_evidence_until_ms = until;
+    save_persisted_settings(data_dir, &pending)?;
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pending.cli_evidence_until_ms;
+    Ok(())
 }
 
 fn persisted_settings(state: &AppState) -> PersistedSettings {
@@ -1432,6 +1585,7 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
             .unwrap_or_default(),
         compute_mode: state.compute.mode(),
         compute_paused_until_ms: state.compute.persisted_pause_ms(),
+        cli_evidence_until_ms: cli_evidence_until_ms(state),
     }
 }
 
@@ -1449,6 +1603,7 @@ struct SettingsPatch {
     llm_model: Option<String>,
     llm_api_key: Option<String>,
     model_download_endpoint: Option<String>,
+    cli_evidence_access: Option<bool>,
 }
 
 async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Response {
@@ -1464,7 +1619,19 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         llm_model,
         llm_api_key,
         model_download_endpoint,
+        cli_evidence_access,
     } = patch;
+    if let Some(enabled) = cli_evidence_access {
+        let until = enabled.then(|| now_ms().saturating_add(CLI_EVIDENCE_WINDOW_MS));
+        if let Err(error) = persist_then_store_cli_evidence(
+            &state.data_dir,
+            persisted_settings(state),
+            &state.cli_evidence_until_ms,
+            until,
+        ) {
+            return Response::failure(format!("could not save CLI evidence access: {error}"));
+        }
+    }
     if let Some(endpoint) = model_download_endpoint {
         let cleaned = endpoint.trim().trim_end_matches('/').to_owned();
         // Same origin policy as the LLM endpoint: https, or plain http only to
@@ -1848,16 +2015,19 @@ async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
         HistoryScope::Today => local_calendar_day_bounds_ms(now),
         HistoryScope::All => (0, now),
     };
-    memory::flush(&state.store, &state.memories);
-    match state.store.delete_history(from_ms, to_ms) {
-        Ok(deleted) => Response::success(serde_json::json!({
-            "scope": scope,
-            "deleted": deleted,
-            "from_ms": from_ms,
-            "to_ms": to_ms,
-        })),
-        Err(error) => Response::failure(error.to_string()),
-    }
+    run_store(state, move |s| {
+        memory::flush(&s.store, &s.memories);
+        match s.store.delete_history(from_ms, to_ms) {
+            Ok(deleted) => Response::success(serde_json::json!({
+                "scope": scope,
+                "deleted": deleted,
+                "from_ms": from_ms,
+                "to_ms": to_ms,
+            })),
+            Err(error) => Response::failure(error.to_string()),
+        }
+    })
+    .await
 }
 
 fn settings_path(data_dir: &Path) -> PathBuf {
@@ -1930,10 +2100,12 @@ fn migrate_api_key_to_keychain(
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
-    memory::flush(&state.store, &state.memories);
-    let _ = state
-        .store
-        .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
+    let reason = reason.unwrap_or("pause").to_owned();
+    let _ = run_store(state, move |s| {
+        memory::flush(&s.store, &s.memories);
+        s.store.begin_idle_span(now_ms(), &reason)
+    })
+    .await;
     let (session_id, scheduler, consumer) = {
         let mut recording = state.recording.lock().await;
         let Some(session_id) = recording.active_session_id.take() else {
@@ -1954,7 +2126,9 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
     if let Some(consumer) = consumer {
         let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
     }
-    let store_result = state.store.end_session_sync(&session_id, now_ms());
+    let session_for_store = session_id.clone();
+    let store_result =
+        run_store(state, move |s| s.store.end_session_sync(&session_for_store, now_ms())).await;
     match (capture_error, store_result) {
         (None, Ok(())) => Response::success(serde_json::json!({"session_id": session_id})),
         (Some(capture_error), Ok(())) => Response::failure(format!(
@@ -2027,7 +2201,8 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
     if let Some(scheduler) = scheduler {
         scheduler.abort();
     }
-    let _ = state.store.end_session_sync(session_id, now_ms());
+    let session_id = session_id.to_owned();
+    let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
 }
 
 async fn import_artifact(
@@ -2042,13 +2217,16 @@ async fn import_artifact(
     let bytes = tokio::fs::read(path).await?;
     match kind {
         ArtifactKind::Screen => {
-            let moment =
-                state
-                    .store
-                    .insert_moment(session_id, started_at_ms, content_type, &bytes)?;
+            let session_id = session_id.to_owned();
+            let content_type = content_type.to_owned();
+            let moment = run_store(state, move |s| {
+                s.store
+                    .insert_moment(&session_id, started_at_ms, &content_type, &bytes)
+            })
+            .await?;
             {
                 let mut recording = state.recording.lock().await;
-                if recording.active_session_id.as_deref() == Some(session_id) {
+                if recording.active_session_id.as_deref() == Some(moment.session_id.as_str()) {
                     recording.captured_frame = true;
                 }
             }
@@ -2096,19 +2274,28 @@ async fn import_artifact(
                     } else {
                         serde_json::to_string(&regions).ok()
                     };
-                    if let Ok(evidence_id) = model_state.store.insert_text_evidence(
-                        &moment.session_id,
-                        Some(&moment.id),
-                        None,
-                        "ocr",
-                        &text,
-                        moment.captured_at_ms,
-                        None,
-                        &snapshot.adapter,
-                        layout_json.as_deref(),
-                    ) {
-                        submit_embedding(&model_state, evidence_id, text).await;
-                    }
+                    let session_id = moment.session_id.clone();
+                    let moment_id = moment.id.clone();
+                    let adapter = snapshot.adapter.clone();
+                    let text_for_store = text.clone();
+                    let evidence = run_store(&model_state, move |s| {
+                        s.store.insert_text_evidence(
+                            &session_id,
+                            Some(&moment_id),
+                            None,
+                            "ocr",
+                            &text_for_store,
+                            moment.captured_at_ms,
+                            None,
+                            &adapter,
+                            layout_json.as_deref(),
+                        )
+                    })
+                    .await;
+                    // Embeddings are switched off; see `search_hits`. The
+                    // text itself is stored, so vectors stay re-derivable
+                    // whenever the redesign lands.
+                    let _ = evidence;
                 }
                 let _ = tokio::fs::remove_file(path).await;
             });
@@ -2120,14 +2307,19 @@ async fn import_artifact(
                     afterray_protocol::AudioTrack::System
                 }
             };
-            state.store.insert_audio_segment(
-                session_id,
-                track,
-                started_at_ms,
-                ended_at_ms,
-                content_type,
-                &bytes,
-            )?;
+            let session_id = session_id.to_owned();
+            let content_type = content_type.to_owned();
+            run_store(state, move |s| {
+                s.store.insert_audio_segment(
+                    &session_id,
+                    track,
+                    started_at_ms,
+                    ended_at_ms,
+                    &content_type,
+                    &bytes,
+                )
+            })
+            .await?;
             // The encrypted segment is the durable queue. Plaintext exists
             // again only while the sweeper owns a claimed ASR item.
             if let Err(error) = tokio::fs::remove_file(path).await {
@@ -2150,7 +2342,7 @@ async fn import_artifact(
                         "accessibility snapshot did not parse, dropping the frame it describes: {error}"
                     );
                     if let Some(moment_id) =
-                        nearest_moment_id(&state.store, session_id, started_at_ms)
+                        nearest_moment_id_async(state, session_id, started_at_ms).await
                     {
                         delete_excluded_moment(state, &moment_id).await;
                     }
@@ -2164,30 +2356,44 @@ async fn import_artifact(
             if is_excluded_bundle(state, metadata.bundle_identifier.as_deref())
                 || is_excluded_url(state, metadata.url.as_deref())
             {
-                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
+                if let Some(moment_id) =
+                    nearest_moment_id_async(state, session_id, started_at_ms).await
                 {
                     delete_excluded_moment(state, &moment_id).await;
                 }
                 tokio::fs::remove_file(path).await?;
                 return Ok(());
             }
-            let attached = attach_accessibility_artifact(
-                &state.store,
-                session_id,
-                started_at_ms,
-                content_type,
-                &bytes,
-            )?;
-            if attached.is_some() {
-                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
-                {
-                    memory::observe_and_maybe_commit(
-                        &state.store,
-                        &state.memories,
+            let session_id_owned = session_id.to_owned();
+            let content_type = content_type.to_owned();
+            let attached = run_store(state, {
+                let bytes = bytes.clone();
+                move |s| {
+                    attach_accessibility_artifact(
+                        &s.store,
+                        &session_id_owned,
                         started_at_ms,
-                        &moment_id,
+                        &content_type,
                         &bytes,
-                    );
+                    )
+                }
+            })
+            .await?;
+            if attached.is_some() {
+                if let Some(moment_id) =
+                    nearest_moment_id_async(state, session_id, started_at_ms).await
+                {
+                    let moment_id = moment_id.clone();
+                    let _ = run_store(state, move |s| {
+                        memory::observe_and_maybe_commit(
+                            &s.store,
+                            &s.memories,
+                            started_at_ms,
+                            &moment_id,
+                            &bytes,
+                        );
+                    })
+                    .await;
                 }
             } else {
                 eprintln!(
@@ -2228,14 +2434,22 @@ fn attach_accessibility_artifact(
     )
 }
 
-fn nearest_moment_id(store: &Vault, session_id: &str, captured_at_ms: i64) -> Option<String> {
-    store
-        .moments_sync(session_id)
-        .ok()?
-        .into_iter()
-        .rev()
-        .find(|moment| moment.captured_at_ms.abs_diff(captured_at_ms) <= 2_000)
-        .map(|moment| moment.id)
+async fn nearest_moment_id_async(
+    state: &Arc<AppState>,
+    session_id: &str,
+    captured_at_ms: i64,
+) -> Option<String> {
+    let session_id = session_id.to_owned();
+    run_store(state, move |s| {
+        s.store
+            .moments_sync(&session_id)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|moment| moment.captured_at_ms.abs_diff(captured_at_ms) <= 2_000)
+            .map(|moment| moment.id)
+    })
+    .await
 }
 
 /// Removing the frame an exclusion just matched *is* the guarantee, so a
@@ -2248,12 +2462,23 @@ fn nearest_moment_id(store: &Vault, session_id: &str, captured_at_ms: i64) -> Op
 async fn delete_excluded_moment(state: &Arc<AppState>, moment_id: &str) {
     const RETRY_DELAY: Duration = Duration::from_millis(250);
 
-    let Err(error) = state.store.delete_moment_and_artifacts(moment_id) else {
+    let moment_id_owned = moment_id.to_owned();
+    let Err(error) = run_store(state, move |s| {
+        s.store.delete_moment_and_artifacts(&moment_id_owned)
+    })
+    .await
+    else {
         return;
     };
     eprintln!("excluded moment {moment_id} could not be deleted, retrying once: {error}");
     tokio::time::sleep(RETRY_DELAY).await;
-    if let Err(error) = state.store.delete_moment_and_artifacts(moment_id) {
+
+    let moment_id_owned = moment_id.to_owned();
+    if let Err(error) = run_store(state, move |s| {
+        s.store.delete_moment_and_artifacts(&moment_id_owned)
+    })
+    .await
+    {
         eprintln!("excluded moment {moment_id} survived a retry and is still recorded: {error}");
     }
 }
@@ -2485,33 +2710,6 @@ fn human_duration(duration: Duration) -> String {
     format!("{}h {:02}m", seconds / 3_600, (seconds % 3_600) / 60)
 }
 
-async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: String) {
-    // Search vectors are the one piece of indexing that degrades quietly: text
-    // search still works without them, so skipping them while suspended costs
-    // the user semantic recall for that window and nothing else.
-    if let Err(refusal) = state.compute.decide(
-        afterray_protocol::ComputeWorkload::Embedding,
-        compute::MachineConditions::probe(),
-        now_ms(),
-    ) {
-        eprintln!("embedding skipped for {evidence_id}: {}", refusal.reason);
-        return;
-    }
-    let Ok(job_id) = state.models.submit(ModelInput::Embedding { text }).await else {
-        return;
-    };
-    let Ok(snapshot) = state.models.wait(&job_id).await else {
-        return;
-    };
-    if snapshot.state == JobState::Done
-        && let Some(ModelOutput::Embedding { vector }) = snapshot.output
-    {
-        let _ = state
-            .store
-            .insert_embedding(&evidence_id, &vector, &snapshot.adapter);
-    }
-}
-
 /// What the recall UI searches with: exact text, and nothing else.
 ///
 /// A person typing into the search field is looking for words they remember
@@ -2527,76 +2725,26 @@ pub(crate) fn text_hits(
     store.search(query, limit)
 }
 
-/// Exact text fused with semantic recall, for callers that can weigh a loose
-/// match: the chat agent and the `search_evidence` tool.
+/// What the agent searches with.
 ///
-/// The semantic side is floored by `SEMANTIC_MIN_SIMILARITY`, so a query with
-/// nothing near it comes back short rather than padded.
-pub(crate) async fn search_hits(
+/// Exact text only. This used to fuse in semantic neighbours, and that path is
+/// switched off: `Vault::semantic_search` has no vector index — it reads every
+/// stored vector out of `SQLite` as JSON and scores it in Rust, which measures
+/// 683 ms over one week of capture and grows linearly from there. See the
+/// embedding redesign before turning it back on.
+///
+/// `filter` is applied **in SQL**, before ranking. Taking the best matches in
+/// the vault and then dropping the ones outside the range answers a different
+/// question than the caller asked, and answers it with silence: a term used
+/// often enough to fill the ranking with recent hits made older ones
+/// unreachable.
+pub(crate) fn search_hits(
     store: afterray_store::ReadOnlyVault<'_>,
-    models: &ModelQueue,
     query: &str,
+    filter: &afterray_store::SearchFilter,
     limit: usize,
 ) -> Result<Vec<SearchHit>, StoreError> {
-    let candidate_limit = limit.saturating_mul(4).clamp(limit, 400);
-    let full_text = match store.search(query, candidate_limit) {
-        Ok(hits) => hits,
-        Err(error) => {
-            eprintln!("full-text search unavailable; continuing with semantic search: {error}");
-            Vec::new()
-        }
-    };
-    let job_id = match models
-        .submit(ModelInput::Embedding {
-            text: query.to_owned(),
-        })
-        .await
-    {
-        Ok(job_id) => job_id,
-        Err(error) => {
-            eprintln!("semantic search unavailable; returning FTS results: {error}");
-            return Ok(limit_hits(full_text, limit));
-        }
-    };
-    let snapshot = match models.wait(&job_id).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!(
-                "semantic search job {job_id} could not be read; returning FTS results: {error}"
-            );
-            return Ok(limit_hits(full_text, limit));
-        }
-    };
-    let ModelOutput::Embedding { vector } = (match snapshot.output {
-        Some(output) if snapshot.state == JobState::Done => output,
-        _ => {
-            eprintln!(
-                "semantic search job {job_id} did not complete; returning FTS results: {}",
-                snapshot
-                    .last_error
-                    .unwrap_or_else(|| format!("state was {:?}", snapshot.state))
-            );
-            return Ok(limit_hits(full_text, limit));
-        }
-    }) else {
-        eprintln!(
-            "semantic search job {job_id} returned the wrong output type; returning FTS results"
-        );
-        return Ok(limit_hits(full_text, limit));
-    };
-    let semantic = match store.semantic_search(&vector, &snapshot.adapter, candidate_limit) {
-        Ok(hits) => hits,
-        Err(error) => {
-            eprintln!("semantic search scoring failed; returning FTS results: {error}");
-            return Ok(limit_hits(full_text, limit));
-        }
-    };
-    Ok(fuse_search_results(full_text, semantic, limit))
-}
-
-fn limit_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
-    hits.truncate(limit);
-    hits
+    store.search_filtered(query, filter, limit)
 }
 
 /// Runs the T2 pass: T1 card → configured model → parsed card.
@@ -2742,13 +2890,15 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
             turn.answer.chars().count()
         ));
     };
-    if let Err(error) = state.store.put_t2_summary_v2(
-        &inputs.card,
-        &t2,
-        "t2-agent",
-        now_ms(),
-        i64::try_from(latency_ms).ok(),
-    ) {
+    let latency_i64 = i64::try_from(latency_ms).ok();
+    let card = inputs.card.clone();
+    let t2_for_store = t2.clone();
+    if let Err(error) = run_store(state, move |s| {
+        s.store
+            .put_t2_summary_v2(&card, &t2_for_store, "t2-agent", now_ms(), latency_i64)
+    })
+    .await
+    {
         eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
     }
 
@@ -2981,9 +3131,8 @@ async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, Stri
                         &stored_segment, &stored_text, &adapter, now_ms(),
                     )
                 }).await.map_err(|error| error.to_string())?;
-                if let Some(evidence_id) = evidence_id {
-                    submit_embedding(state, evidence_id, text).await;
-                }
+                // Embeddings are switched off; see `search_hits`.
+                let _ = evidence_id;
                 Ok(())
             }
             Some(_) => Err(format!(
@@ -3166,7 +3315,8 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
 }
 
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
-    let text = match state.store.session_text(session_id) {
+    let session_id_owned = session_id.to_owned();
+    let text = match run_store(state, move |s| s.store.session_text(&session_id_owned)).await {
         Ok(text) if !text.is_empty() => text,
         Ok(_) => return Response::failure("the session has no OCR or transcript evidence yet"),
         Err(error) => return Response::failure(error.to_string()),
@@ -4278,7 +4428,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
+
     use tokio::io::AsyncReadExt;
 
     /// The sweeper log is where somebody goes to answer "how long did that
@@ -4410,6 +4560,48 @@ mod tests {
         let error = bind_control_socket(&linked).unwrap_err().to_string();
         assert!(error.contains("not a socket"), "{error}");
         assert!(socket.exists(), "the symlink target must survive too");
+    }
+
+    #[test]
+    fn cli_evidence_persists_before_memory_and_rolls_back_on_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let slot = std::sync::Mutex::new(None);
+        persist_then_store_cli_evidence(
+            directory.path(),
+            PersistedSettings::default(),
+            &slot,
+            Some(42),
+        )
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(42));
+        assert_eq!(
+            load_persisted_settings(directory.path()).cli_evidence_until_ms,
+            Some(42)
+        );
+
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"not-a-directory").unwrap();
+        let err = persist_then_store_cli_evidence(
+            &blocked,
+            PersistedSettings {
+                cli_evidence_until_ms: Some(42),
+                ..PersistedSettings::default()
+            },
+            &slot,
+            None,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            *slot.lock().unwrap(),
+            Some(42),
+            "a failed persist must not change the live window"
+        );
+        assert_eq!(
+            load_persisted_settings(directory.path()).cli_evidence_until_ms,
+            Some(42),
+            "the last good settings.json must survive the failed write"
+        );
     }
 
     #[test]
@@ -4784,12 +4976,8 @@ mod tests {
         }
     }
 
-    fn queue(adapters: Vec<Arc<dyn ModelAdapter>>) -> ModelQueue {
-        ModelQueue::new(adapters, QueueConfig::default()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn search_returns_fts_when_embedding_adapter_is_unavailable() {
+    #[test]
+    fn agent_search_is_exact_text_only() {
         let (_directory, vault) = test_vault();
         let session = vault.create_session_sync(1).unwrap();
         vault
@@ -4806,11 +4994,50 @@ mod tests {
             )
             .unwrap();
 
-        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &queue(Vec::new()), "needle", 10)
-            .await
-            .unwrap();
+        let hits = search_hits(
+            afterray_store::ReadOnlyVault::new(&vault),
+            "needle",
+            &afterray_store::SearchFilter::default(),
+            10,
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "needle in local memory");
+    }
+
+    /// The narrowing that used to happen after ranking, and therefore did not
+    /// work: the vault holds the same word in two months, the ranking prefers
+    /// the recent one, and a question about the older month came back empty
+    /// while its evidence sat in the vault.
+    #[test]
+    fn a_narrowed_search_reaches_evidence_the_ranking_would_have_buried() {
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let july = 1_783_000_000_000_i64;
+        let august = 1_786_000_000_000_i64;
+        for (at_ms, text) in [
+            (july, "lody notes from july"),
+            (august, "lody notes from august"),
+            (august + 1, "lody again in august"),
+            (august + 2, "lody once more in august"),
+        ] {
+            vault
+                .insert_text_evidence(
+                    &session.id, None, None, "ocr", text, at_ms, None, "ocr-model", None,
+                )
+                .unwrap();
+        }
+
+        // One result, and the ranking alone would not have chosen July's.
+        let hits = search_hits(
+            afterray_store::ReadOnlyVault::new(&vault),
+            "lody",
+            &afterray_store::SearchFilter::range(Some(july - 1), Some(july + 1)),
+            1,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].text, "lody notes from july");
     }
 
     /// The recall UI reads this path, and a hit it shows is a hit it promises
@@ -4840,67 +5067,29 @@ mod tests {
         assert_eq!(text_hits(&vault, "conceptual", 10).unwrap().len(), 1);
     }
 
-    #[tokio::test]
-    async fn search_embeds_query_and_fuses_semantic_results() {
-        let (_directory, vault) = test_vault();
-        let session = vault.create_session_sync(1).unwrap();
-        let exact_id = vault
-            .insert_text_evidence(
-                &session.id,
-                None,
-                None,
-                "ocr",
-                "needle exact words",
-                1,
-                None,
-                "ocr-model",
-                None,
-            )
-            .unwrap();
-        let semantic_id = vault
-            .insert_text_evidence(
-                &session.id,
-                None,
-                None,
-                "ocr",
-                "conceptual local context",
-                2,
-                None,
-                "ocr-model",
-                None,
-            )
-            .unwrap();
-        vault
-            .insert_embedding(&exact_id, &[0.0, 1.0], "test-embedding")
-            .unwrap();
-        vault
-            .insert_embedding(&semantic_id, &[1.0, 0.0], "test-embedding")
-            .unwrap();
-
-        let script = r#"
-import json, sys
-json.load(sys.stdin)
-print(json.dumps({
-  "protocol_version": 1,
-  "output": {"type": "embedding", "vector": [1.0, 0.0]},
-  "retryable": False
-}))
-"#;
-        let mut config = ProcessAdapterConfig::new(
-            "test-embedding",
-            ModelCapability::Embedding,
-            "/usr/bin/python3",
-        );
-        config.args = vec!["-c".to_owned(), script.to_owned()];
-        let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
-        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &models, "needle", 10).await.unwrap();
-
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().any(|hit| hit.text == "needle exact words"));
-        assert!(
-            hits.iter()
-                .any(|hit| hit.text == "conceptual local context")
-        );
+    /// Embeddings are switched off, and this is the assertion that they stay
+    /// off until the redesign lands: `Vault::semantic_search` reads every
+    /// stored vector out of `SQLite` as JSON and scores it in Rust, which
+    /// measures 683 ms over a week of capture and grows linearly.
+    ///
+    /// Written against the source rather than behaviour, because the failure
+    /// this guards against is someone re-adding the call, not a wrong answer.
+    #[test]
+    fn nothing_in_the_daemon_computes_or_stores_an_embedding() {
+        let production = include_str!("main.rs")
+            .split_once("\n#[cfg(test)]")
+            .map_or(include_str!("main.rs"), |(before, _)| before);
+        for needle in [
+            concat!("semantic_", "search("),
+            concat!("insert_", "embedding("),
+            concat!("ModelInput::", "Embedding"),
+        ] {
+            assert!(
+                !production.contains(needle),
+                "`{needle}` is back. Embedding retrieval has no index; see the \
+                 redesign before wiring it up again."
+            );
+        }
     }
 
     #[tokio::test]

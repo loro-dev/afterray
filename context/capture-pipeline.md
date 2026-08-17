@@ -1,6 +1,6 @@
 # Capture pipeline: screen → vault → search/recall
 
-Verified against code 2026-08-15.
+Verified against code 2026-08-17.
 
 End-to-end map of how a captured frame becomes searchable, summarizable history. Follow the stages in order; each stage lists the owning file and the symbols that matter. Owners: `apps/AfterRayCaptureShim` (capture), `crates/afterray-platform-macos` (shim process), `crates/afterrayd` (scheduling + import + background passes), `crates/afterray-store` (vault + indexes), `crates/afterray-models` / `crates/afterray-infer` + Swift workers (OCR/ASR/embedding/LLM).
 
@@ -9,6 +9,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - Screen capture is **not** in Rust. `apps/AfterRayCaptureShim` is a standalone SwiftPM package (macOS 15, not a target of the root `Package.swift`) using ScreenCaptureKit; the whole shim is one file, `Sources/AfterRayCaptureShim/main.swift`.
 - Pull-based: Rust decides timing. stdin commands `capture_screen` (requires `request_id`) and `stop` (main.swift:962-990); stdout carries JSON-line `Event`s only (`ready`/`artifact`/`warning`/`failed`/`stopped`); logs go to stderr.
 - Output dir is `0700`, artifact files `0600`; the shim excludes AfterRay's own windows from capture.
+- Screenshot and Accessibility evidence share one `ForegroundCaptureContext`. AX selects the frontmost app and its focused window (`main window` fallback); the screenshot refreshes `SCShareableContent` and selects the display with the largest intersection with that window's global frame, falling back to `CGMainDisplayID` when AX has no usable frame. PID, window id, and frame are rechecked before and after the screenshot, and a changed context drops the whole tick. The continuous audio stream remains separate and is never duplicated or restarted as focus crosses displays.
 - The shim exists because the Rust workspace denies `unsafe_code` and ScreenCaptureKit delegates need unsafe FFI. Build it with `make capture-shim`.
 
 ## 2. Shim process ownership — afterray-platform-macos
@@ -28,11 +29,11 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - Screen exclusions (bundle id / URL domain) are enforced **after** the screenshot lands, by deleting the stored moment (`main.rs:1956` → `delete_excluded_moment` → `delete_moment_and_artifacts`, store lib.rs:2064) — only the AX snapshot carries the URL. Keep the delete-after-capture ordering. The delete is logged and retried once; an AX snapshot that will not parse takes the same path, since an unnamed app cannot be checked.
 - **Audio exclusions cannot work that way** — a finished five-minute `m4a` cannot be sliced — so the bundle list is pushed to the shim (`push_audio_exclusions`, main.rs:1537 → `MacOsCaptureBackend::set_excluded_bundle_ids`) and the shim holds every sample until a foreground check vouches for the moment it arrived, dropping the rest (`ExcludedAudioGate`, main.swift:901). Audio is therefore never written and later cut — nothing unvouched-for reaches a file.
 - The pairing is load-bearing: the daemon evaluates exclusions **only** in the accessibility branch, so the shim must never emit a screen artifact without one (`main.swift:1157`).
-- Every sync `Vault` call from async code goes through `run_store` (`main.rs:614`, a `spawn_blocking` wrapper). Blocking a tokio worker on SQLite/encryption has historically frozen socket accepts and chat streams.
+- Every sync `Vault` call from async code goes through `run_store` (`afterrayd` main, a `spawn_blocking` wrapper). Blocking a tokio worker on SQLite/encryption has historically frozen socket accepts and chat streams. The daemon also oversizes its Tokio worker pool (`2 × cores`, min 8) so UI accepts stay free under load.
 
 ## 4. Vault — afterray-store
 
-- `crates/afterray-store/src/lib.rs:502 Vault` — SQLCipher database plus per-artifact encrypted files. One writer (`Mutex<Connection>`) + a `ReadPool` of `PRAGMA query_only` readers; use readers for reads (a write on a reader errors loudly — intentional).
+- `crates/afterray-store/src/lib.rs Vault` — SQLCipher database plus per-artifact encrypted files. One writer (`Mutex<Connection>`) + a `ReadPool` of six `PRAGMA query_only` readers; use readers for reads (a write on a reader errors loudly — intentional). Artifact files use an `RwLock` so concurrent UI decrypts share a read lock while puts/deletes take write.
 - Master key comes from the macOS Keychain (`MacOsKeychainProvider`); blake3 derives the DB key and the artifact wrap key. Non-macOS key providers hard-error.
 - Artifact encryption: `lib.rs:3655 encrypt_artifact` — random DEK per artifact, XChaCha20-Poly1305, AAD binds purpose + id + content_type, file magic `ARV1` (legacy `ARV0` migrates in the background). Renaming or retyping an artifact makes it undecryptable.
 - Schema: `SCHEMA_VERSION = 18` (lib.rs:84), additive `migrate_schema_N` steps in `migrate` (lib.rs:3020). Key tables: `moments`, `artifacts`, `audio_segments`, `text_evidence`, `evidence_fts` (FTS5), `embeddings` (vector_json + Rust cosine scan), `gop_segments`/`gop_frames`, `slot_summaries`, `text_df`, `memories`, `conversations`.

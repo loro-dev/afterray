@@ -105,6 +105,7 @@ dependencies = [
  "afterray-core",
  "async-trait",
  "core-foundation 0.10.1",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

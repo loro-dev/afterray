@@ -11,6 +11,7 @@ macOS platform glue for the daemon: owns the `AfterRayCaptureShim` child process
 - `process.rs` — `process_usage(pid)` (CPU time + memory footprint via `proc_pid_rusage`) and `thermal_pressure()`, for the compute dashboard. **`ri_user_time` is mach absolute time, not nanoseconds** — the timebase conversion is load-bearing and pinned by `measured_cpu_time_is_in_nanoseconds`; without it every figure is ~42× low on Apple Silicon. Deliberately no GPU: macOS has no public per-process GPU accounting.
 - `sysctl.rs` — the crate's single `sysctlbyname` declaration (`scalar::<T>`), with the SAFETY note written once; `total_memory_bytes` and `thermal_pressure` both go through it. This is the workspace's only `unsafe_code` exception, so keep one documented FFI declaration per symbol.
 - `locale.rs` — `preferred_languages`.
+- `peer.rs` — `peer_is_afterray_app(fd, parent_app_anchor())`. Audit token + valid `dev.afterray.app` signature, then matching Team ID **or** the spawn-time parent cdhash. Identifier-only / ad-hoc copies are rejected. Path is not a trust signal.
 
 ## Build / test
 

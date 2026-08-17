@@ -198,7 +198,10 @@ public enum DaySummaryClipboard {
 
     public static func dayText(_ summary: DaySummary, timeZone: TimeZone = .current) -> String {
         var lines = ["## \(summary.day)"]
-        for slot in summary.slots.sorted(by: { $0.slotStartMs < $1.slotStartMs }) {
+        for slot in summary.slots
+            .filter(DaySummaryLayout.isVisibleInPanel)
+            .sorted(by: { $0.slotStartMs < $1.slotStartMs })
+        {
             lines.append(slotText(slot, timeZone: timeZone))
         }
         return lines.joined(separator: "\n")
@@ -296,18 +299,32 @@ public enum DaySummaryLayout {
         slots: [DaySlotSummary],
         timeZone: TimeZone = .current
     ) -> Int64? {
-        if let covering = slots.first(where: { $0.slotStartMs <= playheadMs && playheadMs < $0.slotEndMs }) {
+        // Only consider rows the panel actually draws, so scrubbing through
+        // an idle gap does not try to follow a card that was never rendered.
+        let visible = slots.filter(isVisibleInPanel)
+        if let covering = visible.first(where: { $0.slotStartMs <= playheadMs && playheadMs < $0.slotEndMs }) {
             return covering.slotStartMs
         }
         let start = slotStartMs(atMs: playheadMs, timeZone: timeZone)
-        return slots.contains(where: { $0.slotStartMs == start }) ? start : nil
+        return visible.contains(where: { $0.slotStartMs == start }) ? start : nil
+    }
+
+    /// Idle half-hours carry no activity worth reading; the summary panel
+    /// omits them so the feed is only real work. Gaps still show on the
+    /// timeline. Storage and the wire keep the full slot list.
+    public static func isVisibleInPanel(_ slot: DaySlotSummary) -> Bool {
+        slot.state != "skipped_idle"
     }
 
     /// Panel display order: newest slot first, matching how every feed
     /// the user lives in orders time. Storage and the chat tool keep
-    /// chronological order; this is presentation only.
+    /// chronological order; this is presentation only. Idle slots are
+    /// dropped here rather than in the store so mock data and copy still
+    /// see the underlying day as the daemon sent it.
     public static func displayOrder(_ slots: [DaySlotSummary]) -> [DaySlotSummary] {
-        slots.sorted { $0.slotStartMs > $1.slotStartMs }
+        slots
+            .filter(isVisibleInPanel)
+            .sorted { $0.slotStartMs > $1.slotStartMs }
     }
 
     public static func timeLabel(slotStartMs: Int64, timeZone: TimeZone = .current) -> String {

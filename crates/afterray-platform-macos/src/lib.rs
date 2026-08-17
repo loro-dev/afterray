@@ -8,12 +8,17 @@
 
 mod locale;
 mod memory;
+mod peer;
 mod power;
 mod process;
 mod sysctl;
 
 pub use locale::preferred_languages;
 pub use memory::{GIB, context_tokens_for_memory, local_context_tokens, total_memory_bytes};
+pub use peer::{
+    APP_BUNDLE_IDENTIFIER, CodeIdentity, app_peer_is_trusted, parent_app_anchor,
+    peer_is_afterray_app,
+};
 
 pub use power::{
     apply_background_qos, battery_fraction, load_per_core, on_ac_power, seconds_since_user_input,
