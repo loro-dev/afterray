@@ -34,11 +34,18 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
             defer: false
         )
         window.title = "AfterRay Chat"
-        window.minSize = NSSize(width: 720, height: 480)
+        let minSize = NSSize(width: 720, height: 480)
+        window.minSize = minSize
+        window.contentMinSize = minSize
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true
         window.backgroundColor = NSColor(red: 0.045, green: 0.04, blue: 0.05, alpha: 1)
-        window.contentView = NSHostingView(rootView: ChatWindowRoot())
+        let hosting = NSHostingView(rootView: ChatWindowRoot())
+        // Default options also report intrinsic/max size, which pins the
+        // window to SwiftUI's ideal size so edge-drag snaps back. Min only:
+        // the view tracks contentView.bounds above that floor.
+        hosting.sizingOptions = [.minSize]
+        window.contentView = hosting
         window.center()
         window.delegate = self
         window.setFrameAutosaveName("dev.afterray.chat-window")

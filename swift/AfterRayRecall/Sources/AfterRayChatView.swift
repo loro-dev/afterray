@@ -61,23 +61,13 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         }
         .frame(
             minWidth: fillsAvailableSpace ? 720 : ChatMetrics.panelWidth,
-            minHeight: fillsAvailableSpace ? 480 : ChatMetrics.panelHeight
-        )
-        .frame(
-            width: fillsAvailableSpace ? nil : ChatMetrics.panelWidth,
-            height: fillsAvailableSpace ? nil : ChatMetrics.panelHeight
-        )
-        .frame(
             maxWidth: fillsAvailableSpace ? .infinity : ChatMetrics.panelWidth,
+            minHeight: fillsAvailableSpace ? 480 : ChatMetrics.panelHeight,
             maxHeight: fillsAvailableSpace ? .infinity : ChatMetrics.panelHeight
         )
         .background(ChatPalette.panel)
         .preferredColorScheme(.dark)
-        .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.panelRadius, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: ChatMetrics.panelRadius, style: .continuous)
-                .strokeBorder(.white.opacity(0.09), lineWidth: 1)
-        }
+        .modifier(ChatSurfaceChrome(isPanel: !fillsAvailableSpace))
         .environment(\.openURL, OpenURLAction { url in
             if url.scheme == "afterray", url.host == "moment" {
                 let id = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -190,7 +180,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 if model.isLoadingHistory {
                     ProgressView().controlSize(.small).tint(ChatPalette.accent)
                 }
-                ChatIconButton(symbol: "xmark", help: "Close chat", action: onClose)
+                if !fillsAvailableSpace {
+                    ChatIconButton(symbol: "xmark", help: "Close chat", action: onClose)
+                }
             }
         }
         .padding(.horizontal, ChatMetrics.gutter)
@@ -402,6 +394,25 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         .padding(.vertical, 14)
         .overlay(alignment: .top) {
             Rectangle().fill(ChatPalette.separator).frame(height: 1)
+        }
+    }
+}
+
+/// Overlay chat is a fixed rounded card. Window chat must not clip to that
+/// panel — a real `NSWindow` already has a titlebar and resizable edges.
+private struct ChatSurfaceChrome: ViewModifier {
+    let isPanel: Bool
+
+    func body(content: Content) -> some View {
+        if isPanel {
+            content
+                .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.panelRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: ChatMetrics.panelRadius, style: .continuous)
+                        .strokeBorder(.white.opacity(0.09), lineWidth: 1)
+                }
+        } else {
+            content
         }
     }
 }

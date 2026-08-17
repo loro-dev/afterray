@@ -17,7 +17,7 @@ The shipped macOS app (`AfterRayApp` executable target in the root `Package.swif
 - Sensitive-state teardown on screen lock/sleep: `.afterRaySystemSessionWillSuspend` → `store`/`control`/`chat.clearSensitiveState()` + close the chat window + `images.clearSensitiveData()` (`AfterRayApp.swift:1143-1150`). Hook any new decrypted-content cache into this.
 - The overlay, history window, and chat window must share `AfterRayServices.shared` stores — never construct a private `RecallStore` or `AfterRayChatModel`.
 - `RecallView` exclusively owns the opaque history backdrop because it sees transient scrub state. `AfterRayRootView` must stay transparent; an outer backdrop lags a fast flick to NOW and produces a black screen after the still unmounts.
-- Pop-out controllers retain their `NSWindow`. Every `show()`, including reuse, must ensure the daemon and force-refresh. A first-open connection refusal must not strand the window on `.empty`.
+- Pop-out controllers retain their `NSWindow`. Every `show()`, including reuse, must ensure the daemon and force-refresh. A first-open connection refusal must not strand the window on `.empty`. Chat hosting must use `sizingOptions = [.minSize]` or resize snaps back.
 - Chat is a standalone window. Overlay hide / Escape must not call `chat.stop()` or close it. A moment citation may show the overlay (`OverlayOpenIntent.moment`) without destroying the chat window.
 - `AfterRayStandardWindowPresence`: `.regular` while History or Chat is visible/miniaturized; `.accessory` only when the last one closes.
 - `AfterRaySettingsController.show()` forces the overlay visible first (`AfterRaySettings.swift:33-38`); settings render inside the recall panel.
