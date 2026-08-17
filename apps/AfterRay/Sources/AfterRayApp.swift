@@ -1469,15 +1469,19 @@ private struct ImmersiveQueryBar: View {
     var body: some View {
         HStack(spacing: 10) {
             Button(action: toggleMode) {
-                Label(mode.title, systemImage: mode.symbol)
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(mode == .ask ? RecallPalette.ray : .white.opacity(0.76))
-                    .padding(.horizontal, 9)
-                    .frame(height: 26)
-                    .background(.white.opacity(0.08), in: Capsule())
-                    .contentShape(Capsule())
+                HStack(spacing: 5) {
+                    queryModeIcon
+                    Text(mode.title)
+                }
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(mode == .ask ? RecallPalette.ray : .white.opacity(0.86))
+                .padding(.horizontal, 9)
+                .frame(height: 26)
+                .background(.white.opacity(0.08), in: Capsule())
+                .contentShape(Capsule())
+                .recallHoverFill(in: Capsule())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RecallGlassPressStyle())
             .help("\(mode.toggleHelp) (Tab)")
             .accessibilityLabel("Input mode")
             .accessibilityValue(mode.title)
@@ -1520,10 +1524,14 @@ private struct ImmersiveQueryBar: View {
             Button(action: onOpenChat) {
                 Image(systemName: "bubble.left.and.bubble.right")
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.78))
+                    .foregroundStyle(.white.opacity(0.86))
                     .frame(width: 26, height: 26)
+                    .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .recallHoverFill(
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RecallGlassPressStyle())
             .help("Open chat")
             .accessibilityLabel("Open chat")
 
@@ -1552,8 +1560,29 @@ private struct ImmersiveQueryBar: View {
         }
     }
 
+    /// Search and Ask share one slot. Both glyphs stay mounted so the swap
+    /// can cross-fade instead of popping — hover/click is frequent, so the
+    /// motion stays short and the label still names the state.
+    private var queryModeIcon: some View {
+        ZStack {
+            Image(systemName: ImmersiveQueryMode.search.symbol)
+                .opacity(mode == .search ? 1 : 0)
+                .scaleEffect(mode == .search ? 1 : 0.25)
+                .blur(radius: mode == .search ? 0 : 4)
+            Image(systemName: ImmersiveQueryMode.ask.symbol)
+                .opacity(mode == .ask ? 1 : 0)
+                .scaleEffect(mode == .ask ? 1 : 0.25)
+                .blur(radius: mode == .ask ? 0 : 4)
+        }
+        .frame(width: 11, height: 11)
+        .animation(.easeOut(duration: 0.18), value: mode)
+        .accessibilityHidden(true)
+    }
+
     private func toggleMode() {
-        mode.toggle()
+        withAnimation(.easeOut(duration: 0.18)) {
+            mode.toggle()
+        }
         isInputFocused = true
     }
 

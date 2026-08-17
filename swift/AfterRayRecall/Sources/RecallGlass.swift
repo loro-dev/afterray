@@ -72,6 +72,7 @@ public struct RecallChromeIconButton: View {
                     height: RecallGeometry.overlayChromeButtonSize
                 )
                 .contentShape(Circle())
+                .recallHoverFill(in: Circle())
         }
         .buttonStyle(RecallGlassPressStyle())
         .recallGlass(in: .circle)
@@ -79,8 +80,34 @@ public struct RecallChromeIconButton: View {
     }
 }
 
-struct RecallGlassPressStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
+/// A faint fill that appears on hover so icon-only chrome reads as clickable.
+/// Color change stays even when Reduce Motion is on; the fade is short.
+public struct RecallHoverFill: ViewModifier {
+    let shape: AnyShape
+    @State private var isHovering = false
+
+    public func body(content: Content) -> some View {
+        content
+            .background {
+                shape.fill(Color.white.opacity(isHovering ? 0.16 : 0))
+            }
+            .onHover { hovering in
+                isHovering = hovering
+            }
+            .animation(.easeOut(duration: 0.12), value: isHovering)
+    }
+}
+
+public extension View {
+    func recallHoverFill<S: Shape>(in shape: S) -> some View {
+        modifier(RecallHoverFill(shape: AnyShape(shape)))
+    }
+}
+
+public struct RecallGlassPressStyle: ButtonStyle {
+    public init() {}
+
+    public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .opacity(configuration.isPressed ? 0.82 : 1)
