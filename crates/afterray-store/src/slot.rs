@@ -2307,6 +2307,125 @@ mod tests {
         assert_eq!(parsed["runs"][0]["src"], "ax");
     }
 
+    // ------------------------------------------------- fail-open fixture
+
+    /// A slot with everything a card can carry: three targets, a revisit, a
+    /// capture hole, both text sources, selected text, composed text, audio,
+    /// and lines that exercise the dedup buckets.
+    fn fail_open_fixture() -> Vec<SlotMomentRow> {
+        let mut first = row(
+            "moment-1",
+            0,
+            "Zed",
+            "slot.rs",
+            Some("fn build_slot_card_with_end\nlet dedup = LineDedup::new();\n14:32"),
+        );
+        first.text_from_ax = true;
+        first.selected_text = Some("LineDedup::new()".to_owned());
+
+        let mut second = row(
+            "moment-2",
+            10_000,
+            "Zed",
+            "slot.rs",
+            Some("fn build_slot_card_with_end\nlet mut pieces: Vec<Piece> = Vec::new();\n14:33"),
+        );
+        second.text_from_ax = true;
+        second.focused_value = Some("cargo test -p afterray-store".to_owned());
+
+        let mut third = row(
+            "moment-3",
+            20_000,
+            "Feishu",
+            "Lody Team",
+            Some("赵亮: shipped the fix\nLody Team\nDesign review at 3"),
+        );
+        third.has_audio = true;
+
+        // A hole wider than GAP_MS, then back to the first target.
+        let mut fourth = row(
+            "moment-4",
+            120_000,
+            "Zed",
+            "slot.rs",
+            Some("let mut pieces: Vec<Piece> = Vec::new();\nassert_eq!(card.revisits.len(), 1);"),
+        );
+        fourth.text_from_ax = true;
+
+        vec![first, second, third, fourth]
+    }
+
+    /// Clock-derived fields are the only locale-dependent part of a card, and
+    /// this pin is about content, not time zones.
+    fn normalise_clock(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let chars: Vec<char> = text.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            // `YYYY-MM-DD`
+            if index + 10 <= chars.len()
+                && chars[index..index + 4].iter().all(char::is_ascii_digit)
+                && chars[index + 4] == '-'
+                && chars[index + 5..index + 7].iter().all(char::is_ascii_digit)
+                && chars[index + 7] == '-'
+                && chars[index + 8..index + 10].iter().all(char::is_ascii_digit)
+            {
+                out.push_str("YYYY-MM-DD");
+                index += 10;
+                continue;
+            }
+            // `HH:MM` — but not a line of screen text that happens to look
+            // like one, which is why the fixture's clock lines are `14:32`
+            // inside longer strings and appear here as HH:MM too. Normalising
+            // both sides identically keeps the pin honest.
+            if index + 5 <= chars.len()
+                && chars[index..index + 2].iter().all(char::is_ascii_digit)
+                && chars[index + 2] == ':'
+                && chars[index + 3..index + 5].iter().all(char::is_ascii_digit)
+            {
+                out.push_str("HH:MM");
+                index += 5;
+                continue;
+            }
+            out.push(chars[index]);
+            index += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn zero_input_events_reproduce_the_pre_acts_card_and_prompt() {
+        let rows = fail_open_fixture();
+        let card = build_slot_card_with_end(0, 600_000, &rows, 0, 10_000);
+        let card_json = serde_json::to_string(&card).expect("card serialises");
+        let prompt = render_t2_prompt(
+            &card,
+            &[PrevCard {
+                from_label: "14:20".to_owned(),
+                title: "previous card".to_owned(),
+            }],
+            "English",
+            &crate::infoscore::BackgroundStats::empty(),
+        );
+        if std::env::var("AFTERRAY_DUMP_FAIL_OPEN").is_ok() {
+            println!("---CARD---\n{}", normalise_clock(&card_json));
+            println!("---PROMPT---\n{}", normalise_clock(&prompt));
+        }
+        assert_eq!(normalise_clock(&card_json), FAIL_OPEN_CARD);
+        assert_eq!(normalise_clock(&prompt), FAIL_OPEN_PROMPT);
+    }
+
+    /// Captured from the pipeline as it stood before acts existed (commit
+    /// 9cf8eee), clock fields normalised. This is the fail-open invariant:
+    /// a slot with no input events must leave the acts pipeline exactly as
+    /// it left the pipeline that had no acts. It may never be weakened — a
+    /// failure here means the partition changed a card that has nothing to
+    /// partition by. Regenerate only with AFTERRAY_DUMP_FAIL_OPEN=1 after
+    /// deliberately changing the no-events shape.
+    const FAIL_OPEN_CARD: &str = r#"{"slot_start_ms":0,"slot_end_ms":600000,"local_day":"YYYY-MM-DD","state":"ready","theme_key":"com.test.zed|slot.rs","anchor_moment_id":"moment-2","facts":{"apps":[{"name":"Zed","bundle_identifier":"com.test.zed","ms":30000},{"name":"Feishu","bundle_identifier":"com.test.feishu","ms":10000}],"top_windows":["slot.rs","Lody Team"],"top_documents":[],"top_urls":[],"has_audio":true,"audio_moment_count":1,"moment_count":4,"ocr_moment_count":4,"ax_moment_count":4,"switch_count":2,"longest_focus_ms":20000,"idle_ratio":0.0},"timeline":[{"moment_id":"moment-2","start_ms":0,"end_ms":20000,"app":"Zed","title":"slot.rs","selected":"LineDedup::new()","typing":"cargo test -p afterray-store","lines":["fn build_slot_card_with_end","let dedup = LineDedup::new();","HH:MM","let mut pieces: Vec<Piece> = Vec::new();"],"line_frames":[2,1,2,2],"total_chars":101,"text_source":"ax"},{"moment_id":"moment-3","start_ms":20000,"end_ms":30000,"app":"Feishu","title":"Lody Team","lines":["赵亮: shipped the fix","Lody Team","Design review at 3"],"line_frames":[1,1,1],"total_chars":46,"text_source":"ocr"},{"gap":true,"start_ms":30000,"end_ms":120000},{"moment_id":"moment-4","start_ms":120000,"end_ms":130000,"app":"Zed","title":"slot.rs","lines":["assert_eq!(card.revisits.len(), 1);"],"line_frames":[1],"total_chars":35,"text_source":"ax"},{"gap":true,"start_ms":130000,"end_ms":600000}],"revisits":[{"target":"Zed · slot.rs","visits":2,"total_ms":30000,"at_ms":[0,120000]}],"evidence":{"moment_ids":["moment-1","moment-2","moment-3","moment-4"]}}"#;
+
+    const FAIL_OPEN_PROMPT: &str = r#"{"facts":{"apps":[{"min":1,"name":"Zed"},{"min":0,"name":"Feishu"}],"audio":{"frames_in_recording":1,"of":4,"read_via":"moment tool, transcript_text field"},"idle_pct":0.0,"longest_focus_min":0,"switches":2,"windows":["slot.rs","Lody Team"]},"output_language":"English","prev_cards":[{"from":"HH:MM","note":"context only; do not copy wording","title":"previous card"}],"revisits":[{"at":["HH:MM","HH:MM"],"min":1,"target":"Zed · slot.rs","visits":2}],"runs":[{"app":"Zed","from":"HH:MM","id":"moment-2","more_chars":0,"sel":"LineDedup::new()","src":"ax","text":["fn build_slot_card_with_end","let dedup = LineDedup::new();","HH:MM","let mut pieces: Vec<Piece> = Vec::new();"],"title":"slot.rs","to":"HH:MM","typing":"cargo test -p afterray-store"},{"app":"Feishu","from":"HH:MM","id":"moment-3","more_chars":0,"src":"ocr","text":["赵亮: shipped the fix","Lody Team","Design review at 3"],"title":"Lody Team","to":"HH:MM"},{"from":"HH:MM","gap":true,"to":"HH:MM"},{"app":"Zed","from":"HH:MM","id":"moment-4","more_chars":0,"src":"ax","text":["assert_eq!(card.revisits.len(), 1);"],"title":"slot.rs","to":"HH:MM"},{"from":"HH:MM","gap":true,"to":"HH:MM"}],"slot":{"day":"YYYY-MM-DD","from":"HH:MM","state":"ready","to":"HH:MM"}}"#;
+
     #[test]
     fn revisits_aggregate_across_the_timeline() {
         let rows = vec![
