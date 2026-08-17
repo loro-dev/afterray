@@ -47,6 +47,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 mod activity;
+pub use activity::ActivityMomentRow;
 mod gop;
 pub mod infoscore;
 mod jpeg;
@@ -1191,6 +1192,84 @@ impl Vault {
         drop(statement);
         drop(connection);
         Ok(activity::fold_activity_spans(&moments, limit))
+    }
+
+    /// The most recent capture in `[from_ms, to_ms]`, and where it was taken.
+    ///
+    /// Deliberately not "the last element of `activity_spans`". That folds
+    /// forward from the start of the range and returns the moment it reaches
+    /// its limit, so its last element is the *earliest* limit-th span, not the
+    /// current one — on a day with more switches than the limit it is hours
+    /// stale, which is the worst possible error for something labelled "now".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn latest_activity_moment(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Option<activity::ActivityMomentRow>, StoreError> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT id, captured_at_ms, application_name, bundle_identifier,
+                        window_title, url, document
+                   FROM moments
+                  WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2
+                  ORDER BY captured_at_ms DESC, id DESC
+                  LIMIT 1",
+                params![from_ms, to_ms],
+                |row| {
+                    Ok(activity::ActivityMomentRow {
+                        id: row.get(0)?,
+                        captured_at_ms: row.get(1)?,
+                        application_name: row.get(2)?,
+                        bundle_identifier: row.get(3)?,
+                        window_title: row.get(4)?,
+                        url: row.get(5)?,
+                        document: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Applications by how much of a range they occupied, most first.
+    ///
+    /// Aggregated in SQL rather than by walking spans, so a day with more
+    /// switches than a span limit cannot hide its afternoon behind its
+    /// morning. Capture is interval-driven, so a frame count is time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn top_apps_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        if limit == 0 || from_ms > to_ms {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT application_name, COUNT(*) AS frames
+               FROM moments
+              WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2
+                AND application_name IS NOT NULL
+                AND TRIM(application_name) != ''
+              GROUP BY application_name
+              ORDER BY frames DESC, application_name
+              LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![from_ms, to_ms, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Builds the deterministic T1 card for the slot containing `at_ms`.

@@ -135,15 +135,31 @@ impl ToolHost<'_> {
         // today. Both are derived from captured window titles, so they are
         // untrusted data — which is why they live in a tool result, inside the
         // data fence, and not in the catalog.
+        //
+        // Neither is read off `activity_spans`. That folds forward and stops
+        // at its limit, so on a day with more switches than the limit its last
+        // element is a morning span and its app list has no afternoon in it —
+        // and a stale span printed under "Right now" is read as current fact.
         let (day_start, _) = local_calendar_day_bounds_ms(self.now_ms);
-        if let Ok(spans) = self.store.activity_spans(day_start, self.now_ms, 200) {
-            if let Some(current) = spans.last() {
-                lines.push(format!("Right now: {}", describe_span_place(current)));
-            }
-            let apps = distinct_apps(&spans, 8);
-            if !apps.is_empty() {
-                lines.push(format!("Today's apps: {}", apps.join(", ")));
-            }
+        if let Ok(Some(current)) = self.store.latest_activity_moment(day_start, self.now_ms) {
+            // Stamped, because the newest capture is only "now" while capture
+            // is running: paused or asleep, this is the last thing seen, and
+            // the clock beside it is what says so.
+            lines.push(format!(
+                "Right now: {} {}",
+                format_local_time(current.captured_at_ms),
+                describe_place(
+                    current.application_name.as_deref(),
+                    current.document.as_deref(),
+                    current.url.as_deref(),
+                    current.window_title.as_deref(),
+                )
+            ));
+        }
+        if let Ok(apps) = self.store.top_apps_in_range(day_start, self.now_ms, 8)
+            && !apps.is_empty()
+        {
+            lines.push(format!("Today's apps: {}", apps.join(", ")));
         }
         Ok(lines.join("\n"))
     }
@@ -944,37 +960,30 @@ fn or_none(value: Option<&str>) -> String {
 
 /// Where a span was: the most specific of document, url, or window title.
 fn describe_span_place(span: &ActivitySpan) -> String {
-    let app = span.application_name.as_deref().unwrap_or("Unknown");
-    let place = span
-        .document
-        .as_deref()
-        .or(span.url.as_deref())
-        .or(span.window_title.as_deref())
+    describe_place(
+        span.application_name.as_deref(),
+        span.document.as_deref(),
+        span.url.as_deref(),
+        span.window_title.as_deref(),
+    )
+}
+
+/// One precedence rule for "where", shared by spans and single frames.
+fn describe_place(
+    app: Option<&str>,
+    document: Option<&str>,
+    url: Option<&str>,
+    window_title: Option<&str>,
+) -> String {
+    let app = app.unwrap_or("Unknown");
+    let place = document
+        .or(url)
+        .or(window_title)
         .filter(|text| !text.trim().is_empty());
     match place {
         Some(place) => format!("{app}  {place}"),
         None => app.to_owned(),
     }
-}
-
-fn distinct_apps(spans: &[ActivitySpan], max: usize) -> Vec<String> {
-    let mut apps: Vec<String> = Vec::new();
-    for span in spans {
-        let Some(name) = span
-            .application_name
-            .as_deref()
-            .filter(|name| !name.is_empty())
-        else {
-            continue;
-        };
-        if !apps.iter().any(|seen| seen == name) {
-            apps.push(name.to_owned());
-        }
-        if apps.len() >= max {
-            break;
-        }
-    }
-    apps
 }
 
 fn clock_label(at_ms: i64) -> String {
@@ -1153,8 +1162,13 @@ get_now   {}
     this month  08-01 – 08-31   from_ms=…              to_ms=…
     last month  07-01 – 07-31   from_ms=…              to_ms=…
     Recording covers 2026-07-02 – 2026-08-15.
-    Right now: Zed  tools.rs
+    Right now: 01:52:10  Zed  tools.rs
     Today's apps: Zed, Chrome, Weixin
+
+  "Right now" is the newest capture and carries its clock time — if that
+  time is not recent, capture was paused and it is the last thing seen,
+  not what is on screen. "Today's apps" is ordered by how much of the day
+  each one took.
 
   The date column feeds get_day_summary; the from_ms/to_ms columns feed
   every tool taking a range. Nothing outside "Recording covers" exists.
@@ -1653,6 +1667,22 @@ mod tests {
         }
     }
 
+    /// Names the application on the moment nearest `at_ms`, the way capture
+    /// does: through the accessibility snapshot, which is the only public path
+    /// that sets a moment's application and window title.
+    fn stamp_app(vault: &Vault, session_id: &str, at_ms: i64, app: &str, title: &str) {
+        vault
+            .attach_accessibility_snapshot(
+                session_id,
+                at_ms,
+                "application/vnd.afterray.ax+json",
+                format!(r#"{{"application_name":"{app}","window_title":"{title}"}}"#).as_bytes(),
+                Some(app),
+                None,
+            )
+            .unwrap();
+    }
+
     fn seed_moments(vault: &Vault, stamps: &[i64]) {
         let session = vault.create_session_sync(stamps[0]).unwrap();
         for stamp in stamps {
@@ -1724,6 +1754,67 @@ mod tests {
             assert!(text.contains(label), "`{label}` is missing: {text}");
         }
         assert!(text.contains("Recording covers"), "{text}");
+    }
+
+    /// A day with more switches than any span limit must still report the
+    /// afternoon.
+    ///
+    /// `activity_spans` folds forward and returns the moment it reaches its
+    /// limit, so its last element is the *earliest* limit-th span. Reading
+    /// "Right now" off it printed a morning span as the current state — the
+    /// worst error available to a line the agent treats as present fact — and
+    /// the app sketch beside it had no afternoon in it at all.
+    #[tokio::test]
+    async fn the_clock_reports_the_afternoon_on_a_day_of_many_switches() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+
+        // 260 morning switches: more than any limit the tool might pass.
+        for index in 0..260_i64 {
+            let at_ms = day_start + index * 10_000;
+            let moment = vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Chrome", &format!("tab {index}"));
+            let _ = moment;
+        }
+        // Then a long afternoon in an application that appears nowhere above.
+        let afternoon = day_start + 13 * 3_600_000;
+        for index in 0..40_i64 {
+            let at_ms = afternoon + index * 10_000;
+            let moment = vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Xcode", "ContentView.swift");
+            let _ = moment;
+        }
+        let host = ToolHost {
+            store: ReadOnlyVault::new(&vault),
+            now_ms: afternoon + 40 * 10_000,
+            budget: ContextBudget::DEFAULT,
+        };
+
+        let text = host.invoke("get_now", &json!({})).await.unwrap().text;
+        let right_now = text
+            .lines()
+            .find(|line| line.starts_with("Right now:"))
+            .expect("no current-activity line");
+        assert!(
+            right_now.contains("Xcode") && right_now.contains("ContentView.swift"),
+            "the morning was reported as the present: {right_now}"
+        );
+        // Stamped, so a stale line is visibly stale rather than silently wrong.
+        assert!(
+            right_now.contains(&format_local_time(afternoon + 39 * 10_000)),
+            "the current line carries no clock time: {right_now}"
+        );
+        let apps = text
+            .lines()
+            .find(|line| line.starts_with("Today's apps:"))
+            .expect("no app line");
+        assert!(apps.contains("Xcode"), "the afternoon's app is missing: {apps}");
+        assert!(apps.contains("Chrome"), "{apps}");
     }
 
     /// Structural, not against fixed dates: whichever weekday `NOW` lands on,

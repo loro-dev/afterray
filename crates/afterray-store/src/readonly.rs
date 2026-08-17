@@ -61,6 +61,27 @@ impl<'a> ReadOnlyVault<'a> {
 
     /// # Errors
     /// Propagates the underlying query failure.
+    pub fn latest_activity_moment(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Option<crate::ActivityMomentRow>, StoreError> {
+        self.inner.latest_activity_moment(from_ms, to_ms)
+    }
+
+    /// # Errors
+    /// Propagates the underlying query failure.
+    pub fn top_apps_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        self.inner.top_apps_in_range(from_ms, to_ms, limit)
+    }
+
+    /// # Errors
+    /// Propagates the underlying query failure.
     pub fn memories(&self, from_ms: i64, to_ms: i64, limit: usize) -> Result<Vec<Memory>, StoreError> {
         self.inner.memories(from_ms, to_ms, limit)
     }
