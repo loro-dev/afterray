@@ -48,6 +48,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod activity;
 pub use activity::ActivityMomentRow;
+pub mod acts;
 mod gop;
 pub mod infoscore;
 mod jpeg;
@@ -61,8 +62,8 @@ pub use gop::{
 };
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
-    AccessibilityDigest, accessibility_text_lines, digest_fingerprint, is_idle_digest,
-    parse_accessibility_digest,
+    AccessibilityDigest, AxScopeNode, AxScopeTree, accessibility_scope_tree,
+    accessibility_text_lines, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
 };
 use search_index::{index_text, match_query};
 /// One stretch of transcribed speech: when it started, which track it came

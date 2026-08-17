@@ -1,5 +1,6 @@
 //! Compact Accessibility digests used to produce local memories.
 
+use crate::acts::AxRect;
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -137,45 +138,116 @@ const TEXT_ROLES: &[&str] = &[
 /// frontmost application by construction of the snapshot.
 #[must_use]
 pub fn accessibility_text_lines(snapshot: &[u8]) -> Vec<String> {
-    const LINE_CLIP_CHARS: usize = 500;
-    let Ok(header) = serde_json::from_slice::<SnapshotHeader>(snapshot) else {
-        return Vec::new();
-    };
-    let private_browsing = header.private_browsing;
-    let Some(root) = header.root else {
-        return Vec::new();
-    };
-    let mut lines = Vec::new();
-    collect_text_lines(&root, &mut lines, LINE_CLIP_CHARS, private_browsing);
-    lines
+    walk_snapshot(snapshot, false).map_or_else(Vec::new, |tree| tree.lines)
 }
 
-fn collect_text_lines(
-    node: &SnapshotNode,
-    lines: &mut Vec<String>,
-    clip_chars: usize,
+/// One node of the tree, flattened.
+///
+/// An arena with parent links rather than nested children: every geometric
+/// question the join asks — deepest node containing a point, lowest common
+/// ancestor of several, nearest ancestor big enough to be a region — is an
+/// upward walk, and the nested shape makes each of those a search.
+#[derive(Debug, Clone)]
+pub struct AxScopeNode {
+    pub parent: Option<usize>,
+    pub depth: u16,
+    pub role: String,
+    pub subrole: Option<String>,
+    /// Title or description: what the element is called, never its value.
+    pub label: Option<String>,
+    pub frame: Option<AxRect>,
+}
+
+/// The frame's accessibility tree with geometry, plus the same text lines
+/// [`accessibility_text_lines`] returns and which node contributed each one.
+///
+/// The line vector is produced by the identical traversal, so a card that
+/// partitions lines by tree position can never disagree with the card that
+/// counts them — the `AX_TEXT_MIN_CHARS` text-source decision reads the whole
+/// vector and must keep seeing every line.
+#[derive(Debug, Clone, Default)]
+pub struct AxScopeTree {
+    pub nodes: Vec<AxScopeNode>,
+    pub lines: Vec<String>,
+    /// Node index that produced each line; parallel to `lines`.
+    pub line_node: Vec<usize>,
+}
+
+/// Parses the snapshot into a geometry-bearing tree, or `None` when the
+/// snapshot has no parseable root.
+///
+/// Costs one extra arena per frame over [`accessibility_text_lines`], so only
+/// the paths that actually have input events to join call it.
+#[must_use]
+pub fn accessibility_scope_tree(snapshot: &[u8]) -> Option<AxScopeTree> {
+    walk_snapshot(snapshot, true)
+}
+
+fn walk_snapshot(snapshot: &[u8], geometry: bool) -> Option<AxScopeTree> {
+    const LINE_CLIP_CHARS: usize = 500;
+    let header = serde_json::from_slice::<SnapshotHeader>(snapshot).ok()?;
+    let private_browsing = header.private_browsing;
+    let root = header.root?;
+    let mut walk = TreeWalk {
+        tree: AxScopeTree::default(),
+        geometry,
+        private_browsing,
+        clip_chars: LINE_CLIP_CHARS,
+    };
+    walk.visit(&root, None, 0);
+    Some(walk.tree)
+}
+
+struct TreeWalk {
+    tree: AxScopeTree,
+    geometry: bool,
     private_browsing: bool,
-) {
-    let role = node.role.as_deref().unwrap_or("");
-    if TEXT_ROLES.contains(&role) {
-        let text = node
-            .value
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .or(node.title.as_deref());
-        if let Some(text) = text
-            && !(private_browsing && is_location_field(role) && looks_like_web_location(text))
-        {
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.chars().count() >= 2 {
-                    lines.push(clip(trimmed, clip_chars));
+    clip_chars: usize,
+}
+
+impl TreeWalk {
+    fn visit(&mut self, node: &SnapshotNode, parent: Option<usize>, depth: u16) {
+        let role = node.role.as_deref().unwrap_or("");
+        let index = if self.geometry {
+            let index = self.tree.nodes.len();
+            self.tree.nodes.push(AxScopeNode {
+                parent,
+                depth,
+                role: role.to_owned(),
+                subrole: nonempty(node.subrole.clone()),
+                label: nonempty(node.title.clone())
+                    .or_else(|| nonempty(node.description.clone())),
+                frame: node.frame,
+            });
+            index
+        } else {
+            0
+        };
+        if TEXT_ROLES.contains(&role) {
+            let text = node
+                .value
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or(node.title.as_deref());
+            if let Some(text) = text
+                && !(self.private_browsing
+                    && is_location_field(role)
+                    && looks_like_web_location(text))
+            {
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.chars().count() >= 2 {
+                        self.tree.lines.push(clip(trimmed, self.clip_chars));
+                        if self.geometry {
+                            self.tree.line_node.push(index);
+                        }
+                    }
                 }
             }
         }
-    }
-    for child in &node.children {
-        collect_text_lines(child, lines, clip_chars, private_browsing);
+        for child in &node.children {
+            self.visit(child, Some(index), depth.saturating_add(1));
+        }
     }
 }
 
@@ -278,9 +350,17 @@ struct SnapshotNode {
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     value: Option<String>,
     #[serde(default)]
     focused: Option<bool>,
+    /// UI geometry in global top-left screen points. The shim has always
+    /// written it (measured: 1106 of 1115 nodes on a real frame carry one);
+    /// nothing read it until the input-event join needed to ask which region
+    /// of the window a click landed in.
+    #[serde(default)]
+    frame: Option<AxRect>,
     #[serde(default)]
     children: Vec<SnapshotNode>,
 }
@@ -500,6 +580,60 @@ mod tests {
         assert!(fallback_digest.url.is_none());
         assert!(fallback_digest.focused_value.is_none());
         assert!(fallback_digest.visible_text.is_empty());
+    }
+
+    /// The text-source decision (`AX_TEXT_MIN_CHARS`) counts the whole line
+    /// vector, and the acts join partitions that same vector by tree position.
+    /// If the two traversals could disagree, partitioning would silently move a
+    /// frame between AX and OCR text. They are one traversal, and this says so.
+    #[test]
+    fn the_scope_tree_yields_exactly_the_text_lines() {
+        let snapshot = br#"{
+            "application_name":"Lark",
+            "root":{
+                "role":"AXWindow","title":"Lark",
+                "frame":{"x":0,"y":0,"width":1440,"height":900},
+                "children":[
+                    {"role":"AXGroup","description":"Conversations",
+                     "frame":{"x":0,"y":0,"width":280,"height":900},
+                     "children":[{"role":"AXStaticText","value":"Lody Team"}]},
+                    {"role":"AXGroup","title":"Chat",
+                     "frame":{"x":280.5,"y":0,"width":1159.5,"height":900},
+                     "children":[
+                        {"role":"AXStaticText","value":"first line\nsecond line"},
+                        {"role":"AXButton","title":"Send"}
+                     ]}
+                ]
+            }
+        }"#;
+        let tree = accessibility_scope_tree(snapshot).expect("root parses");
+        assert_eq!(tree.lines, accessibility_text_lines(snapshot));
+        assert_eq!(tree.lines, ["Lody Team", "first line", "second line"]);
+        assert_eq!(tree.line_node.len(), tree.lines.len());
+
+        // Geometry and labels arrive for every node, floats included.
+        assert_eq!(tree.nodes.len(), 6, "buttons are nodes even when not text");
+        assert_eq!(tree.nodes[0].frame, Some(AxRect::new(0.0, 0.0, 1440.0, 900.0)));
+        assert_eq!(tree.nodes[1].label.as_deref(), Some("Conversations"));
+        assert_eq!(tree.nodes[3].frame.map(|frame| frame.x), Some(280.5));
+        assert_eq!(tree.nodes[3].parent, Some(0));
+        assert_eq!(tree.nodes[3].depth, 1);
+        assert_eq!(tree.nodes[4].parent, Some(3), "pre-order, parents first");
+        assert_eq!(tree.nodes[4].depth, 2);
+
+        // Lines hang off the node that produced them, not their parent.
+        assert_eq!(tree.line_node, [2, 4, 4]);
+    }
+
+    #[test]
+    fn a_node_without_a_frame_still_parses() {
+        let snapshot = br#"{"root":{"role":"AXWindow","children":[
+            {"role":"AXStaticText","value":"no geometry here"}]}}"#;
+        let tree = accessibility_scope_tree(snapshot).expect("root parses");
+        assert_eq!(tree.lines, ["no geometry here"]);
+        assert!(tree.nodes.iter().all(|node| node.frame.is_none()));
+        assert!(accessibility_scope_tree(b"not json").is_none());
+        assert!(accessibility_scope_tree(br#"{"application_name":"x"}"#).is_none());
     }
 
     #[test]
