@@ -1074,17 +1074,21 @@ mod tests {
     async fn every_prompt_fits_the_window_it_was_budgeted_for() {
         for window in [4_096, 32_768, 262_144] {
             let budget = ContextBudget::for_window(window);
+            // A small window buys fewer rounds, so the script has to fit the
+            // budget rather than the budget the script: the point here is
+            // whether what we send fits, not how many rounds it took.
+            let calls: Vec<&str> = std::iter::repeat_n(
+                "TOOL get_slot_card\nARGS {\"at_ms\":1}",
+                budget.max_rounds.saturating_sub(1),
+            )
+            .chain(std::iter::once("FINAL\ndone"))
+            .collect();
             let strategy = PruneToolResults;
             let config = LoopConfig {
                 budget,
                 cancel: CancelToken::new(),
                 compaction: Some(&strategy),
             };
-            let calls: Vec<&str> = vec![
-                "TOOL get_slot_card\nARGS {\"at_ms\":1}",
-                "TOOL get_slot_card\nARGS {\"at_ms\":2}",
-                "FINAL\ndone",
-            ];
             let model = ScriptedModel::new(&calls, false);
             // Far larger than any window here, so the cut has to come from us.
             let tools = EchoTools {

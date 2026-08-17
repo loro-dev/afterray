@@ -608,6 +608,119 @@ pub struct DaySummary {
     pub slots: Vec<DaySlot>,
 }
 
+/// One slot whose stored summary mentions a searched string.
+///
+/// The v2 card already writes the identifiers a person will look for later —
+/// `entities` is verbatim-and-grounded, `threads` name the strands of work.
+/// This is the index over them: instead of reading every half-hour of a day to
+/// find where "lody" was worked on, one query returns the stretches that name
+/// it, and `moment_ids` says which frames to open.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SlotMention {
+    pub slot_start_ms: i64,
+    pub slot_end_ms: i64,
+    pub local_day: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Entity texts that matched, exactly as the card stored them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_entities: Vec<String>,
+    /// Threads whose name or prose matched, rendered as `name: prose`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_threads: Vec<String>,
+    /// Frames the matching threads and entities cite. Already grounded by
+    /// `verify_t2_card`, so these are safe to hand back as citations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moment_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<String>,
+}
+
+/// Where a searched string was found. Ranked: a verbatim entity is a stronger
+/// signal than prose that happens to contain the letters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MentionKind {
+    Prose,
+    Title,
+    Entity,
+}
+
+/// Folds a card's stored v2 fields into a mention, or `None` when nothing in
+/// it actually matches.
+///
+/// Split out of the query so the matching rule is unit-testable without a
+/// database: SQL `LIKE` is only the prefilter, and this is the decision.
+#[must_use]
+pub fn match_slot_mention(
+    needle: &str,
+    slot_start_ms: i64,
+    slot_end_ms: i64,
+    local_day: &str,
+    title: Option<&str>,
+    threads: &[T2Thread],
+    entities: &[T2Entity],
+    decisions: &[String],
+) -> Option<(SlotMention, MentionKind)> {
+    let needle = fold_for_match(needle);
+    if needle.is_empty() {
+        return None;
+    }
+    let hits = |text: &str| fold_for_match(text).contains(&needle);
+
+    let mut kind = None;
+    let mut moment_ids: Vec<String> = Vec::new();
+    let push_id = |id: &String, into: &mut Vec<String>| {
+        if !into.iter().any(|seen| seen == id) {
+            into.push(id.clone());
+        }
+    };
+
+    let mut matched_entities = Vec::new();
+    for entity in entities {
+        if hits(&entity.text) {
+            matched_entities.push(entity.text.clone());
+            if let Some(id) = &entity.moment_id {
+                push_id(id, &mut moment_ids);
+            }
+            kind = kind.max(Some(MentionKind::Entity));
+        }
+    }
+
+    let mut matched_threads = Vec::new();
+    for thread in threads {
+        if hits(&thread.name) || hits(&thread.prose) {
+            matched_threads.push(match (thread.name.trim(), thread.prose.trim()) {
+                ("", prose) => prose.to_owned(),
+                (name, "") => name.to_owned(),
+                (name, prose) => format!("{name}: {prose}"),
+            });
+            for id in &thread.moment_ids {
+                push_id(id, &mut moment_ids);
+            }
+            kind = kind.max(Some(MentionKind::Prose));
+        }
+    }
+
+    if title.is_some_and(hits) {
+        kind = kind.max(Some(MentionKind::Title));
+    }
+
+    let kind = kind?;
+    Some((
+        SlotMention {
+            slot_start_ms,
+            slot_end_ms,
+            local_day: local_day.to_owned(),
+            title: title.map(ToOwned::to_owned),
+            matched_entities,
+            matched_threads,
+            moment_ids,
+            decisions: decisions.to_vec(),
+        },
+        kind,
+    ))
+}
+
 /// A bounded page for the history-summary panel. Days are ordered newest
 /// first. `next_before_ms` is an exclusive cursor rather than a timestamp to
 /// display, which keeps pagination stable when the user captures new work.

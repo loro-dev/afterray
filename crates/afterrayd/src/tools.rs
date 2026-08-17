@@ -1,27 +1,72 @@
 //! Read-only history tools shared by CLI handlers and the internal agent loop.
+//!
+//! Eight tools, in two groups: three that find a stretch of time, four that
+//! read one, and a clock. That shape is the interface — a model choosing
+//! between fourteen flat entries chooses badly, and the ones removed here were
+//! either subsumed (`get_moment`, `get_ocr`, `get_ax_digest` all live inside
+//! `get_moment_context`) or unaffordable (`get_ax_tree` cannot fit a 16k
+//! window) or redundant now that ids come back attached to every hit
+//! (`list_moments`, `list_memories`).
+//!
+//! **Timestamps are copied, never computed.** Every tool takes epoch
+//! milliseconds and nothing else; `get_now` hands over a table of every period
+//! a question is likely to name, with the dates beside the numbers. An earlier
+//! design parsed `{"window":"yesterday"}` and four other spellings, on the
+//! theory that copying thirteen digits was itself error-prone. It is not —
+//! verbatim copying is the most reliable thing a small model does. What it
+//! cannot do is arithmetic, and a table removes every occasion for it.
 
-use afterray_models::ModelQueue;
-use afterray_protocol::{AxEvidence, Moment, OcrEvidence, OcrRegion, local_calendar_day_bounds_ms};
-use afterray_store::{ReadOnlyVault, parse_accessibility_digest};
+use afterray_protocol::{
+    ActivitySpan, AxEvidence, Moment, OcrEvidence, OcrRegion, local_calendar_day_bounds_ms,
+};
+use afterray_store::{ReadOnlyVault, SearchFilter, SharedReadOnlyVault, parse_accessibility_digest};
 use chrono::Local;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 
-use afterray_harness::ContextBudget;
 use crate::search_hits;
+use afterray_harness::ContextBudget;
 use afterray_harness::{Budgeted, truncate_head};
 
-
 const DEFAULT_SEARCH_LIMIT: usize = 8;
-const DEFAULT_LIST_LIMIT: usize = 40;
-const HOUR_MS: i64 = 3_600_000;
-const DAY_MS: i64 = 86_400_000;
+const MAX_SEARCH_LIMIT: usize = 20;
+const DEFAULT_MENTION_LIMIT: usize = 12;
+const MAX_MENTION_LIMIT: usize = 40;
+const DEFAULT_ACTIVITY_LIMIT: usize = 40;
+const MAX_ACTIVITY_LIMIT: usize = 200;
+const DEFAULT_TRANSCRIPT_LIMIT: usize = 60;
+const MAX_TRANSCRIPT_LIMIT: usize = 400;
+
+/// How many individual days `get_now` spells out before switching to weeks and
+/// months. Seven covers "the day before yesterday", "last Wednesday" and a
+/// date read off the screen, which is nearly every question that names a day.
+const CLOCK_DAYS: i64 = 7;
+
+/// Per-stretch caps on the day summary's structured lines.
+///
+/// Tighter than they look like they should be, for arithmetic rather than
+/// taste. A worked day is ~48 ten-minute stretches against a
+/// `tool_result_tokens` budget of roughly 1 900 — about 40 tokens a stretch —
+/// and a summary written in Chinese costs one token per character. A moment id
+/// is a 36-character UUID; citing three per thread spends more of the day on
+/// identifiers than on what happened, and the overflow is cut from the tail,
+/// which silently deletes the afternoon.
+const MAX_ENTITIES: usize = 4;
+const MAX_DECISIONS: usize = 2;
+const MAX_DAY_THREAD_MOMENTS: usize = 1;
+/// What a narrowed-down view may cite, where there is one stretch to pay for
+/// rather than a day of them.
+const MAX_THREAD_MOMENTS: usize = 3;
 
 #[derive(Clone)]
-pub struct ToolHost<'a> {
-    /// Reads only. The agent's tools cannot write to the vault because the
-    /// handle they hold has no writing methods — see `afterray_store::readonly`.
-    pub store: ReadOnlyVault<'a>,
-    pub models: &'a ModelQueue,
+pub struct ToolHost {
+    /// Reads only, and owned.
+    ///
+    /// Reads only because the handle has no writing methods — see
+    /// `afterray_store::readonly`. Owned because every tool here is a
+    /// synchronous `SQLite` read, and [`Self::invoke`] runs them on a blocking
+    /// thread; a borrowed handle cannot cross that boundary.
+    pub store: SharedReadOnlyVault,
     /// The wall clock for this turn. Every range answer is anchored to it so
     /// the model never has to derive epoch milliseconds on its own.
     pub now_ms: i64,
@@ -30,252 +75,329 @@ pub struct ToolHost<'a> {
     pub budget: ContextBudget,
 }
 
-impl ToolHost<'_> {
+impl ToolHost {
+    /// Runs one tool, off the runtime.
+    ///
+    /// Every arm below is a synchronous vault call — `day_summary` walks a
+    /// day of rows, `search_filtered` runs FTS, `get_slot_card` builds a card,
+    /// `get_moment_context` decrypts artifacts. Awaiting those on a Tokio
+    /// worker parks it for the whole read, and the daemon has one worker per
+    /// two cores: eight concurrent tool calls is every worker blocked, and
+    /// while they are, socket accepts and capture import are not scheduled.
+    /// `afterrayd`'s standing rule is that a sync `Vault` call from async goes
+    /// through `spawn_blocking`, and more workers are a margin rather than a
+    /// substitute.
+    ///
+    /// So the whole dispatch moves across in one hop rather than each tool
+    /// wrapping itself: one blocking task per tool call, and the bodies below
+    /// stay ordinary synchronous code.
+    pub async fn invoke(&self, name: &str, args: &Value) -> Result<Budgeted, String> {
+        let host = self.clone();
+        let called = name.to_owned();
+        let name = name.to_owned();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = host.invoke_blocking(&name, &args)?;
+            Ok(truncate_head(&result, host.budget.tool_result_tokens()))
+        })
+        .await
+        .map_err(|error| format!("tool `{called}` could not be run: {error}"))?
+    }
+
+    /// The read-only handle, borrowed for one call. Only reachable from the
+    /// blocking side.
+    fn store(&self) -> ReadOnlyVault<'_> {
+        self.store.as_read_only()
+    }
+
     /// Dispatch. The arms below are the authority on what exists; the tests at
     /// the bottom of this file read them straight out of the source and hold
     /// [`tool_catalog_text`] and every system prompt to them. Two hand-written
     /// lists is how `get_day_summary` came to be callable but absent from
     /// chat's prompt for a whole release.
-    pub async fn invoke(&self, name: &str, args: &Value) -> Result<Budgeted, String> {
+    fn invoke_blocking(&self, name: &str, args: &Value) -> Result<String, String> {
         let result = match name {
             "get_now" => self.get_now(),
-            "search_evidence" => self.search_evidence(args).await,
-            "list_activity" => self.list_activity(args),
-            "list_memories" => self.list_memories(args),
-            "list_moments" => self.list_moments(args),
-            "get_transcript" => self.get_transcript(args),
             "get_day_summary" => self.get_day_summary(args),
+            "search_summaries" => self.search_summaries(args),
+            "search_evidence" => self.search_evidence(args),
             "get_slot_card" => self.get_slot_card(args),
-            "get_moment" => self.get_moment(args),
-            "get_ocr" => self.get_ocr(args),
-            "get_ax_digest" => self.get_ax_digest(args),
-            "get_ax_tree" => self.get_ax_tree(args),
+            "get_moment_context" => self.get_moment_context(args),
+            "get_transcript" => self.get_transcript(args),
+            "list_activity" => self.list_activity(args),
             other => Err(format!("unknown tool `{other}`")),
         }?;
-        Ok(truncate_head(&result, self.budget.tool_result_tokens()))
+        Ok(result)
     }
 
-    /// The clock, ready-made windows, and what the vault actually holds.
-    /// Small models get epoch arithmetic wrong by years, so hand them the
-    /// numbers instead of asking them to compute any.
+    /// The clock, every period a question is likely to name, what the
+    /// recording covers, and what is on screen now.
+    ///
+    /// This used to be a block prepended to every turn. It is a tool instead
+    /// because it changes every turn: sitting in the prompt it broke the
+    /// cached prefix each time and was paid for whether or not the question
+    /// involved a time. As a tool it costs one round, once, and only when
+    /// asked — so it answers everything at once rather than a window at a time.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "one arm of a dispatch table whose other arms are fallible"
+    )]
     fn get_now(&self) -> Result<String, String> {
-        let now_ms = self.now_ms;
-        let (today_start, today_end) = local_calendar_day_bounds_ms(now_ms);
-        let (yesterday_start, yesterday_end) =
-            local_calendar_day_bounds_ms(today_start.saturating_sub(DAY_MS));
-        let coverage = self.store.moment_time_bounds().map_err(|e| e.to_string())?;
-        Ok(serde_json::to_string_pretty(&json!({
-            "now_ms": now_ms,
-            "now_local": format_local_datetime(now_ms),
-            "timezone": timezone_label(now_ms),
-            "ranges": {
-                "last_15_minutes": window(now_ms.saturating_sub(15 * 60_000), now_ms),
-                "last_hour": window(now_ms.saturating_sub(HOUR_MS), now_ms),
-                "last_3_hours": window(now_ms.saturating_sub(3 * HOUR_MS), now_ms),
-                "today": window(today_start, today_end),
-                "yesterday": window(yesterday_start, yesterday_end),
-                "last_7_days": window(now_ms.saturating_sub(7 * DAY_MS), now_ms),
-            },
-            "vault_covers": match coverage {
-                Some((first, last)) => window(first, last),
-                None => json!(null),
-            },
-            "note": "Copy from_ms and to_ms out of this reply verbatim. Do not compute epoch milliseconds yourself.",
-        }))
-        .unwrap_or_else(|_| "{}".into()))
+        let mut lines = vec![format!(
+            "Now: {} ({})   now_ms={}",
+            format_local_datetime(self.now_ms),
+            timezone_label(self.now_ms),
+            self.now_ms
+        )];
+        for period in clock_periods(self.now_ms) {
+            lines.push(format!(
+                "{:<11} {:<15} from_ms={}  to_ms={}",
+                period.label, period.dates, period.from_ms, period.to_ms
+            ));
+        }
+        lines.push(match self.store().moment_time_bounds() {
+            Ok(Some((first, last))) => format!(
+                "Recording covers {} – {}.",
+                local_date(first),
+                local_date(last)
+            ),
+            Ok(None) => "Nothing has been recorded yet.".to_owned(),
+            Err(error) => format!("Recording coverage unavailable ({error})."),
+        });
+
+        // What the person is doing right now, and what they have been doing
+        // today. Both are derived from captured window titles, so they are
+        // untrusted data — which is why they live in a tool result, inside the
+        // data fence, and not in the catalog.
+        //
+        // Neither is read off `activity_spans`. That folds forward and stops
+        // at its limit, so on a day with more switches than the limit its last
+        // element is a morning span and its app list has no afternoon in it —
+        // and a stale span printed under "Right now" is read as current fact.
+        let (day_start, _) = local_calendar_day_bounds_ms(self.now_ms);
+        if let Ok(Some(current)) = self.store().latest_activity_moment(day_start, self.now_ms) {
+            // Stamped, because the newest capture is only "now" while capture
+            // is running: paused or asleep, this is the last thing seen, and
+            // the clock beside it is what says so.
+            lines.push(format!(
+                "Right now: {} {}",
+                format_local_time(current.captured_at_ms),
+                describe_place(
+                    current.application_name.as_deref(),
+                    current.document.as_deref(),
+                    current.url.as_deref(),
+                    current.window_title.as_deref(),
+                )
+            ));
+        }
+        if let Ok(apps) = self.store().top_apps_in_range(day_start, self.now_ms, 8)
+            && !apps.is_empty()
+        {
+            lines.push(format!("Today's apps: {}", apps.join(", ")));
+        }
+        Ok(lines.join("\n"))
     }
 
-    async fn search_evidence(&self, args: &Value) -> Result<String, String> {
-        let query = args
-            .get("query")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "search_evidence requires query".to_owned())?
-            .trim();
-        if query.is_empty() {
-            return Err("search_evidence query must not be empty".into());
-        }
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map_or(DEFAULT_SEARCH_LIMIT, |n| n as usize)
-            .clamp(1, 20);
-        let bounded = match (
-            args.get("from_ms").and_then(Value::as_i64),
-            args.get("to_ms").and_then(Value::as_i64),
-        ) {
-            (Some(from), Some(to)) => {
-                let (from, to) = if from <= to { (from, to) } else { (to, from) };
-                self.check_range(from, to)?;
-                Some((from, to))
-            }
-            _ => None,
-        };
-        let mut hits = search_hits(self.store, self.models, query, limit.saturating_mul(2))
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some((from, to)) = bounded {
-            hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
-        }
-        hits.truncate(limit);
-        if hits.is_empty() {
-            if let Some((from, to)) = bounded {
-                return Ok(self.nothing_found("matches", from, to));
-            }
-        }
-        Ok(serde_json::to_string_pretty(&hits).unwrap_or_else(|_| "[]".into()))
-    }
-
-    fn list_activity(&self, args: &Value) -> Result<String, String> {
-        let (from_ms, to_ms, limit) = self.range_args(args, DEFAULT_LIST_LIMIT, 200)?;
-        let spans = self
-            .store
-            .activity_spans(from_ms, to_ms, limit)
-            .map_err(|e| e.to_string())?;
-        if spans.is_empty() {
-            return Ok(self.nothing_found("activity spans", from_ms, to_ms));
-        }
-        Ok(serde_json::to_string_pretty(&spans).unwrap_or_else(|_| "[]".into()))
-    }
-
-    fn list_memories(&self, args: &Value) -> Result<String, String> {
-        let (from_ms, to_ms, limit) = self.range_args(args, DEFAULT_LIST_LIMIT, 100)?;
-        let memories = self
-            .store
-            .memories(from_ms, to_ms, limit)
-            .map_err(|e| e.to_string())?;
-        if memories.is_empty() {
-            return Ok(self.nothing_found("memories", from_ms, to_ms));
-        }
-        Ok(serde_json::to_string_pretty(&memories).unwrap_or_else(|_| "[]".into()))
-    }
-
-    /// Moments in a window: the bridge from "three o'clock yesterday" to
-    /// the ids every other evidence tool needs.
-    fn list_moments(&self, args: &Value) -> Result<String, String> {
-        let (from_ms, to_ms, limit) = self.range_args(args, DEFAULT_LIST_LIMIT, 200)?;
-        let moments = self
-            .store
-            .moment_ids_in_range(from_ms, to_ms, limit)
-            .map_err(|e| e.to_string())?;
-        if moments.is_empty() {
-            return Ok(self.nothing_found("moments", from_ms, to_ms));
-        }
-        let rows: Vec<Value> = moments
-            .into_iter()
-            .map(|(id, at_ms)| json!({"moment_id": id, "captured_at_ms": at_ms}))
-            .collect();
-        Ok(serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into()))
-    }
-
-    /// Speech in a window. Transcripts hang off audio segments rather than
-    /// moments, so without this a meeting is unreachable by time alone.
-    fn get_transcript(&self, args: &Value) -> Result<String, String> {
-        let (from_ms, to_ms, limit) = self.range_args(args, 60, 400)?;
-        let rows = self
-            .store
-            .transcripts_in_range(from_ms, to_ms, limit)
-            .map_err(|e| e.to_string())?;
-        if rows.is_empty() {
-            return Ok(self.nothing_found("speech", from_ms, to_ms));
-        }
-        let items: Vec<Value> = rows
-            .into_iter()
-            .map(|(at_ms, track, text)| json!({"at_ms": at_ms, "track": track, "text": text}))
-            .collect();
-        Ok(serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into()))
-    }
-
-    /// The deterministic 30-minute card: application time, the run
-    /// timeline with its deduplicated screen text, and revisits. One call
-    /// covers a half hour that would otherwise take dozens of frame reads.
-    /// The whole day at half-hour resolution, already summarised.
+    /// The whole day, one stretch at a time, already summarised.
     ///
     /// This is what the day panel shows. Without it the only way to answer
     /// "what did I do today" was to pull T1 cards slot by slot — sixteen
     /// thousand characters of raw evidence each, for work a model had already
     /// summarised and written to the vault.
+    ///
+    /// It renders the v2 card, not the derived bullet list. The stored card
+    /// already holds the frames each thread cites, the identifiers worth
+    /// searching for, and what was actually settled; projecting all of that
+    /// down to `title` + `bullets` meant an agent that wanted a citation had
+    /// to spend a round guessing which frame to open, and an agent asked "what
+    /// did I finish" had to infer it from prose.
     fn get_day_summary(&self, args: &Value) -> Result<String, String> {
-        let day_ms = args
-            .get("day_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(self.now_ms);
+        let day_ms = match args.get("day").and_then(Value::as_str) {
+            Some(text) => parse_local_day(text)
+                .ok_or_else(|| {
+                    format!(
+                        "`{text}` is not a date. Write it as \"2026-08-13\" — get_now \
+                         lists the recent ones."
+                    )
+                })?
+                .0,
+            // Accepted but undocumented: a model that copies a from_ms out of
+            // the clock table instead of the date beside it still lands on the
+            // right day, and correcting it would cost a round to no purpose.
+            None => args
+                .get("day_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(self.now_ms),
+        };
         let (day_start, day_end) = local_calendar_day_bounds_ms(day_ms);
         self.check_range(day_start, day_end.min(self.now_ms))?;
 
         let summary = self
-            .store
+            .store()
             .day_summary(day_ms, 10_000)
             .map_err(|e| e.to_string())?;
         if summary.slots.is_empty() {
             return Ok(format!("Nothing was recorded on {}.", summary.day));
         }
 
+        // Detail first, and the whole day compactly if the detail will not
+        // fit. A worked day is ~48 ten-minute stretches against a result
+        // budget of roughly 1 900 tokens, so the rich form overflows and the
+        // cut falls on the tail — deleting the afternoon from an answer to
+        // "what did I do today", with only a truncation marker to say so.
+        // Losing the *detail* of the afternoon is recoverable in one more
+        // call; losing the fact that the afternoon happened is not.
+        let detailed = render_day(&summary, true);
+        if afterray_harness::estimate_tokens(&detailed) <= self.budget.tool_result_tokens() {
+            return Ok(detailed);
+        }
+        Ok(render_day(&summary, false))
+    }
+
+    /// Stretches of work whose stored summary names something.
+    ///
+    /// The index the day panel could never be. "Which Lody issues did I
+    /// handle" used to mean reading every stretch of the day and scanning the
+    /// prose for the word; this asks the summaries directly and comes back
+    /// with the times, what was settled, and the frames to cite.
+    fn search_summaries(&self, args: &Value) -> Result<String, String> {
+        let query = require_query(args, "search_summaries")?;
+        let filter = self.search_filter(args)?;
+        let limit = parse_limit(args, DEFAULT_MENTION_LIMIT, MAX_MENTION_LIMIT);
+        let mentions = self
+            .store()
+            .find_slot_mentions(query, &filter, limit)
+            .map_err(|e| e.to_string())?;
+        if mentions.is_empty() {
+            // Only summarised stretches are searchable here, so "no mentions"
+            // is not "did not happen" — saying which is the difference between
+            // the model widening its search and it reporting a false negative.
+            return Ok(format!(
+                "// no summary mentions \"{query}\"{}. This reads written \
+                 summaries only, so a stretch nothing has summarised yet \
+                 cannot appear. search_evidence reads the captured screen \
+                 text itself.",
+                describe_filter(&filter)
+            ));
+        }
+
         let mut lines = vec![format!(
-            "Day {} — {} half-hours with activity.",
-            summary.day,
-            summary.slots.len()
+            "\"{query}\" appears in {}{}.",
+            plural(mentions.len(), "summarised stretch", "summarised stretches"),
+            describe_filter(&filter)
         )];
-        let mut unsummarised = 0_usize;
-        for slot in &summary.slots {
-            let clock = chrono::DateTime::from_timestamp_millis(slot.slot_start_ms).map_or_else(
-                || slot.slot_start_ms.to_string(),
-                |dt| dt.with_timezone(&Local).format("%H:%M").to_string(),
+        for mention in &mentions {
+            let mut header = format!(
+                "{} {} at_ms={}",
+                mention.local_day,
+                clock_label(mention.slot_start_ms),
+                mention.slot_start_ms
             );
-            match slot.title.as_deref() {
-                Some(title) => {
-                    lines.push(format!("{clock} at_ms={} — {title}", slot.slot_start_ms));
-                    for bullet in slot.bullets.iter().flatten() {
-                        lines.push(format!("    · {bullet}"));
-                    }
-                }
-                None => {
-                    // Say so rather than presenting the app list as a finding.
-                    // A model handed "Zed 14m · Chrome 9m" with no marker will
-                    // report it as what the user did.
-                    unsummarised += 1;
-                    let apps = slot
-                        .facts
-                        .apps
+            if let Some(title) = &mention.title {
+                let _ = write!(header, " — {title}");
+            }
+            lines.push(header);
+            for thread in &mention.matched_threads {
+                lines.push(format!("    · {thread}"));
+            }
+            if !mention.matched_entities.is_empty() {
+                lines.push(format!("    names: {}", mention.matched_entities.join(", ")));
+            }
+            if let Some(decisions) = joined(Some(&mention.decisions), MAX_DECISIONS, Clone::clone) {
+                lines.push(format!("    decided: {decisions}"));
+            }
+            if !mention.moment_ids.is_empty() {
+                lines.push(format!(
+                    "    moments: {}",
+                    mention
+                        .moment_ids
                         .iter()
-                        .take(3)
-                        .map(|app| app.name.clone())
+                        .take(MAX_THREAD_MOMENTS)
+                        .cloned()
                         .collect::<Vec<_>>()
-                        .join(", ");
-                    lines.push(format!(
-                        "{clock} at_ms={} — [not summarised: {}] apps: {}",
-                        slot.slot_start_ms,
-                        slot.state.as_str(),
-                        if apps.is_empty() {
-                            "none recorded".to_owned()
-                        } else {
-                            apps
-                        }
-                    ));
-                }
+                        .join(", ")
+                ));
             }
         }
-        if unsummarised > 0 {
+        // Say when the answer was cut. These come back strongest-first across
+        // the whole range, so what is missing is weaker rather than older —
+        // but a silent cut still reads as "that is all there is".
+        if mentions.len() >= limit {
             lines.push(format!(
-                "\n{unsummarised} of {} half-hours have no summary yet. For those, \
-                 call get_slot_card with the at_ms above to read the evidence directly.",
-                summary.slots.len()
+                "// the {limit} strongest matches; there may be more. Raise limit, \
+                 or narrow with from_ms/to_ms or app."
             ));
         }
         Ok(lines.join("\n"))
     }
 
+    /// Exact-text search over what was actually on screen and said.
+    ///
+    /// Every hit says where it was — time, frame, application, and the title
+    /// of the stretch it falls in — because a bare id and a snippet cost the
+    /// model a round to learn which app it was even looking at.
+    fn search_evidence(&self, args: &Value) -> Result<String, String> {
+        let query = require_query(args, "search_evidence")?;
+        let filter = self.search_filter(args)?;
+        let limit = parse_limit(args, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+        let hits = search_hits(self.store(), query, &filter, limit).map_err(|e| e.to_string())?;
+        if hits.is_empty() {
+            return Ok(format!(
+                "// nothing captured matches \"{query}\"{}. Try fewer or \
+                 different words — this matches text exactly, not by meaning.",
+                describe_filter(&filter)
+            ));
+        }
+
+        let mut lines = vec![format!(
+            "{} for \"{query}\"{}.",
+            plural(hits.len(), "match", "matches"),
+            describe_filter(&filter)
+        )];
+        for hit in hits {
+            let moment = self.store().moment_by_id(&hit.moment_id).ok().flatten();
+            let mut header = format!(
+                "{} at_ms={} moment={}",
+                format_local_time(hit.captured_at_ms),
+                hit.captured_at_ms,
+                hit.moment_id
+            );
+            match moment.as_ref().and_then(|m| m.application_name.as_deref()) {
+                Some(app) => {
+                    let _ = write!(header, " app={app}");
+                }
+                None => {
+                    let _ = write!(header, " source={}", hit.source);
+                }
+            }
+            lines.push(header);
+            if let Ok(Some((slot_at_ms, title))) =
+                self.store().slot_title_covering(hit.captured_at_ms)
+            {
+                lines.push(format!("    stretch: at_ms={slot_at_ms} — {title}"));
+            }
+            for line in hit.text.lines().filter(|line| !line.trim().is_empty()) {
+                lines.push(format!("    {line}"));
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// One stretch in full: the deterministic T1 card, which is what to read
+    /// when no model has summarised the stretch yet.
     fn get_slot_card(&self, args: &Value) -> Result<String, String> {
-        let at_ms = args
-            .get("at_ms")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| "get_slot_card requires at_ms".to_owned())?;
+        let at_ms = args.get("at_ms").and_then(Value::as_i64).ok_or_else(|| {
+            "get_slot_card needs at_ms — copy one from a summary line or a \
+             search hit, or call get_now for a range."
+                .to_owned()
+        })?;
         self.check_range(at_ms, at_ms)?;
         let mut card = self
-            .store
+            .store()
             .slot_card(at_ms, 10_000)
             .map_err(|e| e.to_string())?;
         let background = self
-            .store
+            .store()
             .background_stats(&card)
             .unwrap_or_else(|_| afterray_store::infoscore::BackgroundStats::empty());
         afterray_store::attach_entity_candidates(&mut card, &background);
@@ -287,50 +409,185 @@ impl ToolHost<'_> {
         ))
     }
 
-    fn get_moment(&self, args: &Value) -> Result<String, String> {
+    /// One frame, whole: what it was, what was on screen, what the app said.
+    ///
+    /// `get_moment` then `get_ocr` then `get_ax_digest` was three rounds of a
+    /// turn that only has a handful, spent on one instant the model had
+    /// already decided to look at. Nothing here is new evidence — it is the
+    /// same three reads, billed once.
+    fn get_moment_context(&self, args: &Value) -> Result<String, String> {
         let moment_id = require_moment_id(args)?;
         let moment = self
-            .store
+            .store()
             .moment_by_id(&moment_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("moment `{moment_id}` not found"))?;
-        Ok(serde_json::to_string_pretty(&moment).unwrap_or_else(|_| "{}".into()))
+
+        let mut lines = vec![
+            format!(
+                "moment={} at_ms={} {}",
+                moment.id,
+                moment.captured_at_ms,
+                format_local_datetime(moment.captured_at_ms)
+            ),
+            format!(
+                "app={}  window={}",
+                or_none(moment.application_name.as_deref()),
+                or_none(moment.window_title.as_deref())
+            ),
+        ];
+        if let Some(url) = &moment.url {
+            lines.push(format!("url={url}"));
+        }
+        if let Some(document) = &moment.document {
+            lines.push(format!("document={document}"));
+        }
+        if let Ok(Some((slot_at_ms, title))) = self.store().slot_title_covering(moment.captured_at_ms)
+        {
+            lines.push(format!("stretch: at_ms={slot_at_ms} — {title}"));
+        }
+        // A frame with no text on it and an app that exposes no accessibility
+        // tree are both ordinary. Reported as absences rather than as failed
+        // reads, which the model would otherwise retry.
+        lines.push(format!(
+            "screen text: {}",
+            match ocr_evidence(self.store(), &moment_id) {
+                Ok(evidence) if !evidence.text.trim().is_empty() => evidence.text,
+                _ => "none recorded".to_owned(),
+            }
+        ));
+        lines.push(format!(
+            "accessibility: {}",
+            match ax_evidence(self.store(), &moment_id, true) {
+                Ok(evidence) => evidence
+                    .digest
+                    .as_ref()
+                    .and_then(|digest| digest.get("compact"))
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or("none recorded")
+                    .to_owned(),
+                Err(_) => "none recorded".to_owned(),
+            }
+        ));
+        lines.push(format!(
+            "said: {}",
+            or_none(
+                moment
+                    .transcript_text
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            )
+        ));
+        Ok(lines.join("\n"))
     }
 
-    fn get_ocr(&self, args: &Value) -> Result<String, String> {
-        let moment_id = require_moment_id(args)?;
-        let evidence = ocr_evidence(self.store, &moment_id)?;
-        Ok(serde_json::to_string_pretty(&evidence).unwrap_or_else(|_| "{}".into()))
+    /// Speech in a window. Transcripts hang off audio segments rather than
+    /// moments, so without this a meeting is unreachable by time alone.
+    fn get_transcript(&self, args: &Value) -> Result<String, String> {
+        let (from_ms, to_ms) = self.require_range(args)?;
+        let limit = parse_limit(args, DEFAULT_TRANSCRIPT_LIMIT, MAX_TRANSCRIPT_LIMIT);
+        let rows = self
+            .store()
+            .transcripts_in_range(from_ms, to_ms, limit)
+            .map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(self.nothing_found("speech", from_ms, to_ms));
+        }
+        let filled = rows.len() == limit;
+        let last_ms = rows.last().map_or(to_ms, |(at_ms, _, _)| *at_ms);
+        let mut lines: Vec<String> = rows
+            .into_iter()
+            .map(|(at_ms, track, text)| {
+                format!("{} {track:<7} {text}", format_local_time(at_ms))
+            })
+            .collect();
+        // Say where the answer stops. A silent cut reads as "that is all that
+        // was said", and the model has no way to discover otherwise.
+        if filled {
+            lines.push(more_from(limit, "lines", last_ms));
+        }
+        Ok(lines.join("\n"))
     }
 
-    fn get_ax_digest(&self, args: &Value) -> Result<String, String> {
-        let moment_id = require_moment_id(args)?;
-        let evidence = ax_evidence(self.store, &moment_id, true)?;
-        Ok(serde_json::to_string_pretty(&evidence).unwrap_or_else(|_| "{}".into()))
+    /// Application and document spans over a range — when something started
+    /// and when it stopped.
+    fn list_activity(&self, args: &Value) -> Result<String, String> {
+        let (from_ms, to_ms) = self.require_range(args)?;
+        let limit = parse_limit(args, DEFAULT_ACTIVITY_LIMIT, MAX_ACTIVITY_LIMIT);
+        // Narrowed in the store, before the limit. Fetching a wider slice and
+        // filtering here only moved the false negative further out: the cut
+        // still landed on the earliest spans of the range, so an application
+        // that came up late read as "no activity".
+        let matched = self
+            .store()
+            .activity_spans_in_app(from_ms, to_ms, optional_text(args, "app"), limit)
+            .map_err(|e| e.to_string())?;
+        if matched.is_empty() {
+            return Ok(self.nothing_found("activity", from_ms, to_ms));
+        }
+        let filled = matched.len() >= limit;
+        let last_ms = matched.last().map_or(to_ms, |span| span.end_ms);
+        let mut lines: Vec<String> = matched
+            .into_iter()
+            .take(limit)
+            .map(|span| {
+                format!(
+                    "{} – {}  {}",
+                    clock_label(span.start_ms),
+                    clock_label(span.end_ms),
+                    describe_span_place(&span)
+                )
+            })
+            .collect();
+        if filled {
+            lines.push(more_from(limit, "spans", last_ms));
+        }
+        Ok(lines.join("\n"))
     }
 
-    fn get_ax_tree(&self, args: &Value) -> Result<String, String> {
-        let moment_id = require_moment_id(args)?;
-        let evidence = ax_evidence(self.store, &moment_id, false)?;
-        Ok(serde_json::to_string_pretty(&evidence).unwrap_or_else(|_| "{}".into()))
+    /// The narrowing both searches share. Identical on purpose: an agent that
+    /// has to remember which search can be bounded by what will bound neither.
+    fn search_filter(&self, args: &Value) -> Result<SearchFilter, String> {
+        let from_ms = args.get("from_ms").and_then(Value::as_i64);
+        let to_ms = args.get("to_ms").and_then(Value::as_i64);
+        let (from_ms, to_ms) = match (from_ms, to_ms) {
+            (Some(from), Some(to)) if from > to => (Some(to), Some(from)),
+            pair => pair,
+        };
+        if let (Some(from), Some(to)) = (from_ms, to_ms) {
+            self.check_range(from, to)?;
+        }
+        Ok(SearchFilter {
+            from_ms,
+            to_ms,
+            app: optional_text(args, "app").map(ToOwned::to_owned),
+        })
     }
 
-    fn range_args(
-        &self,
-        args: &Value,
-        default_limit: usize,
-        max_limit: usize,
-    ) -> Result<(i64, i64, usize), String> {
-        let (from_ms, to_ms, limit) = parse_range(args, default_limit, max_limit)?;
+    fn require_range(&self, args: &Value) -> Result<(i64, i64), String> {
+        let from_ms = args
+            .get("from_ms")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| missing_range("from_ms"))?;
+        let to_ms = args
+            .get("to_ms")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| missing_range("to_ms"))?;
+        let (from_ms, to_ms) = if from_ms <= to_ms {
+            (from_ms, to_ms)
+        } else {
+            (to_ms, from_ms)
+        };
         self.check_range(from_ms, to_ms)?;
-        Ok((from_ms, to_ms, limit))
+        Ok((from_ms, to_ms))
     }
 
     /// Rejects a window that cannot possibly hold evidence, and says why with
     /// numbers the model can copy. A silent `[]` reads as "nothing happened"
     /// and the model stops looking; this makes a mistyped year recoverable.
     fn check_range(&self, from_ms: i64, to_ms: i64) -> Result<(), String> {
-        let Some((first, last)) = self.store.moment_time_bounds().map_err(|e| e.to_string())?
+        let Some((first, last)) = self.store().moment_time_bounds().map_err(|e| e.to_string())?
         else {
             return Err(format!(
                 "the vault holds no captures at all yet. {}",
@@ -340,8 +597,9 @@ impl ToolHost<'_> {
         if to_ms < first || from_ms > last {
             return Err(format!(
                 "the requested window {} is outside the recorded history. \
-                 The vault covers {} (from_ms={first}, to_ms={last}). {} \
-                 Call get_now and copy a range out of its reply instead of computing one.",
+                 The recording covers {} (from_ms={first}, to_ms={last}). {} \
+                 Call get_now and copy a range out of its table rather than \
+                 working one out.",
                 describe_span(from_ms, to_ms),
                 describe_span(first, last),
                 self.clock_hint(),
@@ -353,12 +611,14 @@ impl ToolHost<'_> {
     /// An empty window that *is* inside the recording, reported with the same
     /// anchors so the model can widen or move rather than give up.
     fn nothing_found(&self, what: &str, from_ms: i64, to_ms: i64) -> String {
-        let coverage = match self.store.moment_time_bounds() {
-            Ok(Some((first, last))) => format!(" The vault covers {}.", describe_span(first, last)),
+        let coverage = match self.store().moment_time_bounds() {
+            Ok(Some((first, last))) => {
+                format!(" The recording covers {}.", describe_span(first, last))
+            }
             _ => String::new(),
         };
         format!(
-            "[] // no {what} between {}.{coverage} {}",
+            "// no {what} between {}.{coverage} {}",
             describe_span(from_ms, to_ms),
             self.clock_hint(),
         )
@@ -373,13 +633,393 @@ impl ToolHost<'_> {
     }
 }
 
-fn window(from_ms: i64, to_ms: i64) -> Value {
-    json!({
-        "from_ms": from_ms,
-        "to_ms": to_ms,
-        "from_local": format_local_datetime(from_ms),
-        "to_local": format_local_datetime(to_ms),
-    })
+/// One row of `get_now`'s table.
+struct ClockPeriod {
+    label: &'static str,
+    dates: String,
+    from_ms: i64,
+    to_ms: i64,
+}
+
+/// Every period `get_now` spells out.
+///
+/// One list, read by the tool and by the tests that hold the catalog to it.
+/// The individual days come first because they are what most questions name;
+/// the aggregates after, because "last month" is asked of a month, not a day.
+fn clock_periods(now_ms: i64) -> Vec<ClockPeriod> {
+    use chrono::Days;
+
+    let mut periods = Vec::new();
+    let Some(today) = local_date_of(now_ms) else {
+        let (from_ms, to_ms) = local_calendar_day_bounds_ms(now_ms);
+        return vec![ClockPeriod {
+            label: "today",
+            dates: local_date(from_ms),
+            from_ms,
+            to_ms,
+        }];
+    };
+    // Walked back a calendar date at a time, never by subtracting a day's worth
+    // of milliseconds. A local day is 23 or 25 hours long across a clock
+    // change, so fixed-width arithmetic lands on the wrong date — and it does
+    // so exactly where this table is least forgiving, since the model is told
+    // to copy these rows verbatim. On 2026-03-09 in America/New_York, midnight
+    // less 86_400_000 ms is 2026-03-07 23:00, which would label the 7th
+    // "yesterday" when the answer is the 8th.
+    for index in 0..CLOCK_DAYS {
+        let Some((from_ms, to_ms)) = u64::try_from(index)
+            .ok()
+            .and_then(|back| today.checked_sub_days(Days::new(back)))
+            .and_then(day_bounds_for_date)
+        else {
+            continue;
+        };
+        periods.push(ClockPeriod {
+            label: match index {
+                0 => "today",
+                1 => "yesterday",
+                _ => "",
+            },
+            dates: local_date(from_ms),
+            from_ms,
+            to_ms,
+        });
+    }
+    let mut span = |label: &'static str, bounds: Option<(i64, i64)>| {
+        if let Some((from_ms, to_ms)) = bounds {
+            periods.push(ClockPeriod {
+                label,
+                dates: format!("{} – {}", short_date(from_ms), short_date(to_ms)),
+                from_ms,
+                to_ms,
+            });
+        }
+    };
+    span("this week", week_bounds_for_date(today));
+    span(
+        "last week",
+        today
+            .checked_sub_days(Days::new(7))
+            .and_then(week_bounds_for_date),
+    );
+    span("this month", month_bounds_for_date(today));
+    span(
+        "last month",
+        first_of_month(today)
+            .and_then(|first| first.checked_sub_days(Days::new(1)))
+            .and_then(month_bounds_for_date),
+    );
+    periods
+}
+
+/// The local calendar week containing `date`, Monday through Sunday.
+///
+/// Monday because that is what both ISO-8601 and the languages this is asked
+/// in mean by "last week". A different question from a rolling seven days, not
+/// a rounder version of it: asked on a Monday, the rolling window is six days
+/// of last week and one of this one, which answers neither.
+fn week_bounds_for_date(date: chrono::NaiveDate) -> Option<(i64, i64)> {
+    use chrono::{Datelike as _, Days};
+
+    let monday =
+        date.checked_sub_days(Days::new(u64::from(date.weekday().num_days_from_monday())))?;
+    let sunday = monday.checked_add_days(Days::new(6))?;
+    Some((day_bounds_for_date(monday)?.0, day_bounds_for_date(sunday)?.1))
+}
+
+/// The local calendar month containing `date`.
+fn month_bounds_for_date(date: chrono::NaiveDate) -> Option<(i64, i64)> {
+    use chrono::Days;
+
+    let first = first_of_month(date)?;
+    // Into the next month, then back a day: month lengths and leap years are
+    // chrono's problem, not ours.
+    let last = first
+        .checked_add_days(Days::new(31))
+        .and_then(first_of_month)?
+        .checked_sub_days(Days::new(1))?;
+    Some((day_bounds_for_date(first)?.0, day_bounds_for_date(last)?.1))
+}
+
+fn first_of_month(date: chrono::NaiveDate) -> Option<chrono::NaiveDate> {
+    use chrono::Datelike as _;
+
+    date.with_day(1)
+}
+
+fn local_date_of(at_ms: i64) -> Option<chrono::NaiveDate> {
+    Some(
+        chrono::DateTime::from_timestamp_millis(at_ms)?
+            .with_timezone(&Local)
+            .date_naive(),
+    )
+}
+
+/// Local calendar bounds of a date.
+///
+/// Resolved through [`local_calendar_day_bounds_ms`] from midday rather than by
+/// arithmetic, so the day a clock change falls on is still its own whole day.
+fn day_bounds_for_date(date: chrono::NaiveDate) -> Option<(i64, i64)> {
+    use chrono::TimeZone as _;
+
+    let midday = date.and_hms_opt(12, 0, 0)?;
+    let instant = Local.from_local_datetime(&midday).earliest()?;
+    Some(local_calendar_day_bounds_ms(instant.timestamp_millis()))
+}
+
+/// A local calendar day written as `YYYY-MM-DD` — the one string form any tool
+/// accepts, and the same column `get_now` prints.
+fn parse_local_day(text: &str) -> Option<(i64, i64)> {
+    let date = chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok()?;
+    day_bounds_for_date(date)
+}
+
+/// The day, rendered at one of two densities. See [`ToolHost::get_day_summary`]
+/// for why there are two.
+fn render_day(summary: &afterray_store::DaySummary, detail: bool) -> String {
+    let mut lines = vec![format!(
+        "Day {} — {}.{}",
+        summary.day,
+        plural(
+            summary.slots.len(),
+            "stretch with activity",
+            "stretches with activity"
+        ),
+        if detail {
+            ""
+        } else {
+            " Too many to describe in full, so this is titles only — \
+             call get_slot_card with an at_ms below for what happened inside one."
+        }
+    )];
+    let mut unsummarised = 0_usize;
+    for slot in &summary.slots {
+        let clock = clock_label(slot.slot_start_ms);
+        let Some(title) = slot.title.as_deref() else {
+            // Say so rather than presenting the app list as a finding. A model
+            // handed "Zed 14m · Chrome 9m" with no marker will report it as
+            // what the user did.
+            unsummarised += 1;
+            let apps = slot
+                .facts
+                .apps
+                .iter()
+                .take(3)
+                .map(|app| app.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "{clock} at_ms={} — [not summarised: {}] apps: {}",
+                slot.slot_start_ms,
+                slot.state.as_str(),
+                if apps.is_empty() {
+                    "none recorded".to_owned()
+                } else {
+                    apps
+                }
+            ));
+            continue;
+        };
+
+        let threads = slot.threads.as_deref().filter(|threads| !threads.is_empty());
+        // The anchor is the stretch's first frame, and the threads below
+        // usually cite it too. Only offer it when they cite nothing, so a
+        // stretch always has one id to point at and never the same id twice.
+        let cited = threads.is_some_and(|threads| threads.iter().any(|t| !t.moment_ids.is_empty()));
+        let mut header = format!("{clock} at_ms={} — {title}", slot.slot_start_ms);
+        if let (false, Some(anchor)) = (cited && detail, &slot.anchor_moment_id) {
+            let _ = write!(header, " [moment {anchor}]");
+        }
+        lines.push(header);
+        if !detail {
+            continue;
+        }
+
+        match threads {
+            Some(threads) => {
+                for thread in threads {
+                    lines.push(format!(
+                        "    · {}",
+                        thread_line(thread, MAX_DAY_THREAD_MOMENTS)
+                    ));
+                }
+            }
+            // A v1 row, or a v2 card whose model wrote no threads.
+            None => {
+                for bullet in slot.bullets.iter().flatten() {
+                    lines.push(format!("    · {bullet}"));
+                }
+            }
+        }
+        if let Some(names) = joined(slot.entities.as_deref(), MAX_ENTITIES, |entity| {
+            entity.text.clone()
+        }) {
+            lines.push(format!("    names: {names}"));
+        }
+        if let Some(decisions) = joined(slot.decisions.as_deref(), MAX_DECISIONS, Clone::clone) {
+            lines.push(format!("    decided: {decisions}"));
+        }
+        // `not_captured` is deliberately absent. It is the honest-gaps list,
+        // and it earns its place when one stretch is under the microscope —
+        // but a day of per-stretch caveats is the first thing the budget
+        // should spend nothing on, and paying for it here costs the model the
+        // end of the day.
+    }
+    if unsummarised > 0 {
+        lines.push(format!(
+            "\n{unsummarised} of {} stretches {} no summary yet. For those, \
+             call get_slot_card with the at_ms above to read the evidence directly.",
+            summary.slots.len(),
+            if unsummarised == 1 { "has" } else { "have" }
+        ));
+    }
+    lines.join("\n")
+}
+
+/// One thread of a stretch, with the frames it cites.
+///
+/// The moment ids ride on the line that mentions the work rather than in a
+/// list at the end, so an agent quoting the line has the citation in hand.
+fn thread_line(thread: &afterray_store::T2Thread, max_moments: usize) -> String {
+    let mut line = match (thread.name.trim(), thread.prose.trim()) {
+        ("", prose) => prose.to_owned(),
+        (name, "") => name.to_owned(),
+        (name, prose) => format!("{name}: {prose}"),
+    };
+    let cited: Vec<String> = thread
+        .moment_ids
+        .iter()
+        .take(max_moments)
+        .cloned()
+        .collect();
+    if !cited.is_empty() {
+        let _ = write!(line, " [{}]", cited.join(", "));
+    }
+    line
+}
+
+/// A capped, comma-joined line, or `None` when there is nothing to say. The
+/// overflow is counted rather than dropped in silence.
+fn joined<T>(items: Option<&[T]>, max: usize, render: impl Fn(&T) -> String) -> Option<String> {
+    let items = items?;
+    let rendered: Vec<String> = items
+        .iter()
+        .map(&render)
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    if rendered.is_empty() {
+        return None;
+    }
+    let extra = rendered.len().saturating_sub(max);
+    let mut line = rendered.into_iter().take(max).collect::<Vec<_>>().join(", ");
+    if extra > 0 {
+        let _ = write!(line, " (+{extra} more)");
+    }
+    Some(line)
+}
+
+/// The line every bounded list ends with when it filled up. Nothing is dropped
+/// in silence; a cut the model cannot see reads as "that is all there was".
+fn more_from(returned: usize, unit: &str, last_ms: i64) -> String {
+    format!(
+        "// {returned} {unit}, reaching {} — there may be more. Call again \
+         with from_ms={last_ms} for the rest.",
+        format_local_time(last_ms)
+    )
+}
+
+/// What a narrowed search says it narrowed to, so a short answer is never
+/// mistaken for an empty vault.
+fn describe_filter(filter: &SearchFilter) -> String {
+    let mut parts = Vec::new();
+    match (filter.from_ms, filter.to_ms) {
+        (Some(from), Some(to)) => parts.push(format!("between {}", describe_span(from, to))),
+        (Some(from), None) => parts.push(format!("after {}", format_local_datetime(from))),
+        (None, Some(to)) => parts.push(format!("before {}", format_local_datetime(to))),
+        (None, None) => {}
+    }
+    if let Some(app) = &filter.app {
+        parts.push(format!("in {app}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+fn require_query<'a>(args: &'a Value, tool: &str) -> Result<&'a str, String> {
+    args.get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{tool} requires query — the words to look for"))
+}
+
+fn optional_text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_limit(args: &Value, default_limit: usize, max_limit: usize) -> usize {
+    args.get("limit")
+        .and_then(Value::as_u64)
+        .map_or(default_limit, |n| n as usize)
+        .clamp(1, max_limit)
+}
+
+fn missing_range(key: &str) -> String {
+    format!(
+        "{key} is required, in Unix milliseconds. Call get_now and copy a \
+         from_ms/to_ms pair out of its table — do not work one out."
+    )
+}
+
+/// "1 stretch" / "3 stretches". These lines are read by a model that will
+/// repeat their phrasing back to a person.
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+fn or_none(value: Option<&str>) -> String {
+    value.map_or_else(|| "none recorded".to_owned(), ToOwned::to_owned)
+}
+
+/// Where a span was: the most specific of document, url, or window title.
+fn describe_span_place(span: &ActivitySpan) -> String {
+    describe_place(
+        span.application_name.as_deref(),
+        span.document.as_deref(),
+        span.url.as_deref(),
+        span.window_title.as_deref(),
+    )
+}
+
+/// One precedence rule for "where", shared by spans and single frames.
+fn describe_place(
+    app: Option<&str>,
+    document: Option<&str>,
+    url: Option<&str>,
+    window_title: Option<&str>,
+) -> String {
+    let app = app.unwrap_or("Unknown");
+    let place = document
+        .or(url)
+        .or(window_title)
+        .filter(|text| !text.trim().is_empty());
+    match place {
+        Some(place) => format!("{app}  {place}"),
+        None => app.to_owned(),
+    }
+}
+
+fn clock_label(at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms).map_or_else(
+        || at_ms.to_string(),
+        |instant| instant.with_timezone(&Local).format("%H:%M").to_string(),
+    )
 }
 
 fn describe_span(from_ms: i64, to_ms: i64) -> String {
@@ -391,20 +1031,32 @@ fn describe_span(from_ms: i64, to_ms: i64) -> String {
 }
 
 fn format_local_datetime(ms: i64) -> String {
+    format_local(ms, "%Y-%m-%d %H:%M:%S")
+}
+
+fn format_local_time(ms: i64) -> String {
+    format_local(ms, "%H:%M:%S")
+}
+
+fn local_date(ms: i64) -> String {
+    format_local(ms, "%Y-%m-%d")
+}
+
+fn short_date(ms: i64) -> String {
+    format_local(ms, "%m-%d")
+}
+
+fn format_local(ms: i64, pattern: &str) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map_or_else(
         || ms.to_string(),
-        |dt| {
-            dt.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        },
+        |instant| instant.with_timezone(&Local).format(pattern).to_string(),
     )
 }
 
 fn timezone_label(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map_or_else(
         || "unknown".to_owned(),
-        |dt| dt.with_timezone(&Local).format("%:z").to_string(),
+        |instant| instant.with_timezone(&Local).format("%:z").to_string(),
     )
 }
 
@@ -499,83 +1151,174 @@ fn require_moment_id(args: &Value) -> Result<String, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
-        .ok_or_else(|| "moment_id is required".to_owned())
-}
-
-fn parse_range(
-    args: &Value,
-    default_limit: usize,
-    max_limit: usize,
-) -> Result<(i64, i64, usize), String> {
-    let from_ms = args.get("from_ms").and_then(Value::as_i64).ok_or_else(|| {
-        "from_ms is required (Unix milliseconds; call get_now for one)".to_owned()
-    })?;
-    let to_ms = args
-        .get("to_ms")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| "to_ms is required (Unix milliseconds; call get_now for one)".to_owned())?;
-    let (from_ms, to_ms) = if from_ms <= to_ms {
-        (from_ms, to_ms)
-    } else {
-        (to_ms, from_ms)
-    };
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map_or(default_limit, |n| n as usize)
-        .clamp(1, max_limit);
-    Ok((from_ms, to_ms, limit))
+        .ok_or_else(|| {
+            "moment_id is required — copy one out of a summary line or a search hit".to_owned()
+        })
 }
 
 /// Catalog shown to the LLM in agent prompts.
+///
+/// Every tool documents all of its arguments and the exact shape of what it
+/// returns. That is longer than a one-line-per-tool list and it is the point:
+/// the previous catalog said what each tool was *for* and left the model to
+/// discover the rest a round at a time. Nothing here describes a caveat that
+/// the tool's own output already states — an empty result explains itself, a
+/// truncated one says where it stopped — because a caveat repeated in two
+/// places is a caveat that will disagree with itself.
 #[must_use]
+#[allow(clippy::too_many_lines, reason = "it is one string literal")]
 pub fn tool_catalog_text() -> &'static str {
-    r#"Tools (call at most one per reply). Timestamps are Unix milliseconds.
+    r#"Tools. Call at most one per reply, then wait for its result.
 
-Never work out a Unix millisecond value yourself — you will get the year
-wrong. Take every from_ms, to_ms and at_ms from get_now or from a previous
-tool result, verbatim.
+Timestamps are Unix milliseconds. Every one you use must be copied from a tool
+result — never work one out yourself, you will get the year wrong. Values
+written key=value are there to be copied verbatim.
 
-- get_now: {}
-    The current time, ready-made windows (last_hour, today, yesterday, …)
-    and the span the vault actually covers. Call this first whenever the
-    question mentions a time, unless the numbers are already in front of you.
+────────────────────────────────────────────────────────────────────────
+get_now   {}
 
-Start wide, then narrow:
-- get_day_summary: {"day_ms":0}
-    Every half-hour of one local day, already summarised — a title and a few
-    bullets each, plus the at_ms to drill into. Omit day_ms for today. This
-    is the right first call for "what did I do today / yesterday", and it is
-    far cheaper than reading each half-hour's evidence. Half-hours no model
-    has reached yet are marked "not summarised"; treat those as unknown, not
-    as a finding, and use get_slot_card on them if they matter.
-- get_slot_card: {"at_ms":0}
-    A whole 30-minute window at once: which apps for how long, a timeline of
-    what was open, the screen text each stretch introduced, and what the
-    person kept returning to. Usually the cheapest way to answer "what was I
-    doing around <time>".
-- list_activity: {"from_ms":0,"to_ms":0,"limit":40}
-    Application and document spans over a range — good for spotting when
-    something started or stopped.
-- search_evidence: {"query":"…","from_ms":0,"to_ms":0,"limit":8}
-    Full-text and semantic search across captured screen text.
-- list_memories: {"from_ms":0,"to_ms":0,"limit":40}
-    Short notes already written for each stretch of activity.
-- list_moments: {"from_ms":0,"to_ms":0,"limit":40}
-    Capture ids and their timestamps — use when you know a time but need an
-    id for the tools below.
+  Takes nothing. Ask for it once, first, whenever the question involves a
+  time — everything needed to name any period is in the one reply.
 
-Then, for one captured instant:
-- get_moment: {"moment_id":"…"}       metadata, and transcript_text if any
-- get_ocr: {"moment_id":"…"}          text read off the screen, with boxes
-- get_ax_digest: {"moment_id":"…"}    compact accessibility summary
-- get_ax_tree: {"moment_id":"…"}      full accessibility JSON (large; rare)
+  Returns:
+    Now: 2026-08-15 01:52 (+08:00)   now_ms=1786729937000
+    today       2026-08-15      from_ms=1786723200000  to_ms=1786809599999
+    yesterday   2026-08-14      from_ms=1786636800000  to_ms=1786723199999
+                2026-08-13      from_ms=…              to_ms=…
+                …five more days, one line each…
+    this week   08-11 – 08-17   from_ms=…              to_ms=…
+    last week   08-04 – 08-10   from_ms=…              to_ms=…
+    this month  08-01 – 08-31   from_ms=…              to_ms=…
+    last month  07-01 – 07-31   from_ms=…              to_ms=…
+    Recording covers 2026-07-02 – 2026-08-15.
+    Right now: 01:52:10  Zed  tools.rs
+    Today's apps: Zed, Chrome, Weixin
 
-And for speech:
-- get_transcript: {"from_ms":0,"to_ms":0,"limit":60}
-    Everything said in a window, across microphone and system audio.
+  "Right now" is the newest capture and carries its clock time — if that
+  time is not recent, capture was paused and it is the last thing seen,
+  not what is on screen. "Today's apps" is ordered by how much of the day
+  each one took.
 
-Reply format (exactly one):
+  The date column feeds get_day_summary; the from_ms/to_ms columns feed
+  every tool taking a range. Nothing outside "Recording covers" exists.
+
+────────────────────────────────────────────────────────────────────────
+get_day_summary   {"day":"2026-08-13"}
+
+  day     optional, "YYYY-MM-DD" as printed by get_now. Omit for today.
+
+  Returns every stretch of that day, in time order:
+    Day 2026-08-13 — 27 stretches with activity.
+    14:20 at_ms=1786551600000 — Fixed the recall day panel
+        · lody #38: hid idle slots from the day summary [01a00dc5-…]
+        names: lody, afterray-store
+        decided: hide idle slots rather than dim them
+
+  A stretch nothing has summarised yet reads instead:
+    15:10 at_ms=… — [not summarised: degraded] apps: Zed, Chrome
+  That is "unknown", not a finding. get_slot_card reads it.
+
+  On a busy day only the title line of each stretch comes back and the
+  first line says "titles only".
+
+────────────────────────────────────────────────────────────────────────
+search_summaries   {"query":"lody"}
+
+  query     required. Words matched inside written summaries — stretch
+            titles, thread names and prose, recorded identifiers. Case
+            and spacing are ignored. Exact text, not meaning.
+  from_ms   optional, from get_now. Stretches starting at or after it.
+  to_ms     optional, from get_now. Stretches starting at or before it.
+  app       optional, e.g. "Chrome". Only stretches using that app.
+  limit     optional, default 12, maximum 40.
+
+  Returns one block per stretch, oldest first:
+    "lody" appears in 3 summarised stretches.
+    2026-08-13 14:20 at_ms=1786551600000 — Fixed the recall day panel
+        · lody #38: hid idle slots from the day summary
+        names: lody
+        decided: hide idle slots rather than dim them
+        moments: 01a00dc5-…, 01a00dc5-…
+
+────────────────────────────────────────────────────────────────────────
+search_evidence   {"query":"lody"}
+
+  query     required. Words to find in text read off the screen and in
+            transcripts. Exact text, not meaning.
+  from_ms   optional, from get_now.
+  to_ms     optional, from get_now.
+  app       optional.
+  limit     optional, default 8, maximum 20.
+
+  Returns one block per hit, closest match first:
+    3 matches for "lody".
+    14:23:10 at_ms=1786551790000 moment=01a00dc5-… app=Zed
+        stretch: at_ms=1786551600000 — Fixed the recall day panel
+        …the matching screen text…
+
+  Each hit already says where it was. The moment goes to
+  get_moment_context; the at_ms goes to get_slot_card.
+
+────────────────────────────────────────────────────────────────────────
+get_slot_card   {"at_ms":1786551600000}
+
+  at_ms   required. Any timestamp inside the stretch, copied from a
+          summary line or a search hit.
+
+  Returns that one stretch in full: which applications for how long, a
+  timeline of what was open, the screen text each run introduced, and
+  what was returned to repeatedly. This is how to read a stretch that
+  has no summary yet.
+
+────────────────────────────────────────────────────────────────────────
+get_moment_context   {"moment_id":"01a00dc5-…"}
+
+  moment_id   required, copied from a summary line or a search hit.
+
+  Returns one captured frame, whole:
+    moment=01a00dc5-… at_ms=1786551790000 2026-08-13 14:23:10
+    app=Zed  window=tools.rs
+    url=…
+    document=…
+    stretch: at_ms=1786551600000 — Fixed the recall day panel
+    screen text: …everything read off the screen…
+    accessibility: …headings, focused field, selected text…
+    said: …anything transcribed at that moment…
+
+  A line reading "none recorded" is ordinary — that frame had no such
+  evidence. Prefer this over asking for the pieces separately.
+
+────────────────────────────────────────────────────────────────────────
+get_transcript   {"from_ms":…,"to_ms":…}
+
+  from_ms   required, from get_now or an earlier result.
+  to_ms     required.
+  limit     optional, default 60, maximum 400.
+
+  Returns one line per utterance:
+    14:23:10 mic     …what was said…
+    14:23:18 system  …what came out of the speakers…
+
+────────────────────────────────────────────────────────────────────────
+list_activity   {"from_ms":…,"to_ms":…}
+
+  from_ms   required.
+  to_ms     required.
+  app       optional.
+  limit     optional, default 40, maximum 200.
+
+  Returns one line per unbroken stretch of use, in time order:
+    14:20 – 14:37  Zed  tools.rs
+    14:37 – 14:41  Chrome  github.com/loro-dev/afterray/pull/38
+
+  Use it for when something started or stopped.
+────────────────────────────────────────────────────────────────────────
+
+Whatever a tool could not fit, it says so on its last line, with the
+timestamp to resume from. Nothing is dropped in silence.
+
+Reply with exactly one of:
+
 TOOL <name>
 ARGS <json object>
 
@@ -584,6 +1327,7 @@ or
 FINAL
 <answer text>"#
 }
+
 
 #[cfg(test)]
 mod jail {
@@ -677,14 +1421,48 @@ mod jail {
     #[test]
     fn tool_surfaces_hold_a_read_only_vault() {
         let tools = production_source(include_str!("tools.rs"));
+        // Owned rather than borrowed, because the dispatch runs on a blocking
+        // thread — but still a handle with no writes on it. The `Arc<Vault>`
+        // it wraps is what must not appear here: that would put every mutating
+        // method one keystroke away again.
         assert!(
-            tools.contains(concat!("pub store: ReadOnly", "Vault<'a>")),
+            tools.contains(concat!("pub store: SharedReadOnly", "Vault,")),
             "ToolHost stopped holding a read-only handle"
+        );
+        assert!(
+            !tools.contains(concat!("store: Arc<", "Vault>")),
+            "ToolHost took the writable vault to reach a blocking thread"
         );
         let main = production_source(include_str!("main.rs"));
         assert!(
             main.contains(concat!("store: afterray_store::ReadOnly", "Vault<'a>")),
             "SlotT2Tools stopped holding a read-only handle"
+        );
+    }
+
+    /// Vault reads must leave the runtime.
+    ///
+    /// Every tool here is a synchronous `SQLite` read — a day of summary rows,
+    /// an FTS query, a slot card, an artifact decrypt. Awaiting one on a Tokio
+    /// worker parks it for the whole read, and the daemon runs one worker per
+    /// two cores: eight concurrent tool calls is every worker blocked, and
+    /// socket accepts and capture import stop being scheduled behind them.
+    ///
+    /// This asserts the seam in the source rather than the timing, because the
+    /// failure is a scheduling property no unit test observes. The previous
+    /// version of this file had an `#[allow(clippy::unused_async)]` on
+    /// `invoke` — the lint was telling us the reads were on the runtime, and
+    /// the allow silenced it.
+    #[test]
+    fn the_tool_dispatch_runs_off_the_runtime() {
+        let tools = production_source(include_str!("tools.rs"));
+        assert!(
+            tools.contains(concat!("spawn_", "blocking")),
+            "ToolHost::invoke stopped moving its vault reads off the runtime"
+        );
+        assert!(
+            !tools.contains(concat!("clippy::unused_", "async")),
+            "the async dispatch is being silenced instead of made async"
         );
     }
 
@@ -704,15 +1482,17 @@ mod jail {
     }
 }
 
+
 #[cfg(test)]
 mod catalog_drift {
-    //! The tool catalog, the dispatch table and three system prompts are four
-    //! hand-written texts describing one thing. They have already drifted once:
-    //! `get_day_summary` was dispatchable and documented while `chat.rs` still
-    //! told the model to "start wide with `get_slot_card`".
+    //! The tool catalog, the dispatch table and the system prompt are three
+    //! hand-written texts describing one thing. They have already drifted
+    //! twice: `get_day_summary` was dispatchable while chat's prompt still
+    //! said to start with `get_slot_card`, and chat's prompt described a seed
+    //! block months after the seed had changed shape.
     //!
-    //! These tests read the dispatch arms out of this file's own source, so the
-    //! `match` stays the single authority and the prose has to follow it.
+    //! These tests read the dispatch arms out of this file's own source, so
+    //! the `match` stays the single authority and the prose has to follow it.
 
     use super::tool_catalog_text;
 
@@ -743,7 +1523,7 @@ mod catalog_drift {
 
     /// Tool-shaped identifiers a prompt mentions.
     fn tools_named_in(source: &str) -> Vec<String> {
-        let prefixes = ["get_", "list_", "search_"];
+        let prefixes = ["get_", "list_", "search_", "find_"];
         let mut found: Vec<String> = Vec::new();
         for token in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
             if prefixes.iter().any(|prefix| token.starts_with(prefix))
@@ -755,43 +1535,105 @@ mod catalog_drift {
         found
     }
 
+    /// The production half of this file, without the tests that talk about it.
+    fn production() -> &'static str {
+        include_str!("tools.rs")
+            .split_once("\n#[cfg(test)]")
+            .map_or(include_str!("tools.rs"), |(before, _)| before)
+    }
+
     #[test]
     fn the_scan_finds_the_real_dispatch_table() {
         let names = dispatched_names();
-        assert!(names.len() >= 10, "scan found only {names:?}");
+        assert_eq!(names.len(), 8, "scan found {names:?}");
         assert!(names.iter().any(|name| name == "get_day_summary"), "{names:?}");
-        assert!(names.iter().any(|name| name == "get_now"), "{names:?}");
+        assert!(names.iter().any(|name| name == "search_summaries"), "{names:?}");
     }
 
-    /// The test the plan asks for: nothing callable may be undocumented.
+    /// Nothing callable may be undocumented.
     #[test]
     fn every_dispatched_tool_appears_in_the_catalog() {
         let catalog = tool_catalog_text();
         for name in dispatched_names() {
             assert!(
-                catalog.contains(&format!("- {name}:")),
+                catalog.contains(&format!("{name}   ")),
                 "`{name}` is callable but the catalog never lists it"
             );
         }
     }
 
-    /// And the other direction: nothing documented may be uncallable, or the
-    /// model spends a round discovering `unknown tool`.
+    /// And nothing documented may be uncallable, or the model spends a round
+    /// discovering `unknown tool`.
     #[test]
     fn every_catalogued_tool_is_dispatched() {
         let dispatched = dispatched_names();
-        for line in tool_catalog_text().lines() {
-            let Some(rest) = line.trim().strip_prefix("- ") else {
-                continue;
-            };
-            let Some((name, _)) = rest.split_once(':') else {
-                continue;
-            };
+        for named in tools_named_in(tool_catalog_text()) {
             assert!(
-                dispatched.iter().any(|known| known == name),
-                "the catalog documents `{name}`, which nothing dispatches"
+                dispatched.contains(&named),
+                "the catalog names `{named}`, which nothing dispatches"
             );
         }
+    }
+
+    /// The rule this catalog was rewritten for: every argument a tool actually
+    /// reads is spelled out for the model.
+    ///
+    /// A tool that quietly accepts an argument nobody documented is one the
+    /// model can only discover by accident, and the previous catalog had
+    /// several. Scanned from `args.get("…")`, so adding a parameter and
+    /// forgetting the prose fails here rather than in a chat six weeks later.
+    #[test]
+    fn every_argument_the_tools_read_is_documented() {
+        // `day_ms` is deliberately undocumented: it exists so a model that
+        // copies a from_ms out of the clock table instead of the date beside
+        // it still lands on the right day. Documenting it would offer a second
+        // spelling of the same argument, which is what this catalog is for
+        // getting rid of.
+        const UNDOCUMENTED_ON_PURPOSE: [&str; 1] = ["day_ms"];
+
+        let catalog = tool_catalog_text();
+        let mut seen: Vec<String> = Vec::new();
+        for (index, _) in production().match_indices("args.get(\"") {
+            let rest = &production()[index + "args.get(\"".len()..];
+            let Some((key, _)) = rest.split_once('"') else {
+                continue;
+            };
+            if !seen.iter().any(|known| known == key) {
+                seen.push(key.to_owned());
+            }
+        }
+        assert!(seen.len() >= 6, "the argument scan found only {seen:?}");
+        for key in seen {
+            if UNDOCUMENTED_ON_PURPOSE.contains(&key.as_str()) {
+                continue;
+            }
+            assert!(
+                catalog.contains(&key),
+                "`{key}` is read from tool arguments but the catalog never names it"
+            );
+        }
+    }
+
+    /// The catalog occupies the window whether or not it is read, so its size
+    /// is a budget line and not a matter of taste.
+    ///
+    /// `ContextBudget::system_tokens` is documented as a *measurement*. If this
+    /// fails, re-measure and move the constant deliberately — do not shave the
+    /// catalog until the number fits.
+    #[test]
+    fn the_catalog_and_system_prompt_fit_the_budget_they_are_charged_to() {
+        let system = format!(
+            "{}\n\n{}",
+            crate::agent::RECALL_SYSTEM_PROMPT,
+            tool_catalog_text()
+        );
+        let tokens = afterray_harness::estimate_tokens(&system);
+        let budgeted = afterray_harness::ContextBudget::DEFAULT.system_tokens;
+        assert!(
+            tokens <= budgeted,
+            "the system prompt and catalog measure {tokens} tokens against a \
+             budgeted {budgeted}; re-measure ContextBudget::system_tokens"
+        );
     }
 
     /// The drift that actually shipped was subtler than a wrong name: chat's
@@ -804,6 +1646,7 @@ mod catalog_drift {
     fn system_prompts_leave_tool_advice_to_the_catalog() {
         let dispatched = dispatched_names();
         let prompts = [
+            ("agent.rs", include_str!("agent.rs")),
             ("chat.rs", include_str!("chat.rs")),
             ("stream.rs", include_str!("stream.rs")),
             ("ask.rs", include_str!("ask.rs")),
@@ -829,6 +1672,28 @@ mod catalog_drift {
             }
         }
     }
+
+    /// The seed is gone and must stay gone: a clock block in front of every
+    /// turn changes on every turn, which breaks the cached prefix on every
+    /// turn and is paid for whether or not the question involves a time.
+    #[test]
+    fn no_chat_surface_builds_a_clock_into_its_opening() {
+        for (file, source) in [
+            ("chat.rs", include_str!("chat.rs")),
+            ("stream.rs", include_str!("stream.rs")),
+        ] {
+            // Cut only the trailing test module: `#[cfg(test)]` also marks
+            // test-only imports near the top of a file, and splitting on the
+            // first one hid everything this scan exists to look at.
+            let production = source
+                .rsplit_once("\n#[cfg(test)]\nmod ")
+                .map_or(source, |(before, _)| before);
+            assert!(
+                production.contains("seed: String::new()"),
+                "{file} stopped building an empty seed; the clock belongs in get_now"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -836,16 +1701,15 @@ mod tests {
     use super::*;
     // The fixtures build a real vault before narrowing it; production code in
     // this file only ever sees the read-only handle.
-    use afterray_models::QueueConfig;
     use afterray_store::Vault;
     use afterray_store::VaultConfig;
 
     const DAY: i64 = 86_400_000;
-    /// 2026-08-15, roughly. The screenshot that prompted these guards showed a
-    /// model reaching for 2024 instead.
+    /// 2026-08-15, roughly. The screenshot that prompted the range guards
+    /// showed a model reaching for 2024 instead.
     const NOW: i64 = 1_786_729_937_000;
 
-    fn host_fixture() -> (tempfile::TempDir, Vault, ModelQueue) {
+    fn host_fixture() -> (tempfile::TempDir, std::sync::Arc<Vault>) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
@@ -855,8 +1719,31 @@ mod tests {
             [7_u8; 32],
         )
         .unwrap();
-        let models = ModelQueue::new(Vec::new(), QueueConfig::default()).unwrap();
-        (directory, vault, models)
+        (directory, std::sync::Arc::new(vault))
+    }
+
+    fn host_for(vault: &std::sync::Arc<Vault>) -> ToolHost {
+        ToolHost {
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(vault)),
+            now_ms: NOW,
+            budget: ContextBudget::DEFAULT,
+        }
+    }
+
+    /// Names the application on the moment nearest `at_ms`, the way capture
+    /// does: through the accessibility snapshot, which is the only public path
+    /// that sets a moment's application and window title.
+    fn stamp_app(vault: &Vault, session_id: &str, at_ms: i64, app: &str, title: &str) {
+        vault
+            .attach_accessibility_snapshot(
+                session_id,
+                at_ms,
+                "application/vnd.afterray.ax+json",
+                format!(r#"{{"application_name":"{app}","window_title":"{title}"}}"#).as_bytes(),
+                Some(app),
+                None,
+            )
+            .unwrap();
     }
 
     fn seed_moments(vault: &Vault, stamps: &[i64]) {
@@ -868,133 +1755,711 @@ mod tests {
         }
     }
 
-    /// Seeds one half-hour with moments and gives it a T2 card, leaving a
-    /// second half-hour with evidence but no summary.
-    fn seed_day(vault: &Vault, summarised_at: i64, bare_at: i64) {
-        seed_moments(vault, &[summarised_at, summarised_at + 60_000, bare_at]);
-        let card = vault.slot_card(summarised_at, 10_000).unwrap();
+    /// A stretch summarised the way the T2 summariser writes them now: threads
+    /// that cite their frames, grounded entities, decisions.
+    fn seed_summarised(vault: &Vault, at_ms: i64) -> Vec<String> {
+        seed_moments(vault, &[at_ms, at_ms + 60_000]);
+        let card = vault.slot_card(at_ms, 10_000).unwrap();
+        let ids = card.evidence.moment_ids.clone();
         vault
-            .put_t2_summary(
+            .put_t2_summary_v2(
                 &card,
-                &afterray_store::T2Card {
-                    artifacts: Vec::new(),
-                    title: "Chased a GOP header bug".to_owned(),
-                    bullets: vec!["Read the IVF length check".to_owned()],
+                &afterray_store::T2CardV2 {
+                    title: "Fixed the recall day panel".to_owned(),
+                    description: "Idle slots were being drawn as work.".to_owned(),
+                    threads: vec![afterray_store::T2Thread {
+                        name: "lody #38".to_owned(),
+                        prose: "hid idle slots from the day summary".to_owned(),
+                        moment_ids: ids.clone(),
+                    }],
+                    entities: vec![afterray_store::T2Entity {
+                        text: "lody".to_owned(),
+                        kind: Some("project".to_owned()),
+                        moment_id: ids.first().cloned(),
+                    }],
+                    decisions: vec!["Hide idle slots rather than dim them".to_owned()],
+                    not_captured: vec!["whether the branch was pushed".to_owned()],
                     category: Some("coding".to_owned()),
                     confidence: Some(0.8),
                 },
                 "test",
-                summarised_at,
+                at_ms,
                 Some(1),
             )
             .unwrap();
+        ids
     }
 
-    /// The day panel's contents, reachable by the agent. Before this the only
-    /// route to "what did I do today" was a T1 card per half hour.
+    /// The one reply that has to carry everything: a model that reads it must
+    /// be able to name any period without doing arithmetic.
     #[tokio::test]
-    async fn get_day_summary_returns_the_written_summaries() {
-        let (_dir, vault, models) = host_fixture();
-        // Inside today's local bounds: NOW is early morning, so subtracting
-        // hours would land on yesterday and the day tool would rightly refuse.
-        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
-        seed_day(&vault, noon, noon + 1_800_000);
+    async fn get_now_hands_over_a_table_that_can_be_copied() {
+        let (_dir, vault) = host_fixture();
+        seed_moments(&vault, &[NOW - 10 * DAY, NOW - 60_000]);
+        let host = host_for(&vault);
+
+        let text = host.invoke("get_now", &json!({})).await.unwrap().text;
+        assert!(text.contains(&format!("now_ms={NOW}")), "{text}");
+        // Dates beside the numbers, so a date read off the screen can be
+        // matched against a row rather than converted.
+        for period in clock_periods(NOW) {
+            assert!(
+                text.contains(&format!(
+                    "from_ms={}  to_ms={}",
+                    period.from_ms, period.to_ms
+                )),
+                "`{}` is missing its copyable pair: {text}",
+                period.label
+            );
+            assert!(text.contains(&period.dates), "{}: {text}", period.label);
+        }
+        for label in ["today", "yesterday", "this week", "last week", "last month"] {
+            assert!(text.contains(label), "`{label}` is missing: {text}");
+        }
+        assert!(text.contains("Recording covers"), "{text}");
+    }
+
+    /// A day with more switches than any span limit must still report the
+    /// afternoon.
+    ///
+    /// `activity_spans` folds forward and returns the moment it reaches its
+    /// limit, so its last element is the *earliest* limit-th span. Reading
+    /// "Right now" off it printed a morning span as the current state — the
+    /// worst error available to a line the agent treats as present fact — and
+    /// the app sketch beside it had no afternoon in it at all.
+    #[tokio::test]
+    async fn the_clock_reports_the_afternoon_on_a_day_of_many_switches() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+
+        // 260 morning switches: more than any limit the tool might pass.
+        for index in 0..260_i64 {
+            let at_ms = day_start + index * 10_000;
+            let moment = vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Chrome", &format!("tab {index}"));
+            let _ = moment;
+        }
+        // Then a long afternoon in an application that appears nowhere above.
+        let afternoon = day_start + 13 * 3_600_000;
+        for index in 0..40_i64 {
+            let at_ms = afternoon + index * 10_000;
+            let moment = vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Xcode", "ContentView.swift");
+            let _ = moment;
+        }
         let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
+            now_ms: afternoon + 40 * 10_000,
             budget: ContextBudget::DEFAULT,
         };
 
-        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
-        assert!(text.contains("Chased a GOP header bug"), "{text}");
-        assert!(text.contains("Read the IVF length check"), "{text}");
-        // The at_ms has to come back or the model cannot drill in.
-        assert!(text.contains(&format!("at_ms={noon}")), "{text}");
-    }
-
-    /// A half-hour nothing has summarised must not present its app list as a
-    /// finding — a model handed a bare list will report it as what happened.
-    #[tokio::test]
-    async fn get_day_summary_marks_the_gaps() {
-        let (_dir, vault, models) = host_fixture();
-        // Inside today's local bounds: NOW is early morning, so subtracting
-        // hours would land on yesterday and the day tool would rightly refuse.
-        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
-        seed_day(&vault, noon, noon + 1_800_000);
-        let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
-            budget: ContextBudget::DEFAULT,
-        };
-
-        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
-        assert!(text.contains("not summarised"), "{text}");
+        let text = host.invoke("get_now", &json!({})).await.unwrap().text;
+        let right_now = text
+            .lines()
+            .find(|line| line.starts_with("Right now:"))
+            .expect("no current-activity line");
         assert!(
-            text.contains("get_slot_card"),
-            "the gap note must say how to dig in: {text}"
+            right_now.contains("Xcode") && right_now.contains("ContentView.swift"),
+            "the morning was reported as the present: {right_now}"
         );
+        // Stamped, so a stale line is visibly stale rather than silently wrong.
+        assert!(
+            right_now.contains(&format_local_time(afternoon + 39 * 10_000)),
+            "the current line carries no clock time: {right_now}"
+        );
+        let apps = text
+            .lines()
+            .find(|line| line.starts_with("Today's apps:"))
+            .expect("no app line");
+        assert!(apps.contains("Xcode"), "the afternoon's app is missing: {apps}");
+        assert!(apps.contains("Chrome"), "{apps}");
     }
 
-    /// A day with nothing in it, but inside the recorded span — a weekend
-    /// between two working days. The range guard cannot answer this one, so
-    /// the tool has to say it plainly instead of returning an empty list.
+    /// Structural, not against fixed dates: whichever weekday `NOW` lands on,
+    /// the days must tile backwards and the weeks must meet exactly.
+    #[test]
+    fn the_clock_table_tiles_the_calendar() {
+        use chrono::Datelike as _;
+
+        let periods = clock_periods(NOW);
+        let find = |label: &str| {
+            periods
+                .iter()
+                .find(|period| period.label == label)
+                .map(|period| (period.from_ms, period.to_ms))
+                .expect("period is missing")
+        };
+
+        // Seven consecutive days, newest first, each meeting the next.
+        let days: Vec<&ClockPeriod> = periods
+            .iter()
+            .take(usize::try_from(CLOCK_DAYS).unwrap())
+            .collect();
+        assert_eq!(days.len(), 7);
+        for pair in days.windows(2) {
+            assert_eq!(
+                pair[1].to_ms + 1,
+                pair[0].from_ms,
+                "days {} and {} do not meet",
+                pair[1].dates,
+                pair[0].dates
+            );
+        }
+        assert!(days[0].from_ms <= NOW && NOW <= days[0].to_ms, "today is wrong");
+
+        // The rows have to be consecutive *calendar dates*, which is a
+        // stronger claim than the tiling above and the one that broke: walking
+        // back by 86_400_000 ms skips a date wherever a local day is 23 hours
+        // long. Asserted against `NaiveDate` arithmetic so it holds in every
+        // zone, including the ones this machine is not in.
+        let today = local_date_of(NOW).expect("NOW is a readable instant");
+        for (index, day) in days.iter().enumerate() {
+            let expected = today
+                .checked_sub_days(chrono::Days::new(index as u64))
+                .expect("seven days back is in range");
+            assert_eq!(
+                day.dates,
+                expected.format("%Y-%m-%d").to_string(),
+                "row {index} is not {expected}"
+            );
+        }
+
+        let (this_week_start, _) = find("this week");
+        let (_, last_week_end) = find("last week");
+        assert_eq!(last_week_end + 1, this_week_start, "the weeks do not meet");
+        let (this_month_start, _) = find("this month");
+        let (_, last_month_end) = find("last month");
+        assert_eq!(last_month_end + 1, this_month_start, "the months do not meet");
+
+        // And the aggregates are reached the same way — by date, not by
+        // stepping a day's worth of milliseconds off the start of the period.
+        assert_eq!(
+            week_bounds_for_date(
+                today
+                    .checked_sub_days(chrono::Days::new(7))
+                    .expect("a week back is in range")
+            ),
+            Some(find("last week")),
+            "last week was not derived by calendar date"
+        );
+        let first_of_this_month = first_of_month(today).expect("every date has a first");
+        assert_eq!(
+            month_bounds_for_date(
+                first_of_this_month
+                    .checked_sub_days(chrono::Days::new(1))
+                    .expect("a day back is in range")
+            ),
+            Some(find("last month")),
+            "last month was not derived by calendar date"
+        );
+
+        let weekday = chrono::DateTime::from_timestamp_millis(this_week_start)
+            .unwrap()
+            .with_timezone(&Local)
+            .weekday();
+        assert_eq!(weekday, chrono::Weekday::Mon, "the week starts on {weekday}");
+    }
+
+    /// The date column of the clock table is what this argument takes. One
+    /// spelling, and the same one the model just read.
     #[tokio::test]
-    async fn get_day_summary_says_so_when_a_day_is_empty() {
-        let (_dir, vault, models) = host_fixture();
-        let today = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
-        seed_day(&vault, today, today + 1_800_000);
-        // Push coverage back two days so yesterday sits inside the span.
-        seed_moments(&vault, &[today - 2 * DAY]);
+    async fn a_day_is_named_by_its_date() {
+        let (_dir, vault) = host_fixture();
+        let yesterday_noon = local_calendar_day_bounds_ms(NOW - DAY).0 + 12 * 3_600_000;
+        seed_summarised(&vault, yesterday_noon);
+        seed_moments(&vault, &[NOW - 60_000]);
+        let host = host_for(&vault);
+
+        let day = afterray_store::local_day_for(yesterday_noon);
+        let text = host
+            .invoke("get_day_summary", &json!({"day": day}))
+            .await
+            .unwrap()
+            .text;
+        assert!(text.contains(&format!("Day {day}")), "{text}");
+        assert!(text.contains("Fixed the recall day panel"), "{text}");
+
+        // A date that is not one says so, rather than silently answering about
+        // today.
+        let error = host
+            .invoke("get_day_summary", &json!({"day": "yesterday"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("2026-08-13"), "{error}");
+    }
+
+    /// The stored card already holds the frames, the names and the decisions;
+    /// the day summary used to project all of it down to title + bullets.
+    #[tokio::test]
+    async fn the_day_summary_carries_citations_names_and_decisions() {
+        let (_dir, vault) = host_fixture();
+        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        let ids = seed_summarised(&vault, noon);
+        let host = host_for(&vault);
+
+        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
+        assert!(text.contains("Fixed the recall day panel"), "{text}");
+        assert!(text.contains("hid idle slots from the day summary"), "{text}");
+        assert!(text.contains(&ids[0]), "no moment id to cite: {text}");
+        assert!(text.contains("names: lody"), "{text}");
+        assert!(
+            text.contains("decided: Hide idle slots rather than dim them"),
+            "{text}"
+        );
+        // `not_captured` is not rendered here; the day-scale budget cannot
+        // afford a caveat per stretch.
+        assert!(!text.contains("not captured"), "{text}");
+    }
+
+    /// A worked day must arrive whole.
+    ///
+    /// A day is ~48 ten-minute stretches; describing each in full costs about
+    /// four times `tool_result_tokens`, and the cut falls on the tail — so
+    /// "what did I do today" came back having silently deleted the afternoon.
+    /// Losing the detail of a stretch costs one more call; losing the stretch
+    /// costs a wrong answer. The summaries are Chinese because that is the
+    /// expensive case: a token per character, not a quarter of one.
+    #[tokio::test]
+    async fn a_busy_day_arrives_whole_even_if_it_arrives_compact() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+        let mut starts = Vec::new();
+        for index in 0..48_i64 {
+            let at_ms = day_start + index * 600_000;
+            starts.push(at_ms);
+            for step in 0..3_i64 {
+                vault
+                    .insert_moment(&session.id, at_ms + step * 60_000, "image/jpeg", b"f")
+                    .unwrap();
+            }
+            let card = vault.slot_card(at_ms, 10_000).unwrap();
+            let ids = card.evidence.moment_ids.clone();
+            vault
+                .put_t2_summary_v2(
+                    &card,
+                    &afterray_store::T2CardV2 {
+                        title: "修复回忆面板的空闲时段显示".to_owned(),
+                        description: "空闲时段被当成工作画了出来。".to_owned(),
+                        threads: vec![afterray_store::T2Thread {
+                            name: "lody #38".to_owned(),
+                            prose: "把空闲时段从日摘要面板里隐藏掉，改了渲染分支".to_owned(),
+                            moment_ids: ids.clone(),
+                        }],
+                        entities: vec![afterray_store::T2Entity {
+                            text: "lody".to_owned(),
+                            kind: None,
+                            moment_id: ids.first().cloned(),
+                        }],
+                        decisions: vec!["隐藏而不是置灰空闲时段".to_owned()],
+                        not_captured: vec![],
+                        category: Some("coding".to_owned()),
+                        confidence: Some(0.8),
+                    },
+                    "test",
+                    at_ms,
+                    Some(1),
+                )
+                .unwrap();
+        }
         let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
+            now_ms: day_start + 8 * 3_600_000,
+            budget: ContextBudget::DEFAULT,
+        };
+
+        let result = host.invoke("get_day_summary", &json!({})).await.unwrap();
+        assert!(
+            !result.truncated,
+            "a day of ordinary length did not fit: {} tokens against {}",
+            afterray_harness::estimate_tokens(&result.text),
+            ContextBudget::DEFAULT.tool_result_tokens()
+        );
+        for at_ms in &starts {
+            assert!(
+                result.text.contains(&format!("at_ms={at_ms}")),
+                "the stretch at {at_ms} was dropped from the day"
+            );
+        }
+        // It got there by dropping detail, and says so — otherwise the model
+        // reads the absence as "nothing else was going on".
+        assert!(result.text.contains("titles only"), "{}", result.text);
+    }
+
+    /// The index the day panel could never be.
+    #[tokio::test]
+    async fn search_summaries_locates_the_stretch_that_names_it() {
+        let (_dir, vault) = host_fixture();
+        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        let ids = seed_summarised(&vault, noon);
+        let host = host_for(&vault);
+
+        let text = host
+            .invoke("search_summaries", &json!({"query": "lody"}))
+            .await
+            .unwrap()
+            .text;
+        assert!(text.contains("Fixed the recall day panel"), "{text}");
+        assert!(text.contains(&format!("at_ms={noon}")), "{text}");
+        assert!(text.contains(&ids[0]), "no frame to cite: {text}");
+        assert!(text.contains("decided: Hide idle slots"), "{text}");
+    }
+
+    /// A cut answer says it was cut. These come back strongest-first across
+    /// the whole range, so silence here would read as "that is all there is"
+    /// while the weaker matches sit unmentioned.
+    #[tokio::test]
+    async fn search_summaries_says_when_it_returned_only_the_strongest() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        seed_summarised(&vault, day_start + 3_600_000);
+        seed_summarised(&vault, day_start + 5 * 3_600_000);
+        let host = host_for(&vault);
+
+        let cut = host
+            .invoke("search_summaries", &json!({"query": "lody", "limit": 1}))
+            .await
+            .unwrap()
+            .text;
+        assert!(cut.contains("there may be more"), "{cut}");
+        assert!(cut.contains("Raise limit"), "{cut}");
+
+        // And a complete answer does not claim to be partial.
+        let whole = host
+            .invoke("search_summaries", &json!({"query": "lody", "limit": 10}))
+            .await
+            .unwrap()
+            .text;
+        assert!(!whole.contains("there may be more"), "{whole}");
+    }
+
+    /// Only summarised stretches are searchable this way, so an empty answer
+    /// must not read as "it never happened" — that is a false negative the
+    /// model would report as fact.
+    #[tokio::test]
+    async fn search_summaries_says_it_only_reads_written_summaries() {
+        let (_dir, vault) = host_fixture();
+        seed_summarised(&vault, local_calendar_day_bounds_ms(NOW).0 + 3_600_000);
+        let host = host_for(&vault);
+
+        let text = host
+            .invoke("search_summaries", &json!({"query": "kubernetes"}))
+            .await
+            .unwrap()
+            .text;
+        assert!(text.contains("written summaries only"), "{text}");
+        assert!(text.contains("search_evidence"), "{text}");
+    }
+
+    /// Both searches take the same narrowing, and the narrowing has to reach
+    /// the query rather than filter its output: ranked-then-filtered answers
+    /// "the best matches anywhere, if any happen to fall in this range".
+    #[tokio::test]
+    async fn both_searches_narrow_by_time_and_application() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+        let morning = day_start + 3_600_000;
+        let evening = day_start + 10 * 3_600_000;
+        for at_ms in [morning, evening] {
+            let moment = vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"frame")
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    "lody notes on screen",
+                    at_ms,
+                    None,
+                    "ocr-model",
+                    None,
+                )
+                .unwrap();
+        }
+        let host = host_for(&vault);
+
+        let all = host
+            .invoke("search_evidence", &json!({"query": "lody"}))
+            .await
+            .unwrap()
+            .text;
+        assert!(all.contains("2 matches"), "{all}");
+
+        // Narrowed to the morning, and the ranking alone would not have
+        // chosen it: one result, and it is the earlier one.
+        let bounded = host
+            .invoke(
+                "search_evidence",
+                &json!({"query": "lody", "from_ms": morning - 1, "to_ms": morning + 1, "limit": 1}),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(bounded.contains("1 match"), "{bounded}");
+        assert!(bounded.contains(&format!("at_ms={morning}")), "{bounded}");
+        // And it says what it narrowed to, so a short answer is never read as
+        // an empty vault.
+        assert!(bounded.contains("between"), "{bounded}");
+
+        let by_app = host
+            .invoke(
+                "search_evidence",
+                &json!({"query": "lody", "app": "NoSuchApp"}),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(by_app.contains("nothing captured"), "{by_app}");
+        assert!(by_app.contains("in NoSuchApp"), "{by_app}");
+    }
+
+    /// A hit that cannot be placed costs a round to place. Time, frame, app
+    /// and the stretch it belongs to all ride along.
+    #[tokio::test]
+    async fn a_search_hit_says_where_it_was() {
+        let (_dir, vault) = host_fixture();
+        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        let ids = seed_summarised(&vault, noon);
+        vault
+            .insert_text_evidence(
+                &vault.moment_by_id(&ids[0]).unwrap().unwrap().session_id,
+                Some(&ids[0]),
+                None,
+                "ocr",
+                "recall day panel on screen",
+                noon,
+                None,
+                "ocr-model",
+                None,
+            )
+            .unwrap();
+        let host = host_for(&vault);
+
+        let text = host
+            .invoke("search_evidence", &json!({"query": "panel"}))
+            .await
+            .unwrap()
+            .text;
+        assert!(text.contains(&format!("moment={}", ids[0])), "{text}");
+        assert!(text.contains(&format!("at_ms={noon}")), "{text}");
+        assert!(text.contains("stretch: at_ms="), "{text}");
+        assert!(text.contains("Fixed the recall day panel"), "{text}");
+    }
+
+    /// Three reads of one instant, billed once.
+    #[tokio::test]
+    async fn get_moment_context_answers_in_one_call() {
+        let (_dir, vault) = host_fixture();
+        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        let ids = seed_summarised(&vault, noon);
+        let host = host_for(&vault);
+
+        let text = host
+            .invoke("get_moment_context", &json!({"moment_id": ids[0]}))
+            .await
+            .unwrap()
+            .text;
+        assert!(text.contains(&format!("moment={}", ids[0])), "{text}");
+        assert!(text.contains(&format!("at_ms={noon}")), "{text}");
+        // The stretch it belongs to, so the model can go up as well as down.
+        assert!(text.contains("Fixed the recall day panel"), "{text}");
+        // Absent evidence is ordinary, and reported as an absence rather than
+        // as a failed read the model would retry.
+        for field in ["screen text:", "accessibility:", "said:"] {
+            assert!(text.contains(field), "{field} missing: {text}");
+        }
+        assert!(text.contains("none recorded"), "{text}");
+    }
+
+    /// A cut the model cannot see reads as "that is all there was". Every
+    /// bounded list says where it stopped and how to resume.
+    #[tokio::test]
+    async fn a_filled_transcript_says_where_it_stopped() {
+        let (_dir, vault) = host_fixture();
+        let start = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        let session = vault.create_session_sync(start).unwrap();
+        seed_moments(&vault, &[start]);
+        let segment = vault
+            .insert_audio_segment(&session.id, afterray_protocol::AudioTrack::Microphone, start, start + 600_000, "audio/mp4", b"aud")
+            .unwrap();
+        for index in 0..8_i64 {
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    None,
+                    Some(&segment.id),
+                    "transcript",
+                    &format!("line {index}"),
+                    start + index * 1_000,
+                    None,
+                    "asr",
+                    None,
+                )
+                .unwrap();
+        }
+        let host = host_for(&vault);
+
+        let text = host
+            .invoke(
+                "get_transcript",
+                &json!({"from_ms": start, "to_ms": start + 600_000, "limit": 3}),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(text.contains("line 0"), "{text}");
+        assert!(text.contains("3 lines"), "{text}");
+        assert!(text.contains("there may be more"), "{text}");
+        assert!(text.contains("from_ms="), "{text}");
+    }
+
+    /// The application filter has to reach the store, not the output.
+    ///
+    /// Spans are folded forward and cut at the limit, so filtering what comes
+    /// back filters the *earliest* spans of the range: ask for Zed on a day
+    /// whose first 160 spans are Chrome and the answer is "no activity" while
+    /// the Zed spans sit unread. Fetching a wider slice first only moves the
+    /// boundary — the same day with more Chrome puts it back.
+    #[tokio::test]
+    async fn narrowing_by_app_reaches_work_that_starts_late_in_the_range() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+
+        // 200 Chrome spans, then Zed — well past any slice the tool could
+        // widen to, since MAX_ACTIVITY_LIMIT is 200.
+        for index in 0..200_i64 {
+            let at_ms = day_start + index * 10_000;
+            vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Chrome", &format!("tab {index}"));
+        }
+        let zed_start = day_start + 200 * 10_000;
+        for index in 0..6_i64 {
+            let at_ms = zed_start + index * 10_000;
+            vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Zed", &format!("file{index}.rs"));
+        }
+        let host = ToolHost {
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
+            now_ms: zed_start + 6 * 10_000,
             budget: ContextBudget::DEFAULT,
         };
 
         let text = host
-            .invoke("get_day_summary", &json!({"day_ms": NOW - DAY}))
+            .invoke(
+                "list_activity",
+                &json!({"from_ms": day_start, "to_ms": zed_start + 60_000, "app": "Zed", "limit": 40}),
+            )
             .await
             .unwrap()
             .text;
-        assert!(text.contains("Nothing was recorded"), "{text}");
+        assert!(
+            !text.contains("no activity"),
+            "Zed was in the range and was reported missing: {text}"
+        );
+        assert!(text.contains("file0.rs"), "{text}");
+        assert!(text.contains("file5.rs"), "{text}");
+        assert!(!text.contains("Chrome"), "the filter leaked: {text}");
+
+        // Under the limit and complete, so nothing claims there is more.
+        assert!(!text.contains("there may be more"), "{text}");
     }
 
+    /// A narrowed answer that is cut still says so.
+    ///
+    /// The catalog promises nothing is dropped in silence. Filtering after the
+    /// cut broke that quietly rather than loudly: with only a couple of
+    /// matches inside the slice it fetched, it returned a short list, found it
+    /// under the limit, and said nothing — so a partial answer read as a
+    /// complete one.
     #[tokio::test]
-    async fn get_now_hands_over_ready_made_windows() {
-        let (_dir, vault, models) = host_fixture();
-        seed_moments(&vault, &[NOW - DAY, NOW - 60_000]);
+    async fn a_narrowed_answer_that_is_cut_says_there_may_be_more() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+        // Two Zed spans early, inside any slice a fold-then-filter would have
+        // fetched for a limit of 4, and plenty more Zed after it.
+        for index in 0..40_i64 {
+            let at_ms = day_start + index * 10_000;
+            let (app, place) = if index < 16 {
+                if index == 3 || index == 7 {
+                    ("Zed", format!("early{index}.rs"))
+                } else {
+                    ("Chrome", format!("tab {index}"))
+                }
+            } else {
+                ("Zed", format!("late{index}.rs"))
+            };
+            vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, app, &place);
+        }
         let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
+            now_ms: day_start + 40 * 10_000,
             budget: ContextBudget::DEFAULT,
         };
 
-        let raw = host.invoke("get_now", &json!({})).await.unwrap().text;
-        let value: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["now_ms"], json!(NOW));
-        assert_eq!(value["ranges"]["last_hour"]["to_ms"], json!(NOW));
-        assert_eq!(
-            value["ranges"]["last_hour"]["from_ms"],
-            json!(NOW - 3_600_000)
-        );
-        assert_eq!(value["vault_covers"]["from_ms"], json!(NOW - DAY));
-        assert_eq!(value["vault_covers"]["to_ms"], json!(NOW - 60_000));
+        let text = host
+            .invoke(
+                "list_activity",
+                &json!({"from_ms": day_start, "to_ms": day_start + 600_000, "app": "Zed", "limit": 4}),
+            )
+            .await
+            .unwrap()
+            .text;
+        let spans = text.lines().filter(|line| line.contains(" – ")).count();
+        assert_eq!(spans, 4, "the limit was not filled from the whole range: {text}");
+        assert!(text.contains("there may be more"), "{text}");
+        assert!(text.contains("from_ms="), "no cursor to resume from: {text}");
+    }
+
+    #[tokio::test]
+    async fn list_activity_reports_spans_and_narrows_by_app() {
+        let (_dir, vault) = host_fixture();
+        let start = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        seed_moments(&vault, &[start, start + 60_000]);
+        let host = host_for(&vault);
+
+        let text = host
+            .invoke(
+                "list_activity",
+                &json!({"from_ms": start, "to_ms": start + 600_000}),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(text.contains(" – "), "no span line: {text}");
+
+        let filtered = host
+            .invoke(
+                "list_activity",
+                &json!({"from_ms": start, "to_ms": start + 600_000, "app": "NoSuchApp"}),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(filtered.contains("no activity"), "{filtered}");
     }
 
     #[tokio::test]
     async fn window_outside_history_explains_itself() {
-        let (_dir, vault, models) = host_fixture();
+        let (_dir, vault) = host_fixture();
         seed_moments(&vault, &[NOW - DAY, NOW - 60_000]);
-        let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
-            budget: ContextBudget::DEFAULT,
-        };
+        let host = host_for(&vault);
 
         // The exact arguments from the failing chat: right time of day, wrong year.
         let error = host
@@ -1010,61 +2475,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quiet_window_inside_history_keeps_the_anchors() {
-        let (_dir, vault, models) = host_fixture();
-        seed_moments(&vault, &[NOW - 10 * DAY, NOW - 60_000]);
-        let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
-            budget: ContextBudget::DEFAULT,
-        };
-
-        let result = host
-            .invoke(
-                "list_activity",
-                &json!({"from_ms": NOW - 5 * DAY, "to_ms": NOW - 4 * DAY}),
-            )
-            .await
-            .unwrap()
-            .text;
-        assert!(result.starts_with("[] // no activity spans"), "{result}");
-        assert!(result.contains("The vault covers"), "{result}");
-        assert!(result.contains(&NOW.to_string()), "{result}");
-    }
-
-    #[tokio::test]
     async fn empty_vault_is_reported_rather_than_silently_empty() {
-        let (_dir, vault, models) = host_fixture();
-        let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
-            budget: ContextBudget::DEFAULT,
-        };
+        let (_dir, vault) = host_fixture();
+        let host = host_for(&vault);
 
         let error = host
-            .invoke("list_moments", &json!({"from_ms": 0, "to_ms": NOW}))
+            .invoke("list_activity", &json!({"from_ms": 0, "to_ms": NOW}))
             .await
             .unwrap_err();
         assert!(error.contains("no captures at all yet"), "{error}");
     }
 
+    /// A range that was never given must point at the one place to get one.
     #[tokio::test]
-    async fn missing_bounds_point_at_the_clock_tool() {
-        let (_dir, vault, models) = host_fixture();
+    async fn a_missing_range_points_at_the_clock() {
+        let (_dir, vault) = host_fixture();
         seed_moments(&vault, &[NOW - 60_000]);
-        let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
-            models: &models,
-            now_ms: NOW,
-            budget: ContextBudget::DEFAULT,
-        };
+        let host = host_for(&vault);
 
         let error = host
             .invoke("list_activity", &json!({"limit": 5}))
             .await
             .unwrap_err();
         assert!(error.contains("get_now"), "{error}");
+        assert!(error.contains("do not work one out"), "{error}");
     }
 }
