@@ -146,6 +146,12 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
 
     public var toolCalls: [ChatToolCall] { ChatToolLog.parse(toolLog) }
 
+    /// Best-effort display order from the stored columns. See
+    /// `ChatMessagePart.reconstruct` for what cannot be recovered.
+    public var parts: [ChatMessagePart] {
+        ChatMessagePart.reconstruct(reasoning: reasoningRounds, tools: toolCalls)
+    }
+
     public static func localUser(_ content: String, conversationId: String?, at ms: Int64) -> ChatMessage {
         ChatMessage(
             id: "local-user-\(ms)-\(UUID().uuidString)",
@@ -561,10 +567,85 @@ public enum ChatStreamEventDecoder {
     }
 }
 
+/// One visible stretch of an assistant turn, in the order it arrived.
+///
+/// The answer stays on `ChatBubble.text` so Markdown can keep streaming as
+/// one block. These parts are the work that happened before (and between)
+/// that text: a thought, a lookup, another thought.
+public enum ChatMessagePart: Equatable, Identifiable, Sendable {
+    case reasoning(id: String, round: Int, text: String)
+    case tool(ChatToolCall)
+
+    public var id: String {
+        switch self {
+        case .reasoning(let id, _, _): id
+        case .tool(let call): call.id
+        }
+    }
+
+    public static func tools(in parts: [ChatMessagePart]) -> [ChatToolCall] {
+        parts.compactMap { part in
+            if case .tool(let call) = part { return call }
+            return nil
+        }
+    }
+
+    public static func reasoning(in parts: [ChatMessagePart]) -> [ChatReasoningRound] {
+        parts.compactMap { part in
+            if case .reasoning(_, let round, let text) = part {
+                return ChatReasoningRound(round: round, text: text)
+            }
+            return nil
+        }
+    }
+
+    /// Rebuild arrival order from the two stored columns.
+    ///
+    /// The vault keeps `reasoning` and `tool_log` apart, so the live
+    /// think → tool → think sequence is not recorded. This assumes the
+    /// usual ReAct shape: one tool between consecutive reasoning rounds,
+    /// leftover tools after the last thought. A tool-first turn, or two
+    /// tools then a thought, cannot be recovered.
+    public static func reconstruct(
+        reasoning: [ChatReasoningRound],
+        tools: [ChatToolCall]
+    ) -> [ChatMessagePart] {
+        var parts: [ChatMessagePart] = []
+        parts.reserveCapacity(reasoning.count + tools.count)
+        var toolIndex = 0
+        for (index, round) in reasoning.enumerated() {
+            parts.append(
+                .reasoning(
+                    id: "stored-reason-\(round.round)-\(index)",
+                    round: round.round,
+                    text: round.text
+                )
+            )
+            let isLastThought = index == reasoning.count - 1
+            if isLastThought {
+                while toolIndex < tools.count {
+                    parts.append(.tool(tools[toolIndex]))
+                    toolIndex += 1
+                }
+            } else if toolIndex < tools.count {
+                parts.append(.tool(tools[toolIndex]))
+                toolIndex += 1
+            }
+        }
+        while toolIndex < tools.count {
+            parts.append(.tool(tools[toolIndex]))
+            toolIndex += 1
+        }
+        return parts
+    }
+}
+
 public struct ChatStreamState: Equatable, Sendable {
     public var text: String
-    public var tools: [ChatToolCall]
-    public var reasoning: [ChatReasoningRound]
+    /// Think / tool segments in event-arrival order. Do not flatten this
+    /// into `reasoning` + `tools` and render those separately — that is
+    /// what used to merge every thought into one chip above every tool.
+    public var parts: [ChatMessagePart]
     public var conversationId: String?
     public var messageId: String?
     public var error: String?
@@ -581,6 +662,7 @@ public struct ChatStreamState: Equatable, Sendable {
         text: String = "",
         tools: [ChatToolCall] = [],
         reasoning: [ChatReasoningRound] = [],
+        parts: [ChatMessagePart]? = nil,
         conversationId: String? = nil,
         messageId: String? = nil,
         error: String? = nil,
@@ -590,8 +672,7 @@ public struct ChatStreamState: Equatable, Sendable {
         progress: ChatProgress? = nil
     ) {
         self.text = text
-        self.tools = tools
-        self.reasoning = reasoning
+        self.parts = parts ?? ChatMessagePart.reconstruct(reasoning: reasoning, tools: tools)
         self.conversationId = conversationId
         self.messageId = messageId
         self.error = error
@@ -601,8 +682,12 @@ public struct ChatStreamState: Equatable, Sendable {
         self.progress = progress
     }
 
+    public var tools: [ChatToolCall] { ChatMessagePart.tools(in: parts) }
+
+    public var reasoning: [ChatReasoningRound] { ChatMessagePart.reasoning(in: parts) }
+
     public var receivedWork: Bool {
-        !text.isEmpty || !tools.isEmpty || !reasoning.isEmpty
+        !text.isEmpty || !parts.isEmpty
     }
 
     public var shouldFallbackToSend: Bool {
@@ -616,27 +701,37 @@ public enum ChatStreamReducer {
         case .toolCall(let name, let argsJSON):
             // The tool row takes over as the visible sign of work.
             state.progress = nil
-            state.tools.append(
-                ChatToolCall(
-                    id: "tool-\(state.tools.count)-\(name)",
-                    name: name,
-                    argsJSON: argsJSON
+            state.parts.append(
+                .tool(
+                    ChatToolCall(
+                        id: "tool-\(state.parts.count)-\(name)",
+                        name: name,
+                        argsJSON: argsJSON
+                    )
                 )
             )
         case .toolResult(let name, let chars, let truncated, let dropped):
-            if let index = state.tools.lastIndex(where: { $0.name == name && $0.resultChars == nil }) {
-                state.tools[index].resultChars = chars
-                state.tools[index].truncated = truncated
-                state.tools[index].droppedTokens = dropped
+            if let index = state.parts.lastIndex(where: { part in
+                if case .tool(let call) = part {
+                    return call.name == name && call.resultChars == nil
+                }
+                return false
+            }), case .tool(var call) = state.parts[index] {
+                call.resultChars = chars
+                call.truncated = truncated
+                call.droppedTokens = dropped
+                state.parts[index] = .tool(call)
             } else {
-                state.tools.append(
-                    ChatToolCall(
-                        id: "tool-\(state.tools.count)-\(name)",
-                        name: name,
-                        argsJSON: "{}",
-                        resultChars: chars,
-                        truncated: truncated,
-                        droppedTokens: dropped
+                state.parts.append(
+                    .tool(
+                        ChatToolCall(
+                            id: "tool-\(state.parts.count)-\(name)",
+                            name: name,
+                            argsJSON: "{}",
+                            resultChars: chars,
+                            truncated: truncated,
+                            droppedTokens: dropped
+                        )
                     )
                 )
             }
@@ -664,10 +759,25 @@ public enum ChatStreamReducer {
             state.progress = nil
         case .reasoning(let text, let round):
             guard !text.isEmpty else { break }
-            if let index = state.reasoning.lastIndex(where: { $0.round == round }) {
-                state.reasoning[index].text += text
+            // Same-round deltas append only while that thought is still the
+            // last part. A tool in between starts a new segment even if the
+            // daemon reuses the round number — arrival order is the identity.
+            if case .reasoning(let id, let lastRound, let existing) = state.parts.last,
+               lastRound == round
+            {
+                state.parts[state.parts.count - 1] = .reasoning(
+                    id: id,
+                    round: round,
+                    text: existing + text
+                )
             } else {
-                state.reasoning.append(ChatReasoningRound(round: round, text: text))
+                state.parts.append(
+                    .reasoning(
+                        id: "reason-\(state.parts.count)-\(round)",
+                        round: round,
+                        text: text
+                    )
+                )
             }
         case .done(let messageId, let conversationId):
             state.progress = nil
@@ -838,15 +948,19 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
     public let id: String
     public let role: ChatRole
     public let text: String
-    public let tools: [ChatToolCall]
+    /// Think / tool segments in display order. Live turns use event arrival;
+    /// reloaded rows reconstruct a ReAct order from the stored columns.
+    public let parts: [ChatMessagePart]
     public let isStreaming: Bool
     public let createdAtMs: Int64
     /// Set on the streaming bubble while the turn has nothing to show yet.
     public let progress: ChatProgress?
-    /// The model's reasoning for this answer. Shown folded away.
-    public let reasoning: [ChatReasoningRound]
     /// Whether the turn behind this bubble was stopped part-way.
     public let wasAborted: Bool
+
+    public var tools: [ChatToolCall] { ChatMessagePart.tools(in: parts) }
+
+    public var reasoning: [ChatReasoningRound] { ChatMessagePart.reasoning(in: parts) }
 
     public init(
         id: String,
@@ -857,16 +971,16 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         createdAtMs: Int64,
         progress: ChatProgress? = nil,
         reasoning: [ChatReasoningRound] = [],
-        wasAborted: Bool = false
+        wasAborted: Bool = false,
+        parts: [ChatMessagePart]? = nil
     ) {
         self.id = id
         self.role = role
         self.text = text
-        self.tools = tools
+        self.parts = parts ?? ChatMessagePart.reconstruct(reasoning: reasoning, tools: tools)
         self.isStreaming = isStreaming
         self.createdAtMs = createdAtMs
         self.progress = progress
-        self.reasoning = reasoning
         self.wasAborted = wasAborted
     }
 
@@ -890,6 +1004,7 @@ public enum ChatTranscript {
         streamingText: String = "",
         streamingTools: [ChatToolCall] = [],
         streamingReasoning: [ChatReasoningRound] = [],
+        streamingParts: [ChatMessagePart] = [],
         isSending: Bool = false,
         nowMs: Int64 = 0,
         liveCompactions: [ChatCompactionNotice] = [],
@@ -907,7 +1022,8 @@ public enum ChatTranscript {
                 tools: message.toolCalls,
                 createdAtMs: message.createdAtMs,
                 reasoning: message.reasoningRounds,
-                wasAborted: message.wasAborted
+                wasAborted: message.wasAborted,
+                parts: message.parts
             )
         }
         if isSending {
@@ -924,6 +1040,12 @@ public enum ChatTranscript {
                     )
                 )
             }
+            let liveParts = streamingParts.isEmpty
+                ? ChatMessagePart.reconstruct(
+                    reasoning: streamingReasoning,
+                    tools: streamingTools
+                )
+                : streamingParts
             items.append(
                 ChatBubble(
                     id: "streaming",
@@ -933,7 +1055,8 @@ public enum ChatTranscript {
                     isStreaming: true,
                     createdAtMs: nowMs,
                     progress: progress,
-                    reasoning: streamingReasoning
+                    reasoning: streamingReasoning,
+                    parts: liveParts
                 )
             )
         }

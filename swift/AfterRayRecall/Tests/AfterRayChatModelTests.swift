@@ -3,6 +3,40 @@ import XCTest
 
 @MainActor
 final class AfterRayChatModelTests: XCTestCase {
+    func testSendPublishesThinkToolThinkPartsInOrder() async {
+        let daemon = ChatDaemon()
+        await daemon.seed(
+            conversations: [ChatConversation(id: "c1", title: "Old", createdAtMs: 1, updatedAtMs: 2, messageCount: 0)],
+            history: [:]
+        )
+        await daemon.setEvents([
+            .reasoning(text: "plan", round: 1),
+            .toolCall(name: "get_slot_card", argsJSON: #"{"at_ms":1}"#),
+            .toolResult(name: "get_slot_card", chars: 20),
+            .reasoning(text: "found", round: 2),
+            .token(text: "You did"),
+        ])
+        await daemon.setHoldOpen(true)
+
+        let model = AfterRayChatModel(daemon: daemon, clock: { 99 })
+        model.draft = "hi"
+        model.send()
+        await waitUntil { model.streamParts.count >= 3 || !model.isSending }
+
+        XCTAssertGreaterThanOrEqual(model.streamParts.count, 3)
+        let kinds = model.streamParts.map { part -> String in
+            switch part {
+            case .reasoning(_, let round, _): "r\(round)"
+            case .tool(let call): call.name
+            }
+        }
+        XCTAssertEqual(Array(kinds.prefix(3)), ["r1", "get_slot_card", "r2"])
+        let bubble = model.bubbles.last
+        XCTAssertEqual(bubble?.parts.count, model.streamParts.count)
+        model.stop()
+        await waitUntil { !model.isSending }
+    }
+
     func testSendStreamsTokensThenReloadsHistory() async {
         let daemon = ChatDaemon()
         await daemon.seed(
@@ -347,6 +381,7 @@ private actor ChatDaemon: AfterRayChatServing {
     var lastSentMessage: String?
     var listShouldFail = false
     var blockAfterFirstEvent = false
+    var holdOpen = false
 
     func seed(conversations: [ChatConversation], history: [String: [ChatMessage]]) {
         self.conversations = conversations
@@ -365,6 +400,7 @@ private actor ChatDaemon: AfterRayChatServing {
     }
     func setListShouldFail(_ value: Bool) { listShouldFail = value }
     func setBlockAfterFirstEvent(_ value: Bool) { blockAfterFirstEvent = value }
+    func setHoldOpen(_ value: Bool) { holdOpen = value }
 
     func chatList() async throws -> [ChatConversation] {
         if listShouldFail { throw DaemonClientError.rejected("chat is not available") }
@@ -398,13 +434,16 @@ private actor ChatDaemon: AfterRayChatServing {
                         try? await Task.sleep(for: .seconds(2))
                     }
                 }
+                if snapshot.hold {
+                    try? await Task.sleep(for: .seconds(2))
+                }
                 continuation.finish()
             }
         }
     }
 
-    private func streamSnapshot(message: String) -> (events: [ChatStreamEvent], block: Bool) {
+    private func streamSnapshot(message: String) -> (events: [ChatStreamEvent], block: Bool, hold: Bool) {
         lastStreamedMessage = message
-        return (events, blockAfterFirstEvent)
+        return (events, blockAfterFirstEvent, holdOpen)
     }
 }

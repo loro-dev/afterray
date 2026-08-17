@@ -8,7 +8,7 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
     case markdown
     case tools
     case pressure
-    /// A thinking model mid-turn with live reasoning visible.
+    /// A thinking model mid-turn: thought, a lookup, then another thought.
     case thinking
     /// A finished answer with its reasoning kept beside it, and a turn that
     /// was stopped part-way but kept what it had.
@@ -46,6 +46,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var streamText = ""
     @Published public private(set) var streamTools: [ChatToolCall] = []
     @Published public private(set) var streamReasoning: [ChatReasoningRound] = []
+    @Published public private(set) var streamParts: [ChatMessagePart] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
@@ -69,9 +70,10 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         isSending = false
         streamText = ""
         streamTools = []
-        streamReasoning = scenario == .thinking
-            ? [ChatReasoningRound(round: 1, text: "Checking the recent timeline and weighing the strongest evidence…")]
-            : []
+        streamReasoning = []
+        streamParts = ChatFixtures.liveParts(scenario)
+        streamTools = ChatMessagePart.tools(in: streamParts)
+        streamReasoning = ChatMessagePart.reasoning(in: streamParts)
         errorMessage = nil
         statusMessage = nil
         let fixture = ChatFixtures.load(scenario)
@@ -97,6 +99,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         selectedID = id
         messages = store[id] ?? []
         // Same rule as the real model: occupancy belongs to a turn, so it does
@@ -113,6 +116,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         errorMessage = nil
         contextUsage = nil
         compactionNotices = []
@@ -166,14 +170,16 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         var state = ChatStreamState()
-        let events = script ?? ChatFixtures.replyScript
+        let events = script ?? ChatFixtures.replyScript(for: scenario)
         for event in events {
             if Task.isCancelled { break }
             ChatStreamReducer.apply(event, to: &state)
             streamText = state.text
             streamTools = state.tools
             streamReasoning = state.reasoning
+            streamParts = state.parts
             if let usage = state.usage { contextUsage = usage }
             if !state.compactions.isEmpty { compactionNotices = state.compactions }
             streamProgress = state.progress
@@ -188,11 +194,17 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamTask = nil
     }
 
     private func persistPartial(_ state: ChatStreamState? = nil) {
-        let snapshot = state ?? ChatStreamState(text: streamText, tools: streamTools)
+        let snapshot = state ?? ChatStreamState(
+            text: streamText,
+            tools: streamTools,
+            reasoning: streamReasoning,
+            parts: streamParts
+        )
         guard let conversationId = selectedID else { return }
         guard !snapshot.text.isEmpty || !snapshot.tools.isEmpty else { return }
         let message = ChatMessage.localAssistant(
@@ -254,8 +266,66 @@ public enum ChatFixtures {
         ]
     }
 
+    /// think → tool → think → answer. The case a single reasoning chip
+    /// above the tools used to flatten.
+    public static var thinkToolThinkScript: [ChatStreamEvent] {
+        [
+            .progress(ChatProgress(phase: .thinking, reasoningDeltas: 4, elapsedMs: 400, round: 1)),
+            .reasoning(
+                text: "The question is about yesterday afternoon. A slot card is the cheapest first look.\n",
+                round: 1
+            ),
+            .reasoning(text: "If that is thin I can open the transcript.", round: 1),
+            .toolCall(name: "get_slot_card", argsJSON: #"{"at_ms":50400000}"#),
+            .toolResult(name: "get_slot_card", chars: 2480),
+            .progress(ChatProgress(phase: .thinking, reasoningDeltas: 8, elapsedMs: 900, round: 2)),
+            .reasoning(
+                text: "The card shows Safari on a PDF, not Xcode. That is the reading.",
+                round: 2
+            ),
+            .token(text: "Yesterday afternoon you were reading a PDF in Safari, not editing."),
+            .done(messageId: "preview-think", conversationId: "c-think"),
+        ]
+    }
+
     public static var replyScript: [ChatStreamEvent] {
         tokenEvents(from: markdownAnswer)
+    }
+
+    public static func replyScript(for scenario: ChatScenario) -> [ChatStreamEvent] {
+        switch scenario {
+        case .thinking: thinkToolThinkScript
+        default: replyScript
+        }
+    }
+
+    /// Frozen mid-turn parts for the thinking lab / snapshot.
+    public static func liveParts(_ scenario: ChatScenario) -> [ChatMessagePart] {
+        switch scenario {
+        case .thinking:
+            [
+                .reasoning(
+                    id: "think-r1",
+                    round: 1,
+                    text: "Checking the recent timeline and weighing the strongest evidence…"
+                ),
+                .tool(
+                    ChatToolCall(
+                        id: "think-t1",
+                        name: "list_moments",
+                        argsJSON: #"{"from_ms":50400000,"to_ms":52200000}"#,
+                        resultChars: 640
+                    )
+                ),
+                .reasoning(
+                    id: "think-r2",
+                    round: 2,
+                    text: "The afternoon tab was a long PDF in Safari, not the editor."
+                ),
+            ]
+        default:
+            []
+        }
     }
 
     public static func tokenEvents(from text: String) -> [ChatStreamEvent] {

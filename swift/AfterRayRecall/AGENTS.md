@@ -8,7 +8,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - `Sources/RecallStore.swift:4` `RecallStore` — `@MainActor` timeline/playhead state; `Sources/RecallStore.swift:302` `RecallImageRepository` (actor) — NSCache + in-flight dedup of artifact bytes.
 - `Sources/RecallModels.swift` — `RecallSession` (:3), `RecallMoment` (:21), `RecallGopRef` (:133), `ArtifactPayload` (:163); all `Codable` with explicit snake_case `CodingKeys`.
 - `Sources/RecallView.swift:9` `RecallView` — the main recall surface (`RecallPalette` at :2211).
-- `Sources/AfterRayControlModel.swift:4` — recording/search state; `Sources/AfterRayChatModel.swift:46` chat model behind `AfterRayChatModeling` (:4).
+- `Sources/AfterRayControlModel.swift:4` — recording/search state; `Sources/AfterRayChatModel.swift` + `ChatModels.swift` — chat model; `ChatMessagePart` keeps think/tool arrival order (`reconstruct` from stored columns is ReAct-only).
 - `Sources/StreamingMarkdown.swift` + `Sources/ChatMomentCitationView.swift` — streaming-safe chat Markdown and protocol-backed screenshot citations; only standalone `![label](afterray://moment/ID)` loads media.
 - `Sources/ChatAutoScrollState.swift` + `Sources/ChatScrollObserver.swift` — macOS 14 chat bottom-follow state machine and the narrow AppKit live-scroll/geometry bridge; content growth follows only until the user scrolls away.
 - `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:327) — settings UI generic over the protocol, so mock and real models share it; `downloadQueueSection` draws the models page's downloads; `downloadSourceSection` picks the Hugging Face mirror (official / hf-mirror / custom).

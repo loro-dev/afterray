@@ -122,6 +122,26 @@ final class ChatWireTests: XCTestCase {
         XCTAssertTrue(state.receivedWork)
     }
 
+    /// A tool between thoughts is its own part. Merging every round into
+    /// `state.reasoning` and rendering that above the tools is what hid
+    /// think → tool → think as one chip.
+    func testReducerDoesNotMergeThoughtsAcrossATool() {
+        var state = ChatStreamState()
+        ChatStreamReducer.apply(.reasoning(text: "check", round: 1), to: &state)
+        ChatStreamReducer.apply(.toolCall(name: "get_slot_card", argsJSON: "{}"), to: &state)
+        ChatStreamReducer.apply(.reasoning(text: "use it", round: 2), to: &state)
+        XCTAssertEqual(state.parts.count, 3)
+        XCTAssertEqual(
+            state.parts.map { part -> String in
+                switch part {
+                case .reasoning(_, let round, _): "r\(round)"
+                case .tool(let call): call.name
+                }
+            },
+            ["r1", "get_slot_card", "r2"]
+        )
+    }
+
     func testUsageAndCompactionDecodeFromTheWire() throws {
         let usage = try ChatStreamEventDecoder.decode(
             line: Data(#"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2}"#.utf8)

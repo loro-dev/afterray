@@ -529,32 +529,25 @@ private struct ChatBubbleView: View {
     let bubble: ChatBubble
     let thumbnailLoader: RecallThumbnailLoader?
     let onOpenMoment: ((String) -> Void)?
-    @State private var toolsExpanded = false
-    @State private var reasoningExpanded: Bool
     @State private var copied = false
-
-    init(
-        bubble: ChatBubble,
-        thumbnailLoader: RecallThumbnailLoader?,
-        onOpenMoment: ((String) -> Void)?
-    ) {
-        self.bubble = bubble
-        self.thumbnailLoader = thumbnailLoader
-        self.onOpenMoment = onOpenMoment
-        _reasoningExpanded = State(initialValue: bubble.isStreaming)
-    }
 
     var body: some View {
         HStack {
             if bubble.role == .user { Spacer(minLength: 48) }
             VStack(alignment: bubble.role == .user ? .trailing : .leading, spacing: 6) {
-                if !bubble.reasoning.isEmpty {
-                    reasoningChip
+                ForEach(bubble.parts) { part in
+                    switch part {
+                    case .reasoning(let id, _, let text):
+                        ChatReasoningChip(
+                            text: text,
+                            isActive: isActiveReasoning(id),
+                            progress: isActiveReasoning(id) ? bubble.progress : nil
+                        )
+                    case .tool(let tool):
+                        ChatToolChip(tool: tool)
+                    }
                 }
-                if !bubble.tools.isEmpty {
-                    toolChip
-                }
-                if !bubble.text.isEmpty || (bubble.isStreaming && bubble.reasoning.isEmpty) {
+                if shouldShowBody {
                     bubbleBody
                 }
             }
@@ -563,101 +556,23 @@ private struct ChatBubbleView: View {
         }
     }
 
-    /// Says when an answer stands on a shortened lookup. Without it, a reply
-    /// that missed something the tool did return looks like the model failing
-    /// rather than the budget biting.
-    private func resultNote(chars: Int, tool: ChatToolCall) -> String {
-        guard tool.truncated else { return "\(chars) characters back" }
-        return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
+    /// The thought still arriving — last reasoning part, no answer yet.
+    /// Earlier thoughts stay folded so think → tool → think reads as
+    /// three stretches, not one chip above the tools.
+    private func isActiveReasoning(_ id: String) -> Bool {
+        guard bubble.isStreaming, bubble.text.isEmpty,
+              case .reasoning(let lastID, _, _) = bubble.parts.last
+        else { return false }
+        return lastID == id
     }
 
-    /// Live reasoning stays open while it is arriving. Stored reasoning folds
-    /// after the answer completes, but remains available for inspection.
-    private var reasoningChip: some View {
-        DisclosureGroup(isExpanded: $reasoningExpanded) {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(bubble.reasoning) { round in
-                    VStack(alignment: .leading, spacing: 3) {
-                        if bubble.reasoning.count > 1 {
-                            Text("Round \(round.round)")
-                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(ChatPalette.tertiary)
-                        }
-                        Text(round.text)
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(ChatPalette.secondary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
-            .padding(.top, 6)
-        } label: {
-            Text(reasoningLabel)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(ChatPalette.tertiary)
+    private var shouldShowBody: Bool {
+        if !bubble.text.isEmpty { return true }
+        guard bubble.isStreaming else { return false }
+        if case .reasoning = bubble.parts.last, bubble.text.isEmpty {
+            return false
         }
-        .tint(ChatPalette.tertiary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private var reasoningLabel: String {
-        if bubble.isStreaming {
-            if let progress = bubble.progress {
-                return "\(progress.title) · \(progress.detail)"
-            }
-            return "Thinking"
-        }
-        return bubble.reasoning.count > 1
-            ? "Thought it through in \(bubble.reasoning.count) rounds"
-            : "Thought it through"
-    }
-
-    private var toolChip: some View {
-        DisclosureGroup(isExpanded: $toolsExpanded) {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(bubble.tools) { tool in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(tool.name)
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(ChatPalette.coral)
-                        Text(tool.argsJSON)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(ChatPalette.secondary)
-                            .textSelection(.enabled)
-                        if let chars = tool.resultChars {
-                            Text(resultNote(chars: chars, tool: tool))
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(tool.truncated ? ChatPalette.coral.opacity(0.85) : ChatPalette.tertiary)
-                        }
-                    }
-                }
-            }
-            .padding(.top, 6)
-        } label: {
-            HStack(spacing: 5) {
-                Text(ChatToolSummary.collapsed(bubble.tools))
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(ChatPalette.tertiary)
-                if bubble.hasTruncatedEvidence {
-                    Text("shortened")
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(ChatPalette.coral.opacity(0.9))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(
-                            ChatPalette.coral.opacity(0.12),
-                            in: Capsule()
-                        )
-                }
-            }
-        }
-        .tint(ChatPalette.tertiary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        return true
     }
 
     @ViewBuilder
@@ -743,6 +658,109 @@ private struct ChatBubbleView: View {
 
     private var bubbleStroke: Color {
         bubble.role == .user ? ChatPalette.userStroke : ChatPalette.cardStroke
+    }
+}
+
+/// One thought, in the place it arrived. Live text stays open; a finished
+/// thought folds so the next tool or thought can take the eye.
+private struct ChatReasoningChip: View {
+    let text: String
+    let isActive: Bool
+    let progress: ChatProgress?
+    @State private var expanded: Bool
+
+    init(text: String, isActive: Bool, progress: ChatProgress?) {
+        self.text = text
+        self.isActive = isActive
+        self.progress = progress
+        _expanded = State(initialValue: isActive)
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            Text(text)
+                .font(.system(size: 11.5))
+                .foregroundStyle(ChatPalette.secondary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 6)
+        } label: {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ChatPalette.tertiary)
+        }
+        .tint(ChatPalette.tertiary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .onChange(of: isActive) { _, active in
+            expanded = active
+        }
+    }
+
+    private var label: String {
+        if isActive {
+            if let progress {
+                return "\(progress.title) · \(progress.detail)"
+            }
+            return "Thinking"
+        }
+        return "Thought it through"
+    }
+}
+
+private struct ChatToolChip: View {
+    let tool: ChatToolCall
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(tool.name)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(ChatPalette.coral)
+                Text(tool.argsJSON)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(ChatPalette.secondary)
+                    .textSelection(.enabled)
+                if let chars = tool.resultChars {
+                    Text(resultNote)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(tool.truncated ? ChatPalette.coral.opacity(0.85) : ChatPalette.tertiary)
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 5) {
+                Text(ChatToolSummary.headline(tool))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(ChatPalette.tertiary)
+                if tool.truncated {
+                    Text("shortened")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(ChatPalette.coral.opacity(0.9))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(
+                            ChatPalette.coral.opacity(0.12),
+                            in: Capsule()
+                        )
+                }
+            }
+        }
+        .tint(ChatPalette.tertiary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    /// Says when an answer stands on a shortened lookup. Without it, a reply
+    /// that missed something the tool did return looks like the model failing
+    /// rather than the budget biting.
+    private var resultNote: String {
+        guard let chars = tool.resultChars else { return "" }
+        guard tool.truncated else { return "\(chars) characters back" }
+        return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
     }
 }
 

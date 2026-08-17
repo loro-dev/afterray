@@ -12,6 +12,9 @@ public protocol AfterRayChatModeling: ObservableObject {
     var streamText: String { get }
     var streamTools: [ChatToolCall] { get }
     var streamReasoning: [ChatReasoningRound] { get }
+    /// Think / tool segments in arrival order for the turn in flight.
+    /// Prefer this over `streamReasoning` + `streamTools`, which flatten it.
+    var streamParts: [ChatMessagePart] { get }
     var errorMessage: String? { get }
     var statusMessage: String? { get }
     /// Context occupancy for the turn in progress, or the last one in this
@@ -41,12 +44,17 @@ public extension AfterRayChatModeling {
         !isSending && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var streamParts: [ChatMessagePart] {
+        ChatMessagePart.reconstruct(reasoning: streamReasoning, tools: streamTools)
+    }
+
     var bubbles: [ChatBubble] {
         ChatTranscript.bubbles(
             messages: messages,
             streamingText: streamText,
             streamingTools: streamTools,
             streamingReasoning: streamReasoning,
+            streamingParts: streamParts,
             isSending: isSending,
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
             liveCompactions: isSending ? compactionNotices : [],
@@ -67,6 +75,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var streamText = ""
     @Published public private(set) var streamTools: [ChatToolCall] = []
     @Published public private(set) var streamReasoning: [ChatReasoningRound] = []
+    @Published public private(set) var streamParts: [ChatMessagePart] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
@@ -123,6 +132,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
         errorMessage = nil
         contextUsage = nil
@@ -155,6 +165,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
         cancelStreamPresentation()
         // A new turn starts from this conversation's stored history, not from
@@ -188,6 +199,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
         errorMessage = nil
         statusMessage = nil
@@ -286,6 +298,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
     }
 
@@ -300,6 +313,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
         guard let conversationId = selectedID, !conversationId.isEmpty else { return }
         await loadHistory(conversationId)
@@ -307,7 +321,12 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
 
     private func finalizePartialStream(_ state: ChatStreamState? = nil) {
         cancelStreamPresentation()
-        let snapshot = state ?? ChatStreamState(text: streamText, tools: streamTools)
+        let snapshot = state ?? ChatStreamState(
+            text: streamText,
+            tools: streamTools,
+            reasoning: streamReasoning,
+            parts: streamParts
+        )
         if !snapshot.text.isEmpty || !snapshot.tools.isEmpty {
             messages.append(
                 .localAssistant(
@@ -321,6 +340,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamProgress = nil
     }
 
@@ -357,6 +377,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         if streamText != state.text { streamText = state.text }
         if streamTools != state.tools { streamTools = state.tools }
         if streamReasoning != state.reasoning { streamReasoning = state.reasoning }
+        if streamParts != state.parts { streamParts = state.parts }
         if streamProgress != state.progress { streamProgress = state.progress }
         if let usage = state.usage, contextUsage != usage { contextUsage = usage }
         if !state.compactions.isEmpty, compactionNotices != state.compactions {
