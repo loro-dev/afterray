@@ -181,6 +181,30 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertEqual(ordered.map(\.title), ["noon", "late morning", "morning"])
     }
 
+    /// Idle slots exist on the wire so the day is complete, but they add
+    /// nothing to read — the panel skips them instead of painting "Idle".
+    func testDisplayOrderOmitsIdleSlots() {
+        let work = slot(start: 0, title: "morning")
+        let idle = DaySlotSummary(
+            slotStartMs: DaySummaryLayout.slotDurationMs,
+            slotEndMs: DaySummaryLayout.slotDurationMs * 2,
+            state: "skipped_idle",
+            facts: DaySlotFacts(apps: [], momentCount: 0)
+        )
+        let later = slot(start: DaySummaryLayout.slotDurationMs * 2, title: "afternoon")
+        let ordered = DaySummaryLayout.displayOrder([work, idle, later])
+        XCTAssertEqual(ordered.map(\.title), ["afternoon", "morning"])
+        XCTAssertFalse(ordered.contains(where: { $0.state == "skipped_idle" }))
+        XCTAssertFalse(DaySummaryLayout.isVisibleInPanel(idle))
+        XCTAssertNil(
+            DaySummaryLayout.highlightedSlotStartMs(
+                playheadMs: idle.slotStartMs + 1,
+                slots: [work, idle, later]
+            ),
+            "playhead over idle must not follow a card the panel never drew"
+        )
+    }
+
     func testEmptyFactsHaveAnExplicitLine() {
         XCTAssertEqual(DaySummaryLayout.factLine(apps: []), "Quiet — nothing on screen")
     }
@@ -257,7 +281,8 @@ final class DaySummaryLayoutTests: XCTestCase {
     }
 
     /// Copy is for pasting into notes: chronological, day-headed, bullets
-    /// indented — regardless of the newest-first display order.
+    /// indented — regardless of the newest-first display order. Idle gaps
+    /// stay out of the paste the same way they stay out of the panel.
     func testClipboardTextIsChronologicalAndComplete() {
         let day = DaySummary(
             day: "2026-08-15",
@@ -271,6 +296,12 @@ final class DaySummaryLayoutTests: XCTestCase {
                     facts: DaySlotFacts(apps: []),
                     title: "Later work",
                     bullets: ["shipped the fix"]
+                ),
+                DaySlotSummary(
+                    slotStartMs: DaySummaryLayout.slotDurationMs * 2,
+                    slotEndMs: DaySummaryLayout.slotDurationMs * 3,
+                    state: "skipped_idle",
+                    facts: DaySlotFacts(apps: [])
                 ),
                 DaySlotSummary(
                     slotStartMs: 0,
@@ -287,6 +318,7 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertLessThan(earlier, later, "copied text must read forward in time")
         XCTAssertTrue(text.contains("  - shipped the fix"), text)
         XCTAssertTrue(text.contains("(Not summarised)"), "fallback rows say so in copies too")
+        XCTAssertFalse(text.contains("Idle"), "idle slots must not leak into pasted notes")
 
         let older = DaySummary(day: "2026-08-14", dayStartMs: -86_400_000, dayEndMs: 0, slots: [])
         let history = DaySummaryClipboard.historyText([day, older])
