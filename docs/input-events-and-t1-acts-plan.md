@@ -71,12 +71,66 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 | # | 内容 | 状态 |
 |---|---|---|
 | 0 | shim 走树降本（菜单跳过 + 时间盒） | ✅ 2026-08-17 |
-| 1 | shim 事件流：listen-only tap、burst/命令键/点击/滚动 coalesce（500ms 合并、20/s/app 上限）、现场元素解析、活性对账 | |
-| 2 | store：events 表（48h、delete_history 级联）+ 封口物化 | |
-| 3 | T1 重组：acts / run 切分 / engaged-peripheral / not_engaged | |
+| 1 | shim 事件流：listen-only tap、burst/命令键/点击/滚动 coalesce、现场元素解析、活性对账 | ✅ 2026-08-17（运行时行为待签名 dev 实例验证） |
+| 2 | store：`input_events` 表（48h、`delete_history` 级联）+ daemon 持久化。物化移入阶段 3（acts 的形状在那里才定义） | |
+| 3 | T1 重组：acts / run 切分 / engaged-peripheral / not_engaged / 封口物化 | |
 | 4 | R3 边沿快照 | |
 | 5 | 回归：≥20 slot（IM 1:1 / 群 / triage / 编辑器 / 终端），指标 = thread 命中率、幻觉会话数、focus precision（基线 33%） | |
 | 独立 | theme_key/target_key 噪音修复、anchor 帧改选（首帧实测是噪音最集中的一帧） | |
+
+## 实现契约
+
+实现者注意：改前读根到叶的每个 `AGENTS.md`；T1 保持纯函数（无模型、无网络、固定输入 → 固定输出）；`Vault` 只能经 `afterrayd` 的 `run_store` 从异步侧调用。
+
+### 阶段 2 — events 持久化（afterray-store + afterrayd）
+
+- `SCHEMA_VERSION` 21 → 22，新增 `migrate` 步骤：
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS input_events (
+    id INTEGER PRIMARY KEY,
+    at_ms INTEGER NOT NULL,
+    end_ms INTEGER,              -- burst/scroll 的结束时刻；点事件为 NULL
+    kind TEXT NOT NULL,          -- burst | command | click | scroll
+    count INTEGER,
+    ended_with TEXT,
+    command TEXT,
+    bundle_identifier TEXT,
+    target_json TEXT             -- 平台层 InputTargetRef 原样 JSON；本阶段不解读
+  );
+  CREATE INDEX IF NOT EXISTS input_events_at ON input_events(at_ms);
+  ALTER TABLE slot_summaries ADD COLUMN acts_json TEXT;  -- 阶段 3 消费，此处一并迁移
+  ```
+
+- Vault API：`insert_input_events(&[InputEventRow])`（单事务，写连接）；`input_events_between(from_ms, to_ms)`（reader 池，按 at_ms 排序，`[at_ms, end_ms]` 与窗口重叠即命中，end_ms NULL 视为点）；`prune_input_events(now_ms)`（`INPUT_EVENT_RETENTION_MS = 48h`）。
+- **`delete_history` 必须级联删除重叠的 `input_events`**（与 `slot_summaries` 同一隐私不变量）。
+- daemon：`CaptureEvent::InputEvents` 分支从 log-only 改为 `run_store` 批量入库（target 序列化为 JSON）；`prune` 挂在既有 retention 执行点，单一 call site。
+- `SharedReadOnlyVault` 本阶段**不**暴露 events（agent 工具面不变）。
+- 测试：插入/查询往返（含重叠语义与未知 kind 容忍）、prune 边界、`delete_history` 级联、自 v21 的迁移、并发（写入批量时 reader 并发查询）——新并发测试须 `make test-repeat N=10 TEST=<name>` ≥5 连绿。
+
+### 阶段 3 — T1 acts join（afterray-store/slot.rs + lib.rs + afterrayd sweeper）
+
+- join：对封口 slot 取 `input_events_between(bounds)`；在 `slot_card()` 既有的逐帧 AX 解密循环里，把事件的 `target.frame` rect 对该帧树做包含命中（最深包含节点，几何同 `docs` 实测原型）；engaged 范围 = 落点集合的 LCA 向上扩到 ≥ 窗口面积 10% 的祖先（常量 `ENGAGED_MIN_WINDOW_AREA_RATIO = 0.10`，全系统唯一旋钮）。
+- run 切分：事件按 scope key 分段，滞回 = 新 scope ≥2 事件或 ≥15s 才成段；快速交替归并为单 run（triage 呈现为点击目标 label 列表）。
+- acts 聚合（per run，进 prompt 与物化，形状固定）：
+
+  ```json
+  {"keys": 180, "submits": [{"at_ms": 0, "kind": "return"}], 
+   "clicks": [{"label": "0817.log", "count": 1}], "scrolls": 2,
+   "signal": "ok"}
+  ```
+
+  `signal`: `ok | unavailable`（窗口内出现 `input_tap_stalled`/tap 缺失 → `unavailable`，此时**不得**输出 engaged 断言）。
+- 文本预算：engaged 行吃满现有预算；peripheral 压至 ≤200 字符 + `N lines not shown`；卡片级 `not_engaged`（可见但全程无输入的区域 label + 行数）。IDF 只在桶内去 chrome。
+- **fail-open 不变量（测试钉死）**：slot 内零事件 → 输出与现行为逐字节一致。
+- facts 增量：`no_input_ratio: Option<f32>`（事件覆盖内无输入时长占比；无事件为 None）；`idle_ratio` 本阶段不改名不改义（UI 兼容）。
+- 物化：既有 5-min sweeper 对封口且 `acts_json IS NULL` 的 slot 写入 acts JSON；`slot_card()` 在事件已过期时读取物化值。
+- 协议/渲染：`render_t2_prompt` 的 run 对象加 `acts`，system prompt 措辞改为"acts 是用户做的事，text 是屏幕上有的东西，peripheral 可见但未被操作"。
+
+### 独立修复 — T1 噪音（afterray-store/slot.rs）
+
+- `target_key` / `place_label` / `theme_key` / `top_documents` 的候选一律过 `is_chrome_noise` + `is_opaque_id`，并新增：`file://` 路径含 `.app/`（应用包内资源）判为 app 资源而非用户文档。实测靶子：`file:///Applications/Lark.app/…/en-US.html` 不得成为 target 身份或 top_documents；`native-resource://sdk/avatar?…` 不得成为 theme_key。全部候选皆噪音时退化为 app-only key。
+- `anchor_moment_id`：从"slot 首帧"改为"最长 run 的中间帧"——实测首帧承载一次性侧边栏倾倒（1399 字符噪音），真实增量都在后续帧。纯函数，测试钉死。
 
 ## 开放 PoC
 
