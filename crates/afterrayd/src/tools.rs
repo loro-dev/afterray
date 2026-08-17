@@ -472,28 +472,14 @@ impl ToolHost<'_> {
     fn list_activity(&self, args: &Value) -> Result<String, String> {
         let (from_ms, to_ms) = self.require_range(args)?;
         let limit = parse_limit(args, DEFAULT_ACTIVITY_LIMIT, MAX_ACTIVITY_LIMIT);
-        let app = optional_text(args, "app");
-        // Widened when narrowing by application, because the store filters by
-        // range only and the cut would otherwise land before the filter.
-        let fetch = if app.is_some() {
-            limit.saturating_mul(4).min(MAX_ACTIVITY_LIMIT)
-        } else {
-            limit
-        };
-        let spans = self
+        // Narrowed in the store, before the limit. Fetching a wider slice and
+        // filtering here only moved the false negative further out: the cut
+        // still landed on the earliest spans of the range, so an application
+        // that came up late read as "no activity".
+        let matched = self
             .store
-            .activity_spans(from_ms, to_ms, fetch)
+            .activity_spans_in_app(from_ms, to_ms, optional_text(args, "app"), limit)
             .map_err(|e| e.to_string())?;
-        let matched: Vec<ActivitySpan> = spans
-            .into_iter()
-            .filter(|span| match app {
-                Some(wanted) => span
-                    .application_name
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(wanted)),
-                None => true,
-            })
-            .collect();
         if matched.is_empty() {
             return Ok(self.nothing_found("activity", from_ms, to_ms));
         }
@@ -2228,6 +2214,112 @@ mod tests {
         assert!(text.contains("3 lines"), "{text}");
         assert!(text.contains("there may be more"), "{text}");
         assert!(text.contains("from_ms="), "{text}");
+    }
+
+    /// The application filter has to reach the store, not the output.
+    ///
+    /// Spans are folded forward and cut at the limit, so filtering what comes
+    /// back filters the *earliest* spans of the range: ask for Zed on a day
+    /// whose first 160 spans are Chrome and the answer is "no activity" while
+    /// the Zed spans sit unread. Fetching a wider slice first only moves the
+    /// boundary — the same day with more Chrome puts it back.
+    #[tokio::test]
+    async fn narrowing_by_app_reaches_work_that_starts_late_in_the_range() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+
+        // 200 Chrome spans, then Zed — well past any slice the tool could
+        // widen to, since MAX_ACTIVITY_LIMIT is 200.
+        for index in 0..200_i64 {
+            let at_ms = day_start + index * 10_000;
+            vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Chrome", &format!("tab {index}"));
+        }
+        let zed_start = day_start + 200 * 10_000;
+        for index in 0..6_i64 {
+            let at_ms = zed_start + index * 10_000;
+            vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, "Zed", &format!("file{index}.rs"));
+        }
+        let host = ToolHost {
+            store: ReadOnlyVault::new(&vault),
+            now_ms: zed_start + 6 * 10_000,
+            budget: ContextBudget::DEFAULT,
+        };
+
+        let text = host
+            .invoke(
+                "list_activity",
+                &json!({"from_ms": day_start, "to_ms": zed_start + 60_000, "app": "Zed", "limit": 40}),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            !text.contains("no activity"),
+            "Zed was in the range and was reported missing: {text}"
+        );
+        assert!(text.contains("file0.rs"), "{text}");
+        assert!(text.contains("file5.rs"), "{text}");
+        assert!(!text.contains("Chrome"), "the filter leaked: {text}");
+
+        // Under the limit and complete, so nothing claims there is more.
+        assert!(!text.contains("there may be more"), "{text}");
+    }
+
+    /// A narrowed answer that is cut still says so.
+    ///
+    /// The catalog promises nothing is dropped in silence. Filtering after the
+    /// cut broke that quietly rather than loudly: with only a couple of
+    /// matches inside the slice it fetched, it returned a short list, found it
+    /// under the limit, and said nothing — so a partial answer read as a
+    /// complete one.
+    #[tokio::test]
+    async fn a_narrowed_answer_that_is_cut_says_there_may_be_more() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        let session = vault.create_session_sync(day_start).unwrap();
+        // Two Zed spans early, inside any slice a fold-then-filter would have
+        // fetched for a limit of 4, and plenty more Zed after it.
+        for index in 0..40_i64 {
+            let at_ms = day_start + index * 10_000;
+            let (app, place) = if index < 16 {
+                if index == 3 || index == 7 {
+                    ("Zed", format!("early{index}.rs"))
+                } else {
+                    ("Chrome", format!("tab {index}"))
+                }
+            } else {
+                ("Zed", format!("late{index}.rs"))
+            };
+            vault
+                .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
+                .unwrap();
+            stamp_app(&vault, &session.id, at_ms, app, &place);
+        }
+        let host = ToolHost {
+            store: ReadOnlyVault::new(&vault),
+            now_ms: day_start + 40 * 10_000,
+            budget: ContextBudget::DEFAULT,
+        };
+
+        let text = host
+            .invoke(
+                "list_activity",
+                &json!({"from_ms": day_start, "to_ms": day_start + 600_000, "app": "Zed", "limit": 4}),
+            )
+            .await
+            .unwrap()
+            .text;
+        let spans = text.lines().filter(|line| line.contains(" – ")).count();
+        assert_eq!(spans, 4, "the limit was not filled from the whole range: {text}");
+        assert!(text.contains("there may be more"), "{text}");
+        assert!(text.contains("from_ms="), "no cursor to resume from: {text}");
     }
 
     #[tokio::test]

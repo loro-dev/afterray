@@ -61,6 +61,18 @@ impl<'a> ReadOnlyVault<'a> {
 
     /// # Errors
     /// Propagates the underlying query failure.
+    pub fn activity_spans_in_app(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        app: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ActivitySpan>, StoreError> {
+        self.inner.activity_spans_in_app(from_ms, to_ms, app, limit)
+    }
+
+    /// # Errors
+    /// Propagates the underlying query failure.
     pub fn latest_activity_moment(
         &self,
         from_ms: i64,

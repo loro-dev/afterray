@@ -1166,6 +1166,35 @@ impl Vault {
         to_ms: i64,
         limit: usize,
     ) -> Result<Vec<ActivitySpan>, StoreError> {
+        self.activity_spans_in_app(from_ms, to_ms, None, limit)
+    }
+
+    /// Activity spans in a range, optionally only those in one application.
+    ///
+    /// The application filter runs **after folding and before the limit**, and
+    /// both halves of that matter.
+    ///
+    /// After folding, because filtering the moments first would let the fold
+    /// merge two stretches that were separated by another application into one
+    /// span claiming the gap — "Zed 09:00–17:00" for a morning and an
+    /// afternoon with three hours of something else between them.
+    ///
+    /// Before the limit, because [`activity::fold_activity_spans`] stops the
+    /// moment it reaches its limit, so a caller that folds-then-filters is
+    /// filtering the *earliest* spans of the range. Ask for 40 spans of Zed on
+    /// a day whose first 160 spans are Chrome and it answers "no activity"
+    /// while the Zed spans sit in the range, unread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn activity_spans_in_app(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        app: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ActivitySpan>, StoreError> {
         if limit == 0 || from_ms > to_ms {
             return Ok(Vec::new());
         }
@@ -1191,7 +1220,19 @@ impl Vault {
         let moments = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         drop(connection);
-        Ok(activity::fold_activity_spans(&moments, limit))
+        // Folded whole, then narrowed, then cut. The unbounded fold costs
+        // nothing extra: the query above has no LIMIT, so every moment in the
+        // range is already in hand, and the fold is linear over it.
+        let mut spans = activity::fold_activity_spans(&moments, usize::MAX);
+        if let Some(wanted) = app {
+            spans.retain(|span| {
+                span.application_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+            });
+        }
+        spans.truncate(limit);
+        Ok(spans)
     }
 
     /// The most recent capture in `[from_ms, to_ms]`, and where it was taken.
