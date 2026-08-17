@@ -1395,6 +1395,13 @@ impl Vault {
         }
 
         let mut rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
+        // The second fact stream. Fetched before the frame loop because the
+        // join happens inside it, against each frame's own tree, and an empty
+        // stream must leave that loop exactly as it was: a slot with no events
+        // is not a degraded card, it is the card this pipeline always built.
+        let mut events =
+            acts::parse_events(&self.input_events_between(slot_start_ms, slot_end_ms)?);
+        let step = capture_interval_ms.max(1_000);
         // The AX artifact is decrypted once per frame at T1 build time
         // (once per half hour). It yields the two strongest intent signals
         // (selection, composition) and, when the tree is rich enough, the
@@ -1411,21 +1418,64 @@ impl Vault {
                 let digest = parse_accessibility_digest(&bytes);
                 row.selected_text = digest.selected_text;
                 row.focused_value = digest.focused_value;
-                let lines = accessibility_text_lines(&bytes);
+                // The geometry-bearing parse yields the same line vector as
+                // `accessibility_text_lines` by construction — one traversal —
+                // so the text-source decision below still counts every line.
+                // Partitioning must never be able to flip a frame's source.
+                let tree = if events.is_empty() {
+                    None
+                } else {
+                    accessibility_scope_tree(&bytes)
+                };
+                let lines = match tree.as_ref() {
+                    Some(tree) => tree.lines.clone(),
+                    None => accessibility_text_lines(&bytes),
+                };
                 let chars: usize = lines.iter().map(|line| line.chars().count()).sum();
                 if chars >= slot::AX_TEXT_MIN_CHARS {
                     row.ocr_text = Some(lines.join("\n"));
                     row.text_from_ax = true;
                 }
+                if let Some(tree) = tree {
+                    // One pass over this frame's events serves both readers:
+                    // each event learns the region it individually landed in
+                    // (which is what run splitting segments on), and the frame
+                    // learns the region covering all of them (which is what
+                    // partitions its text).
+                    let indices = acts::frame_event_indices(
+                        &events,
+                        row.captured_at_ms,
+                        step,
+                        row.bundle_identifier.as_deref(),
+                    );
+                    let mut rects = Vec::with_capacity(indices.len());
+                    for index in indices {
+                        let Some(rect) = events[index].frame else {
+                            continue;
+                        };
+                        rects.push(rect);
+                        if events[index].scope.is_none() {
+                            events[index].scope = acts::event_scope(&tree, rect);
+                        }
+                    }
+                    row.ax_join = acts::join_frame(&tree, &rects);
+                }
             }
         }
+        let materialized = if events.is_empty() {
+            self.slot_acts(slot_start_ms)?
+        } else {
+            None
+        };
         let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
-        let card = slot::build_slot_card_with_end(
+        let card = slot::build_slot_card_with_acts(
             slot_start_ms,
             slot_end_ms,
             &rows,
             idle_ms,
             capture_interval_ms,
+            &events,
+            materialized.as_ref(),
         );
         if settled {
             let mut cache = self.card_cache.lock().unwrap();
@@ -2214,6 +2264,8 @@ impl Vault {
                 text_from_ax: false,
                 ax_present: row.get(8)?,
                 has_audio: row.get(9)?,
+                // Filled by `slot_card`, where the trees are decrypted.
+                ax_join: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -2802,6 +2854,32 @@ impl Vault {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The acts frozen for a slot, if any were.
+    ///
+    /// Read only when the live event stream comes back empty: while the events
+    /// exist they are the truth, and the frozen copy is a summary of them. After
+    /// 48 hours they are gone and this is all that is left.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn slot_acts(&self, slot_start_ms: i64) -> Result<Option<acts::MaterializedActs>, StoreError> {
+        let connection = self.readers.get();
+        let raw: Option<Option<String>> = connection
+            .query_row(
+                "SELECT acts_json FROM slot_summaries WHERE slot_start_ms = ?1",
+                params![slot_start_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // A row without acts and no row at all are the same answer here; a
+        // stored blob this build cannot parse degrades to "no acts" rather than
+        // failing a card build.
+        Ok(raw
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok()))
     }
 
     /// Drops observations older than [`INPUT_EVENT_RETENTION_MS`].
@@ -8535,6 +8613,201 @@ mod tests {
             bundle_identifier: None,
             target_json: None,
         }
+    }
+
+    /// A two-pane window: a sidebar of short rows and a wide content pane whose
+    /// text is long enough to carry the frame past `AX_TEXT_MIN_CHARS` — but
+    /// only when both panes are counted together.
+    fn two_pane_snapshot(sidebar: &[&str], content: &[&str]) -> Vec<u8> {
+        let node = |role: &str, text: &str| {
+            serde_json::json!({"role": role, "value": text, "children": []})
+        };
+        serde_json::to_vec(&serde_json::json!({
+            "application_name": "Feishu",
+            "bundle_identifier": "com.electron.lark",
+            "window_title": "Lody Team",
+            "root": {
+                "role": "AXWindow",
+                "title": "Lark",
+                "frame": {"x": 0, "y": 0, "width": 1000, "height": 1000},
+                "children": [
+                    {
+                        "role": "AXGroup",
+                        "title": "Conversations",
+                        "frame": {"x": 0, "y": 0, "width": 200, "height": 1000},
+                        "children": sidebar
+                            .iter()
+                            .map(|line| node("AXStaticText", line))
+                            .collect::<Vec<_>>(),
+                    },
+                    {
+                        "role": "AXGroup",
+                        "title": "Chat",
+                        "frame": {"x": 200, "y": 0, "width": 800, "height": 1000},
+                        "children": content
+                            .iter()
+                            .map(|line| node("AXStaticText", line))
+                            .collect::<Vec<_>>(),
+                    }
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// The text-source decision and the engaged partition read the same line
+    /// vector, and they must stay independent: a frame whose engaged region is
+    /// small still uses accessibility text if the *whole* tree is rich enough.
+    ///
+    /// Get this wrong and partitioning silently demotes a frame to OCR — worse
+    /// text, whole-screen scope — for the frames the join works best on.
+    #[test]
+    fn partitioning_never_flips_a_frames_text_source() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = slot_start_for(1_786_698_000_000) + 60_000;
+
+        // 20 sidebar rows of ~24 chars carry the frame over the 400-char gate;
+        // the engaged pane alone holds well under it.
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let content = ["赵亮: shipped the fix", "me: thanks"];
+        let engaged_chars: usize = content.iter().map(|line| line.chars().count()).sum();
+        assert!(
+            engaged_chars < slot::AX_TEXT_MIN_CHARS,
+            "the engaged pane must be under the gate for this test to mean anything"
+        );
+        let snapshot = two_pane_snapshot(&sidebar_refs, &content);
+        assert!(
+            accessibility_text_lines(&snapshot)
+                .iter()
+                .map(|line| line.chars().count())
+                .sum::<usize>()
+                >= slot::AX_TEXT_MIN_CHARS,
+            "the whole tree must be over the gate"
+        );
+
+        for step in 0..3_i64 {
+            let at = slot + step * 10_000;
+            let moment = insert_named_moment(
+                &vault,
+                &session.id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &snapshot,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(!moment.id.is_empty());
+        }
+
+        // One click, inside the chat pane: engaged scope is the chat pane.
+        let mut click = input_event(slot + 5_000, None, "click");
+        click.bundle_identifier = Some("com.electron.lark".to_owned());
+        click.target_json = Some(
+            r#"{"role":"AXStaticText","label":"赵亮",
+                "frame":{"x":300,"y":100,"width":200,"height":20}}"#
+                .to_owned(),
+        );
+        vault.insert_input_events(&[click]).unwrap();
+
+        let card = vault.slot_card(slot + 1_000, 10_000).unwrap();
+        let run = card
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot has a run");
+
+        assert_eq!(
+            run.text_source, "ax",
+            "the gate counts every line, engaged or not"
+        );
+        assert_eq!(
+            run.lines,
+            ["赵亮: shipped the fix", "me: thanks"],
+            "only the pane the click landed in"
+        );
+        assert_eq!(run.peripheral.len(), 20, "the sidebar is visible, not operated");
+        assert_eq!(
+            card.not_engaged,
+            vec![acts::Region {
+                label: "Conversations".to_owned(),
+                lines: 20,
+                engaged: false,
+            }]
+        );
+        let acts = run.acts.as_ref().expect("the slot has events");
+        assert_eq!(acts.clicks.len(), 1);
+        assert_eq!(acts.clicks[0].label, "赵亮");
+        assert_eq!(acts.signal, acts::ActsSignal::Ok);
+        assert!(card.facts.no_input_ratio.is_some());
+    }
+
+    /// The same slot with its events removed: the card must be the one the
+    /// pipeline built before acts existed, sidebar text included.
+    #[test]
+    fn a_slot_whose_events_are_gone_partitions_nothing() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = slot_start_for(1_786_698_000_000) + 60_000;
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let snapshot = two_pane_snapshot(&sidebar_refs, &["赵亮: shipped the fix", "me: thanks"]);
+        for step in 0..3_i64 {
+            let at = slot + step * 10_000;
+            insert_named_moment(
+                &vault,
+                &session.id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &snapshot,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+
+        let card = vault.slot_card(slot + 1_000, 10_000).unwrap();
+        let run = card
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot has a run");
+        assert_eq!(run.text_source, "ax");
+        assert_eq!(run.lines.len(), 22, "every line, in tree order");
+        assert!(run.peripheral.is_empty());
+        assert!(run.acts.is_none());
+        assert!(card.not_engaged.is_empty());
+        assert_eq!(card.facts.no_input_ratio, None);
     }
 
     /// A window owns an event when the two intervals touch at all: a burst that

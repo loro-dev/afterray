@@ -806,6 +806,95 @@ pub fn no_input_ratio(events: &[ActEvent], from_ms: i64, to_ms: i64) -> Option<f
     Some(ratio.clamp(0.0, 1.0))
 }
 
+/// What one frame's tree says about where that frame's input landed.
+///
+/// Computed per frame, next to the single decryption of that frame's tree —
+/// the only place the tree is in hand — and carried on the moment row so the
+/// pure card build can partition text without touching a vault.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FrameJoin {
+    /// Stable identity of the engaged region, `None` when nothing resolved.
+    pub scope: Option<String>,
+    /// Parallel to the frame's accessibility text lines: `true` when the line
+    /// sits inside the engaged region. Empty when there is no region, which
+    /// means "do not partition" rather than "nothing is engaged".
+    pub engaged: Vec<bool>,
+    /// Sibling regions of the engaged one, with their line counts.
+    pub regions: Vec<Region>,
+}
+
+impl FrameJoin {
+    /// Whether this frame resolved a region at all. Without one, every line
+    /// stays in the main bucket: an unpartitioned frame is honest, a frame
+    /// partitioned against a guess is not.
+    #[must_use]
+    pub fn has_scope(&self) -> bool {
+        self.scope.is_some() && !self.engaged.is_empty()
+    }
+
+    /// Whether the line at `index` is inside the engaged region. Lines the join
+    /// never saw count as engaged, so a mismatch can only ever widen the
+    /// budget, never silently drop text.
+    #[must_use]
+    pub fn line_is_engaged(&self, index: usize) -> bool {
+        self.engaged.get(index).copied().unwrap_or(true)
+    }
+}
+
+/// Indices of the events this frame can speak for.
+///
+/// A heartbeat frame is a snapshot of a moving screen, so an event is only
+/// attributable to it if it happened within one capture interval — beyond that
+/// the tree has probably moved on, and hit-testing against a stale layout would
+/// invent a region. Bundle identifiers must agree when both are known: a click
+/// in another app never landed in this window.
+#[must_use]
+pub fn frame_event_indices(
+    events: &[ActEvent],
+    at_ms: i64,
+    step_ms: i64,
+    bundle: Option<&str>,
+) -> Vec<usize> {
+    let window = step_ms.max(1_000);
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.is_input() && event.frame.is_some())
+        .filter(|(_, event)| event.overlaps(at_ms - window, at_ms + window))
+        .filter(|(_, event)| match (event.bundle_identifier.as_deref(), bundle) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The region one event landed in, as a stable key.
+#[must_use]
+pub fn event_scope(tree: &AxScopeTree, rect: AxRect) -> Option<String> {
+    engaged_scope(tree, &[rect]).map(|node| scope_key(tree, node))
+}
+
+/// Joins one frame's tree against the events attributable to it.
+///
+/// Returns `None` whenever the join cannot answer — no events landed in this
+/// tree, or no window bounds the region — because everything downstream reads a
+/// `Some` as "the user was in this region and not the others".
+#[must_use]
+pub fn join_frame(tree: &AxScopeTree, rects: &[AxRect]) -> Option<FrameJoin> {
+    let scope = engaged_scope(tree, rects)?;
+    let engaged: Vec<bool> = tree
+        .line_node
+        .iter()
+        .map(|&owner| is_within(tree, scope, owner))
+        .collect();
+    Some(FrameJoin {
+        scope: Some(scope_key(tree, scope)),
+        engaged,
+        regions: sibling_regions(tree, scope),
+    })
+}
+
 /// Per-run acts frozen into `slot_summaries.acts_json` before the events they
 /// came from expire.
 ///

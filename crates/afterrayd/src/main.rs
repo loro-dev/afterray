@@ -4537,6 +4537,7 @@ mod tests {
                 switch_count: 0,
                 longest_focus_ms: 0,
                 idle_ratio: 0.0,
+                no_input_ratio: None,
             },
             title: None,
             bullets: None,
