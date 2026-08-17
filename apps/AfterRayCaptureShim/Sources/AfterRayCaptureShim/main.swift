@@ -111,6 +111,8 @@ private struct Event: Encodable {
     var height: Int?
     var code: String?
     var message: String?
+    var inputRecords: [InputEventRecord]?
+    var droppedInputs: Int?
 
     enum CodingKeys: String, CodingKey {
         case event, kind, path, code, message
@@ -121,6 +123,8 @@ private struct Event: Encodable {
         case requestId = "request_id"
         case displayId = "display_id"
         case width, height
+        case inputRecords = "events"
+        case droppedInputs = "dropped"
     }
 
     static func ready(display: SCDisplay) -> Self {
@@ -163,6 +167,13 @@ private struct Event: Encodable {
     }
 
     static let stopped = Self(event: "stopped")
+
+    static func inputEvents(_ records: [InputEventRecord], dropped: Int) -> Self {
+        var event = Self(event: "input_events")
+        event.inputRecords = records
+        event.droppedInputs = dropped > 0 ? dropped : nil
+        return event
+    }
 
     init(
         event: String,
@@ -985,6 +996,16 @@ private final class ExcludedAudioGate: @unchecked Sendable {
         return foreground
     }
 
+    /// Verdict for input-event suppression: `nil` until the daemon's list
+    /// has arrived, or when the frontmost app is unknown — both fail closed,
+    /// the same startup posture the audio hold takes.
+    func excludedVerdict(for bundleId: String?) -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let excluded, let bundleId else { return nil }
+        return excluded.contains(bundleId.lowercased())
+    }
+
     /// The daemon sends the list once at startup and again on every change.
     func setExcludedBundles(_ bundleIds: [String]) {
         let normalized = Set(bundleIds.map { $0.lowercased() })
@@ -1370,6 +1391,434 @@ private func captureScreen(
     }
 }
 
+// MARK: - Input events (listen-only)
+//
+// CAP-005 discipline is enforced here, at the source (see
+// docs/input-events-and-t1-acts-plan.md): plain keystrokes exist only as
+// burst counts — key codes are read solely to classify command keys and never
+// leave the tap callback; pointer coordinates live exactly as long as the
+// element resolution they feed. Return/Tab/Esc count as command keys
+// (2026-08-17 decision): they carry no character content and their
+// "submit/execute" semantics is the strongest read-vs-write signal T1 has.
+
+private struct InputTargetFrame: Encodable {
+    let x: Int
+    let y: Int
+    let width: Int
+    let height: Int
+}
+
+private struct InputAncestorRef: Encodable {
+    let role: String?
+    let label: String?
+}
+
+/// The resolved identity of the element an input landed on. `label` is
+/// title/description only — never `AXValue`, which is the element's content.
+private struct InputTargetRef: Encodable {
+    let role: String?
+    let label: String?
+    let frame: InputTargetFrame?
+    let ancestors: [InputAncestorRef]
+}
+
+private struct InputEventRecord: Encodable {
+    var atMs: Int64
+    var kind: String
+    var endMs: Int64?
+    var count: Int?
+    var endedWith: String?
+    var command: String?
+    var bundleIdentifier: String?
+    var target: InputTargetRef?
+
+    enum CodingKeys: String, CodingKey {
+        case kind, count, command, target
+        case atMs = "at_ms"
+        case endMs = "end_ms"
+        case endedWith = "ended_with"
+        case bundleIdentifier = "bundle_identifier"
+    }
+
+    init(atMs: Int64, kind: String) {
+        self.atMs = atMs
+        self.kind = kind
+    }
+}
+
+/// Listen-only observation of user input, coalesced at the source.
+///
+/// The tap callback must return fast — a slow callback gets the tap disabled
+/// by the system (`tapDisabledByTimeout`) — so it only classifies and
+/// enqueues primitives; all AX resolution happens on the worker queue, where
+/// the process-global 100ms messaging timeout bounds each query. Element
+/// resolution is a single-element path (~a dozen attribute reads), never a
+/// tree walk: capture cadence is unchanged by interaction intensity.
+private final class InputEventMonitor: @unchecked Sendable {
+    /// Batches are flushed at this cadence once records exist.
+    private static let flushIntervalMs: Int64 = 2_000
+    /// A typing burst closes after this much silence.
+    private static let burstGapMs: Int64 = 2_000
+    /// Scroll ticks within this gap coalesce into one burst.
+    private static let scrollGapMs: Int64 = 1_000
+    /// Producer-side cap (§7.5): records beyond this per flush window are
+    /// dropped and counted, never queued.
+    private static let recordsPerFlushCap = 40
+
+    private enum KeyClass {
+        case plain
+        case autorepeat
+        case command(String)
+    }
+
+    private let events: EventWriter
+    private let excludedVerdict: (String?) -> Bool?
+    private let worker = DispatchQueue(label: "dev.afterray.capture.input", qos: .utility)
+    private let tapLock = NSLock()
+    private var tap: CFMachPort?
+    private var runLoop: CFRunLoop?
+
+    // Worker-queue state — touched only on `worker`.
+    private var records: [InputEventRecord] = []
+    private var dropped = 0
+    private var lastFlushMs: Int64 = 0
+    private var burst: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
+    private var scroll: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
+    private var lastRawMs: Int64 = 0
+    private var timer: DispatchSourceTimer?
+    private var livenessTick = 0
+
+    init(events: EventWriter, excludedVerdict: @escaping (String?) -> Bool?) {
+        self.events = events
+        self.excludedVerdict = excludedVerdict
+    }
+
+    func start() {
+        let now = Self.nowMs()
+        worker.async {
+            self.lastRawMs = now
+            self.lastFlushMs = now
+        }
+        let thread = Thread { [weak self] in self?.runTapLoop() }
+        thread.name = "dev.afterray.capture.input-tap"
+        thread.start()
+        let timer = DispatchSource.makeTimerSource(queue: worker)
+        timer.schedule(deadline: .now() + 1, repeating: 1.0)
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.resume()
+        self.timer = timer
+    }
+
+    func stop() {
+        tapLock.lock()
+        let tap = self.tap
+        let runLoop = self.runLoop
+        tapLock.unlock()
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let runLoop { CFRunLoopStop(runLoop) }
+        timer?.cancel()
+        worker.sync {
+            self.closeBurst(endedWith: nil)
+            self.closeScroll()
+            self.flush(nowMs: Self.nowMs())
+        }
+    }
+
+    private func runTapLoop() {
+        let mask = Self.maskBit(.keyDown)
+            | Self.maskBit(.leftMouseDown)
+            | Self.maskBit(.rightMouseDown)
+            | Self.maskBit(.otherMouseDown)
+            | Self.maskBit(.scrollWheel)
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            if let userInfo {
+                Unmanaged<InputEventMonitor>.fromOpaque(userInfo)
+                    .takeUnretainedValue()
+                    .handle(type: type, event: event)
+            }
+            return Unmanaged.passUnretained(event)
+        }
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            // Accessibility permission covers listen-only taps (§7.3);
+            // reaching here means it is missing. Capture continues without
+            // input events — fail open, but say so, because downstream must
+            // not read the absence of events as "the user did nothing".
+            events.send(.warning(
+                code: "input_tap_unavailable",
+                message: "listen-only event tap could not be created"
+            ))
+            return
+        }
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        let runLoop = CFRunLoopGetCurrent()
+        CFRunLoopAddSource(runLoop, source, CFRunLoopMode.commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        tapLock.lock()
+        self.tap = tap
+        self.runLoop = runLoop
+        tapLock.unlock()
+        log("input tap started")
+        CFRunLoopRun()
+    }
+
+    /// Runs on the tap thread. Classifies and enqueues; nothing else.
+    private func handle(type: CGEventType, event: CGEvent) {
+        let now = Self.nowMs()
+        switch type {
+        case .keyDown:
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let autorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            let classified: KeyClass =
+                autorepeat ? .autorepeat : Self.classify(keyCode: keyCode, flags: event.flags)
+            // The key code goes no further than the classification above.
+            worker.async { self.onKey(atMs: now, classified: classified) }
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            let location = event.location
+            worker.async { self.onClick(atMs: now, x: location.x, y: location.y) }
+        case .scrollWheel:
+            let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase) != 0
+            let location = event.location
+            worker.async { self.onScroll(atMs: now, x: location.x, y: location.y, momentum: momentum) }
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            tapLock.lock()
+            let tap = self.tap
+            tapLock.unlock()
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            log("input tap re-enabled after disable event")
+        default:
+            break
+        }
+    }
+
+    private func onKey(atMs: Int64, classified: KeyClass) {
+        lastRawMs = atMs
+        switch classified {
+        case .autorepeat:
+            if burst != nil { burst?.endMs = atMs }
+        case .plain:
+            if burst != nil, atMs - (burst?.endMs ?? 0) <= Self.burstGapMs {
+                burst?.endMs = atMs
+                burst?.count += 1
+            } else {
+                closeBurst(endedWith: nil)
+                burst = (atMs, atMs, 1, frontmostBundle(), resolveFocusedTarget())
+            }
+        case .command(let name):
+            closeBurst(endedWith: name)
+            var record = InputEventRecord(atMs: atMs, kind: "command")
+            record.command = name
+            record.bundleIdentifier = frontmostBundle()
+            record.target = resolveFocusedTarget()
+            append(record)
+        }
+    }
+
+    private func onClick(atMs: Int64, x: Double, y: Double) {
+        lastRawMs = atMs
+        // A click into another pane usually precedes typing there; close the
+        // burst so its recorded target stays honest.
+        closeBurst(endedWith: nil)
+        var record = InputEventRecord(atMs: atMs, kind: "click")
+        record.bundleIdentifier = frontmostBundle()
+        record.target = resolveTarget(x: x, y: y)
+        append(record)
+    }
+
+    private func onScroll(atMs: Int64, x: Double, y: Double, momentum: Bool) {
+        lastRawMs = atMs
+        if scroll != nil, atMs - (scroll?.endMs ?? 0) <= Self.scrollGapMs {
+            scroll?.endMs = atMs
+            scroll?.count += 1
+            return
+        }
+        // A momentum tail after the burst already closed is not a new act.
+        if momentum { return }
+        closeScroll()
+        scroll = (atMs, atMs, 1, frontmostBundle(), resolveTarget(x: x, y: y))
+    }
+
+    private func closeBurst(endedWith: String?) {
+        guard let current = burst else { return }
+        burst = nil
+        var record = InputEventRecord(atMs: current.startMs, kind: "burst")
+        record.endMs = current.endMs
+        record.count = current.count
+        record.endedWith = endedWith
+        record.bundleIdentifier = current.bundle
+        record.target = current.target
+        append(record)
+    }
+
+    private func closeScroll() {
+        guard let current = scroll else { return }
+        scroll = nil
+        var record = InputEventRecord(atMs: current.startMs, kind: "scroll")
+        record.endMs = current.endMs
+        record.count = current.count
+        record.bundleIdentifier = current.bundle
+        record.target = current.target
+        append(record)
+    }
+
+    private func append(_ record: InputEventRecord) {
+        // The shim never records its own host app, and fails closed for
+        // excluded apps exactly like the audio hold: before the daemon's
+        // list arrives, nothing can be judged, so nothing is recorded.
+        if record.bundleIdentifier == afterRayAppBundleIdentifier { return }
+        guard excludedVerdict(record.bundleIdentifier) == false else { return }
+        guard records.count < Self.recordsPerFlushCap else {
+            dropped += 1
+            return
+        }
+        records.append(record)
+    }
+
+    private func tick() {
+        let now = Self.nowMs()
+        if let current = burst, now - current.endMs > Self.burstGapMs {
+            closeBurst(endedWith: nil)
+        }
+        if let current = scroll, now - current.endMs > Self.scrollGapMs {
+            closeScroll()
+        }
+        if !records.isEmpty || dropped > 0, now - lastFlushMs >= Self.flushIntervalMs {
+            flush(nowMs: now)
+        }
+        livenessTick += 1
+        if livenessTick >= 60 {
+            livenessTick = 0
+            checkLiveness(nowMs: now)
+        }
+    }
+
+    private func flush(nowMs: Int64) {
+        lastFlushMs = nowMs
+        guard !records.isEmpty || dropped > 0 else { return }
+        events.send(.inputEvents(records, dropped: dropped))
+        records = []
+        dropped = 0
+    }
+
+    /// Code-signature changes disable taps silently. If the system saw input
+    /// recently but the tap saw nothing for a minute, the tap is dead —
+    /// downstream must mark the gap rather than read it as "no activity".
+    private func checkLiveness(nowMs: Int64) {
+        let systemIdle = min(
+            CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown),
+            CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .leftMouseDown),
+            CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .scrollWheel)
+        )
+        if systemIdle < 30, nowMs - lastRawMs > 60_000 {
+            events.send(.warning(
+                code: "input_tap_stalled",
+                message: "system saw input but the tap did not; re-enabling"
+            ))
+            tapLock.lock()
+            let tap = self.tap
+            tapLock.unlock()
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+        }
+    }
+
+    // MARK: resolution — worker queue only
+
+    private func frontmostBundle() -> String? {
+        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+    }
+
+    private func resolveTarget(x: Double, y: Double) -> InputTargetRef? {
+        var element: AXUIElement?
+        guard
+            AXUIElementCopyElementAtPosition(
+                AXUIElementCreateSystemWide(), Float(x), Float(y), &element
+            ) == .success,
+            let element
+        else { return nil }
+        // The coordinates die with this stack frame.
+        return targetRef(for: element)
+    }
+
+    private func resolveFocusedTarget() -> InputTargetRef? {
+        axElement(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute)
+            .map(targetRef(for:))
+    }
+
+    private func targetRef(for element: AXUIElement) -> InputTargetRef {
+        var ancestors: [InputAncestorRef] = []
+        var cursor = axElement(element, kAXParentAttribute)
+        var hops = 0
+        while let parent = cursor, hops < 6 {
+            let role = axString(parent, kAXRoleAttribute)
+            if role == "AXApplication" { break }
+            let label = nonempty(axString(parent, kAXTitleAttribute))
+                ?? nonempty(axString(parent, kAXDescriptionAttribute))
+            if role != nil || label != nil {
+                ancestors.append(InputAncestorRef(role: role, label: label.map { clip($0, 80) }))
+            }
+            cursor = axElement(parent, kAXParentAttribute)
+            hops += 1
+        }
+        let frame = accessibilityFrame(element).map {
+            InputTargetFrame(
+                x: Int($0.origin.x.rounded()),
+                y: Int($0.origin.y.rounded()),
+                width: Int($0.width.rounded()),
+                height: Int($0.height.rounded())
+            )
+        }
+        let label = nonempty(axString(element, kAXTitleAttribute))
+            ?? nonempty(axString(element, kAXDescriptionAttribute))
+        return InputTargetRef(
+            role: axString(element, kAXRoleAttribute),
+            label: label.map { clip($0, 120) },
+            frame: frame,
+            ancestors: ancestors
+        )
+    }
+
+    private static func classify(keyCode: Int64, flags: CGEventFlags) -> KeyClass {
+        if flags.contains(.maskCommand) {
+            // Hardware key codes are ANSI positions; on other layouts a
+            // letter command may misname, but still records as a command.
+            let name: String
+            switch keyCode {
+            case 0: name = "cmd-a"
+            case 1: name = "cmd-s"
+            case 3: name = "cmd-f"
+            case 6: name = "cmd-z"
+            case 7: name = "cmd-x"
+            case 8: name = "cmd-c"
+            case 9: name = "cmd-v"
+            case 36, 76: name = "cmd-return"
+            default: name = "cmd"
+            }
+            return .command(name)
+        }
+        // Position keys, layout-independent.
+        switch keyCode {
+        case 36, 76: return .command("return")
+        case 48: return .command("tab")
+        case 53: return .command("esc")
+        default: return .plain
+        }
+    }
+
+    private static func maskBit(_ type: CGEventType) -> CGEventMask {
+        CGEventMask(1) << CGEventMask(type.rawValue)
+    }
+
+    private static func nowMs() -> Int64 {
+        Int64((Date().timeIntervalSince1970 * 1_000).rounded())
+    }
+}
+
 private struct InputCommand: Decodable {
     let command: String
     let requestId: String?
@@ -1451,6 +1900,16 @@ private enum AfterRayCaptureShim {
             log("startCapture returned, sending ready")
             events.send(.ready(display: streamDisplay))
 
+            // Listen-only input observation, coalesced at the source
+            // (docs/input-events-and-t1-acts-plan.md phase 1). Shares the
+            // audio gate's exclusion list; fails open into a warning event
+            // when the tap cannot be created.
+            let inputMonitor = InputEventMonitor(
+                events: events,
+                excludedVerdict: { output.audioGate.excludedVerdict(for: $0) }
+            )
+            inputMonitor.start()
+
             let decoder = JSONDecoder()
             while let line = readLine(strippingNewline: true) {
                 guard let data = line.data(using: .utf8) else { continue }
@@ -1470,6 +1929,7 @@ private enum AfterRayCaptureShim {
                     case "set_excluded_bundles":
                         output.audioGate.setExcludedBundles(command.bundleIds ?? [])
                     case "stop":
+                        inputMonitor.stop()
                         try await stream.stopCapture()
                         callbackQueue.sync { output.finishAudio() }
                         events.send(.stopped)

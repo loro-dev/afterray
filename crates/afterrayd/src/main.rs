@@ -2047,6 +2047,14 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
             Ok(CaptureEvent::Warning { code, message }) => {
                 eprintln!("capture warning [{code}]: {message}");
             }
+            Ok(CaptureEvent::InputEvents { events, dropped }) => {
+                // Phase 1: observe only. Persistence (events table, 48h
+                // retention, seal-time acts materialization) lands with
+                // docs/input-events-and-t1-acts-plan.md phase 2.
+                if !events.is_empty() || dropped > 0 {
+                    eprintln!("capture input events batch={} dropped={dropped}", events.len());
+                }
+            }
             Ok(CaptureEvent::Failed { code, message }) => {
                 eprintln!("capture failed [{code}]: {message}");
                 finish_failed_recording(&state, &session_id).await;

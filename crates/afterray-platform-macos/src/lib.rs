@@ -116,7 +116,70 @@ pub enum CaptureEvent {
         code: String,
         message: String,
     },
+    /// Coalesced user-input observations from the shim's listen-only event
+    /// tap (docs/input-events-and-t1-acts-plan.md). Plain keystrokes arrive
+    /// only as burst counts; pointer events arrive as resolved element
+    /// identities, never coordinates. `dropped` counts records the shim's
+    /// producer-side cap discarded.
+    InputEvents {
+        #[serde(default)]
+        events: Vec<InputEventRecord>,
+        #[serde(default)]
+        dropped: u64,
+    },
     Stopped,
+}
+
+/// One coalesced input observation. `kind` is `burst` (typing, with
+/// `count`/`end_ms`/`ended_with`), `command` (⌘-combo or Return/Tab/Esc,
+/// named in `command`), `click`, or `scroll` (coalesced, with `count`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InputEventRecord {
+    pub at_ms: i64,
+    pub kind: String,
+    #[serde(default)]
+    pub end_ms: Option<i64>,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub ended_with: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub bundle_identifier: Option<String>,
+    #[serde(default)]
+    pub target: Option<InputTargetRef>,
+}
+
+/// The resolved identity of the element an input landed on. `label` is the
+/// element's title/description, never its value; `frame` is UI geometry in
+/// global top-left screen points, rounded — not a pointer coordinate.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InputTargetRef {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub frame: Option<InputTargetFrame>,
+    #[serde(default)]
+    pub ancestors: Vec<InputAncestorRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct InputTargetFrame {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InputAncestorRef {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -435,6 +498,43 @@ mod tests {
                 request_id: Some("moment-1".into()),
             }
         );
+    }
+
+    #[test]
+    fn parses_input_events_event() {
+        let event: CaptureEvent = serde_json::from_str(
+            r#"{"event":"input_events","dropped":2,"events":[
+                {"at_ms":100,"kind":"burst","end_ms":2100,"count":34,"ended_with":"return",
+                 "bundle_identifier":"com.electron.lark",
+                 "target":{"role":"AXTextArea","label":"Message 赵亮",
+                           "frame":{"x":831,"y":899,"width":541,"height":22},
+                           "ancestors":[{"role":"AXGroup","label":null}]}},
+                {"at_ms":150,"kind":"click","bundle_identifier":"com.electron.lark"}
+            ]}"#,
+        )
+        .unwrap();
+        let CaptureEvent::InputEvents { events, dropped } = event else {
+            panic!("expected input_events, got {event:?}");
+        };
+        assert_eq!(dropped, 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "burst");
+        assert_eq!(events[0].count, Some(34));
+        assert_eq!(events[0].ended_with.as_deref(), Some("return"));
+        let target = events[0].target.as_ref().expect("burst target");
+        assert_eq!(target.role.as_deref(), Some("AXTextArea"));
+        assert_eq!(
+            target.frame,
+            Some(InputTargetFrame {
+                x: 831,
+                y: 899,
+                width: 541,
+                height: 22
+            })
+        );
+        // A minimal record parses with every optional field absent.
+        assert_eq!(events[1].kind, "click");
+        assert_eq!(events[1].target, None);
     }
 
     #[test]
