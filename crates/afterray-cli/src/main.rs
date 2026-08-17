@@ -1,15 +1,19 @@
-mod chat;
+mod docs;
 
 use afterray_models::{download_packs, library_in, model_directory, specs_for_download_in};
 use afterray_protocol::{Request, Response};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, process::Command as ProcessCommand};
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 #[derive(Parser)]
-#[command(name = "afterray", version, about = "AfterRay V0 control client")]
+#[command(
+    name = "afterray",
+    version,
+    about = "AfterRay query CLI for agents. Start with `afterray docs`."
+)]
 struct Cli {
     #[arg(long, env = "AFTERRAY_SOCKET")]
     socket: Option<PathBuf>,
@@ -21,15 +25,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Daemon {
-        #[command(subcommand)]
-        command: DaemonCommand,
+    /// Agent documentation: permissions, commands, and failure modes.
+    Docs {
+        /// Page id (`permissions`, `search`, `slot`, …). Omit for the index.
+        topic: Option<String>,
     },
     Status,
-    Record {
-        #[command(subcommand)]
-        command: RecordCommand,
-    },
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
@@ -45,12 +46,12 @@ enum Command {
         #[arg(long = "at-ms", conflicts_with = "moment_id")]
         at_ms: Option<i64>,
     },
-    /// Deterministic T1 slot cards and the T2 prompt built from them.
+    /// Slot summaries (Query) and T1 cards (Evidence).
     Slot {
         #[command(subcommand)]
         command: SlotCommand,
     },
-    /// Write the captured frame nearest a timestamp to a file (for a vision model).
+    /// Write the captured frame nearest a timestamp to a file. Requires Evidence.
     Frame {
         #[arg(long = "at-ms")]
         at_ms: Option<i64>,
@@ -73,7 +74,7 @@ enum Command {
         #[arg(long = "to-ms")]
         to_ms: Option<i64>,
     },
-    /// Read OCR / accessibility evidence for a moment.
+    /// Read OCR / accessibility evidence for a moment. Requires Evidence.
     Evidence {
         #[command(subcommand)]
         command: EvidenceCommand,
@@ -94,23 +95,6 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         limit: usize,
     },
-    History {
-        #[command(subcommand)]
-        command: HistoryCommand,
-    },
-    Favorite {
-        #[command(subcommand)]
-        command: FavoriteCommand,
-    },
-    /// Read or change daemon settings.
-    Settings {
-        /// Interface language (BCP-47 code, or `auto`).
-        #[arg(long = "ui-language")]
-        ui_language: Option<String>,
-        /// Language the summarising agent writes cards in.
-        #[arg(long = "summary-language")]
-        summary_language: Option<String>,
-    },
     Models,
     Download {
         #[arg(long)]
@@ -122,21 +106,6 @@ enum Command {
         #[command(subcommand)]
         command: JobsCommand,
     },
-    Summarize {
-        session_id: String,
-    },
-    Ask {
-        question: String,
-        #[arg(long = "from-ms")]
-        from_ms: Option<i64>,
-        #[arg(long = "to-ms")]
-        to_ms: Option<i64>,
-    },
-    /// Multi-turn chat against the local vault.
-    Chat {
-        #[command(subcommand)]
-        command: chat::ChatCommand,
-    },
     Gop {
         segment_id: String,
     },
@@ -147,32 +116,13 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum RecordCommand {
-    Start,
-    Stop,
-}
-
-#[derive(Subcommand)]
-enum DaemonCommand {
-    Start,
-    Stop,
-}
-
-#[derive(Subcommand)]
 enum SessionsCommand {
     List,
 }
 
 #[derive(Subcommand)]
-enum FavoriteCommand {
-    Add { moment_id: String },
-    Remove { moment_id: String },
-}
-
-#[derive(Subcommand)]
 enum JobsCommand {
     List,
-    Retry { job_id: String },
 }
 
 #[derive(Subcommand)]
@@ -182,23 +132,10 @@ enum PackCommand {
 
 #[derive(Subcommand)]
 enum SlotCommand {
-    /// The T1 card: facts plus the retrieval map handed to a T2 agent.
+    /// The T1 card: screen-text rollup. Requires Evidence.
     Card {
         #[arg(long = "at-ms")]
         at_ms: i64,
-    },
-    /// Run the T2 pass through the configured model and print the card.
-    Summarize {
-        #[arg(long = "at-ms")]
-        at_ms: i64,
-    },
-    /// The rendered T2 prompt (system + user) for this slot.
-    Prompt {
-        #[arg(long = "at-ms")]
-        at_ms: i64,
-        /// Print only the user half, as plain text.
-        #[arg(long)]
-        user_only: bool,
     },
     /// The day panel payload: every occupied slot, T2 titles when they exist.
     Day {
@@ -212,12 +149,6 @@ enum SlotCommand {
         before_ms: Option<i64>,
         #[arg(long, default_value_t = 7)]
         limit: usize,
-    },
-    /// Summarise every ready-but-untouched slot in the last N days. The daemon
-    /// sweeps the last two on its own; this is for older history.
-    Backfill {
-        #[arg(long, default_value_t = 7)]
-        days: i64,
     },
 }
 
@@ -242,32 +173,17 @@ enum EvidenceCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum HistoryCommand {
-    Clear {
-        #[arg(long, value_enum)]
-        scope: HistoryScopeArg,
-    },
-}
-
-#[derive(Clone, clap::ValueEnum)]
-enum HistoryScopeArg {
-    LastHour,
-    Today,
-    All,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Command::Docs { topic } = &cli.command {
+        return docs::run(topic.as_deref(), cli.json);
+    }
     let socket = match cli.socket {
         Some(path) => path,
         None => afterray_protocol::socket::default_socket_path()
             .context("resolve the afterray daemon socket")?,
     };
-    if let Command::Chat { command } = cli.command {
-        return chat::run(&socket, command, cli.json).await;
-    }
     let Some(request) = request_from_command(cli.command, &socket).await? else {
         return Ok(());
     };
@@ -292,28 +208,8 @@ async fn request_from_command(
     socket: &PathBuf,
 ) -> anyhow::Result<Option<Request>> {
     Ok(Some(match command {
-        Command::Daemon {
-            command: DaemonCommand::Start,
-        } => {
-            let status = ProcessCommand::new("afterrayd")
-                .env("AFTERRAY_SOCKET", socket)
-                .status()
-                .context("start afterrayd; ensure it is installed or available on PATH")?;
-            if !status.success() {
-                anyhow::bail!("afterrayd exited with {status}");
-            }
-            return Ok(None);
-        }
-        Command::Daemon {
-            command: DaemonCommand::Stop,
-        } => Request::Shutdown,
+        Command::Docs { .. } => unreachable!("docs is handled before the socket path"),
         Command::Status => Request::Status,
-        Command::Record {
-            command: RecordCommand::Start,
-        } => Request::RecordStart,
-        Command::Record {
-            command: RecordCommand::Stop,
-        } => Request::RecordStop { reason: None },
         Command::Sessions {
             command: SessionsCommand::List,
         } => Request::SessionsList,
@@ -330,33 +226,11 @@ async fn request_from_command(
             command: SlotCommand::Card { at_ms },
         } => Request::SlotCard { at_ms },
         Command::Slot {
-            command: SlotCommand::Summarize { at_ms },
-        } => Request::SlotSummarize { at_ms },
-        Command::Slot {
             command: SlotCommand::Day { at_ms },
         } => Request::DaySummary { day_ms: at_ms },
         Command::Slot {
             command: SlotCommand::History { before_ms, limit },
         } => Request::SummaryHistory { before_ms, limit },
-        Command::Slot {
-            command: SlotCommand::Backfill { days },
-        } => Request::SlotBackfill { days },
-        Command::Slot {
-            command: SlotCommand::Prompt { at_ms, user_only },
-        } => {
-            if user_only {
-                let response = send(socket, &Request::SlotPrompt { at_ms }).await?;
-                let user = response
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("user"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                println!("{user}");
-                return Ok(None);
-            }
-            Request::SlotPrompt { at_ms }
-        }
         Command::Frame {
             at_ms,
             moment_id,
@@ -414,71 +288,14 @@ async fn request_from_command(
             to_ms,
             limit,
         },
-        Command::History {
-            command: HistoryCommand::Clear { scope },
-        } => Request::ClearHistory {
-            scope: match scope {
-                HistoryScopeArg::LastHour => afterray_protocol::HistoryScope::LastHour,
-                HistoryScopeArg::Today => afterray_protocol::HistoryScope::Today,
-                HistoryScopeArg::All => afterray_protocol::HistoryScope::All,
-            },
-        },
-        Command::Favorite {
-            command: FavoriteCommand::Add { moment_id },
-        } => Request::FavoriteSet {
-            moment_id,
-            favorite: true,
-        },
-        Command::Favorite {
-            command: FavoriteCommand::Remove { moment_id },
-        } => Request::FavoriteSet {
-            moment_id,
-            favorite: false,
-        },
         Command::Download { pack, dir } => {
             run_local_download(pack, dir).await?;
             return Ok(None);
         }
-        Command::Settings {
-            ui_language: None,
-            summary_language: None,
-        } => Request::Settings,
-        Command::Settings {
-            ui_language,
-            summary_language,
-        } => Request::UpdateSettings {
-            record_audio: None,
-            ui_language,
-            summary_language,
-            storage_limit_bytes: None,
-            excluded_bundle_ids: None,
-            excluded_domains: None,
-            llm_provider: None,
-            llm_base_url: None,
-            llm_model: None,
-            llm_api_key: None,
-            model_download_endpoint: None,
-        },
         Command::Models => Request::ModelsStatus,
         Command::Jobs {
             command: JobsCommand::List,
         } => Request::JobsList,
-        Command::Jobs {
-            command: JobsCommand::Retry { job_id },
-        } => Request::JobRetry { job_id },
-        Command::Summarize { session_id } => Request::Summarize { session_id },
-        Command::Ask {
-            question,
-            from_ms,
-            to_ms,
-        } => Request::Ask {
-            question,
-            from_ms,
-            to_ms,
-        },
-        Command::Chat { .. } => {
-            anyhow::bail!("chat is handled before the one-line request path")
-        }
         Command::Gop { segment_id } => Request::GopShow { segment_id },
         Command::Pack {
             command: PackCommand::Status,

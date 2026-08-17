@@ -72,6 +72,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var draftLlmModel = ""
     @Published var draftLlmApiKey = ""
     @Published var isInstallingCli = false
+    @Published var isUpdatingCliEvidence = false
     @Published private(set) var cliStatus = AfterRayCliInstall.statusSummary
     @Published private(set) var cliInstalled = AfterRayCliInstall.isInstalled
     @Published private(set) var developerOptionsUnlocked = UserDefaults.standard.bool(
@@ -140,6 +141,30 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             )
             await probeLlm()
             await persistRecommendedOllamaModelIfNeeded()
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func setCliEvidenceAccess(_ enabled: Bool) async {
+        isUpdatingCliEvidence = true
+        defer { isUpdatingCliEvidence = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: nil,
+                llmProvider: nil,
+                llmBaseUrl: nil,
+                llmModel: nil,
+                llmApiKey: nil,
+                cliEvidenceAccess: enabled
+            )
+            message = enabled
+                ? "CLI agents can read original evidence for 30 minutes."
+                : "CLI original evidence is off."
         } catch {
             message = error.localizedDescription
         }

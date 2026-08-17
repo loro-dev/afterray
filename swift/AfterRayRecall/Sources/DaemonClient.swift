@@ -133,7 +133,8 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
         llmApiKey: String?,
         storageLimitBytes: UInt64?,
         uiLanguage: String?,
-        summaryLanguage: String?
+        summaryLanguage: String?,
+        cliEvidenceAccess: Bool?
     ) async throws -> AppSettings
     /// Points model downloads at a mirror; an empty string restores the
     /// official huggingface.co endpoint.
@@ -178,13 +179,14 @@ public extension AfterRayDaemonServing {
             llmApiKey: nil,
             storageLimitBytes: nil,
             uiLanguage: nil,
-            summaryLanguage: nil
+            summaryLanguage: nil,
+            cliEvidenceAccess: nil
         )
     }
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 12
+    public static let protocolVersion = 13
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -249,7 +251,8 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         llmApiKey: String? = nil,
         storageLimitBytes: UInt64? = nil,
         uiLanguage: String? = nil,
-        summaryLanguage: String? = nil
+        summaryLanguage: String? = nil,
+        cliEvidenceAccess: Bool? = nil
     ) async throws -> AppSettings {
         try await request(
             WireRequest(
@@ -263,7 +266,8 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 llmApiKey: llmApiKey,
                 storageLimitBytes: storageLimitBytes,
                 uiLanguage: uiLanguage,
-                summaryLanguage: summaryLanguage
+                summaryLanguage: summaryLanguage,
+                cliEvidenceAccess: cliEvidenceAccess
             ),
             as: AppSettings.self
         )
@@ -565,6 +569,7 @@ struct WireRequest: Encodable, Equatable {
     var baseUrl: String?
     var conversationID: String? = nil
     var message: String? = nil
+    var cliEvidenceAccess: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -606,6 +611,7 @@ struct WireRequest: Encodable, Equatable {
         case baseUrl = "base_url"
         case conversationID = "conversation_id"
         case message
+        case cliEvidenceAccess = "cli_evidence_access"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -651,6 +657,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(baseUrl, forKey: .baseUrl)
         try container.encodeIfPresent(conversationID, forKey: .conversationID)
         try container.encodeIfPresent(message, forKey: .message)
+        try container.encodeIfPresent(cliEvidenceAccess, forKey: .cliEvidenceAccess)
     }
 }
 

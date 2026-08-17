@@ -48,9 +48,11 @@ OpenAI-compatible API.
 ## CLI for agents
 
 AfterRay can install an `afterray` CLI from **Settings → Advanced → CLI for
-agents**. It lets tools such as Claude Code and Codex query the history you
-choose to share. This repository also includes an Agent Skill at
-[`skills/afterray`](skills/afterray/SKILL.md) for agents that support skills.
+agents**. It lets tools such as Claude Code and Codex query summaries and
+search hits. Original evidence (screenshots, OCR, accessibility trees) stays
+off until you allow it for 30 minutes in that same settings section. Start
+agents with `afterray docs`. This repository also includes an Agent Skill at
+[`skills/afterray`](skills/afterray/SKILL.md).
 
 The built-in assistant receives only allowlisted, read-only history tools. A
 local model keeps prompts and retrieved evidence on this Mac; a remote model

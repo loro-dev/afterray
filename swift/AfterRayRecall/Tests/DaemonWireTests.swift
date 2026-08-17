@@ -201,6 +201,16 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["record_audio"] as? Bool, false)
     }
 
+    func testUpdateSettingsRequestIncludesCliEvidenceAccess() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "update_settings", cliEvidenceAccess: true)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "update_settings")
+        XCTAssertEqual(json["cli_evidence_access"] as? Bool, true)
+        XCTAssertNil(json["record_audio"])
+    }
+
     func testAppSettingsDecodesRustShape() throws {
         let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":false,"capture_interval_seconds":10}"#
         let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
@@ -214,6 +224,7 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.uiLanguage, AppSettings.defaultLanguage)
         XCTAssertEqual(settings.summaryLanguage, AppSettings.defaultLanguage)
         XCTAssertTrue(settings.languageOptions.isEmpty)
+        XCTAssertNil(settings.cliEvidenceUntilMs)
     }
 
     func testAppSettingsDefaultsLanguageWhenOldDaemonOmitsFields() throws {
@@ -595,7 +606,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 12)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 13)
     }
 
     func testCaptureSetPausedRequestMatchesRustShape() throws {

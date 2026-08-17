@@ -216,7 +216,8 @@ private actor ControlDaemon: AfterRayDaemonServing {
         llmApiKey _: String?,
         storageLimitBytes: UInt64?,
         uiLanguage: String?,
-        summaryLanguage: String?
+        summaryLanguage: String?,
+        cliEvidenceAccess _: Bool?
     ) async throws -> AppSettings {
         AppSettings(
             dataDir: "/tmp/afterray-data",

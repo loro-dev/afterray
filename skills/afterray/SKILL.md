@@ -1,68 +1,48 @@
 ---
 name: afterray
 description: >
-  Query this Mac's local AfterRay computer history — screens, system audio,
-  transcripts, OCR, activity spans, and on-device answers with citations.
-  Use when the user asks what they saw, heard, decided, searched, or did
-  earlier; or mentions AfterRay, recall, computer history, replay, or the
-  afterray CLI.
+  Query this Mac's local AfterRay computer history — summaries, activity,
+  memories, and (only if the user opened a 30-minute window) original
+  screenshots, OCR, and accessibility trees. Use when the user asks what
+  they saw, heard, decided, searched, or did earlier; or mentions AfterRay,
+  recall, computer history, replay, or the afterray CLI.
 ---
 
 # AfterRay
 
-AfterRay is local-first computer history on this Mac. Query it with the `afterray` CLI. Never open the vault, the database, or the Keychain.
+AfterRay is local-first computer history on this Mac. Query it with the
+`afterray` CLI. Never open the vault, the database, or the Keychain.
 
 ## Prerequisite
 
-`afterray` must be on `PATH` (the app installs it to `~/.local/bin`). If the binary is missing, tell the user to open AfterRay and turn on **Settings → Advanced → CLI for agents**.
+`afterray` must be on `PATH` (the app installs it to `~/.local/bin`). If the
+binary is missing, tell the user to open AfterRay and turn on
+**Settings → Advanced → CLI for agents**.
 
-Prefer `--json` on every command except when `afterray ask` is the whole answer.
-
-## Read commands
-
-```sh
-afterray search '<query>' --json
-afterray search '<query>' --from-ms <ms> --to-ms <ms> --json
-afterray moment <moment-id> --json
-afterray evidence ocr <moment-id> --json
-afterray evidence ax <moment-id> --json
-afterray activity --from-ms <ms> --to-ms <ms> --json
-afterray memories --from-ms <ms> --to-ms <ms> --json
-afterray ask '<question>'
-```
-
-### Whole days
-
-Wall-clock slots the daemon has already summarised — 10 minutes for new
-history, with upgraded vaults retaining 30-minute rows before their persisted
-cutover. They are cheaper and better structured than searching a day span
-moment by moment; always trust each row's `slot_start_ms`/`slot_end_ms` rather
-than assuming a duration.
+**Read the docs first.** They are the source of truth for commands,
+permissions, and errors:
 
 ```sh
-afterray slot day --at-ms <ms> --json          # every occupied slot of that day
-afterray slot history --before-ms <ms> --limit 7 --json
+afterray docs --json
+afterray docs permissions
+afterray docs <command>
 ```
 
-`slot history` returns newest first; pass the `next_before_ms` from the previous
-response to page further back.
-
-### Follow-up turns
-
-`ask` is one-shot. To keep context across turns, use a conversation:
-
-```sh
-afterray chat send '<message>' --json
-afterray chat send '<message>' --conversation <conversation-id> --json
-afterray chat list --json
-afterray chat history <conversation-id> --json
-```
+Prefer `--json` on every command except `docs`.
 
 ## How to answer
 
-1. Search or `ask` first. Follow a hit with `moment` / `evidence` only when the user needs the original screen or transcript.
-2. For "what did I do today / that week", reach for `slot day` or `slot history` before `search`.
-3. Cite clock time and app (and a moment id if you have one).
-4. Do not run mutating or expensive commands unless the user explicitly asks: `record`, `favorite`, `history` (deletes), `chat delete`, `settings`, `download`, and the model passes `slot summarize` / `slot backfill` / `summarize`.
+1. `afterray docs` if you have not read it this session.
+2. For a day or week, `slot day` / `slot history` before `search`.
+3. `search` only locates a moment id. It does not return OCR or screenshots.
+4. Follow a hit with `moment` for metadata. Do not expect `ocr_text`.
+5. Original evidence (`evidence ocr` / `evidence ax` / `frame` / `slot card`)
+   is **off by default**. If the daemon returns `evidence_access_disabled`,
+   tell the user to open **Settings → Advanced → CLI for agents** and choose
+   **Allow for 30 minutes**. Do not invent another command to dump the same
+   bytes.
+6. Cite clock time and app (and a moment id if you have one).
+7. Recording, deleting history, changing settings, `ask`, and `chat` are not
+   on the CLI. They belong in the AfterRay app.
 
 The vault key stays in the daemon. Agents never touch the database.

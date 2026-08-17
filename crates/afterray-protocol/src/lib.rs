@@ -2,7 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
+pub mod cli_access;
 pub mod socket;
+
+pub use cli_access::{
+    APP_TOKEN_ENV, CLI_EVIDENCE_WINDOW_MS, CLI_FORBIDDEN, CliRequestClass, EVIDENCE_ACCESS_DISABLED,
+    authorize_cli_request, cli_request_class, evidence_window_open, redact_cli_response_data,
+    redact_moment_for_cli, redact_search_hit_for_cli,
+};
 
 pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// Bumped whenever the request or event vocabulary changes.
@@ -16,8 +23,10 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// `CaptureSetPaused`. 10 adds `CancelModelDownload`, which drops one pack from
 /// the download queue instead of tearing the whole queue down. 11 streams the
 /// model's reasoning so the chat UI can show thinking as it happens. 12 adds
-/// the privacy-bounded parsed summary export.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// the privacy-bounded parsed summary export. 13 adds the CLI evidence
+/// window (`cli_evidence_until_ms` / `cli_evidence_access`) and treats
+/// unprivileged socket clients as a gated query surface.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -229,6 +238,10 @@ pub enum Request {
         /// the official huggingface.co endpoint; `None` leaves it unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_download_endpoint: Option<String>,
+        /// App-only. `true` opens a 30-minute CLI evidence window from now;
+        /// `false` closes it. `None` leaves it unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cli_evidence_access: Option<bool>,
     },
     LlmProbe {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,6 +383,10 @@ pub struct Status {
     /// that the socket is still owned by the daemon it just replaced.
     #[serde(default)]
     pub host_build: Option<String>,
+    /// When CLI evidence is temporarily allowed, the wall-clock instant it
+    /// closes. Absent or in the past means closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_evidence_until_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
@@ -479,6 +496,9 @@ pub struct AppSettings {
     /// packs verify against SHA-256 hashes shipped in the daemon.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model_download_endpoint: String,
+    /// Wall-clock close of the CLI evidence window. `None` means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_evidence_until_ms: Option<i64>,
 }
 
 /// A language a summary can be written in.
@@ -1143,6 +1163,7 @@ mod tests {
                 llm_model: None,
                 llm_api_key: None,
                 model_download_endpoint: None,
+                cli_evidence_access: None,
             })
             .unwrap(),
             r#"{"type":"update_settings","record_audio":false}"#
@@ -1160,6 +1181,7 @@ mod tests {
                 llm_model: None,
                 llm_api_key: None,
                 model_download_endpoint: Some("https://hf-mirror.com".into()),
+                cli_evidence_access: None,
             })
             .unwrap(),
             r#"{"type":"update_settings","model_download_endpoint":"https://hf-mirror.com"}"#
@@ -1217,11 +1239,35 @@ mod tests {
             llm_model: None,
             llm_api_key: None,
             model_download_endpoint: None,
+            cli_evidence_access: None,
         })
         .unwrap();
         assert_eq!(
             json,
             r#"{"type":"update_settings","storage_limit_bytes":250000000000}"#
+        );
+    }
+
+    #[test]
+    fn cli_evidence_access_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::UpdateSettings {
+            record_audio: None,
+            ui_language: None,
+            summary_language: None,
+            storage_limit_bytes: None,
+            excluded_bundle_ids: None,
+            excluded_domains: None,
+            llm_provider: None,
+            llm_base_url: None,
+            llm_model: None,
+            llm_api_key: None,
+            model_download_endpoint: None,
+            cli_evidence_access: Some(true),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"update_settings","cli_evidence_access":true}"#
         );
     }
 

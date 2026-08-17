@@ -45,6 +45,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var draftLlmApiKey = ""
     @Published public var cliStatus = "Not installed. Other AI agents cannot call `afterray` yet."
     @Published public var isInstallingCli = false
+    @Published public var isUpdatingCliEvidence = false
     @Published public var cliInstalled = false
     @Published public var updatesSupported = true
     @Published public var automaticUpdates = true
@@ -521,6 +522,37 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         isProbingLlm = true
         try? await Task.sleep(for: .milliseconds(120))
         isProbingLlm = false
+    }
+
+    public func setCliEvidenceAccess(_ enabled: Bool) async {
+        isUpdatingCliEvidence = true
+        try? await Task.sleep(for: .milliseconds(80))
+        isUpdatingCliEvidence = false
+        let until = enabled ? Int64(Date().timeIntervalSince1970 * 1000) + 30 * 60 * 1000 : nil
+        if let current = settings {
+            settings = AppSettings(
+                dataDir: current.dataDir,
+                modelDir: current.modelDir,
+                recordAudio: current.recordAudio,
+                captureIntervalSeconds: current.captureIntervalSeconds,
+                storageLimitBytes: current.storageLimitBytes,
+                excludedBundleIds: current.excludedBundleIds,
+                protectedBundleIds: current.protectedBundleIds,
+                excludedDomains: current.excludedDomains,
+                llmProvider: current.llmProvider,
+                llmBaseUrl: current.llmBaseUrl,
+                llmModel: current.llmModel,
+                llmApiKeySet: current.llmApiKeySet,
+                uiLanguage: current.uiLanguage,
+                summaryLanguage: current.summaryLanguage,
+                languageOptions: current.languageOptions,
+                modelDownloadEndpoint: current.modelDownloadEndpoint,
+                cliEvidenceUntilMs: until
+            )
+        }
+        message = enabled
+            ? "Preview opened a 30-minute CLI evidence window."
+            : "Preview turned CLI evidence off."
     }
 
     public func installCli() async {

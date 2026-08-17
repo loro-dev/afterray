@@ -42,7 +42,8 @@ AfterRay 是一款本地优先的 macOS 电脑历史记录应用。它会录制�
 ## 供 Agent 使用的 CLI
 
 AfterRay 可在**设置 → 高级 → CLI for agents**中安装 `afterray` CLI。Claude Code、
-Codex 等工具可以借此查询你选择分享的历史。本仓库也在
+Codex 等工具可以借此查询摘要和搜索结果。截图、OCR 等原始证据默认关闭，需要你在
+同一设置页里允许 30 分钟。Agent 应从 `afterray docs` 读用法。本仓库也在
 [`skills/afterray`](skills/afterray/SKILL.md) 附带了一个供支持 Skills 的 Agent 使用的
 Skill。
 

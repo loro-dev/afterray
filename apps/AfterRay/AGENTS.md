@@ -12,7 +12,7 @@ The shipped macOS app (`AfterRayApp` executable target in the root `Package.swif
 
 ## Invariants
 
-- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 12, which must match `afterray-protocol`.
+- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 13, which must match `afterray-protocol`.
 - Sensitive-state teardown on screen lock/sleep: `.afterRaySystemSessionWillSuspend` → `store`/`control`/`chat.clearSensitiveState()` + `images.clearSensitiveData()` (`AfterRayApp.swift:1097-1104`). Hook any new decrypted-content cache into this.
 - The overlay and the history window must share `AfterRayServices.shared` stores — never construct a private `RecallStore`.
 - `RecallView` exclusively owns the opaque history backdrop because it sees transient scrub state. `AfterRayRootView` must stay transparent; an outer backdrop lags a fast flick to NOW and produces a black screen after the still unmounts.

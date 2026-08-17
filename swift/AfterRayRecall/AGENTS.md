@@ -20,7 +20,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 ## Invariants
 
 - The UI never opens the database or reads encryption keys (`docs/development.md:112-113`) — everything arrives via `UnixSocketDaemonClient`.
-- `protocolVersion` must stay in lockstep with `PROTOCOL_VERSION: u32 = 12`; bump both on any wire change or every request fails with `protocolMismatch`.
+- `protocolVersion` must stay in lockstep with `PROTOCOL_VERSION: u32 = 13`; bump both on any wire change or every request fails with `protocolMismatch`.
 - Concurrency: stores are `@MainActor` `ObservableObject`s; socket client and image repository are actors; daemon I/O runs in `Task.detached(priority: .userInitiated)` (`DaemonClient.swift:394,416`). Never block the main thread — the HangWatchdog kills the app.
 - Unary socket reads have a 30s receive deadline (`DaemonClient.swift:587`, postmortem in the comment above); streaming reads deliberately stay deadline-free. Do not remove.
 - Every async load guards completion with a generation counter (`sensitiveGeneration`, `RecallStore.swift:16`); new load paths must follow the same capture-and-compare pattern.

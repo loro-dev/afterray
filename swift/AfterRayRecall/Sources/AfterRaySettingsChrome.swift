@@ -37,6 +37,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var cliStatus: String { get }
     var isInstallingCli: Bool { get }
     var cliInstalled: Bool { get }
+    var isUpdatingCliEvidence: Bool { get }
     /// False in a development build, where the updater is not running and the
     /// section has nothing to control.
     var updatesSupported: Bool { get }
@@ -72,6 +73,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func saveLlmConnection() async
     func probeLlm() async
     func installCli() async
+    func setCliEvidenceAccess(_ enabled: Bool) async
     func setAutomaticUpdates(_ enabled: Bool)
     func checkForUpdates()
     func unlockDeveloperOptions()
@@ -1610,7 +1612,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
         SettingsSection(
             title: "CLI for agents",
-            footnote: "Installs `afterray` to ~/.local/bin so coding agents can search your history. V0 installs the full developer CLI, which can also change settings and delete history."
+            footnote: "Installs `afterray` to ~/.local/bin. Agents can search and read summaries. Screenshots, OCR, and other original evidence stay off unless you allow them for 30 minutes."
         ) {
             SettingsRow(
                 title: model.cliInstalled ? "afterray is installed" : "afterray CLI",
@@ -1623,6 +1625,20 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 )
             }
             SettingsSeparator()
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let active = model.settings?.cliEvidenceIsActive(at: context.date) ?? false
+                SettingsRow(
+                    title: "Original evidence",
+                    subtitle: cliEvidenceSubtitle(now: context.date),
+                    subtitleLineLimit: 3
+                ) {
+                    SettingsPill(
+                        active ? "On" : "Off",
+                        tone: active ? .warning : .neutral
+                    )
+                }
+            }
+            SettingsSeparator()
             SettingsFooterBar {
                 Button(model.cliInstalled ? "Reinstall CLI" : "Install CLI") {
                     Task { await model.installCli() }
@@ -1632,6 +1648,18 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 if model.isInstallingCli {
                     ProgressView()
                         .controlSize(.small)
+                }
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let active = model.settings?.cliEvidenceIsActive(at: context.date) ?? false
+                    Button(active ? "Turn off" : "Allow for 30 minutes") {
+                        Task { await model.setCliEvidenceAccess(!active) }
+                    }
+                    .buttonStyle(SettingsButtonStyle(kind: active ? .standard : .prominent))
+                    .disabled(model.isUpdatingCliEvidence)
+                    if model.isUpdatingCliEvidence {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
                 }
             }
         }
@@ -1661,6 +1689,20 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private var captureCadenceTitle: String {
         let seconds = model.settings?.captureIntervalSeconds ?? 10
         return "One still every \(seconds) second\(seconds == 1 ? "" : "s")"
+    }
+
+    private func cliEvidenceSubtitle(now: Date) -> String {
+        guard let until = model.settings?.cliEvidenceUntilMs,
+              model.settings?.cliEvidenceIsActive(at: now) == true
+        else {
+            return "Screenshots, OCR, accessibility trees, and T1 cards stay off for CLI agents."
+        }
+        let remaining = max(0, until - Int64(now.timeIntervalSince1970 * 1000))
+        let minutes = (remaining + 59_999) / 60_000
+        if minutes <= 1 {
+            return "CLI agents can read original evidence for less than a minute."
+        }
+        return "CLI agents can read original evidence for about \(minutes) minutes."
     }
 
     // MARK: Developer
