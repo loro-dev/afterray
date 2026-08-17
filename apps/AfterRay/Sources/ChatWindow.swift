@@ -39,7 +39,10 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         window.contentMinSize = minSize
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true
-        window.backgroundColor = NSColor(red: 0.045, green: 0.04, blue: 0.05, alpha: 1)
+        window.titlebarSeparatorStyle = .none
+        window.styleMask.insert(.fullSizeContentView)
+        window.isOpaque = false
+        window.backgroundColor = .clear
         let hosting = NSHostingView(rootView: ChatWindowRoot())
         // Default options also report intrinsic/max size, which pins the
         // window to SwiftUI's ideal size so edge-drag snaps back. Min only:
@@ -89,24 +92,28 @@ private struct ChatWindowRoot: View {
     private let images = AfterRayServices.shared.images
 
     var body: some View {
-        AfterRayChatView(
-            model: chat,
-            onClose: { ChatWindowController.shared.close() },
-            onOpenMoment: { momentID in
-                RecallOverlayController.shared.show(navigatingToMoment: momentID)
-            },
-            thumbnailLoader: { momentID in
-                try await images.thumbnail(momentID: momentID).bytes
-            },
-            previewLoader: { momentID in
-                let moment = try await images.moment(id: momentID)
-                return try await images.chatPreviewBytes(for: moment)
-            },
-            momentLoader: { momentID in
-                try await images.moment(id: momentID)
-            },
-            fillsAvailableSpace: true
-        )
+        ZStack {
+            RecallBehindWindowFill()
+                .ignoresSafeArea()
+            AfterRayChatView(
+                model: chat,
+                onClose: { ChatWindowController.shared.close() },
+                onOpenMoment: { momentID in
+                    RecallOverlayController.shared.show(navigatingToMoment: momentID)
+                },
+                thumbnailLoader: { momentID in
+                    try await images.thumbnail(momentID: momentID).bytes
+                },
+                previewLoader: { momentID in
+                    let moment = try await images.moment(id: momentID)
+                    return try await images.chatPreviewBytes(for: moment)
+                },
+                momentLoader: { momentID in
+                    try await images.moment(id: momentID)
+                },
+                fillsAvailableSpace: true
+            )
+        }
         .preferredColorScheme(.dark)
     }
 }

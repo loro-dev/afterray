@@ -139,6 +139,23 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             statusMessage = Self.disconnectedNote(from: error)
             errorMessage = error.localizedDescription
         }
+        await refreshChatModels()
+    }
+
+    private func refreshChatModels() async {
+        guard let host = daemon as? any AfterRayDaemonServing else { return }
+        let library = try? await host.modelLibrary()
+        let settings = try? await host.settings()
+        let ollama = (try? await host.probeLlm(provider: .ollama, baseUrl: nil))?.models ?? []
+        let catalog = ChatModelChoice.catalog(
+            packs: library?.packs ?? [],
+            ollamaModels: ollama,
+            settings: settings
+        )
+        if !catalog.models.isEmpty {
+            chatModels = catalog.models
+            selectedChatModelID = catalog.selectedID
+        }
     }
 
     public func select(_ id: String) async {
@@ -155,6 +172,41 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     public func selectChatModel(_ id: String) {
         guard chatModels.contains(where: { $0.id == id }) else { return }
         selectedChatModelID = id
+        Task { await persistChatModel(id) }
+    }
+
+    private func persistChatModel(_ id: String) async {
+        guard let host = daemon as? any AfterRayDaemonServing else { return }
+        let provider: LlmProvider
+        let modelName: String
+        if id.hasPrefix(ChatModelChoice.ollamaPrefix) {
+            provider = .ollama
+            modelName = String(id.dropFirst(ChatModelChoice.ollamaPrefix.count))
+        } else if id.hasPrefix(ChatModelChoice.builtinPrefix) {
+            provider = .mlxLocal
+            modelName = String(id.dropFirst(ChatModelChoice.builtinPrefix.count))
+        } else if id.hasPrefix(ChatModelChoice.remotePrefix) {
+            provider = .openaiCompatible
+            modelName = String(id.dropFirst(ChatModelChoice.remotePrefix.count))
+        } else {
+            return
+        }
+        do {
+            _ = try await host.updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: nil,
+                llmProvider: provider,
+                llmBaseUrl: nil,
+                llmModel: modelName,
+                llmApiKey: nil,
+                storageLimitBytes: nil,
+                uiLanguage: nil,
+                summaryLanguage: nil
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     public func startNew() {

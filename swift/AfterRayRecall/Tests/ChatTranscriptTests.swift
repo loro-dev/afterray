@@ -210,6 +210,42 @@ final class ChatTranscriptTests: XCTestCase {
         XCTAssertEqual(groups[2].conversations.map(\.id), ["old"])
     }
 
+    func testChatModelCatalogListsEveryLlmPackAndOllamaRow() {
+        let packs = [
+            ModelPack(
+                id: "llm_qwen35_4b_mlx4",
+                name: "Qwen 3.5 4B",
+                capability: "llm_vlm",
+                path: "/tmp/q",
+                present: true,
+                bytes: 1,
+                required: true
+            ),
+            ModelPack(
+                id: "embed",
+                name: "Embed",
+                capability: "embed",
+                path: "/tmp/e",
+                present: true,
+                bytes: 1,
+                required: false
+            ),
+        ]
+        let ollama = (0..<30).map { LlmRemoteModel(id: "m\($0)", name: "model-\($0)") }
+        let settings = AppSettings(
+            dataDir: "/tmp",
+            modelDir: "/tmp",
+            recordAudio: false,
+            captureIntervalSeconds: 10,
+            llmProvider: .ollama,
+            llmModel: "m7"
+        )
+        let catalog = ChatModelChoice.catalog(packs: packs, ollamaModels: ollama, settings: settings)
+        XCTAssertEqual(catalog.models.filter { $0.group == "Built-in" }.count, 1)
+        XCTAssertEqual(catalog.models.filter { $0.group == "Ollama" }.count, 30)
+        XCTAssertEqual(catalog.selectedID, "ollama:m7")
+    }
+
     func testConversationSearchFiltersByTitleAndKeepsDayGroups() {
         let conversations = [
             ChatConversation(id: "a", title: "Flock release bugs", createdAtMs: 2_000, updatedAtMs: 2_000, messageCount: 1),

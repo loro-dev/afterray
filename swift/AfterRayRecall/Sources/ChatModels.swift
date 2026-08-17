@@ -53,11 +53,57 @@ public struct ChatModelChoice: Identifiable, Equatable, Sendable {
         self.group = group
     }
 
+    public static let builtinPrefix = "builtin:"
+    public static let ollamaPrefix = "ollama:"
+    public static let remotePrefix = "remote:"
+
     public static let previewCatalog: [ChatModelChoice] = [
         ChatModelChoice(id: "builtin:qwen35-4b", title: "Qwen 3.5 4B", group: "Built-in"),
         ChatModelChoice(id: "ollama:llama3.2", title: "llama3.2", group: "Ollama"),
         ChatModelChoice(id: "ollama:qwen2.5", title: "qwen2.5", group: "Ollama"),
     ]
+
+    /// One linear pass over packs + Ollama rows. Selection is the saved
+    /// provider/model when it is still in the list.
+    public static func catalog(
+        packs: [ModelPack],
+        ollamaModels: [LlmRemoteModel],
+        settings: AppSettings?
+    ) -> (models: [ChatModelChoice], selectedID: String?) {
+        var models: [ChatModelChoice] = []
+        models.reserveCapacity(packs.count + ollamaModels.count + 1)
+        for pack in packs where pack.capability.contains("llm") {
+            let title = pack.present ? pack.name : "\(pack.name) (not downloaded)"
+            models.append(ChatModelChoice(id: builtinPrefix + pack.id, title: title, group: "Built-in"))
+        }
+        for remote in ollamaModels {
+            models.append(
+                ChatModelChoice(id: ollamaPrefix + remote.id, title: remote.name, group: "Ollama")
+            )
+        }
+        if let settings, settings.llmProvider == .openaiCompatible {
+            let name = settings.llmModel.isEmpty ? "Remote endpoint" : settings.llmModel
+            models.append(ChatModelChoice(id: remotePrefix + settings.llmModel, title: name, group: "Remote"))
+        }
+        return (models, selectedID(in: models, settings: settings))
+    }
+
+    public static func selectedID(in models: [ChatModelChoice], settings: AppSettings?) -> String? {
+        guard let settings else { return models.first?.id }
+        switch settings.llmProvider {
+        case .mlxLocal:
+            return models.first(where: { $0.id == builtinPrefix + settings.llmModel })?.id
+                ?? models.first(where: { $0.group == "Built-in" })?.id
+                ?? models.first?.id
+        case .ollama:
+            return models.first(where: { $0.id == ollamaPrefix + settings.llmModel })?.id
+                ?? models.first(where: { $0.group == "Ollama" })?.id
+                ?? models.first?.id
+        case .openaiCompatible:
+            return models.first(where: { $0.id.hasPrefix(remotePrefix) })?.id
+                ?? models.first?.id
+        }
+    }
 }
 
 /// Conversations bucketed by local calendar day, newest day first.

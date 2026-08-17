@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 public extension View {
@@ -102,6 +103,24 @@ public extension View {
     func recallHoverFill<S: Shape>(in shape: S) -> some View {
         modifier(RecallHoverFill(shape: AnyShape(shape)))
     }
+}
+
+/// Desktop-visible frost for standalone windows. `behindWindow` is what lets
+/// the wallpaper show through; SwiftUI materials alone stay opaque if the
+/// `NSWindow` itself is opaque.
+public struct RecallBehindWindowFill: NSViewRepresentable {
+    public init() {}
+
+    public func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .underWindowBackground
+        view.blendingMode = .behindWindow
+        view.state = .active
+        view.isEmphasized = true
+        return view
+    }
+
+    public func updateNSView(_: NSVisualEffectView, context: Context) {}
 }
 
 public struct RecallGlassPressStyle: ButtonStyle {

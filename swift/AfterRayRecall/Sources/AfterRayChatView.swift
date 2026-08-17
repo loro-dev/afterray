@@ -40,6 +40,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     @State private var scrollToLatestRequest: UInt64 = 0
     @State private var sidebarCollapsed = false
     @State private var conversationQuery = ""
+    @State private var modelPickerOpen = false
 
     public init(
         model: Model,
@@ -72,7 +73,13 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             minHeight: fillsAvailableSpace ? 480 : ChatMetrics.panelHeight,
             maxHeight: fillsAvailableSpace ? .infinity : ChatMetrics.panelHeight
         )
-        .background(ChatPalette.panel)
+        .background {
+            if fillsAvailableSpace {
+                Color.white.opacity(0.04)
+            } else {
+                ChatPalette.panel
+            }
+        }
         .preferredColorScheme(.dark)
         .modifier(ChatSurfaceChrome(isPanel: !fillsAvailableSpace))
         .environment(\.openURL, OpenURLAction { url in
@@ -148,12 +155,12 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
-        .padding(.top, 10)
+        .padding(.top, fillsAvailableSpace ? 28 : 10)
         .padding(.bottom, 12)
         .frame(width: ChatMetrics.sidebarWidth, alignment: .leading)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(.ultraThinMaterial)
-        .background(ChatPalette.sidebar.opacity(0.55))
+        .background(Color.black.opacity(0.12))
         .overlay(alignment: .trailing) {
             Rectangle().fill(ChatPalette.separator).frame(width: 1)
         }
@@ -225,7 +232,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
         }
         .padding(.horizontal, 14)
-        .padding(.top, 10)
+        .padding(.top, fillsAvailableSpace ? 28 : 10)
         .padding(.bottom, 4)
     }
 
@@ -456,31 +463,82 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private var modelMenu: some View {
-        Menu {
-            ForEach(modelMenuSections, id: \.group) { section in
-                Section(section.group) {
-                    ForEach(section.models) { choice in
-                        Button(choice.title) {
-                            model.selectChatModel(choice.id)
-                        }
-                    }
-                }
-            }
+        Button {
+            modelPickerOpen.toggle()
         } label: {
             HStack(spacing: 4) {
                 Text(model.selectedChatModelTitle)
                     .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 8, weight: .semibold))
             }
             .foregroundStyle(ChatPalette.secondary)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 3)
-            .contentShape(Rectangle())
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .recallHoverFill(in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
+        .buttonStyle(ChatPressStyle())
+        .popover(isPresented: $modelPickerOpen, arrowEdge: .top) {
+            ChatModelPickerList(
+                sections: modelMenuSections,
+                selectedID: model.selectedChatModelID,
+                onPick: { id in
+                    model.selectChatModel(id)
+                    modelPickerOpen = false
+                }
+            )
+        }
         .help("Choose a model")
+    }
+}
+
+private struct ChatModelPickerList: View {
+    let sections: [(group: String, models: [ChatModelChoice])]
+    let selectedID: String?
+    let onPick: (String) -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(sections, id: \.group) { section in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(section.group)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(ChatPalette.tertiary)
+                            .padding(.horizontal, 8)
+                            .padding(.top, 4)
+                        ForEach(section.models) { choice in
+                            Button {
+                                onPick(choice.id)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Text(choice.title)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(ChatPalette.label)
+                                        .lineLimit(1)
+                                    Spacer(minLength: 8)
+                                    if choice.id == selectedID {
+                                        Image(systemName: "checkmark")
+                                            .font(.system(size: 10, weight: .semibold))
+                                            .foregroundStyle(ChatPalette.accent)
+                                    }
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .padding(6)
+        }
+        .frame(minWidth: 240, idealWidth: 260, maxWidth: 320)
+        .frame(maxHeight: 280)
+        .background(.ultraThinMaterial)
     }
 }
 
