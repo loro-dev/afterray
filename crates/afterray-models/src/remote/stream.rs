@@ -6,7 +6,7 @@
 //! generation.
 
 use super::{LlmRuntimeConfig, chat_completions_url, normalize_origin, remote_http_error};
-use crate::{AdapterError, Cancellation, ChatMessage, LlmDelta};
+use crate::{AdapterError, Cancellation, ChatMessage, LlmDelta, LlmUsage};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -32,7 +32,7 @@ pub(super) async fn generate_streaming(
     system: Option<&str>,
     token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
-) -> Result<String, AdapterError> {
+) -> Result<(String, Option<LlmUsage>), AdapterError> {
     let body = chat_messages(prompt, messages, system);
     match config.provider {
         afterray_protocol::LlmProvider::Ollama => {
@@ -53,7 +53,7 @@ async fn generate_ollama_stream(
     messages: Vec<Value>,
     token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
-) -> Result<String, AdapterError> {
+) -> Result<(String, Option<LlmUsage>), AdapterError> {
     let model = require_model(config)?;
     let origin = require_origin(config)?;
     let url = ollama_chat_url(&origin);
@@ -76,7 +76,7 @@ async fn generate_ollama_stream(
         let text = response_text(response).await?;
         return Err(remote_http_error(status.as_u16(), &text, model));
     }
-    fold_lines(response, cancellation, &token_tx, ollama_chat_delta).await
+    fold_lines(response, cancellation, &token_tx, ollama_chat_line).await
 }
 
 async fn generate_openai_stream(
@@ -85,27 +85,35 @@ async fn generate_openai_stream(
     messages: Vec<Value>,
     token_tx: mpsc::Sender<LlmDelta>,
     cancellation: Cancellation,
-) -> Result<String, AdapterError> {
+) -> Result<(String, Option<LlmUsage>), AdapterError> {
     let model = require_model(config)?;
     let origin = require_origin(config)?;
     let url = chat_completions_url(&origin);
-    let body = json!({
-        "model": model,
-        "messages": messages,
-        "stream": true,
-    });
     let api_key = config
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let response = send_chat(client, &url, api_key, &body, &cancellation).await?;
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+    let mut response = send_chat(client, &url, api_key, &body, &cancellation).await?;
+    if response.status().as_u16() == 400 {
+        // Older OpenAI-compatible servers reject `stream_options`.
+        if let Some(object) = body.as_object_mut() {
+            object.remove("stream_options");
+        }
+        response = send_chat(client, &url, api_key, &body, &cancellation).await?;
+    }
     let status = response.status();
     if !status.is_success() {
         let text = response_text(response).await?;
         return Err(remote_http_error(status.as_u16(), &text, model));
     }
-    fold_lines(response, cancellation, &token_tx, openai_sse_delta).await
+    fold_lines(response, cancellation, &token_tx, openai_sse_line).await
 }
 
 fn require_model(config: &LlmRuntimeConfig) -> Result<&str, AdapterError> {
@@ -181,11 +189,13 @@ async fn fold_lines(
     response: reqwest::Response,
     cancellation: Cancellation,
     token_tx: &mpsc::Sender<LlmDelta>,
-    parse_line: fn(&str) -> Option<LlmDelta>,
-) -> Result<String, AdapterError> {
+    parse_line: fn(&str) -> ParsedLine,
+) -> Result<(String, Option<LlmUsage>), AdapterError> {
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
     let mut assembled = String::new();
+    let mut usage = None;
+    let mut decode_started = None;
     loop {
         let chunk = tokio::select! {
             () = cancellation.cancelled() => return Err(AdapterError::Cancelled),
@@ -197,12 +207,27 @@ async fn fold_lines(
         let chunk = chunk
             .map_err(|error| AdapterError::Process(format!("LLM stream ended early: {error}")))?;
         pending.extend_from_slice(&chunk);
-        drain_complete_lines(&mut pending, &mut assembled, token_tx, parse_line).await;
+        drain_complete_lines(
+            &mut pending,
+            &mut assembled,
+            &mut usage,
+            &mut decode_started,
+            token_tx,
+            parse_line,
+        )
+        .await;
     }
     if !pending.is_empty() {
         let line = String::from_utf8_lossy(&pending);
         if !line.trim().is_empty() {
-            push_delta(&mut assembled, token_tx, parse_line(line.as_ref())).await;
+            apply_line(
+                &mut assembled,
+                &mut usage,
+                &mut decode_started,
+                token_tx,
+                parse_line(line.as_ref()),
+            )
+            .await;
         }
     }
     if assembled.trim().is_empty() {
@@ -210,14 +235,22 @@ async fn fold_lines(
             "streamed chat response had no assistant text".into(),
         ));
     }
-    Ok(assembled)
+    if let Some(usage) = usage.as_mut()
+        && usage.generation_ms == 0
+        && let Some(started) = decode_started
+    {
+        usage.generation_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+    }
+    Ok((assembled, usage))
 }
 
 async fn drain_complete_lines(
     pending: &mut Vec<u8>,
     assembled: &mut String,
+    usage: &mut Option<LlmUsage>,
+    decode_started: &mut Option<std::time::Instant>,
     token_tx: &mpsc::Sender<LlmDelta>,
-    parse_line: fn(&str) -> Option<LlmDelta>,
+    parse_line: fn(&str) -> ParsedLine,
 ) {
     while let Some(idx) = pending.iter().position(|&byte| byte == b'\n') {
         let mut line = pending.drain(..=idx).collect::<Vec<_>>();
@@ -226,8 +259,31 @@ async fn drain_complete_lines(
             line.pop();
         }
         let line = String::from_utf8_lossy(&line);
-        push_delta(assembled, token_tx, parse_line(line.as_ref())).await;
+        apply_line(
+            assembled,
+            usage,
+            decode_started,
+            token_tx,
+            parse_line(line.as_ref()),
+        )
+        .await;
     }
+}
+
+async fn apply_line(
+    assembled: &mut String,
+    usage: &mut Option<LlmUsage>,
+    decode_started: &mut Option<std::time::Instant>,
+    token_tx: &mpsc::Sender<LlmDelta>,
+    line: ParsedLine,
+) {
+    if line.usage.is_some() {
+        *usage = line.usage;
+    }
+    if line.delta.as_ref().is_some_and(|delta| !delta.text.is_empty()) {
+        decode_started.get_or_insert_with(std::time::Instant::now);
+    }
+    push_delta(assembled, token_tx, line.delta).await;
 }
 
 /// Forwards one delta, and assembles only the ones that are the answer.
@@ -250,6 +306,11 @@ async fn push_delta(
     let _ = token_tx.send(delta).await;
 }
 
+struct ParsedLine {
+    delta: Option<LlmDelta>,
+    usage: Option<LlmUsage>,
+}
+
 /// One Ollama `/api/chat` JSON line, as answer text or as reasoning.
 ///
 /// Ollama puts reasoning in `message.thinking` and leaves `message.content`
@@ -257,15 +318,51 @@ async fn push_delta(
 /// at all until the model is done deliberating.
 #[must_use]
 pub fn ollama_chat_delta(line: &str) -> Option<LlmDelta> {
+    ollama_chat_line(line).delta
+}
+
+fn ollama_chat_line(line: &str) -> ParsedLine {
     let line = line.trim();
     if line.is_empty() {
+        return ParsedLine {
+            delta: None,
+            usage: None,
+        };
+    }
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return ParsedLine {
+            delta: None,
+            usage: None,
+        };
+    };
+    let usage = ollama_usage(&value);
+    let delta = if let Some(text) = json_text(value.pointer("/message/content")) {
+        Some(LlmDelta::content(text))
+    } else {
+        json_text(value.pointer("/message/thinking")).map(LlmDelta::reasoning)
+    };
+    ParsedLine { delta, usage }
+}
+
+fn ollama_usage(value: &Value) -> Option<LlmUsage> {
+    if value.get("done") != Some(&Value::Bool(true)) {
         return None;
     }
-    let value: Value = serde_json::from_str(line).ok()?;
-    if let Some(text) = json_text(value.pointer("/message/content")) {
-        return Some(LlmDelta::content(text));
+    let prompt_tokens = json_usize(value.get("prompt_eval_count"))?;
+    let completion_tokens = json_usize(value.get("eval_count"))?;
+    if prompt_tokens == 0 && completion_tokens == 0 {
+        return None;
     }
-    json_text(value.pointer("/message/thinking")).map(LlmDelta::reasoning)
+    let generation_ms = value
+        .get("eval_duration")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        / 1_000_000;
+    Some(LlmUsage {
+        prompt_tokens,
+        completion_tokens,
+        generation_ms,
+    })
 }
 
 /// One OpenAI-compatible SSE `data:` line, as answer text or as reasoning.
@@ -276,18 +373,54 @@ pub fn ollama_chat_delta(line: &str) -> Option<LlmDelta> {
 /// neither simply never yields a reasoning delta.
 #[must_use]
 pub fn openai_sse_delta(line: &str) -> Option<LlmDelta> {
+    openai_sse_line(line).delta
+}
+
+fn openai_sse_line(line: &str) -> ParsedLine {
     let line = line.trim();
-    let payload = line.strip_prefix("data:")?.trim();
+    let Some(payload) = line.strip_prefix("data:") else {
+        return ParsedLine {
+            delta: None,
+            usage: None,
+        };
+    };
+    let payload = payload.trim();
     if payload.is_empty() || payload == "[DONE]" {
-        return None;
+        return ParsedLine {
+            delta: None,
+            usage: None,
+        };
     }
-    let value: Value = serde_json::from_str(payload).ok()?;
-    if let Some(text) = json_text(value.pointer("/choices/0/delta/content")) {
-        return Some(LlmDelta::content(text));
-    }
-    json_text(value.pointer("/choices/0/delta/reasoning_content"))
-        .or_else(|| json_text(value.pointer("/choices/0/delta/reasoning")))
-        .map(LlmDelta::reasoning)
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return ParsedLine {
+            delta: None,
+            usage: None,
+        };
+    };
+    let usage = openai_usage(value.get("usage"));
+    let delta = if let Some(text) = json_text(value.pointer("/choices/0/delta/content")) {
+        Some(LlmDelta::content(text))
+    } else {
+        json_text(value.pointer("/choices/0/delta/reasoning_content"))
+            .or_else(|| json_text(value.pointer("/choices/0/delta/reasoning")))
+            .map(LlmDelta::reasoning)
+    };
+    ParsedLine { delta, usage }
+}
+
+fn openai_usage(value: Option<&Value>) -> Option<LlmUsage> {
+    let value = value?;
+    let prompt_tokens = json_usize(value.get("prompt_tokens"))?;
+    let completion_tokens = json_usize(value.get("completion_tokens"))?;
+    Some(LlmUsage {
+        prompt_tokens,
+        completion_tokens,
+        generation_ms: 0,
+    })
+}
+
+fn json_usize(value: Option<&Value>) -> Option<usize> {
+    usize::try_from(value?.as_u64()?).ok()
 }
 
 fn json_text(value: Option<&Value>) -> Option<String> {
@@ -346,6 +479,14 @@ mod tests {
                 .is_none()
         );
         assert!(ollama_chat_delta("not-json").is_none());
+        let usage = ollama_chat_line(
+            r#"{"message":{"content":""},"done":true,"prompt_eval_count":26,"eval_count":298,"eval_duration":4799921000}"#,
+        )
+        .usage
+        .expect("done chunk should carry tokenizer counts");
+        assert_eq!(usage.prompt_tokens, 26);
+        assert_eq!(usage.completion_tokens, 298);
+        assert_eq!(usage.generation_ms, 4799);
     }
 
     /// What a thinking model actually sends. Measured on `qwen3.6:35b-mlx`:
@@ -678,7 +819,7 @@ mod tests {
             .timeout(Duration::from_secs(90))
             .build()
             .unwrap();
-        let text = generate_streaming(
+        let (text, _usage) = generate_streaming(
             &client,
             &config,
             "Reply with exactly the two characters: OK",
@@ -721,7 +862,8 @@ mod tests {
             .build()
             .unwrap();
         let (tx, mut rx) = mpsc::channel(16);
-        let text = generate_streaming(&client, &config, "hi", &[], None, tx, cancellation).await?;
+        let (text, _usage) =
+            generate_streaming(&client, &config, "hi", &[], None, tx, cancellation).await?;
         let mut tokens = Vec::new();
         while let Ok(token) = rx.try_recv() {
             tokens.push(token);

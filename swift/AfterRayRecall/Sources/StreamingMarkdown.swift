@@ -5,8 +5,8 @@ import Foundation
 /// Closed prose, lists, tables, and quotes are coalesced into one
 /// `.markdown` value so MarkdownUI owns structure. The splitter only
 /// isolates the things a full re-parse would get wrong mid-stream:
-/// unclosed fences, standalone moment citations, and unfinished image
-/// syntax. Block identity is prefix-stable: completed leading slices
+/// unclosed fences, `afterray://moment` image citations, and unfinished
+/// image syntax. Block identity is prefix-stable: completed leading slices
 /// do not change as later tokens arrive.
 public enum MarkdownBlock: Equatable, Sendable {
     case markdown(String)
@@ -57,9 +57,20 @@ public enum StreamingMarkdown {
                 continue
             }
 
-            if let image = momentImageMatch(line) {
-                flushMarkdown(closeDangling: false)
-                blocks.append(.momentImage(label: image.label, momentID: image.momentID))
+            if firstMomentImage(in: line) != nil {
+                var rest = line
+                while let image = firstMomentImage(in: rest) {
+                    let prefix = String(rest[..<image.range.lowerBound])
+                    if !isIgnorableCitationPrefix(prefix) {
+                        markdownLines.append(prefix)
+                    }
+                    flushMarkdown(closeDangling: false)
+                    blocks.append(.momentImage(label: image.label, momentID: image.momentID))
+                    rest = String(rest[image.range.upperBound...])
+                }
+                if !isIgnorableCitationPrefix(rest) {
+                    markdownLines.append(rest)
+                }
                 index += 1
                 continue
             }
@@ -136,7 +147,9 @@ public enum StreamingMarkdown {
     }
 
     /// Turns leftover `![alt](url)` into literal text so MarkdownUI cannot
-    /// treat an http/file/data (or embedded moment) image as media.
+    /// treat an http/file/data image as media. Trusted `afterray://moment`
+    /// citations are left alone — the splitter should already have lifted
+    /// them, and this keeps a stray one renderable.
     public static func escapeUntrustedImages(_ text: String) -> String {
         guard let regex = try? NSRegularExpression(pattern: #"!\[([^\]\n]{0,160})\]\(([^)\n]*)\)"#) else {
             return text
@@ -147,6 +160,12 @@ public enum StreamingMarkdown {
         var result = text
         for match in matches.reversed() {
             guard let full = Range(match.range, in: result) else { continue }
+            if match.numberOfRanges >= 3,
+               let destRange = Range(match.range(at: 2), in: result),
+               isTrustedMomentDestination(String(result[destRange]))
+            {
+                continue
+            }
             let original = String(result[full])
             guard original.hasPrefix("!") else { continue }
             result.replaceSubrange(full, with: "\\!\\" + original.dropFirst())
@@ -154,29 +173,48 @@ public enum StreamingMarkdown {
         return result
     }
 
-    /// Agent-authored images are deliberately narrower than general Markdown.
-    /// Only a standalone, protocol-backed moment reference becomes media; an
-    /// http/file/data image stays ordinary selectable text and never triggers
-    /// a resource read.
-    private static func momentImageMatch(_ line: String) -> (label: String, momentID: String)? {
+    /// Any complete `![label](afterray://moment/ID)` becomes a citation card.
+    /// Leading list/quote markers and surrounding prose stay as Markdown.
+    private static func firstMomentImage(
+        in line: String
+    ) -> (range: Range<String.Index>, label: String, momentID: String)? {
         guard let regex = try? NSRegularExpression(
-            pattern: #"^!\[([^\]\n]{0,160})\]\(afterray://moment/([A-Za-z0-9-]+)\)\s*$"#
+            pattern: #"!\[([^\]\n]{0,160})\]\(afterray://moment/([A-Za-z0-9-]+)\)"#
         ) else { return nil }
         let range = NSRange(line.startIndex..<line.endIndex, in: line)
-        guard let match = regex.firstMatch(in: line, range: range), match.range == range,
+        guard let match = regex.firstMatch(in: line, range: range),
+              let full = Range(match.range, in: line),
               let labelRange = Range(match.range(at: 1), in: line),
               let momentRange = Range(match.range(at: 2), in: line)
         else { return nil }
-        return (String(line[labelRange]), String(line[momentRange]))
+        return (full, String(line[labelRange]), String(line[momentRange]))
     }
 
-    /// A standalone moment citation that has started but is still missing `)`.
+    /// A citation that has started but is still missing `)`.
     /// Flushed separately so the preceding closed Markdown keeps its identity.
     private static func isIncompleteMomentImage(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("![") else { return false }
         guard trimmed.contains("](afterray://moment/") else { return false }
-        return momentImageMatch(line) == nil
+        return firstMomentImage(in: line) == nil
+    }
+
+    /// Whitespace, a list marker, or a blockquote sigil before a citation.
+    /// Those wrappers are not content — dropping them keeps the card.
+    private static func isIgnorableCitationPrefix(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return true }
+        if trimmed == "-" || trimmed == "*" || trimmed == ">" { return true }
+        if trimmed.hasSuffix("."), trimmed.dropLast().allSatisfy(\.isNumber) {
+            return true
+        }
+        return false
+    }
+
+    private static func isTrustedMomentDestination(_ destination: String) -> Bool {
+        guard let url = URL(string: destination.trimmingCharacters(in: .whitespaces)) else {
+            return false
+        }
+        return momentID(from: url) != nil
     }
 
     private static func fenceMatch(_ line: String) -> String? {

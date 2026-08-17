@@ -36,12 +36,14 @@ public struct MlxWorkerRequest: Decodable, Sendable {
 
 public struct MlxWorkerResponse: Encodable, Sendable {
     public struct Usage: Encodable, Sendable {
-        public let outputCharacters: Int
-        public let elapsedMilliseconds: Int
+        public let promptTokens: Int
+        public let completionTokens: Int
+        public let generationMs: Int
 
         enum CodingKeys: String, CodingKey {
-            case outputCharacters = "output_characters"
-            case elapsedMilliseconds = "elapsed_ms"
+            case promptTokens = "prompt_tokens"
+            case completionTokens = "completion_tokens"
+            case generationMs = "generation_ms"
         }
     }
 
@@ -208,13 +210,15 @@ actor MlxModelRuntime {
                 }
                 return .url(url)
             }
-            let clock = ContinuousClock()
-            let started = clock.now
             var raw = ""
             var emitted = ""
+            var promptTokens = 0
+            var completionTokens = 0
+            var generationMs = 0
             for try await item in session.streamDetails(to: prompt, images: imageInputs) {
                 try Task.checkCancellation()
-                if case .chunk(let chunk) = item {
+                switch item {
+                case .chunk(let chunk):
                     raw += chunk
                     let visible = normalizeModelOutput(raw)
                     if visible.hasPrefix(emitted) {
@@ -229,20 +233,27 @@ actor MlxModelRuntime {
                             ))
                         }
                     }
+                case .info(let info):
+                    promptTokens = info.promptTokenCount
+                    completionTokens = info.generationTokenCount
+                    generationMs = Int((info.generateTime * 1_000).rounded())
+                default:
+                    break
                 }
             }
             try Task.checkCancellation()
             let final = normalizeModelOutput(raw)
             guard !final.isEmpty else { throw WorkerFailure("model returned empty output") }
-            let duration = started.duration(to: clock.now)
-            let elapsed = Int(duration.components.seconds * 1_000)
-                + Int(duration.components.attoseconds / 1_000_000_000_000_000)
             await writer.send(.init(
                 v: mlxWorkerProtocolVersion,
                 kind: "final",
                 requestId: request.requestId,
                 text: final,
-                usage: .init(outputCharacters: final.count, elapsedMilliseconds: elapsed),
+                usage: .init(
+                    promptTokens: promptTokens,
+                    completionTokens: completionTokens,
+                    generationMs: generationMs
+                ),
                 cache: cacheMode
             ))
         } catch is CancellationError {

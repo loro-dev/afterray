@@ -36,9 +36,9 @@ pub use compaction::{CompactionNotice, CompactionStrategy, PruneToolResults};
 pub use opening::{Opening, OpeningTrim};
 pub use progress::{Phase, ProgressReport};
 pub use run::{
-    DeltaKind, Discard, EventSink, GenerateRequest, HarnessEvent, LoopConfig, LoopError,
-    ModelError, ModelSurface, RoundReasoning, StreamDelta, ToolCallRecord, ToolSurface, Turn,
-    TurnUsage, run_turn,
+    DeltaKind, Discard, EventSink, GenerateOutcome, GenerateRequest, GenerationUsage, HarnessEvent,
+    LoopConfig, LoopError, ModelError, ModelSurface, RoundReasoning, StreamDelta, ToolCallRecord,
+    ToolSurface, Turn, TurnUsage, run_turn,
 };
 pub use transcript::{Pruned, Transcript};
 pub use truncate::{Budgeted, truncate_head, truncate_tail};

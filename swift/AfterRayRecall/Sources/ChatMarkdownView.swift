@@ -6,8 +6,8 @@ import SwiftUI
 /// Closed `.markdown` chunks go through the library (tables, nested lists,
 /// GFM). Open fences keep a dedicated code chrome so a half-written fence
 /// cannot reshuffle later blocks. Image providers refuse every URL except
-/// a standalone `afterray://moment/ID` citation — the splitter already
-/// extracts those, so the providers are a second lock.
+/// an `afterray://moment/ID` citation — the splitter already extracts
+/// those, so the providers are a second lock.
 struct ChatMarkdownView: View {
     let blocks: [MarkdownBlock]
     let thumbnailLoader: RecallThumbnailLoader?

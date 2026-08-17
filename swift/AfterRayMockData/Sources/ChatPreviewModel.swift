@@ -409,7 +409,8 @@ public enum ChatFixtures {
                             conversationId: "c-markdown",
                             role: .assistant,
                             content: markdownAnswer,
-                            createdAtMs: nowMs - 120_000
+                            createdAtMs: nowMs - 120_000,
+                            usageJSON: #"{"prompt_tokens":3180,"window_tokens":16384,"round":2,"completion_tokens":180,"generation_ms":1500}"#
                         ),
                     ],
                     "c-old": shortMessages,
@@ -433,13 +434,16 @@ public enum ChatFixtures {
     public static func usage(_ scenario: ChatScenario) -> ChatContextUsage? {
         switch scenario {
         case .empty, .short: nil
-        case .markdown: ChatContextUsage(promptTokens: 3_180, windowTokens: 16_384, round: 2)
-        case .streaming, .tools: ChatContextUsage(promptTokens: 6_420, windowTokens: 16_384, round: 3)
-        case .pressure: ChatContextUsage(promptTokens: 13_910, windowTokens: 16_384, round: 5)
+        case .markdown:
+            ChatContextUsage(promptTokens: 3_180, windowTokens: 16_384, round: 2, completionTokens: 180, generationMs: 1_500)
+        case .streaming, .tools:
+            ChatContextUsage(promptTokens: 6_420, windowTokens: 16_384, round: 3, completionTokens: 260, generationMs: 2_000)
+        case .pressure:
+            ChatContextUsage(promptTokens: 13_910, windowTokens: 16_384, round: 5, completionTokens: 90, generationMs: 1_200)
         case .thinking, .waiting:
             ChatContextUsage(promptTokens: 2_240, windowTokens: 16_384, round: 1)
         case .reasoning:
-            ChatContextUsage(promptTokens: 5_050, windowTokens: 16_384, round: 2)
+            ChatContextUsage(promptTokens: 5_050, windowTokens: 16_384, round: 2, completionTokens: 140, generationMs: 1_800)
         }
     }
 
@@ -478,7 +482,7 @@ public enum ChatFixtures {
                 createdAtMs: nowMs - 190_000,
                 reasoning: #"[{"round":1,"text":"The user is asking about a build failure yesterday. I should look at the half hour around the last commit rather than search blindly — a slot card will show which files were open and what the terminal said."},{"round":2,"text":"The card shows an IVF header assertion. That points at the length field, not the encoder itself."}]"#,
                 status: "complete",
-                usageJSON: #"{"prompt_tokens":5050,"window_tokens":16384,"round":2}"#
+                usageJSON: #"{"prompt_tokens":5050,"window_tokens":16384,"round":2,"completion_tokens":140,"generation_ms":1800}"#
             ),
             ChatMessage(
                 id: "u-reason-2",
@@ -552,7 +556,8 @@ public enum ChatFixtures {
                         resultChars: 2_040
                     ),
                 ]),
-                createdAtMs: nowMs - 20_000
+                createdAtMs: nowMs - 20_000,
+                usageJSON: #"{"prompt_tokens":13910,"window_tokens":16384,"round":5,"completion_tokens":90,"generation_ms":1200}"#
             ),
         ]
     }

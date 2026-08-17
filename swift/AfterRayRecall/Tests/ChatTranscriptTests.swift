@@ -317,6 +317,89 @@ final class ChatTranscriptTests: XCTestCase {
             "Yesterday"
         )
     }
+
+    func testToolLogReadsStoredResultAndDroppedTokens() {
+        let tools = ChatToolLog.parse(
+            #"[{"name":"get_ocr","args":{"moment_id":"m1"},"chars":12,"result":"hello screen","truncated":true,"dropped_tokens":40}]"#
+        )
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools[0].name, "get_ocr")
+        XCTAssertEqual(tools[0].result, "hello screen")
+        XCTAssertEqual(tools[0].resultChars, 12)
+        XCTAssertTrue(tools[0].truncated)
+        XCTAssertEqual(tools[0].droppedTokens, 40)
+    }
+
+    func testConversationExportIncludesThinkingAndToolResults() {
+        let tool = ChatToolCall(
+            id: "t1",
+            name: "get_ocr",
+            argsJSON: #"{"moment_id":"m1"}"#,
+            resultChars: 12,
+            result: "the dock said Safari",
+            truncated: false
+        )
+        let bubbles = [
+            ChatBubble(id: "u1", role: .user, text: "what was on screen?", createdAtMs: 1),
+            ChatBubble(
+                id: "a1",
+                role: .assistant,
+                text: "Safari was frontmost.",
+                createdAtMs: 2,
+                parts: [
+                    .reasoning(id: "r1", round: 1, text: "need the frame"),
+                    .tool(tool),
+                ]
+            ),
+        ]
+        let markdown = ChatConversationExport.markdown(title: "Screen check", bubbles: bubbles)
+        XCTAssertTrue(markdown.contains("# Screen check"))
+        XCTAssertTrue(markdown.contains("## User"))
+        XCTAssertTrue(markdown.contains("what was on screen?"))
+        XCTAssertTrue(markdown.contains("## Agent"))
+        XCTAssertTrue(markdown.contains("### Thinking"))
+        XCTAssertTrue(markdown.contains("need the frame"))
+        XCTAssertTrue(markdown.contains("### Tool call: `get_ocr`"))
+        XCTAssertTrue(markdown.contains("the dock said Safari"))
+        XCTAssertTrue(markdown.contains("### Answer"))
+        XCTAssertTrue(markdown.contains("Safari was frontmost."))
+    }
+
+    func testTokenEstimateAndTurnRate() {
+        XCTAssertEqual(ChatTokenEstimate.count(in: "abcd"), 1)
+        XCTAssertEqual(ChatTokenEstimate.count(in: "截图"), 2)
+        let rate = ChatTokenEstimate.tokensPerSecond(
+            text: String(repeating: "abcd", count: 25),
+            reasoning: [ChatReasoningRound(round: 1, text: String(repeating: "abcd", count: 25))],
+            elapsedMs: 1_000
+        )
+        XCTAssertEqual(rate ?? 0, 50, accuracy: 0.01)
+        XCTAssertEqual(ChatTokenEstimate.rateLabel(12.4), "12.4 tok/s")
+        let bubble = ChatBubble(
+            id: "a",
+            role: .assistant,
+            text: "hello",
+            createdAtMs: 2,
+            workElapsedMs: 2_000,
+            usage: ChatContextUsage(
+                promptTokens: 1_000,
+                windowTokens: 16_384,
+                round: 1,
+                completionTokens: 40,
+                generationMs: 2_000
+            )
+        )
+        XCTAssertEqual(bubble.tokensPerSecond ?? 0, 20, accuracy: 0.01)
+        XCTAssertNil(
+            ChatBubble(id: "b", role: .assistant, text: "hello", createdAtMs: 2).tokensPerSecond
+        )
+    }
+
+    func testContextUsagePercentLabel() {
+        let usage = ChatContextUsage(promptTokens: 5_120, windowTokens: 16_384, round: 2)
+        XCTAssertEqual(usage.percentLabel, "31%")
+        XCTAssertEqual(usage.shortLabel, "5.1k / 16k")
+    }
 }
 
 final class ChatStreamReducerTests: XCTestCase {

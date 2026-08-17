@@ -83,7 +83,8 @@ public extension AfterRayChatModeling {
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
             liveCompactions: isSending ? compactionNotices : [],
             progress: streamProgress,
-            lastWorkElapsedMs: lastWorkElapsedMs
+            lastWorkElapsedMs: lastWorkElapsedMs,
+            liveUsage: contextUsage
         )
     }
 }
@@ -473,6 +474,9 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         if let usage = state.usage, contextUsage != usage { contextUsage = usage }
         if !state.compactions.isEmpty, compactionNotices != state.compactions {
             compactionNotices = state.compactions
+        }
+        if state.lastElapsedMs > 0, lastWorkElapsedMs != state.lastElapsedMs {
+            lastWorkElapsedMs = state.lastElapsedMs
         }
     }
 

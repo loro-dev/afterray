@@ -70,7 +70,7 @@ fn output_preview(output: &ModelOutput) -> String {
         ModelOutput::Ocr { text, regions } => {
             format!("{} chars, {} regions", text.chars().count(), regions.len())
         }
-        ModelOutput::Llm { text } => format!("{} chars", text.chars().count()),
+        ModelOutput::Llm { text, .. } => format!("{} chars", text.chars().count()),
         ModelOutput::Asr { text, language } => match language {
             Some(language) if !language.is_empty() => {
                 format!("{language}, {} chars", text.chars().count())

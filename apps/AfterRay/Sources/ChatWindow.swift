@@ -38,6 +38,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         window.minSize = minSize
         window.contentMinSize = minSize
         window.isReleasedWhenClosed = false
+        window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.titlebarSeparatorStyle = .none
         window.styleMask.insert(.fullSizeContentView)
@@ -111,7 +112,8 @@ private struct ChatWindowRoot: View {
                 momentLoader: { momentID in
                     try await images.moment(id: momentID)
                 },
-                fillsAvailableSpace: true
+                fillsAvailableSpace: true,
+                occupiesWindowTitlebar: true
             )
         }
         .preferredColorScheme(.dark)

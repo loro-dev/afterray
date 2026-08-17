@@ -113,6 +113,36 @@ final class StreamingMarkdownTests: XCTestCase {
         )
     }
 
+    func testNumericMomentIDCitationBecomesPreviewCard() {
+        let source = "![2:14 Safari](afterray://moment/1786936000000)"
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: source),
+            [.momentImage(label: "2:14 Safari", momentID: "1786936000000")]
+        )
+    }
+
+    func testIndentedAndListPrefixedMomentImagesBecomeMedia() {
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: "  ![2:14 Safari](afterray://moment/1786936000000)"),
+            [.momentImage(label: "2:14 Safari", momentID: "1786936000000")]
+        )
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: "- ![2:14 Safari](afterray://moment/1786936000000)"),
+            [.momentImage(label: "2:14 Safari", momentID: "1786936000000")]
+        )
+    }
+
+    func testEmbeddedMomentImageBecomesMediaAndKeepsSurroundingProse() {
+        XCTAssertEqual(
+            StreamingMarkdown.blocks(from: "See ![frame](afterray://moment/abc) here"),
+            [
+                .markdown("See "),
+                .momentImage(label: "frame", momentID: "abc"),
+                .markdown(" here"),
+            ]
+        )
+    }
+
     func testExternalAndLocalImagesStaySelectableText() {
         for source in [
             "![remote](https://example.com/image.jpg)",
@@ -135,7 +165,12 @@ final class StreamingMarkdownTests: XCTestCase {
         XCTAssertEqual(escaped, "\\!\\[remote](https://example.com/a.png)")
     }
 
-    func testPartialOrEmbeddedMomentImageDoesNotLoadMedia() {
+    func testEscapeUntrustedImagesLeavesMomentCitationsIntact() {
+        let source = "![2:14 Safari](afterray://moment/1786936000000)"
+        XCTAssertEqual(StreamingMarkdown.escapeUntrustedImages(source), source)
+    }
+
+    func testPartialMomentImageDoesNotLoadMedia() {
         let partial = StreamingMarkdown.blocks(from: "![still streaming](afterray://moment/abc")
         XCTAssertEqual(partial.count, 1)
         guard case .markdown(let partialText) = partial[0] else {
@@ -143,15 +178,6 @@ final class StreamingMarkdownTests: XCTestCase {
         }
         XCTAssertTrue(partialText.contains("afterray://moment/abc"))
         XCTAssertFalse(partial.contains { if case .momentImage = $0 { return true } else { return false } })
-
-        let embedded = StreamingMarkdown.blocks(from: "See ![frame](afterray://moment/abc) here")
-        XCTAssertEqual(embedded.count, 1)
-        guard case .markdown(let embeddedText) = embedded[0] else {
-            return XCTFail("embedded moment image must stay text")
-        }
-        XCTAssertFalse(embeddedText.contains("![frame]"))
-        XCTAssertTrue(embeddedText.contains("frame"))
-        XCTAssertFalse(embedded.contains { if case .momentImage = $0 { return true } else { return false } })
     }
 
     func testMomentURLParserAcceptsOnlyTheAfterrayScheme() {

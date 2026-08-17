@@ -160,8 +160,17 @@ fn print_event(event: &ChatStreamEvent, json: bool) -> anyhow::Result<()> {
             prompt_tokens,
             window_tokens,
             round,
+            completion_tokens,
+            generation_ms,
         } => {
-            println!("usage round={round} {prompt_tokens}/{window_tokens} tokens");
+            if *completion_tokens > 0 && *generation_ms > 0 {
+                let rate = *completion_tokens as f64 / (*generation_ms as f64 / 1_000.0);
+                println!(
+                    "usage round={round} {prompt_tokens}/{window_tokens} tokens · {completion_tokens} completion in {generation_ms}ms ({rate:.1} tok/s)"
+                );
+            } else {
+                println!("usage round={round} {prompt_tokens}/{window_tokens} tokens");
+            }
         }
         // The row the answer is being written into. Nothing to print: the CLI
         // shows the text, and the id only matters to a client that reloads.

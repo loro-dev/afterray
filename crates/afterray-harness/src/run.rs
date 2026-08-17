@@ -86,6 +86,32 @@ pub enum DeltaKind {
     Reasoning,
 }
 
+/// What one model round produced, including tokenizer-accurate usage when
+/// the runtime reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerateOutcome {
+    pub text: String,
+    pub usage: Option<GenerationUsage>,
+}
+
+impl GenerateOutcome {
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            usage: None,
+        }
+    }
+}
+
+/// Tokenizer-accurate counts from the model runtime for one generate call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub generation_ms: u64,
+}
+
 /// Something that can run one model round.
 ///
 /// An implementation that can stream pushes deltas into `tokens` as they
@@ -97,7 +123,7 @@ pub trait ModelSurface {
         &self,
         request: GenerateRequest<'_>,
         tokens: mpsc::Sender<StreamDelta>,
-    ) -> impl Future<Output = Result<String, ModelError>> + Send;
+    ) -> impl Future<Output = Result<GenerateOutcome, ModelError>> + Send;
 }
 
 /// Why a round could not produce text.
@@ -157,6 +183,10 @@ pub enum HarnessEvent {
         prompt_tokens: usize,
         window_tokens: usize,
         round: usize,
+        /// Summed across rounds of this turn. Zero until a runtime reports it.
+        completion_tokens: usize,
+        /// Decode time summed across rounds, milliseconds. Zero until reported.
+        generation_ms: u64,
     },
     /// The turn is alive but has nothing to show yet. See [`crate::progress`]
     /// for the three stretches this covers.
@@ -294,6 +324,8 @@ pub struct TurnUsage {
     pub prompt_tokens: usize,
     pub window_tokens: usize,
     pub rounds: usize,
+    pub completion_tokens: usize,
+    pub generation_ms: u64,
 }
 
 impl TurnUsage {
@@ -428,21 +460,6 @@ where
         // that takes one string and one that takes an array see the same thing.
         let mut messages = opening_messages.clone();
         messages.extend(transcript.messages());
-        turn.usage = TurnUsage {
-            prompt_tokens: estimate_tokens(&prompt),
-            window_tokens: config.budget.window_tokens,
-            rounds: round + 1,
-        };
-        emit(
-            sink,
-            HarnessEvent::Usage {
-                prompt_tokens: turn.usage.prompt_tokens,
-                window_tokens: turn.usage.window_tokens,
-                round: round + 1,
-            },
-        )
-        .await?;
-
         let request = GenerateRequest {
             system,
             prompt: &prompt,
@@ -450,7 +467,42 @@ where
             round: round + 1,
             cancel: &config.cancel,
         };
-        let (text, mut gate, reasoning) = generate_gated(model, sink, request).await?;
+        // Occupancy preview before the call, so a gone client fails here
+        // instead of paying for a generate. Overwritten with runtime counts
+        // after the round if the adapter reported them.
+        turn.usage.prompt_tokens = estimate_tokens(&prompt);
+        turn.usage.window_tokens = config.budget.window_tokens;
+        turn.usage.rounds = round + 1;
+        emit(
+            sink,
+            HarnessEvent::Usage {
+                prompt_tokens: turn.usage.prompt_tokens,
+                window_tokens: turn.usage.window_tokens,
+                round: turn.usage.rounds,
+                completion_tokens: turn.usage.completion_tokens,
+                generation_ms: turn.usage.generation_ms,
+            },
+        )
+        .await?;
+        let (text, mut gate, reasoning, measured) = generate_gated(model, sink, request).await?;
+        apply_round_usage(
+            &mut turn.usage,
+            config.budget.window_tokens,
+            round + 1,
+            measured,
+            estimate_tokens(&prompt),
+        );
+        emit(
+            sink,
+            HarnessEvent::Usage {
+                prompt_tokens: turn.usage.prompt_tokens,
+                window_tokens: turn.usage.window_tokens,
+                round: turn.usage.rounds,
+                completion_tokens: turn.usage.completion_tokens,
+                generation_ms: turn.usage.generation_ms,
+            },
+        )
+        .await?;
         if !reasoning.trim().is_empty() {
             turn.reasoning.push(RoundReasoning {
                 round: round + 1,
@@ -525,12 +577,33 @@ where
     Err(LoopError::Exhausted)
 }
 
+/// Prefer runtime counts; fall back to the character estimate for occupancy.
+fn apply_round_usage(
+    usage: &mut TurnUsage,
+    window_tokens: usize,
+    round: usize,
+    measured: Option<GenerationUsage>,
+    estimated_prompt: usize,
+) {
+    usage.window_tokens = window_tokens;
+    usage.rounds = round;
+    if let Some(measured) = measured {
+        usage.prompt_tokens = measured.prompt_tokens;
+        usage.completion_tokens = usage
+            .completion_tokens
+            .saturating_add(measured.completion_tokens);
+        usage.generation_ms = usage.generation_ms.saturating_add(measured.generation_ms);
+    } else {
+        usage.prompt_tokens = estimated_prompt;
+    }
+}
+
 /// Runs one round, forwarding gated token deltas to the sink as they arrive.
 async fn generate_gated<M, S>(
     model: &M,
     sink: &mut S,
     request: GenerateRequest<'_>,
-) -> Result<(String, AnswerGate, String), LoopError>
+) -> Result<(String, AnswerGate, String, Option<GenerationUsage>), LoopError>
 where
     M: ModelSurface + Sync,
     S: EventSink,
@@ -554,7 +627,7 @@ where
     // feedback.
     heartbeat.tick().await;
 
-    let text = loop {
+    let outcome = loop {
         tokio::select! {
             // Bias towards draining tokens: a finished generate that leaves
             // deltas queued would otherwise emit them all after the fact.
@@ -604,7 +677,7 @@ where
             }
         }
     }
-    Ok((text, gate, reasoning))
+    Ok((outcome.text, gate, reasoning, outcome.usage))
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -696,7 +769,7 @@ mod tests {
             &self,
             request: GenerateRequest<'_>,
             tokens: mpsc::Sender<StreamDelta>,
-        ) -> Result<String, ModelError> {
+        ) -> Result<GenerateOutcome, ModelError> {
             if request.cancel.is_cancelled() {
                 return Err(ModelError::Cancelled);
             }
@@ -713,7 +786,7 @@ mod tests {
                     let _ = tokens.send(StreamDelta::content(piece)).await;
                 }
             }
-            Ok(text)
+            Ok(GenerateOutcome::text(text))
         }
     }
 
@@ -902,7 +975,12 @@ mod tests {
                 HarnessEvent::Usage { round, .. } => Some(*round),
                 _ => None,
             })
-            .collect();
+            .fold(Vec::new(), |mut acc, round| {
+                if acc.last() != Some(&round) {
+                    acc.push(round);
+                }
+                acc
+            });
         assert_eq!(rounds, [1, 2]);
     }
 
@@ -995,7 +1073,7 @@ mod tests {
                 &self,
                 _request: GenerateRequest<'_>,
                 _tokens: mpsc::Sender<StreamDelta>,
-            ) -> Result<String, ModelError> {
+            ) -> Result<GenerateOutcome, ModelError> {
                 Err(ModelError::Missing)
             }
         }
@@ -1218,9 +1296,9 @@ mod tests {
                 &self,
                 _request: GenerateRequest<'_>,
                 _tokens: mpsc::Sender<StreamDelta>,
-            ) -> Result<String, ModelError> {
+            ) -> Result<GenerateOutcome, ModelError> {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                Ok("FINAL\ntoo late".to_owned())
+                Ok(GenerateOutcome::text("FINAL\ntoo late"))
             }
         }
         let cancel = CancelToken::new();
@@ -1261,7 +1339,7 @@ mod tests {
             &self,
             _request: GenerateRequest<'_>,
             tokens: mpsc::Sender<StreamDelta>,
-        ) -> Result<String, ModelError> {
+        ) -> Result<GenerateOutcome, ModelError> {
             for index in 0..self.reasoning_deltas {
                 let _ = tokens
                     .send(StreamDelta::reasoning(format!("step{index} ")))
@@ -1269,7 +1347,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
             let _ = tokens.send(StreamDelta::content(self.answer)).await;
-            Ok(self.answer.to_owned())
+            Ok(GenerateOutcome::text(self.answer))
         }
     }
 
@@ -1344,9 +1422,9 @@ mod tests {
                 &self,
                 _request: GenerateRequest<'_>,
                 _tokens: mpsc::Sender<StreamDelta>,
-            ) -> Result<String, ModelError> {
+            ) -> Result<GenerateOutcome, ModelError> {
                 tokio::time::sleep(Duration::from_millis(900)).await;
-                Ok("FINAL\nloaded".to_owned())
+                Ok(GenerateOutcome::text("FINAL\nloaded"))
             }
         }
         let tools = EchoTools { body: String::new() };
@@ -1379,14 +1457,14 @@ mod tests {
                 &self,
                 request: GenerateRequest<'_>,
                 tokens: mpsc::Sender<StreamDelta>,
-            ) -> Result<String, ModelError> {
+            ) -> Result<GenerateOutcome, ModelError> {
                 if request.round == 1 {
                     let _ = tokens.send(StreamDelta::content("TOOL get_now")).await;
                     tokio::time::sleep(Duration::from_millis(700)).await;
                     let _ = tokens.send(StreamDelta::content("\nARGS {}")).await;
-                    return Ok("TOOL get_now\nARGS {}".to_owned());
+                    return Ok(GenerateOutcome::text("TOOL get_now\nARGS {}"));
                 }
-                Ok("FINAL\ndone".to_owned())
+                Ok(GenerateOutcome::text("FINAL\ndone"))
             }
         }
         let tools = EchoTools {
@@ -1424,10 +1502,10 @@ mod tests {
                 &self,
                 _request: GenerateRequest<'_>,
                 tokens: mpsc::Sender<StreamDelta>,
-            ) -> Result<String, ModelError> {
+            ) -> Result<GenerateOutcome, ModelError> {
                 let _ = tokens.send(StreamDelta::content("FINAL\nhere")).await;
                 tokio::time::sleep(Duration::from_millis(900)).await;
-                Ok("FINAL\nhere".to_owned())
+                Ok(GenerateOutcome::text("FINAL\nhere"))
             }
         }
         let tools = EchoTools { body: String::new() };
@@ -1595,12 +1673,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn measured_usage_is_preferred_over_the_character_estimate() {
+        struct Counted;
+        impl ModelSurface for Counted {
+            async fn generate(
+                &self,
+                _request: GenerateRequest<'_>,
+                _tokens: mpsc::Sender<StreamDelta>,
+            ) -> Result<GenerateOutcome, ModelError> {
+                Ok(GenerateOutcome {
+                    text: "FINAL\nok".into(),
+                    usage: Some(GenerationUsage {
+                        prompt_tokens: 88,
+                        completion_tokens: 12,
+                        generation_ms: 400,
+                    }),
+                })
+            }
+        }
+        let turn = run_turn(
+            &Counted,
+            &EchoTools { body: String::new() },
+            &mut Recorder::default(),
+            &config(),
+            "s",
+            task("t"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.usage.prompt_tokens, 88);
+        assert_eq!(turn.usage.completion_tokens, 12);
+        assert_eq!(turn.usage.generation_ms, 400);
+        assert_eq!(turn.usage.window_tokens, ContextBudget::DEFAULT.window_tokens);
+    }
+
     #[test]
     fn usage_fraction_is_clamped() {
         let usage = TurnUsage {
             prompt_tokens: 8_192,
             window_tokens: 16_384,
             rounds: 1,
+            completion_tokens: 0,
+            generation_ms: 0,
         };
         assert!((usage.fraction() - 0.5).abs() < f32::EPSILON);
         assert!(TurnUsage::default().fraction().abs() < f32::EPSILON);
@@ -1608,6 +1723,8 @@ mod tests {
             prompt_tokens: 99_999,
             window_tokens: 1_000,
             rounds: 1,
+            completion_tokens: 0,
+            generation_ms: 0,
         };
         assert!((over.fraction() - 1.0).abs() < f32::EPSILON);
     }

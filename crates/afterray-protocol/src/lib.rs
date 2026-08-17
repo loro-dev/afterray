@@ -911,6 +911,16 @@ pub struct AskAnswer {
 /// Growing this enum is additive by contract. A client that meets a `kind` it
 /// does not know must skip the line, and new fields on an existing kind must
 /// be `#[serde(default)]` so an older daemon's lines still decode.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
@@ -939,13 +949,19 @@ pub enum ChatStreamEvent {
     },
     /// How full the context window is, once per round.
     ///
-    /// Context pressure was invisible from every angle before this: the user
-    /// could not see that a long thread was crowding the window, and neither
-    /// could anyone reading a bug report.
+    /// `prompt_tokens` / `window_tokens` are the occupancy meter.
+    /// `completion_tokens` / `generation_ms` are the decode rate. Both come
+    /// from the model runtime when it reports them; 0 means "not reported".
     Usage {
         prompt_tokens: usize,
         window_tokens: usize,
         round: usize,
+        /// Tokenizer-accurate completion tokens for the turn so far.
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        completion_tokens: usize,
+        /// Decode time for the turn so far, milliseconds.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        generation_ms: u64,
     },
     /// The turn is alive but has nothing to show yet.
     ///
@@ -1381,6 +1397,8 @@ mod tests {
             prompt_tokens: 5_120,
             window_tokens: 16_384,
             round: 2,
+            completion_tokens: 0,
+            generation_ms: 0,
         };
         assert_eq!(
             serde_json::to_string(&usage).unwrap(),

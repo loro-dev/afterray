@@ -8,6 +8,10 @@ private enum ChatMetrics {
     static let sidebarWidth: CGFloat = 228
     static let bubbleRadius: CGFloat = 12
     static let gutter: CGFloat = 20
+    static let titlebarHeight: CGFloat = 32
+    /// Close / miniaturize / zoom sit in the first ~72pt; leave a gap after.
+    static let trafficLightClearance: CGFloat = 80
+    static let conversationRowHeight: CGFloat = 32
     static let bottomAnchorID = "afterray-chat-bottom-anchor"
 }
 
@@ -22,8 +26,9 @@ enum ChatPalette {
     static let card = Color.white.opacity(0.042)
     static let cardStroke = Color.white.opacity(0.070)
     static let separator = Color.white.opacity(0.055)
-    static let userFill = Color(red: 0.62, green: 0.16, blue: 0.12)
-    static let userStroke = Color(red: 1.0, green: 0.36, blue: 0.26).opacity(0.38)
+    static let userFill = Color(hue: 0.02, saturation: 0.16, brightness: 0.30)
+    static let userStroke = Color.white.opacity(0.08)
+    static let deleteHover = Color(red: 0.78, green: 0.46, blue: 0.42)
     static let assistantFill = Color.white.opacity(0.045)
     static let codeFill = Color.black.opacity(0.46)
 }
@@ -36,11 +41,15 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     var previewLoader: RecallChatPreviewLoader?
     var momentLoader: RecallMomentLoader?
     var fillsAvailableSpace: Bool
+    var occupiesWindowTitlebar: Bool
     @State private var autoScrollState = ChatAutoScrollState()
     @State private var scrollToLatestRequest: UInt64 = 0
     @State private var sidebarCollapsed = false
     @State private var conversationQuery = ""
     @State private var modelPickerOpen = false
+    @State private var moreMenuOpen = false
+    @State private var conversationCopied = false
+    @State private var titlebarInset = ChatMetrics.titlebarHeight
 
     public init(
         model: Model,
@@ -49,7 +58,8 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         thumbnailLoader: RecallThumbnailLoader? = nil,
         previewLoader: RecallChatPreviewLoader? = nil,
         momentLoader: RecallMomentLoader? = nil,
-        fillsAvailableSpace: Bool = false
+        fillsAvailableSpace: Bool = false,
+        occupiesWindowTitlebar: Bool = false
     ) {
         self.model = model
         self.onClose = onClose
@@ -58,14 +68,28 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         self.previewLoader = previewLoader
         self.momentLoader = momentLoader
         self.fillsAvailableSpace = fillsAvailableSpace
+        self.occupiesWindowTitlebar = occupiesWindowTitlebar
     }
 
     public var body: some View {
-        HStack(spacing: 0) {
-            if !sidebarCollapsed {
-                sidebar
+        ZStack {
+            if occupiesWindowTitlebar {
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear { updateTitlebarInset(geo.safeAreaInsets.top) }
+                        .onChange(of: geo.safeAreaInsets.top) { _, top in
+                            updateTitlebarInset(top)
+                        }
+                }
+                .allowsHitTesting(false)
             }
-            thread
+            HStack(spacing: 0) {
+                if !sidebarCollapsed {
+                    sidebar
+                }
+                thread
+            }
+            .modifier(ChatTitlebarSafeArea(enabled: occupiesWindowTitlebar))
         }
         .frame(
             minWidth: fillsAvailableSpace ? 720 : ChatMetrics.panelWidth,
@@ -94,16 +118,31 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         })
         .task { await model.refresh() }
         .animation(.easeOut(duration: 0.16), value: sidebarCollapsed)
+        .onChange(of: model.selectedID) { _, _ in
+            conversationCopied = false
+        }
+        .task(id: conversationCopied) {
+            guard conversationCopied else { return }
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            conversationCopied = false
+        }
+    }
+
+    private var chromeHeight: CGFloat {
+        occupiesWindowTitlebar ? titlebarInset : ChatMetrics.titlebarHeight
+    }
+
+    private func updateTitlebarInset(_ top: CGFloat) {
+        let next = max(top, ChatMetrics.titlebarHeight)
+        if abs(next - titlebarInset) > 0.5 {
+            titlebarInset = next
+        }
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ChatIconButton(
-                symbol: "sidebar.left",
-                help: "Hide sidebar",
-                action: { sidebarCollapsed = true }
-            )
-            .padding(.leading, 2)
+        VStack(alignment: .leading, spacing: 8) {
+            sidebarTitlebar
 
             if !model.conversations.isEmpty {
                 conversationSearchField
@@ -155,7 +194,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
-        .padding(.top, fillsAvailableSpace ? 28 : 10)
+        .padding(.top, occupiesWindowTitlebar ? 0 : 8)
         .padding(.bottom, 12)
         .frame(width: ChatMetrics.sidebarWidth, alignment: .leading)
         .frame(maxHeight: .infinity, alignment: .top)
@@ -164,6 +203,22 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         .overlay(alignment: .trailing) {
             Rectangle().fill(ChatPalette.separator).frame(width: 1)
         }
+    }
+
+    private var sidebarTitlebar: some View {
+        HStack(spacing: 0) {
+            if occupiesWindowTitlebar {
+                Color.clear
+                    .frame(width: max(0, ChatMetrics.trafficLightClearance - 10))
+            }
+            ChatIconButton(
+                symbol: "sidebar.left",
+                help: "Hide sidebar",
+                action: { sidebarCollapsed = true }
+            )
+            Spacer(minLength: 0)
+        }
+        .frame(height: chromeHeight)
     }
 
     /// Filter then group — each is one pass / one sort, not per row.
@@ -214,26 +269,44 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            if sidebarCollapsed {
-                ChatIconButton(
-                    symbol: "sidebar.left",
-                    help: "Show sidebar",
-                    action: { sidebarCollapsed = false }
-                )
-            }
-            Spacer(minLength: 8)
-            if model.isLoadingHistory {
-                ProgressView().controlSize(.small).tint(ChatPalette.accent)
-            }
-            ChatIconButton(symbol: "plus", help: "New conversation", action: model.startNew)
-            if !fillsAvailableSpace {
-                ChatIconButton(symbol: "xmark", help: "Close chat", action: onClose)
+        ZStack {
+            Text(model.selectedTitle)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(ChatPalette.label)
+                .lineLimit(1)
+                .padding(.horizontal, 120)
+                .frame(maxWidth: .infinity)
+
+            HStack(spacing: 4) {
+                if occupiesWindowTitlebar && sidebarCollapsed {
+                    Color.clear
+                        .frame(width: max(0, ChatMetrics.trafficLightClearance - 14))
+                }
+                if sidebarCollapsed {
+                    ChatIconButton(
+                        symbol: "sidebar.left",
+                        help: "Show sidebar",
+                        action: { sidebarCollapsed = false }
+                    )
+                }
+                if model.isLoadingHistory {
+                    ProgressView().controlSize(.small).tint(ChatPalette.accent)
+                }
+                Spacer(minLength: 8)
+                ChatIconButton(symbol: "plus", help: "New conversation", action: model.startNew)
+                ChatIconButton(symbol: "ellipsis", help: "More", action: { moreMenuOpen.toggle() })
+                    .popover(isPresented: $moreMenuOpen, arrowEdge: .bottom) {
+                        moreMenu
+                    }
+                if !fillsAvailableSpace {
+                    ChatIconButton(symbol: "xmark", help: "Close chat", action: onClose)
+                }
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.top, fillsAvailableSpace ? 28 : 10)
-        .padding(.bottom, 4)
+        .padding(.horizontal, occupiesWindowTitlebar ? 10 : 14)
+        .frame(height: chromeHeight)
+        .padding(.top, occupiesWindowTitlebar ? 0 : 8)
+        .padding(.bottom, occupiesWindowTitlebar ? 0 : 4)
     }
 
     private var messageList: some View {
@@ -492,6 +565,58 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         }
         .help("Choose a model")
     }
+
+    private var moreMenu: some View {
+        Button {
+            copyConversationMarkdown()
+            moreMenuOpen = false
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: conversationCopied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(conversationCopied ? ChatPalette.accent : ChatPalette.secondary)
+                    .frame(width: 14)
+                Text(conversationCopied ? "Copied" : "Copy Entire Conversation as Markdown")
+                    .font(.system(size: 12))
+                    .foregroundStyle(ChatPalette.label)
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!canCopyConversation)
+        .help("Copy this thread including thinking and tool results")
+        .padding(6)
+        .frame(minWidth: 280)
+        .background(.ultraThinMaterial)
+        .accessibilityIdentifier("chat-copy-conversation")
+    }
+
+    private var canCopyConversation: Bool {
+        model.bubbles.contains { bubble in
+            switch bubble.role {
+            case .compaction:
+                return !bubble.text.isEmpty
+            case .user, .assistant:
+                return !bubble.text.isEmpty || !bubble.parts.isEmpty
+            }
+        }
+    }
+
+    private func copyConversationMarkdown() {
+        let markdown = ChatConversationExport.markdown(
+            title: model.selectedTitle,
+            bubbles: model.bubbles
+        )
+        guard !markdown.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(markdown, forType: .string)
+        conversationCopied = true
+    }
 }
 
 private struct ChatModelPickerList: View {
@@ -561,6 +686,19 @@ private struct ChatSurfaceChrome: ViewModifier {
     }
 }
 
+/// Draw custom chrome in the real titlebar instead of sitting under it.
+private struct ChatTitlebarSafeArea: ViewModifier {
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.ignoresSafeArea(.container, edges: .top)
+        } else {
+            content
+        }
+    }
+}
+
 /// Where the agent stopped being able to see.
 ///
 /// Drawn as a rule across the thread rather than a bubble: it is not something
@@ -602,6 +740,7 @@ private struct ChatConversationRow: View {
     let onSelect: () -> Void
     let onDelete: () -> Void
     @State private var isHovering = false
+    @State private var isHoveringTrash = false
 
     var body: some View {
         Button(action: onSelect) {
@@ -612,25 +751,33 @@ private struct ChatConversationRow: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 4)
-                if isHovering {
-                    Button(action: onDelete) {
-                        Image(systemName: "trash")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(ChatPalette.tertiary)
-                            .frame(width: 20, height: 20)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Delete conversation")
+                Button(action: onDelete) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(isHoveringTrash ? ChatPalette.deleteHover : ChatPalette.tertiary)
+                        .frame(width: 22, height: 22)
+                        .background(
+                            isHoveringTrash ? ChatPalette.deleteHover.opacity(0.16) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        )
                 }
+                .buttonStyle(.plain)
+                .help("删除该对话")
+                .onHover { isHoveringTrash = $0 }
+                .opacity(isHovering ? 1 : 0)
+                .allowsHitTesting(isHovering)
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .frame(height: ChatMetrics.conversationRowHeight)
             .background(rowFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(ChatPressStyle())
-        .onHover { isHovering = $0 }
-        .help(conversation.title)
+        .onHover { hovering in
+            isHovering = hovering
+            if !hovering { isHoveringTrash = false }
+        }
+        .help(isHoveringTrash ? "删除该对话" : conversation.title)
     }
 
     private var rowFill: Color {
@@ -641,23 +788,82 @@ private struct ChatConversationRow: View {
 
 private struct ChatContextRing: View {
     let usage: ChatContextUsage
+    @State private var isHovering = false
+    @State private var showDetails = false
 
     var body: some View {
-        ZStack {
-            Circle()
-                .stroke(Color.white.opacity(0.12), lineWidth: 2)
-            Circle()
-                .trim(from: 0, to: usage.fraction)
-                .stroke(
-                    usage.isTight ? ChatPalette.coral : Color.white.opacity(0.72),
-                    style: StrokeStyle(lineWidth: 2, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
+        Button {
+            showDetails.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                ZStack {
+                    Circle()
+                        .stroke(Color.white.opacity(isHovering || showDetails ? 0.28 : 0.12), lineWidth: 2)
+                    Circle()
+                        .trim(from: 0, to: usage.fraction)
+                        .stroke(
+                            ringColor,
+                            style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                }
+                .frame(width: 14, height: 14)
+                Text(usage.percentLabel)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(isHovering || showDetails ? ChatPalette.label : ChatPalette.secondary)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(
+                isHovering || showDetails ? Color.white.opacity(0.08) : Color.clear,
+                in: Capsule()
+            )
+            .contentShape(Capsule())
         }
-        .frame(width: 14, height: 14)
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .popover(isPresented: $showDetails, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Context window")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(ChatPalette.tertiary)
+                Text(usage.shortLabel.replacingOccurrences(of: " / ", with: "/"))
+                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(ChatPalette.label)
+                VStack(alignment: .leading, spacing: 4) {
+                    detailRow("Used", ChatContextUsage.compact(usage.promptTokens))
+                    detailRow("Total", ChatContextUsage.compact(usage.windowTokens))
+                }
+            }
+            .padding(12)
+            .frame(minWidth: 176, alignment: .leading)
+        }
         .help("Context used: \(usage.shortLabel)")
         .accessibilityLabel("Context window")
-        .accessibilityValue("\(Int(usage.fraction * 100)) percent used")
+        .accessibilityValue("\(usage.percentLabel) used, \(usage.shortLabel)")
+        .accessibilityIdentifier("chat-context-ring")
+    }
+
+    private var ringColor: Color {
+        if usage.isTight {
+            return ChatPalette.coral
+        }
+        return Color.white.opacity(isHovering || showDetails ? 0.92 : 0.72)
+    }
+
+    private func detailRow(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundStyle(ChatPalette.secondary)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(ChatPalette.label)
+        }
     }
 }
 
@@ -731,15 +937,23 @@ private struct ChatBubbleView: View {
         return true
     }
 
+    private var showsTurnMeta: Bool {
+        if let rate = bubble.tokensPerSecond, rate > 0 { return true }
+        return !bubble.isStreaming && !bubble.text.isEmpty
+    }
+
     @ViewBuilder
     private var bubbleBody: some View {
         VStack(alignment: .leading, spacing: 8) {
             if bubble.role == .user {
-                Text(bubble.text)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(ChatPalette.label)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                ChatMarkdownView(
+                    blocks: bubble.markdownBlocks,
+                    thumbnailLoader: thumbnailLoader,
+                    previewLoader: previewLoader,
+                    momentLoader: momentLoader,
+                    onOpenMoment: onOpenMoment
+                )
+                .textSelection(.enabled)
             } else {
                 // The indicator replaces the caret rather than joining it. A
                 // blinking caret in front of no text reads as "waiting for you";
@@ -766,23 +980,33 @@ private struct ChatBubbleView: View {
                             .font(.system(size: 11))
                             .foregroundStyle(ChatPalette.tertiary)
                     }
-                    if !bubble.isStreaming, !bubble.text.isEmpty {
-                        HStack {
+                    if showsTurnMeta {
+                        HStack(spacing: 8) {
                             Spacer(minLength: 0)
-                            Button(action: copyOutput) {
-                                Label(
-                                    copied ? "Copied" : "Copy",
-                                    systemImage: copied ? "checkmark" : "doc.on.doc"
-                                )
-                                .font(.system(size: 10.5, weight: .medium))
-                                .foregroundStyle(copied ? ChatPalette.accent : ChatPalette.tertiary)
-                                .padding(.horizontal, 7)
-                                .frame(height: 24)
-                                .contentShape(Rectangle())
+                            if let rate = bubble.tokensPerSecond {
+                                Text(ChatTokenEstimate.rateLabel(rate))
+                                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                                    .monospacedDigit()
+                                    .foregroundStyle(ChatPalette.tertiary)
+                                    .help("Estimated tokens per second for this turn")
+                                    .accessibilityIdentifier("chat-tokens-per-second-\(bubble.id)")
                             }
-                            .buttonStyle(.plain)
-                            .help(copied ? "Agent output copied" : "Copy agent output")
-                            .accessibilityIdentifier("chat-copy-output-\(bubble.id)")
+                            if !bubble.isStreaming, !bubble.text.isEmpty {
+                                Button(action: copyOutput) {
+                                    Label(
+                                        copied ? "Copied" : "Copy",
+                                        systemImage: copied ? "checkmark" : "doc.on.doc"
+                                    )
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(copied ? ChatPalette.accent : ChatPalette.tertiary)
+                                    .padding(.horizontal, 7)
+                                    .frame(height: 24)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help(copied ? "Agent output copied" : "Copy agent output")
+                                .accessibilityIdentifier("chat-copy-output-\(bubble.id)")
+                            }
                         }
                     }
                 }

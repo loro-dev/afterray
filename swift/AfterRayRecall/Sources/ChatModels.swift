@@ -242,7 +242,9 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
         return ChatContextUsage(
             promptTokens: intValue(object["prompt_tokens"]) ?? 0,
             windowTokens: window,
-            round: intValue(object["round"]) ?? 0
+            round: intValue(object["round"]) ?? 0,
+            completionTokens: intValue(object["completion_tokens"]) ?? 0,
+            generationMs: intValue(object["generation_ms"]) ?? 0
         )
     }
 
@@ -427,11 +429,30 @@ public struct ChatContextUsage: Equatable, Sendable {
     public var promptTokens: Int
     public var windowTokens: Int
     public var round: Int
+    /// Tokenizer-accurate completion tokens for this turn. Zero until reported.
+    public var completionTokens: Int
+    /// Decode time for this turn, milliseconds. Zero until reported.
+    public var generationMs: Int
 
-    public init(promptTokens: Int, windowTokens: Int, round: Int) {
+    public init(
+        promptTokens: Int,
+        windowTokens: Int,
+        round: Int,
+        completionTokens: Int = 0,
+        generationMs: Int = 0
+    ) {
         self.promptTokens = promptTokens
         self.windowTokens = windowTokens
         self.round = round
+        self.completionTokens = completionTokens
+        self.generationMs = generationMs
+    }
+
+    /// Model-reported decode rate. Nil until both counts arrive — do not
+    /// invent this from character estimates.
+    public var tokensPerSecond: Double? {
+        guard completionTokens > 0, generationMs > 0 else { return nil }
+        return Double(completionTokens) / (Double(generationMs) / 1_000)
     }
 
     /// Occupancy, clamped. Zero when the daemon did not say what the window is.
@@ -447,6 +468,10 @@ public struct ChatContextUsage: Equatable, Sendable {
 
     public var shortLabel: String {
         "\(ChatContextUsage.compact(promptTokens)) / \(ChatContextUsage.compact(windowTokens))"
+    }
+
+    public var percentLabel: String {
+        "\(Int((fraction * 100).rounded()))%"
     }
 
     static func compact(_ tokens: Int) -> String {
@@ -653,7 +678,9 @@ public enum ChatStreamEventDecoder {
                 ChatContextUsage(
                     promptTokens: intValue(object["prompt_tokens"]) ?? 0,
                     windowTokens: intValue(object["window_tokens"]) ?? 0,
-                    round: intValue(object["round"]) ?? 0
+                    round: intValue(object["round"]) ?? 0,
+                    completionTokens: intValue(object["completion_tokens"]) ?? 0,
+                    generationMs: intValue(object["generation_ms"]) ?? 0
                 )
             )
         case "started":
@@ -944,6 +971,9 @@ public struct ChatToolCall: Equatable, Identifiable, Sendable {
     public var name: String
     public var argsJSON: String
     public var resultChars: Int?
+    /// The bytes that went to the model, when the vault still has them.
+    /// Older rows and the live stream only know the character count.
+    public var result: String?
     /// Whether the daemon cut this result to fit its budget. Shown on the
     /// bubble: an answer built on a shortened lookup earns the caveat.
     public var truncated: Bool
@@ -954,6 +984,7 @@ public struct ChatToolCall: Equatable, Identifiable, Sendable {
         name: String,
         argsJSON: String = "{}",
         resultChars: Int? = nil,
+        result: String? = nil,
         truncated: Bool = false,
         droppedTokens: Int = 0
     ) {
@@ -961,6 +992,7 @@ public struct ChatToolCall: Equatable, Identifiable, Sendable {
         self.name = name
         self.argsJSON = argsJSON
         self.resultChars = resultChars
+        self.result = result
         self.truncated = truncated
         self.droppedTokens = droppedTokens
     }
@@ -999,7 +1031,9 @@ public enum ChatToolLog {
                 name: name,
                 argsJSON: stringifyJSON(item["args"]),
                 resultChars: intValue(item["chars"]),
-                truncated: item["truncated"] as? Bool ?? false
+                result: item["result"] as? String,
+                truncated: item["truncated"] as? Bool ?? false,
+                droppedTokens: intValue(item["dropped_tokens"]) ?? 0
             )
         }
     }
@@ -1009,7 +1043,9 @@ public enum ChatToolLog {
         let payload: [[String: Any]] = tools.map { tool in
             var row: [String: Any] = ["name": tool.name, "args": tool.args]
             if let chars = tool.resultChars { row["chars"] = chars }
+            if let result = tool.result { row["result"] = result }
             if tool.truncated { row["truncated"] = true }
+            if tool.droppedTokens > 0 { row["dropped_tokens"] = tool.droppedTokens }
             return row
         }
         guard JSONSerialization.isValidJSONObject(payload),
@@ -1124,6 +1160,8 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
     /// How long the agent spent working, when we know. Nil if the turn
     /// had no intermediate work or the clock cannot be recovered.
     public let workElapsedMs: Int?
+    /// Model-reported occupancy and decode rate for this turn, when known.
+    public let usage: ChatContextUsage?
 
     public var tools: [ChatToolCall] { ChatMessagePart.tools(in: parts) }
 
@@ -1140,7 +1178,8 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         reasoning: [ChatReasoningRound] = [],
         wasAborted: Bool = false,
         parts: [ChatMessagePart]? = nil,
-        workElapsedMs: Int? = nil
+        workElapsedMs: Int? = nil,
+        usage: ChatContextUsage? = nil
     ) {
         self.id = id
         self.role = role
@@ -1151,12 +1190,13 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         self.progress = progress
         self.wasAborted = wasAborted
         self.workElapsedMs = workElapsedMs
+        self.usage = usage
     }
 
     public var markdownBlocks: [MarkdownBlock] {
         switch role {
-        case .user: [.markdown(text)]
-        case .assistant: StreamingMarkdown.blocks(from: text)
+        case .user, .assistant:
+            StreamingMarkdown.blocks(from: text)
         // Never markdown: a compaction row is the daemon's own prose and is
         // drawn as a rule, not a message.
         case .compaction: [.markdown(text)]
@@ -1165,6 +1205,152 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
 
     /// Whether any lookup behind this answer was shortened to fit.
     public var hasTruncatedEvidence: Bool { tools.contains(where: \.truncated) }
+
+    /// Model-reported decode rate for this turn. Nil until the daemon sent
+    /// both completion tokens and generate time.
+    public var tokensPerSecond: Double? { usage?.tokensPerSecond }
+}
+
+/// Approximate tokens for mixed CJK / Latin so a turn can show tok/s
+/// without a protocol field for completion counts.
+enum ChatTokenEstimate {
+    static func count(in text: String) -> Int {
+        var ascii = 0
+        var other = 0
+        for scalar in text.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                continue
+            }
+            if scalar.isASCII {
+                ascii += 1
+            } else {
+                other += 1
+            }
+        }
+        let latin = ascii == 0 ? 0 : (ascii + 3) / 4
+        return max(other + latin, text.isEmpty ? 0 : 1)
+    }
+
+    static func tokensPerSecond(
+        text: String,
+        reasoning: [ChatReasoningRound],
+        elapsedMs: Int?
+    ) -> Double? {
+        guard let elapsedMs, elapsedMs > 0 else { return nil }
+        let body = reasoning.map(\.text).joined() + text
+        let tokens = count(in: body)
+        guard tokens > 0 else { return nil }
+        return Double(tokens) / (Double(elapsedMs) / 1_000)
+    }
+
+    static func rateLabel(_ rate: Double) -> String {
+        if rate >= 100 {
+            return "\(Int(rate.rounded())) tok/s"
+        }
+        if rate >= 10 {
+            return String(format: "%.1f tok/s", rate)
+        }
+        return String(format: "%.2f tok/s", rate)
+    }
+}
+
+/// Full-thread paste: thinking, tool calls with their stored results, then
+/// the answer. Built from bubbles so a live turn is included.
+public enum ChatConversationExport {
+    public static func markdown(title: String, bubbles: [ChatBubble]) -> String {
+        var lines: [String] = []
+        let heading = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !heading.isEmpty {
+            lines.append("# \(heading)")
+            lines.append("")
+        }
+        for bubble in bubbles {
+            switch bubble.role {
+            case .user:
+                lines.append("## User")
+                lines.append("")
+                lines.append(bubble.text)
+                lines.append("")
+            case .assistant:
+                appendAssistant(&lines, bubble: bubble)
+            case .compaction:
+                lines.append("## Context compacted")
+                lines.append("")
+                lines.append(bubble.text)
+                lines.append("")
+            }
+        }
+        while lines.last == "" { lines.removeLast() }
+        if lines.isEmpty { return "" }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private static func appendAssistant(_ lines: inout [String], bubble: ChatBubble) {
+        lines.append("## Agent")
+        lines.append("")
+        for part in bubble.parts {
+            switch part {
+            case .reasoning(_, _, let text):
+                guard !text.isEmpty else { continue }
+                lines.append("### Thinking")
+                lines.append("")
+                lines.append(text)
+                lines.append("")
+            case .tool(let tool):
+                lines.append("### Tool call: `\(tool.name)`")
+                lines.append("")
+                lines.append("**Arguments**")
+                lines.append("")
+                lines.append("```json")
+                lines.append(prettyJSON(tool.argsJSON))
+                lines.append("```")
+                lines.append("")
+                lines.append("**Result**")
+                lines.append("")
+                if let result = tool.result, !result.isEmpty {
+                    lines.append("```")
+                    lines.append(result)
+                    lines.append("```")
+                } else if let chars = tool.resultChars {
+                    var note = "(\(chars) characters returned"
+                    if tool.truncated {
+                        note += ", shortened"
+                        if tool.droppedTokens > 0 {
+                            note += ", ~\(tool.droppedTokens) tokens left out"
+                        }
+                    }
+                    note += ")"
+                    lines.append(note)
+                } else {
+                    lines.append("(no result stored)")
+                }
+                lines.append("")
+            }
+        }
+        if !bubble.text.isEmpty {
+            if !bubble.parts.isEmpty {
+                lines.append("### Answer")
+                lines.append("")
+            }
+            lines.append(bubble.text)
+            lines.append("")
+        }
+    }
+
+    private static func prettyJSON(_ raw: String) -> String {
+        guard let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              JSONSerialization.isValidJSONObject(object) || object is [Any],
+              let pretty = try? JSONSerialization.data(
+                  withJSONObject: object,
+                  options: [.prettyPrinted, .sortedKeys]
+              ),
+              let text = String(data: pretty, encoding: .utf8)
+        else {
+            return raw
+        }
+        return text
+    }
 }
 
 public enum ChatTranscript {
@@ -1178,7 +1364,8 @@ public enum ChatTranscript {
         nowMs: Int64 = 0,
         liveCompactions: [ChatCompactionNotice] = [],
         progress: ChatProgress? = nil,
-        lastWorkElapsedMs: Int? = nil
+        lastWorkElapsedMs: Int? = nil,
+        liveUsage: ChatContextUsage? = nil
     ) -> [ChatBubble] {
         var previousUserMs: Int64?
         var items = messages
@@ -1204,7 +1391,8 @@ public enum ChatTranscript {
                 reasoning: message.reasoningRounds,
                 wasAborted: message.wasAborted,
                 parts: message.parts,
-                workElapsedMs: elapsed
+                workElapsedMs: elapsed,
+                usage: message.role == .assistant ? message.usage : nil
             )
         }
         if isSending {
@@ -1238,7 +1426,8 @@ public enum ChatTranscript {
                     progress: progress,
                     reasoning: streamingReasoning,
                     parts: liveParts,
-                    workElapsedMs: progress?.elapsedMs
+                    workElapsedMs: progress?.elapsedMs ?? lastWorkElapsedMs,
+                    usage: liveUsage
                 )
             )
         } else if let lastWorkElapsedMs, lastWorkElapsedMs > 0,
@@ -1256,7 +1445,8 @@ public enum ChatTranscript {
                 createdAtMs: finished.createdAtMs,
                 wasAborted: finished.wasAborted,
                 parts: finished.parts,
-                workElapsedMs: lastWorkElapsedMs
+                workElapsedMs: lastWorkElapsedMs,
+                usage: finished.usage
             )
         }
         return items

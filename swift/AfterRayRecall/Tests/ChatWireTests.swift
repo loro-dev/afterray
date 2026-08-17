@@ -157,6 +157,21 @@ final class ChatWireTests: XCTestCase {
         XCTAssertEqual(value.fraction, 5_120.0 / 16_384.0, accuracy: 0.0001)
         XCTAssertFalse(value.isTight)
         XCTAssertEqual(value.shortLabel, "5.1k / 16k")
+        XCTAssertEqual(value.percentLabel, "31%")
+        XCTAssertEqual(value.completionTokens, 0)
+        XCTAssertNil(value.tokensPerSecond)
+
+        let withRate = try ChatStreamEventDecoder.decode(
+            line: Data(
+                #"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2,"completion_tokens":240,"generation_ms":2000}"#.utf8
+            )
+        )
+        guard case .usage(let rated)? = withRate else {
+            return XCTFail("expected a usage event with completion counts")
+        }
+        XCTAssertEqual(rated.completionTokens, 240)
+        XCTAssertEqual(rated.generationMs, 2_000)
+        XCTAssertEqual(rated.tokensPerSecond ?? 0, 120, accuracy: 0.01)
 
         let compaction = try ChatStreamEventDecoder.decode(
             line: Data(

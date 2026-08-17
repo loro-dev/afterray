@@ -718,7 +718,7 @@ fn output_summary(output: &ModelOutput) -> String {
             _ => format!("asr, {} chars", text.chars().count()),
         },
         ModelOutput::Embedding { vector } => format!("embedding, {} dims", vector.len()),
-        ModelOutput::Llm { text } => format!("llm, {} chars", text.chars().count()),
+        ModelOutput::Llm { text, .. } => format!("llm, {} chars", text.chars().count()),
     }
 }
 
@@ -783,9 +783,7 @@ mod tests {
                 return Err(AdapterError::Process("wrong input".into()));
             };
             self.order.lock().unwrap().push(prompt.clone());
-            Ok(ModelOutput::Llm {
-                text: prompt.clone(),
-            })
+            Ok(ModelOutput::llm(prompt.clone()))
         }
     }
 
