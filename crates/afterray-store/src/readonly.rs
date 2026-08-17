@@ -24,6 +24,36 @@ use crate::{
     infoscore, slot,
 };
 
+/// An owned, cloneable read-only handle.
+///
+/// [`ReadOnlyVault`] borrows, which is right for a synchronous caller and
+/// unusable for `spawn_blocking`, whose closure has to be `'static`. An async
+/// caller that cannot move a handle onto a blocking thread ends up running
+/// `SQLite` and artifact decryption on a runtime worker instead — which is what
+/// `afterrayd`'s "never call `Vault` from async" rule exists to stop.
+///
+/// So this is the same narrowing with an `Arc` behind it: movable, cloneable,
+/// and still unable to write, because the only thing it hands out is a
+/// [`ReadOnlyVault`].
+#[derive(Clone)]
+pub struct SharedReadOnlyVault {
+    inner: std::sync::Arc<Vault>,
+}
+
+impl SharedReadOnlyVault {
+    /// Narrows an owned vault to its reads.
+    #[must_use]
+    pub fn new(inner: std::sync::Arc<Vault>) -> Self {
+        Self { inner }
+    }
+
+    /// Borrows it for the duration of one blocking call.
+    #[must_use]
+    pub fn as_read_only(&self) -> ReadOnlyVault<'_> {
+        ReadOnlyVault::new(&self.inner)
+    }
+}
+
 /// Read-only view of a [`Vault`], for the agent's tools.
 ///
 /// Every method forwards unchanged. The value is in what is absent.

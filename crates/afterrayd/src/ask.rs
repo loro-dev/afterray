@@ -383,7 +383,7 @@ fn missing_model_answer(memories: &[Memory], spans: &[ActivitySpan]) -> AskAnswe
 }
 
 pub(crate) async fn handle_ask(
-    store: &Vault,
+    store: &std::sync::Arc<Vault>,
     models: &ModelQueue,
     question: &str,
     from_ms: Option<i64>,
@@ -447,7 +447,7 @@ pub(crate) async fn handle_ask(
         ..afterray_harness::Opening::default()
     };
     let host = ToolHost {
-        store: afterray_store::ReadOnlyVault::new(store),
+        store: afterray_store::SharedReadOnlyVault::new(std::sync::Arc::clone(store)),
         now_ms,
         budget: model.budget,
     };
@@ -482,7 +482,7 @@ mod tests {
     use afterray_store::{Vault, VaultConfig};
     use std::sync::Arc;
 
-    fn test_vault() -> (tempfile::TempDir, Vault) {
+    fn test_vault() -> (tempfile::TempDir, std::sync::Arc<Vault>) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
@@ -492,7 +492,7 @@ mod tests {
             [9_u8; 32],
         )
         .unwrap();
-        (directory, vault)
+        (directory, std::sync::Arc::new(vault))
     }
 
     fn queue(adapters: Vec<Arc<dyn ModelAdapter>>) -> ModelQueue {

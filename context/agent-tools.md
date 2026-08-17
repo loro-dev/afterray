@@ -5,9 +5,18 @@ What the language model can see and ask for, and why it has that shape. Code:
 (`RECALL_SYSTEM_PROMPT`), `chat.rs` / `stream.rs` (openings).
 
 The whole surface is read-only by construction: tools hold an
-`afterray_store::ReadOnlyVault`, which has no writing methods, and the `jail`
-test in `tools.rs` fails the build if a tool reaches for the filesystem, a
-process or a socket. See `docs/harness-threat-model.md`.
+`afterray_store::SharedReadOnlyVault`, which has no writing methods, and the
+`jail` test in `tools.rs` fails the build if a tool reaches for the filesystem,
+a process or a socket. See `docs/harness-threat-model.md`.
+
+It is *owned* rather than borrowed because `ToolHost::invoke` runs the whole
+dispatch inside `spawn_blocking`. Every tool below is a synchronous vault read
+— a day of summary rows, an FTS query, a slot card, an artifact decrypt — and
+awaiting one on a Tokio worker parks it for the duration. The daemon runs one
+worker per two cores, so eight concurrent tool calls is every worker blocked,
+and socket accepts and capture import stop being scheduled behind them. This is
+`afterrayd`'s standing "never call `Vault` from async" rule; the tool host
+obeys it by moving across once per call rather than per query.
 
 ## Eight tools, in two groups
 

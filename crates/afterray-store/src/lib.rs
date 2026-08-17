@@ -86,7 +86,7 @@ pub use slot::{
 };
 
 mod readonly;
-pub use readonly::ReadOnlyVault;
+pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
 pub const SCHEMA_VERSION: u32 = 21;
 

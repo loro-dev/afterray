@@ -19,7 +19,7 @@
 use afterray_protocol::{
     ActivitySpan, AxEvidence, Moment, OcrEvidence, OcrRegion, local_calendar_day_bounds_ms,
 };
-use afterray_store::{ReadOnlyVault, SearchFilter, parse_accessibility_digest};
+use afterray_store::{ReadOnlyVault, SearchFilter, SharedReadOnlyVault, parse_accessibility_digest};
 use chrono::Local;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -59,10 +59,14 @@ const MAX_DAY_THREAD_MOMENTS: usize = 1;
 const MAX_THREAD_MOMENTS: usize = 3;
 
 #[derive(Clone)]
-pub struct ToolHost<'a> {
-    /// Reads only. The agent's tools cannot write to the vault because the
-    /// handle they hold has no writing methods — see `afterray_store::readonly`.
-    pub store: ReadOnlyVault<'a>,
+pub struct ToolHost {
+    /// Reads only, and owned.
+    ///
+    /// Reads only because the handle has no writing methods — see
+    /// `afterray_store::readonly`. Owned because every tool here is a
+    /// synchronous `SQLite` read, and [`Self::invoke`] runs them on a blocking
+    /// thread; a borrowed handle cannot cross that boundary.
+    pub store: SharedReadOnlyVault,
     /// The wall clock for this turn. Every range answer is anchored to it so
     /// the model never has to derive epoch milliseconds on its own.
     pub now_ms: i64,
@@ -71,17 +75,47 @@ pub struct ToolHost<'a> {
     pub budget: ContextBudget,
 }
 
-impl ToolHost<'_> {
+impl ToolHost {
+    /// Runs one tool, off the runtime.
+    ///
+    /// Every arm below is a synchronous vault call — `day_summary` walks a
+    /// day of rows, `search_filtered` runs FTS, `get_slot_card` builds a card,
+    /// `get_moment_context` decrypts artifacts. Awaiting those on a Tokio
+    /// worker parks it for the whole read, and the daemon has one worker per
+    /// two cores: eight concurrent tool calls is every worker blocked, and
+    /// while they are, socket accepts and capture import are not scheduled.
+    /// `afterrayd`'s standing rule is that a sync `Vault` call from async goes
+    /// through `spawn_blocking`, and more workers are a margin rather than a
+    /// substitute.
+    ///
+    /// So the whole dispatch moves across in one hop rather than each tool
+    /// wrapping itself: one blocking task per tool call, and the bodies below
+    /// stay ordinary synchronous code.
+    pub async fn invoke(&self, name: &str, args: &Value) -> Result<Budgeted, String> {
+        let host = self.clone();
+        let called = name.to_owned();
+        let name = name.to_owned();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = host.invoke_blocking(&name, &args)?;
+            Ok(truncate_head(&result, host.budget.tool_result_tokens()))
+        })
+        .await
+        .map_err(|error| format!("tool `{called}` could not be run: {error}"))?
+    }
+
+    /// The read-only handle, borrowed for one call. Only reachable from the
+    /// blocking side.
+    fn store(&self) -> ReadOnlyVault<'_> {
+        self.store.as_read_only()
+    }
+
     /// Dispatch. The arms below are the authority on what exists; the tests at
     /// the bottom of this file read them straight out of the source and hold
     /// [`tool_catalog_text`] and every system prompt to them. Two hand-written
     /// lists is how `get_day_summary` came to be callable but absent from
     /// chat's prompt for a whole release.
-    #[allow(
-        clippy::unused_async,
-        reason = "ToolSurface is async; every tool reads the vault synchronously today"
-    )]
-    pub async fn invoke(&self, name: &str, args: &Value) -> Result<Budgeted, String> {
+    fn invoke_blocking(&self, name: &str, args: &Value) -> Result<String, String> {
         let result = match name {
             "get_now" => self.get_now(),
             "get_day_summary" => self.get_day_summary(args),
@@ -93,7 +127,7 @@ impl ToolHost<'_> {
             "list_activity" => self.list_activity(args),
             other => Err(format!("unknown tool `{other}`")),
         }?;
-        Ok(truncate_head(&result, self.budget.tool_result_tokens()))
+        Ok(result)
     }
 
     /// The clock, every period a question is likely to name, what the
@@ -121,7 +155,7 @@ impl ToolHost<'_> {
                 period.label, period.dates, period.from_ms, period.to_ms
             ));
         }
-        lines.push(match self.store.moment_time_bounds() {
+        lines.push(match self.store().moment_time_bounds() {
             Ok(Some((first, last))) => format!(
                 "Recording covers {} – {}.",
                 local_date(first),
@@ -141,7 +175,7 @@ impl ToolHost<'_> {
         // element is a morning span and its app list has no afternoon in it —
         // and a stale span printed under "Right now" is read as current fact.
         let (day_start, _) = local_calendar_day_bounds_ms(self.now_ms);
-        if let Ok(Some(current)) = self.store.latest_activity_moment(day_start, self.now_ms) {
+        if let Ok(Some(current)) = self.store().latest_activity_moment(day_start, self.now_ms) {
             // Stamped, because the newest capture is only "now" while capture
             // is running: paused or asleep, this is the last thing seen, and
             // the clock beside it is what says so.
@@ -156,7 +190,7 @@ impl ToolHost<'_> {
                 )
             ));
         }
-        if let Ok(apps) = self.store.top_apps_in_range(day_start, self.now_ms, 8)
+        if let Ok(apps) = self.store().top_apps_in_range(day_start, self.now_ms, 8)
             && !apps.is_empty()
         {
             lines.push(format!("Today's apps: {}", apps.join(", ")));
@@ -199,7 +233,7 @@ impl ToolHost<'_> {
         self.check_range(day_start, day_end.min(self.now_ms))?;
 
         let summary = self
-            .store
+            .store()
             .day_summary(day_ms, 10_000)
             .map_err(|e| e.to_string())?;
         if summary.slots.is_empty() {
@@ -231,7 +265,7 @@ impl ToolHost<'_> {
         let filter = self.search_filter(args)?;
         let limit = parse_limit(args, DEFAULT_MENTION_LIMIT, MAX_MENTION_LIMIT);
         let mentions = self
-            .store
+            .store()
             .find_slot_mentions(query, &filter, limit)
             .map_err(|e| e.to_string())?;
         if mentions.is_empty() {
@@ -306,7 +340,7 @@ impl ToolHost<'_> {
         let query = require_query(args, "search_evidence")?;
         let filter = self.search_filter(args)?;
         let limit = parse_limit(args, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
-        let hits = search_hits(self.store, query, &filter, limit).map_err(|e| e.to_string())?;
+        let hits = search_hits(self.store(), query, &filter, limit).map_err(|e| e.to_string())?;
         if hits.is_empty() {
             return Ok(format!(
                 "// nothing captured matches \"{query}\"{}. Try fewer or \
@@ -321,7 +355,7 @@ impl ToolHost<'_> {
             describe_filter(&filter)
         )];
         for hit in hits {
-            let moment = self.store.moment_by_id(&hit.moment_id).ok().flatten();
+            let moment = self.store().moment_by_id(&hit.moment_id).ok().flatten();
             let mut header = format!(
                 "{} at_ms={} moment={}",
                 format_local_time(hit.captured_at_ms),
@@ -338,7 +372,7 @@ impl ToolHost<'_> {
             }
             lines.push(header);
             if let Ok(Some((slot_at_ms, title))) =
-                self.store.slot_title_covering(hit.captured_at_ms)
+                self.store().slot_title_covering(hit.captured_at_ms)
             {
                 lines.push(format!("    stretch: at_ms={slot_at_ms} — {title}"));
             }
@@ -359,11 +393,11 @@ impl ToolHost<'_> {
         })?;
         self.check_range(at_ms, at_ms)?;
         let mut card = self
-            .store
+            .store()
             .slot_card(at_ms, 10_000)
             .map_err(|e| e.to_string())?;
         let background = self
-            .store
+            .store()
             .background_stats(&card)
             .unwrap_or_else(|_| afterray_store::infoscore::BackgroundStats::empty());
         afterray_store::attach_entity_candidates(&mut card, &background);
@@ -384,7 +418,7 @@ impl ToolHost<'_> {
     fn get_moment_context(&self, args: &Value) -> Result<String, String> {
         let moment_id = require_moment_id(args)?;
         let moment = self
-            .store
+            .store()
             .moment_by_id(&moment_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("moment `{moment_id}` not found"))?;
@@ -408,7 +442,7 @@ impl ToolHost<'_> {
         if let Some(document) = &moment.document {
             lines.push(format!("document={document}"));
         }
-        if let Ok(Some((slot_at_ms, title))) = self.store.slot_title_covering(moment.captured_at_ms)
+        if let Ok(Some((slot_at_ms, title))) = self.store().slot_title_covering(moment.captured_at_ms)
         {
             lines.push(format!("stretch: at_ms={slot_at_ms} — {title}"));
         }
@@ -417,14 +451,14 @@ impl ToolHost<'_> {
         // reads, which the model would otherwise retry.
         lines.push(format!(
             "screen text: {}",
-            match ocr_evidence(self.store, &moment_id) {
+            match ocr_evidence(self.store(), &moment_id) {
                 Ok(evidence) if !evidence.text.trim().is_empty() => evidence.text,
                 _ => "none recorded".to_owned(),
             }
         ));
         lines.push(format!(
             "accessibility: {}",
-            match ax_evidence(self.store, &moment_id, true) {
+            match ax_evidence(self.store(), &moment_id, true) {
                 Ok(evidence) => evidence
                     .digest
                     .as_ref()
@@ -454,7 +488,7 @@ impl ToolHost<'_> {
         let (from_ms, to_ms) = self.require_range(args)?;
         let limit = parse_limit(args, DEFAULT_TRANSCRIPT_LIMIT, MAX_TRANSCRIPT_LIMIT);
         let rows = self
-            .store
+            .store()
             .transcripts_in_range(from_ms, to_ms, limit)
             .map_err(|e| e.to_string())?;
         if rows.is_empty() {
@@ -486,7 +520,7 @@ impl ToolHost<'_> {
         // still landed on the earliest spans of the range, so an application
         // that came up late read as "no activity".
         let matched = self
-            .store
+            .store()
             .activity_spans_in_app(from_ms, to_ms, optional_text(args, "app"), limit)
             .map_err(|e| e.to_string())?;
         if matched.is_empty() {
@@ -553,7 +587,7 @@ impl ToolHost<'_> {
     /// numbers the model can copy. A silent `[]` reads as "nothing happened"
     /// and the model stops looking; this makes a mistyped year recoverable.
     fn check_range(&self, from_ms: i64, to_ms: i64) -> Result<(), String> {
-        let Some((first, last)) = self.store.moment_time_bounds().map_err(|e| e.to_string())?
+        let Some((first, last)) = self.store().moment_time_bounds().map_err(|e| e.to_string())?
         else {
             return Err(format!(
                 "the vault holds no captures at all yet. {}",
@@ -577,7 +611,7 @@ impl ToolHost<'_> {
     /// An empty window that *is* inside the recording, reported with the same
     /// anchors so the model can widen or move rather than give up.
     fn nothing_found(&self, what: &str, from_ms: i64, to_ms: i64) -> String {
-        let coverage = match self.store.moment_time_bounds() {
+        let coverage = match self.store().moment_time_bounds() {
             Ok(Some((first, last))) => {
                 format!(" The recording covers {}.", describe_span(first, last))
             }
@@ -1387,14 +1421,48 @@ mod jail {
     #[test]
     fn tool_surfaces_hold_a_read_only_vault() {
         let tools = production_source(include_str!("tools.rs"));
+        // Owned rather than borrowed, because the dispatch runs on a blocking
+        // thread — but still a handle with no writes on it. The `Arc<Vault>`
+        // it wraps is what must not appear here: that would put every mutating
+        // method one keystroke away again.
         assert!(
-            tools.contains(concat!("pub store: ReadOnly", "Vault<'a>")),
+            tools.contains(concat!("pub store: SharedReadOnly", "Vault,")),
             "ToolHost stopped holding a read-only handle"
+        );
+        assert!(
+            !tools.contains(concat!("store: Arc<", "Vault>")),
+            "ToolHost took the writable vault to reach a blocking thread"
         );
         let main = production_source(include_str!("main.rs"));
         assert!(
             main.contains(concat!("store: afterray_store::ReadOnly", "Vault<'a>")),
             "SlotT2Tools stopped holding a read-only handle"
+        );
+    }
+
+    /// Vault reads must leave the runtime.
+    ///
+    /// Every tool here is a synchronous `SQLite` read — a day of summary rows,
+    /// an FTS query, a slot card, an artifact decrypt. Awaiting one on a Tokio
+    /// worker parks it for the whole read, and the daemon runs one worker per
+    /// two cores: eight concurrent tool calls is every worker blocked, and
+    /// socket accepts and capture import stop being scheduled behind them.
+    ///
+    /// This asserts the seam in the source rather than the timing, because the
+    /// failure is a scheduling property no unit test observes. The previous
+    /// version of this file had an `#[allow(clippy::unused_async)]` on
+    /// `invoke` — the lint was telling us the reads were on the runtime, and
+    /// the allow silenced it.
+    #[test]
+    fn the_tool_dispatch_runs_off_the_runtime() {
+        let tools = production_source(include_str!("tools.rs"));
+        assert!(
+            tools.contains(concat!("spawn_", "blocking")),
+            "ToolHost::invoke stopped moving its vault reads off the runtime"
+        );
+        assert!(
+            !tools.contains(concat!("clippy::unused_", "async")),
+            "the async dispatch is being silenced instead of made async"
         );
     }
 
@@ -1641,7 +1709,7 @@ mod tests {
     /// showed a model reaching for 2024 instead.
     const NOW: i64 = 1_786_729_937_000;
 
-    fn host_fixture() -> (tempfile::TempDir, Vault) {
+    fn host_fixture() -> (tempfile::TempDir, std::sync::Arc<Vault>) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
@@ -1651,12 +1719,12 @@ mod tests {
             [7_u8; 32],
         )
         .unwrap();
-        (directory, vault)
+        (directory, std::sync::Arc::new(vault))
     }
 
-    fn host_for(vault: &Vault) -> ToolHost<'_> {
+    fn host_for(vault: &std::sync::Arc<Vault>) -> ToolHost {
         ToolHost {
-            store: ReadOnlyVault::new(vault),
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(vault)),
             now_ms: NOW,
             budget: ContextBudget::DEFAULT,
         }
@@ -1785,7 +1853,7 @@ mod tests {
             let _ = moment;
         }
         let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
             now_ms: afternoon + 40 * 10_000,
             budget: ContextBudget::DEFAULT,
         };
@@ -2000,7 +2068,7 @@ mod tests {
                 .unwrap();
         }
         let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
             now_ms: day_start + 8 * 3_600_000,
             budget: ContextBudget::DEFAULT,
         };
@@ -2284,7 +2352,7 @@ mod tests {
             stamp_app(&vault, &session.id, at_ms, "Zed", &format!("file{index}.rs"));
         }
         let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
             now_ms: zed_start + 6 * 10_000,
             budget: ContextBudget::DEFAULT,
         };
@@ -2340,7 +2408,7 @@ mod tests {
             stamp_app(&vault, &session.id, at_ms, app, &place);
         }
         let host = ToolHost {
-            store: ReadOnlyVault::new(&vault),
+            store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
             now_ms: day_start + 40 * 10_000,
             budget: ContextBudget::DEFAULT,
         };

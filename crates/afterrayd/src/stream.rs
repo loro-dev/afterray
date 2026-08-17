@@ -26,7 +26,7 @@ use crate::agent::RECALL_SYSTEM_PROMPT as SYSTEM_PROMPT;
 const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
 pub(crate) struct ChatStreamCtx<'a> {
-    pub store: &'a Vault,
+    pub store: &'a std::sync::Arc<Vault>,
     pub models: &'a ModelQueue,
     pub token_sink: &'a LlmTokenSink,
     pub now_ms: i64,
@@ -545,7 +545,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
     let budget = ctx.budget;
     let system = format!("{SYSTEM_PROMPT}\n\n{}", tool_catalog_text());
     let host = ToolHost {
-        store: afterray_store::ReadOnlyVault::new(ctx.store),
+        store: afterray_store::SharedReadOnlyVault::new(std::sync::Arc::clone(ctx.store)),
         now_ms: ctx.now_ms,
         budget,
     };
@@ -681,7 +681,7 @@ mod tests {
     use tokio::io::AsyncBufReadExt as _;
     use std::sync::Arc;
 
-    fn test_vault() -> (tempfile::TempDir, Vault) {
+    fn test_vault() -> (tempfile::TempDir, std::sync::Arc<Vault>) {
         let directory = tempfile::tempdir().unwrap();
         let vault = Vault::open_with_key(
             VaultConfig {
@@ -691,7 +691,7 @@ mod tests {
             [9_u8; 32],
         )
         .unwrap();
-        (directory, vault)
+        (directory, std::sync::Arc::new(vault))
     }
 
     fn queue(adapters: Vec<Arc<dyn ModelAdapter>>) -> ModelQueue {

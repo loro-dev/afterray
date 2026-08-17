@@ -87,7 +87,7 @@ impl From<Turn> for AgentTurn {
 /// Runs a short tool-using loop. The model must answer with TOOL/ARGS or FINAL.
 pub async fn run_readonly_agent(
     models: &ModelQueue,
-    tools: &ToolHost<'_>,
+    tools: &ToolHost,
     system: &str,
     opening: Opening,
 ) -> Result<String, AgentError> {
@@ -99,7 +99,7 @@ pub async fn run_readonly_agent(
 /// Same loop as [`run_readonly_agent`], but keeps every tool call for storage.
 pub async fn run_readonly_agent_traced(
     models: &ModelQueue,
-    tools: &ToolHost<'_>,
+    tools: &ToolHost,
     system: &str,
     opening: Opening,
 ) -> Result<AgentTurn, AgentError> {
@@ -128,7 +128,7 @@ pub async fn run_readonly_agent_traced(
     Ok(turn.into())
 }
 
-impl ToolSurface for ToolHost<'_> {
+impl ToolSurface for ToolHost {
     async fn invoke(&self, name: &str, args: &Value) -> Result<Budgeted, String> {
         Self::invoke(self, name, args).await
     }
