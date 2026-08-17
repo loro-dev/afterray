@@ -1403,6 +1403,22 @@ fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
     save_persisted_settings(&state.data_dir, &persisted_settings(state))
 }
 
+/// Disk first, then memory. A failed write must not leave the live window
+/// open (or closed) against a settings.json that still has the old value.
+fn persist_then_store_cli_evidence(
+    data_dir: &Path,
+    mut pending: PersistedSettings,
+    slot: &std::sync::Mutex<Option<i64>>,
+    until: Option<i64>,
+) -> std::io::Result<()> {
+    pending.cli_evidence_until_ms = until;
+    save_persisted_settings(data_dir, &pending)?;
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pending.cli_evidence_until_ms;
+    Ok(())
+}
+
 fn persisted_settings(state: &AppState) -> PersistedSettings {
     let llm = current_llm_config(state);
     PersistedSettings {
@@ -1474,14 +1490,12 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
     } = patch;
     if let Some(enabled) = cli_evidence_access {
         let until = enabled.then(|| now_ms().saturating_add(CLI_EVIDENCE_WINDOW_MS));
-        {
-            let mut slot = state
-                .cli_evidence_until_ms
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *slot = until;
-        }
-        if let Err(error) = persist_current_settings(state) {
+        if let Err(error) = persist_then_store_cli_evidence(
+            &state.data_dir,
+            persisted_settings(state),
+            &state.cli_evidence_until_ms,
+            until,
+        ) {
             return Response::failure(format!("could not save CLI evidence access: {error}"));
         }
     }
@@ -4165,6 +4179,48 @@ mod tests {
         let error = bind_control_socket(&linked).unwrap_err().to_string();
         assert!(error.contains("not a socket"), "{error}");
         assert!(socket.exists(), "the symlink target must survive too");
+    }
+
+    #[test]
+    fn cli_evidence_persists_before_memory_and_rolls_back_on_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let slot = std::sync::Mutex::new(None);
+        persist_then_store_cli_evidence(
+            directory.path(),
+            PersistedSettings::default(),
+            &slot,
+            Some(42),
+        )
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(42));
+        assert_eq!(
+            load_persisted_settings(directory.path()).cli_evidence_until_ms,
+            Some(42)
+        );
+
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"not-a-directory").unwrap();
+        let err = persist_then_store_cli_evidence(
+            &blocked,
+            PersistedSettings {
+                cli_evidence_until_ms: Some(42),
+                ..PersistedSettings::default()
+            },
+            &slot,
+            None,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            *slot.lock().unwrap(),
+            Some(42),
+            "a failed persist must not change the live window"
+        );
+        assert_eq!(
+            load_persisted_settings(directory.path()).cli_evidence_until_ms,
+            Some(42),
+            "the last good settings.json must survive the failed write"
+        );
     }
 
     #[test]

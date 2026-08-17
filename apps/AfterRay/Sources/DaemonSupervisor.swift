@@ -124,6 +124,11 @@ final class DaemonSupervisor {
         if let hostBuild = Self.hostBuild {
             environment["AFTERRAY_HOST_BUILD"] = hostBuild
         }
+        // Ad-hoc / unsigned afterrayd has no Team ID. The packaged Developer
+        // ID daemon ignores this flag and still requires a matching team.
+        if Self.developmentRepoRoot() != nil {
+            environment["AFTERRAY_DEV_TRUST_IDENTIFIER"] = "1"
+        }
         applyModelDefaults(to: &environment)
         child.environment = environment
         let output = DaemonOutputBuffer()

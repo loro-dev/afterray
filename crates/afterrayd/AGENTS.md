@@ -6,7 +6,7 @@ Single-binary tokio daemon: socket/RPC, capture import, model jobs, GOP packing,
 
 - `main` — Tokio multi-thread runtime (`2 × cores`, min 8 workers, 512 blocking threads) keeps UI accepts free under load.
 - `bind_control_socket` — rejects symlinks/non-sockets, chmod `0600`, uid check; peer-uid re-check after `accept`.
-- `handle` — artifact reads + `ChatStream` bypass `dispatch`; every vault/decrypt path still uses `run_store`. Unprivileged peers (not AfterRay.app) are authorized via `afterray_protocol::authorize_cli_request` and have query payloads redacted.
+- `handle` — artifact reads + `ChatStream` bypass `dispatch`; every vault/decrypt path still uses `run_store`. Unprivileged peers are authorized via `afterray_protocol::authorize_cli_request` and have query payloads redacted. The app is identified by socket audit token + code signature (`peer_is_afterray_app`), not by executable path.
 
 - `dispatch` — one arm per `Request` (protocol version lives in `afterray-protocol`).
 - `run_store` — **only** way to call sync `Vault` from async (`spawn_blocking`). UI RPC, capture import, OCR/ASR writes all use it.
