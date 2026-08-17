@@ -39,6 +39,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     @State private var autoScrollState = ChatAutoScrollState()
     @State private var scrollToLatestRequest: UInt64 = 0
     @State private var sidebarCollapsed = false
+    @State private var conversationQuery = ""
 
     public init(
         model: Model,
@@ -97,6 +98,10 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             )
             .padding(.leading, 2)
 
+            if !model.conversations.isEmpty {
+                conversationSearchField
+            }
+
             if model.isLoadingList, model.conversations.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.mini).tint(ChatPalette.accent)
@@ -111,6 +116,12 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .foregroundStyle(ChatPalette.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 6)
+            } else if conversationDays.isEmpty {
+                Text("No chats match.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(ChatPalette.tertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.top, 4)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
@@ -148,9 +159,41 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         }
     }
 
-    /// Computed once per model change — not inside each row.
+    /// Filter then group — each is one pass / one sort, not per row.
     private var conversationDays: [ChatDayGroup] {
-        ChatConversationGrouping.days(model.conversations)
+        ChatConversationGrouping.days(
+            ChatConversationGrouping.matching(model.conversations, query: conversationQuery)
+        )
+    }
+
+    private var conversationSearchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ChatPalette.tertiary)
+            TextField("Search chats", text: $conversationQuery)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundStyle(ChatPalette.label)
+            if !conversationQuery.isEmpty {
+                Button {
+                    conversationQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(ChatPalette.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 28)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        }
     }
 
     private var thread: some View {

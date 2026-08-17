@@ -210,6 +210,20 @@ final class ChatTranscriptTests: XCTestCase {
         XCTAssertEqual(groups[2].conversations.map(\.id), ["old"])
     }
 
+    func testConversationSearchFiltersByTitleAndKeepsDayGroups() {
+        let conversations = [
+            ChatConversation(id: "a", title: "Flock release bugs", createdAtMs: 2_000, updatedAtMs: 2_000, messageCount: 1),
+            ChatConversation(id: "b", title: "Yesterday's meeting", createdAtMs: 1_000, updatedAtMs: 1_000, messageCount: 1),
+            ChatConversation(id: "c", title: "flock follow-up", createdAtMs: 3_000, updatedAtMs: 3_000, messageCount: 1),
+        ]
+        XCTAssertEqual(
+            ChatConversationGrouping.matching(conversations, query: "  FLOCK ").map(\.id),
+            ["a", "c"]
+        )
+        XCTAssertEqual(ChatConversationGrouping.matching(conversations, query: "   ").map(\.id), ["a", "b", "c"])
+        XCTAssertTrue(ChatConversationGrouping.matching(conversations, query: "zzz").isEmpty)
+    }
+
     func testUnknownRoleDecodesAsAssistant() throws {
         let json = #"{"id":"m1","conversation_id":"c1","role":"system","content":"x","created_at_ms":1}"#
         let message = try JSONDecoder().decode(ChatMessage.self, from: Data(json.utf8))

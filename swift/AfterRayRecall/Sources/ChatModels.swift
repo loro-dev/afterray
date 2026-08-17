@@ -68,6 +68,16 @@ public struct ChatDayGroup: Identifiable, Equatable, Sendable {
 }
 
 public enum ChatConversationGrouping {
+    /// Title filter, one linear pass. Empty / whitespace query is a no-op.
+    public static func matching(
+        _ conversations: [ChatConversation],
+        query: String
+    ) -> [ChatConversation] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return conversations }
+        return conversations.filter { $0.title.localizedStandardContains(needle) }
+    }
+
     /// Sort once, then walk — O(n log n). Callers must not re-sort inside a
     /// view body per row.
     public static func days(
