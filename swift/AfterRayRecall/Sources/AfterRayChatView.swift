@@ -5,7 +5,7 @@ private enum ChatMetrics {
     static let panelWidth: CGFloat = 960
     static let panelHeight: CGFloat = 660
     static let panelRadius: CGFloat = 14
-    static let sidebarWidth: CGFloat = 228
+    static let sidebarWidth = ChatSidebarState.expandedWidth
     static let bubbleRadius: CGFloat = 12
     static let gutter: CGFloat = 20
     static let titlebarHeight: CGFloat = 32

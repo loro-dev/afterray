@@ -57,16 +57,22 @@ final class ChatHostingViewTests: XCTestCase {
             backing: .buffered,
             defer: false
         )
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.toolbarStyle = .unified
         window.toolbar = toolbar
+        window.styleMask.insert(.fullSizeContentView)
         window.orderFrontRegardless()
+        controller.updateResponsiveLayout(for: window)
 
         XCTAssertEqual(window.toolbarStyle, .unified)
-        XCTAssertEqual(toolbar.centeredItemIdentifiers, [.chatTitle])
+        XCTAssertEqual(toolbar.centeredItemIdentifiers, [])
         XCTAssertEqual(
             controller.toolbarDefaultItemIdentifiers(toolbar),
             [
                 .chatSidebarToggle,
+                .space,
+                .space,
                 .flexibleSpace,
                 .chatTitle,
                 .flexibleSpace,
@@ -74,6 +80,18 @@ final class ChatHostingViewTests: XCTestCase {
                 .chatMore,
             ]
         )
+        XCTAssertEqual(toolbar.items.filter { $0.itemIdentifier == .space }.count, 2)
+        XCTAssertEqual(
+            toolbar.items.filter { $0.view != nil }.map(\.itemIdentifier),
+            [.chatTitle]
+        )
+
+        let titleView = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier == .chatTitle }?.view
+        )
+        titleView.superview?.layoutSubtreeIfNeeded()
+        let titleFrame = titleView.convert(titleView.bounds, to: nil)
+        XCTAssertGreaterThan(titleFrame.midX, window.frame.width / 2 + 20)
 
         let sidebar = try XCTUnwrap(
             toolbar.items.first { $0.itemIdentifier == .chatSidebarToggle }
@@ -82,10 +100,14 @@ final class ChatHostingViewTests: XCTestCase {
         XCTAssertTrue(sidebar.target === controller)
         XCTAssertFalse(controller.sidebarState.isCollapsed)
         XCTAssertTrue(NSApp.sendAction(sidebar.action!, to: sidebar.target, from: sidebar))
+        controller.updateResponsiveLayout(for: window)
         XCTAssertTrue(controller.sidebarState.isCollapsed)
+        XCTAssertFalse(toolbar.items.contains { $0.itemIdentifier == .space })
         XCTAssertEqual(sidebar.toolTip, "Show sidebar")
         XCTAssertTrue(NSApp.sendAction(sidebar.action!, to: sidebar.target, from: sidebar))
+        controller.updateResponsiveLayout(for: window)
         XCTAssertFalse(controller.sidebarState.isCollapsed)
+        XCTAssertEqual(toolbar.items.filter { $0.itemIdentifier == .space }.count, 2)
         XCTAssertEqual(sidebar.toolTip, "Hide sidebar")
 
         let newConversation = try XCTUnwrap(
@@ -102,12 +124,59 @@ final class ChatHostingViewTests: XCTestCase {
         )
         XCTAssertFalse(more.showsIndicator)
         XCTAssertEqual(more.menu.items.map(\.title), ["Copy Entire Conversation as Markdown"])
-        let titleView = try XCTUnwrap(
-            toolbar.items.first { $0.itemIdentifier == .chatTitle }?.view
-        )
         XCTAssertGreaterThanOrEqual(titleView.fittingSize.width, 180)
         XCTAssertGreaterThanOrEqual(titleView.fittingSize.height, 28)
 
+        window.setContentSize(
+            NSSize(width: ChatWindowController.sidebarAutoCollapseWidth - 1, height: 700)
+        )
+        controller.updateResponsiveLayout(for: window)
+        XCTAssertTrue(controller.sidebarState.isCollapsed)
+        XCTAssertFalse(toolbar.items.contains { $0.itemIdentifier == .space })
+
+        window.setContentSize(
+            NSSize(width: ChatWindowController.sidebarAutoCollapseWidth + 1, height: 700)
+        )
+        controller.updateResponsiveLayout(for: window)
+        XCTAssertFalse(controller.sidebarState.isCollapsed)
+        XCTAssertEqual(toolbar.items.filter { $0.itemIdentifier == .space }.count, 2)
+
+        window.orderOut(nil)
+    }
+
+    func testManualSidebarChoiceSurvivesCompactWidthRoundTrip() throws {
+        let controller = ChatWindowController()
+        let toolbar = controller.makeToolbar()
+        let window = NSWindow(
+            contentRect: NSRect(x: -30_000, y: -30_000, width: 960, height: 700),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.toolbarStyle = .unified
+        window.toolbar = toolbar
+        window.orderFrontRegardless()
+        controller.updateResponsiveLayout(for: window)
+
+        let sidebar = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier == .chatSidebarToggle }
+        )
+        XCTAssertTrue(NSApp.sendAction(sidebar.action!, to: sidebar.target, from: sidebar))
+        XCTAssertTrue(controller.sidebarState.isCollapsed)
+
+        window.setContentSize(
+            NSSize(width: ChatWindowController.sidebarAutoCollapseWidth - 1, height: 700)
+        )
+        controller.updateResponsiveLayout(for: window)
+        window.setContentSize(
+            NSSize(width: ChatWindowController.sidebarAutoCollapseWidth + 1, height: 700)
+        )
+        controller.updateResponsiveLayout(for: window)
+
+        XCTAssertTrue(controller.sidebarState.isCollapsed)
+        XCTAssertEqual(sidebar.toolTip, "Show sidebar")
         window.orderOut(nil)
     }
 

@@ -9,8 +9,13 @@ import SwiftUI
 @MainActor
 final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate, NSMenuItemValidation {
     static let shared = ChatWindowController()
+    static let minimumExpandedConversationWidth: CGFloat = 560
+    static let sidebarAutoCollapseWidth =
+        ChatSidebarState.expandedWidth + minimumExpandedConversationWidth
 
     private var window: NSWindow?
+    private var usesCompactLayout: Bool?
+    private var sidebarCollapsedAutomatically = false
     let sidebarState = ChatSidebarState()
 
     func occupiesActivation(excluding closing: NSWindow?) -> Bool {
@@ -32,6 +37,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
         if let window {
             AfterRayStandardWindowPresence.activate()
             window.makeKeyAndOrderFront(nil)
+            updateResponsiveLayout(for: window)
             refreshThenMaybeSend(send)
             return
         }
@@ -70,6 +76,11 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
 
         AfterRayStandardWindowPresence.activate()
         window.makeKeyAndOrderFront(nil)
+        updateResponsiveLayout(for: window)
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window else { return }
+            self.updateResponsiveLayout(for: window)
+        }
         refreshThenMaybeSend(send)
     }
 
@@ -100,18 +111,24 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
         )
     }
 
+    func windowDidResize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        updateResponsiveLayout(for: window)
+    }
+
     func makeToolbar() -> NSToolbar {
         let toolbar = NSToolbar(identifier: .afterRayChat)
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
-        toolbar.centeredItemIdentifiers = [.chatTitle]
         return toolbar
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         [
             .chatSidebarToggle,
+            .space,
+            .space,
             .flexibleSpace,
             .chatTitle,
             .flexibleSpace,
@@ -172,7 +189,40 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
 
     @objc func toggleSidebar(_ sender: Any?) {
         sidebarState.isCollapsed.toggle()
-        guard let item = sender as? NSToolbarItem else { return }
+        sidebarCollapsedAutomatically = false
+        let item = (sender as? NSToolbarItem) ?? window?.toolbar?.items.first {
+            $0.itemIdentifier == .chatSidebarToggle
+        }
+        updateSidebarToggleItem(item)
+        if let toolbar = item?.toolbar ?? window?.toolbar {
+            updateToolbarAlignmentItems(in: toolbar)
+        }
+    }
+
+    func updateResponsiveLayout(for window: NSWindow) {
+        let isCompact = window.contentLayoutRect.width < Self.sidebarAutoCollapseWidth
+
+        if usesCompactLayout != isCompact {
+            usesCompactLayout = isCompact
+            if isCompact, !sidebarState.isCollapsed {
+                sidebarState.isCollapsed = true
+                sidebarCollapsedAutomatically = true
+            } else if !isCompact, sidebarCollapsedAutomatically {
+                sidebarState.isCollapsed = false
+                sidebarCollapsedAutomatically = false
+            }
+            updateSidebarToggleItem(
+                window.toolbar?.items.first { $0.itemIdentifier == .chatSidebarToggle }
+            )
+        }
+
+        if let toolbar = window.toolbar {
+            updateToolbarAlignmentItems(in: toolbar)
+        }
+    }
+
+    private func updateSidebarToggleItem(_ item: NSToolbarItem?) {
+        guard let item else { return }
         item.label = sidebarToggleLabel
         item.paletteLabel = item.label
         item.toolTip = item.label
@@ -180,6 +230,26 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
             systemSymbolName: "sidebar.left",
             accessibilityDescription: item.label
         )
+    }
+
+    private func updateToolbarAlignmentItems(in toolbar: NSToolbar) {
+        let alignmentIndices = toolbar.items.indices.filter {
+            toolbar.items[$0].itemIdentifier == .space
+        }
+        let desiredCount = sidebarState.isCollapsed ? 0 : 2
+        guard alignmentIndices.count != desiredCount else { return }
+
+        for index in alignmentIndices.reversed() {
+            toolbar.removeItem(at: index)
+        }
+        guard desiredCount > 0,
+              let sidebarIndex = toolbar.items.firstIndex(where: {
+                  $0.itemIdentifier == .chatSidebarToggle
+              })
+        else { return }
+        for offset in 0..<desiredCount {
+            toolbar.insertItem(withItemIdentifier: .space, at: sidebarIndex + 1 + offset)
+        }
     }
 
     @objc func startNewConversation(_ sender: Any?) {
