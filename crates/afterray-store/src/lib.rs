@@ -39,7 +39,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -538,7 +538,10 @@ pub struct Vault {
     artifacts_dir: PathBuf,
     artifact_wrap_key: Zeroizing<[u8; 32]>,
     legacy_artifact_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
-    artifact_io: Mutex<()>,
+    /// Serializes artifact *writes* (put/delete/migrate) against each other and
+    /// against reads of the same file tree. Concurrent reads share a read lock
+    /// so filmstrip scrubbing can decrypt many JPEGs in parallel.
+    artifact_io: RwLock<()>,
     max_storage_bytes: AtomicU64,
     /// Absent for a new/empty vault. Existing vaults persist the first
     /// 10-minute boundary so reopening never reinterprets old half-hours.
@@ -554,7 +557,9 @@ struct ReadPool {
 }
 
 impl ReadPool {
-    const SIZE: usize = 3;
+    /// Sized for overlapping UI reads (timeline + filmstrip + search) while a
+    /// day-summary build is also fanning out slot cards on scoped threads.
+    const SIZE: usize = 6;
 
     fn open(path: &Path, key: &Zeroizing<[u8; 32]>) -> Result<Self, StoreError> {
         let mut connections = Vec::with_capacity(Self::SIZE);
@@ -671,7 +676,7 @@ impl Vault {
                 &*master_key,
             )),
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
-            artifact_io: Mutex::new(()),
+            artifact_io: RwLock::new(()),
             max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
             summary_slot_cutover_ms,
         };
@@ -697,7 +702,7 @@ impl Vault {
     }
 
     pub fn storage_usage_bytes(&self) -> Result<u64, StoreError> {
-        let bytes = self.connection.lock().unwrap().query_row(
+        let bytes = self.readers.get().query_row(
             "SELECT COALESCE(SUM(byte_length + ?1), 0) FROM artifacts",
             [ARTIFACT_FILE_OVERHEAD_BYTES],
             |row| row.get::<_, i64>(0),
@@ -805,7 +810,7 @@ impl Vault {
     }
 
     pub fn timeline_sync(&self) -> Result<Vec<Moment>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
                     (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
@@ -848,7 +853,7 @@ impl Vault {
     }
 
     pub fn timeline_since_sync(&self, since_ms: i64) -> Result<Vec<Moment>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
                     (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
@@ -2590,9 +2595,8 @@ impl Vault {
 
     /// Artifact holding this moment's filmstrip thumbnail, if one was built.
     pub fn thumbnail_artifact_id(&self, moment_id: &str) -> Result<Option<String>, StoreError> {
-        self.connection
-            .lock()
-            .unwrap()
+        self.readers
+            .get()
             .query_row(
                 "SELECT thumbnail_artifact_id FROM moments WHERE id = ?1",
                 [moment_id],
@@ -2883,19 +2887,22 @@ impl Vault {
     }
 
     pub fn read_artifact(&self, id: &str) -> Result<ArtifactPayload, StoreError> {
-        let _artifact_guard = self.artifact_io.lock().unwrap();
-        let connection = self.connection.lock().unwrap();
-        let metadata: Option<ArtifactRecordMetadata> = connection
-            .query_row(
-                "SELECT content_type, format_version, wrapped_key, wrapping_nonce
-                   FROM artifacts WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
+        // Shared lock: many UI reads decrypt at once. Writers take the exclusive
+        // side so a put/delete/migrate cannot race a reader mid-file.
+        let _artifact_guard = self.artifact_io.read().unwrap();
+        let metadata: Option<ArtifactRecordMetadata> = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    "SELECT content_type, format_version, wrapped_key, wrapping_nonce
+                       FROM artifacts WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?
+        };
         let (content_type, format_version, wrapped_key, wrapping_nonce) =
             metadata.ok_or_else(|| StoreError::ArtifactNotFound(id.to_owned()))?;
-        drop(connection);
         if format_version < ARTIFACT_FORMAT_VERSION {
             let legacy_key = self
                 .legacy_artifact_key
@@ -2934,7 +2941,7 @@ impl Vault {
     }
 
     fn put_artifact(&self, content_type: &str, bytes: &[u8]) -> Result<String, StoreError> {
-        let _artifact_guard = self.artifact_io.lock().unwrap();
+        let _artifact_guard = self.artifact_io.write().unwrap();
         let staged = self.stage_artifact_unlocked(content_type, bytes)?;
         let result = self.connection.lock().unwrap().execute(
             "INSERT INTO artifacts (
@@ -3031,7 +3038,7 @@ impl Vault {
             .ok_or(StoreError::Crypto)?;
         let total = artifacts.len();
         for (id, content_type) in artifacts {
-            let _artifact_guard = self.artifact_io.lock().unwrap();
+            let _artifact_guard = self.artifact_io.write().unwrap();
             let path = self.artifact_path(&id);
             let legacy_path = self.legacy_artifact_path(&id);
             let legacy_encrypted = fs::read(&legacy_path)?;
@@ -3070,7 +3077,7 @@ impl Vault {
             .lock()
             .unwrap()
             .execute("DELETE FROM artifacts WHERE id = ?1", [id])?;
-        let _artifact_guard = self.artifact_io.lock().unwrap();
+        let _artifact_guard = self.artifact_io.write().unwrap();
         match fs::remove_file(self.artifact_path(id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -3079,7 +3086,7 @@ impl Vault {
     }
 
     fn cleanup_orphaned_artifact_files(&self) -> Result<(), StoreError> {
-        let _artifact_guard = self.artifact_io.lock().unwrap();
+        let _artifact_guard = self.artifact_io.write().unwrap();
         for entry in fs::read_dir(&self.artifacts_dir)? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -5403,6 +5410,37 @@ mod tests {
         let reader = vault.readers.get();
         let result = reader.execute("CREATE TABLE should_fail (id INTEGER)", []);
         assert!(result.is_err(), "a pool reader accepted a write");
+    }
+
+    /// Filmstrip scrubbing decrypts many artifacts at once. Under a plain
+    /// `Mutex` those reads queue; the `RwLock` lets them share a read lock.
+    #[test]
+    fn concurrent_artifact_reads_do_not_serialize() {
+        let (_directory, vault) = test_vault(100);
+        let session = vault.create_session_sync(1_000).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..8 {
+            let moment = vault
+                .insert_moment(
+                    &session.id,
+                    1_000 + i * 1_000,
+                    "image/jpeg",
+                    format!("frame-{i}").as_bytes(),
+                )
+                .unwrap();
+            ids.push(moment.image_artifact_id.expect("still stored"));
+        }
+        let vault = std::sync::Arc::new(vault);
+        std::thread::scope(|scope| {
+            for id in &ids {
+                let vault = std::sync::Arc::clone(&vault);
+                let id = id.clone();
+                scope.spawn(move || {
+                    let payload = vault.read_artifact(&id).expect("decrypt still");
+                    assert!(!payload.bytes.is_empty());
+                });
+            }
+        });
     }
 
     #[test]

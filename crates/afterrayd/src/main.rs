@@ -139,8 +139,27 @@ fn clear_stale_capture_files(staging_dir: &Path) -> std::io::Result<usize> {
     Ok(removed)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// UI traffic (socket accepts, chat streams, artifact scrubbing) must never
+/// share a tiny worker pool with capture import, day-summary builds, or other
+/// long CPU work. Default `#[tokio::main]` sizes workers to one per core; we
+/// oversubscribe so a few blocked tasks cannot starve the accept loop.
+fn main() -> anyhow::Result<()> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2).max(8))
+        .unwrap_or(8);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        // Default is 512; keep it high so spawn_blocking UI reads never queue
+        // behind capture encrypt / T2 / GOP-adjacent store work.
+        .max_blocking_threads(512)
+        .thread_name("afterrayd-worker")
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let socket =
         afterray_protocol::socket::default_socket_path().context("resolve daemon socket path")?;
     let (listener, owner_uid) = bind_control_socket(&socket)?;
@@ -578,24 +597,29 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Request>(&line) {
+            // Artifact / thumbnail reads decrypt on the blocking pool. Doing
+            // that on a worker used to freeze accepts and chat streams while
+            // the filmstrip scrubbed.
             Ok(Request::ReadArtifact { artifact_id }) => {
-                write_artifact_response(&mut write, read_still_artifact(&state, &artifact_id))
-                    .await?;
+                let result =
+                    run_store(&state, move |s| read_still_artifact(s, &artifact_id)).await;
+                write_artifact_response(&mut write, result).await?;
             }
             Ok(Request::ReadGopSegment { segment_id }) => {
-                write_artifact_response(&mut write, state.store.read_gop_artifact(&segment_id))
-                    .await?;
+                let result =
+                    run_store(&state, move |s| s.store.read_gop_artifact(&segment_id)).await;
+                write_artifact_response(&mut write, result).await?;
             }
             Ok(Request::ReadGopFrame {
                 segment_id,
                 index,
                 mode,
             }) => {
-                write_artifact_response(
-                    &mut write,
-                    gop_packer::read_gop_frame(&state.store, &segment_id, index, mode),
-                )
-                .await?;
+                let result = run_store(&state, move |s| {
+                    gop_packer::read_gop_frame(&s.store, &segment_id, index, mode)
+                })
+                .await;
+                write_artifact_response(&mut write, result).await?;
             }
             Ok(Request::ChatStream {
                 conversation_id,
@@ -626,11 +650,11 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
                 moment_id,
                 max_edge,
             }) => {
-                write_artifact_response(
-                    &mut write,
-                    read_moment_thumbnail(&state.store, &moment_id, max_edge),
-                )
-                .await?;
+                let result = run_store(&state, move |s| {
+                    read_moment_thumbnail(&s.store, &moment_id, max_edge)
+                })
+                .await;
+                write_artifact_response(&mut write, result).await?;
             }
             Ok(request) => {
                 write_json_response(&mut write, &dispatch(request, &state).await).await?;
@@ -743,7 +767,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             );
             Response::success(serde_json::json!({"capture_paused": paused}))
         }
-        Request::SessionsList => into_response(state.store.sessions_sync()),
+        // Every Vault touch below goes through `run_store`. The async surface
+        // (accepts, Status/Ping, chat stream IO) stays on workers; SQLite and
+        // decrypt stay on the blocking pool.
+        Request::SessionsList => {
+            run_store(state, |s| into_response(s.store.sessions_sync())).await
+        }
         Request::TimelineList => run_store(state, |s| into_response(s.store.timeline_sync())).await,
         Request::TimelineSince { since_ms } => {
             run_store(state, move |s| {
@@ -761,15 +790,18 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             session_id,
             center_ms,
             limit,
-        } => match state.store.moments_sync(&session_id) {
-            Ok(mut moments) => {
-                moments.sort_by_key(|moment| moment.captured_at_ms.abs_diff(center_ms));
-                moments.truncate(limit.clamp(1, 500));
-                moments.sort_by_key(|moment| moment.captured_at_ms);
-                Response::success(moments)
-            }
-            Err(error) => Response::failure(error.to_string()),
-        },
+        } => {
+            run_store(state, move |s| match s.store.moments_sync(&session_id) {
+                Ok(mut moments) => {
+                    moments.sort_by_key(|moment| moment.captured_at_ms.abs_diff(center_ms));
+                    moments.truncate(limit.clamp(1, 500));
+                    moments.sort_by_key(|moment| moment.captured_at_ms);
+                    Response::success(moments)
+                }
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
+        }
         Request::ReadArtifact { .. }
         | Request::ReadGopSegment { .. }
         | Request::ReadGopFrame { .. }
@@ -780,36 +812,55 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             Response::failure("chat streams are framed as NDJSON events and are handled separately")
         }
         Request::ChatAbort { conversation_id } => abort_turn(state, &conversation_id),
-        Request::PackStatus => pack_status(state),
-        Request::GopShow { segment_id } => into_response(state.store.gop_segment_view(&segment_id)),
+        Request::PackStatus => run_store(state, |s| pack_status(s)).await,
+        Request::GopShow { segment_id } => {
+            run_store(state, move |s| into_response(s.store.gop_segment_view(&segment_id))).await
+        }
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
         Request::Search {
             query,
             limit,
             from_ms,
             to_ms,
-        } => match text_hits(&state.store, &query, limit.clamp(1, 100)) {
-            Ok(mut hits) => {
-                if let (Some(from), Some(to)) = (from_ms, to_ms) {
-                    let (from, to) = if from <= to { (from, to) } else { (to, from) };
-                    hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
+        } => {
+            run_store(state, move |s| match text_hits(&s.store, &query, limit.clamp(1, 100)) {
+                Ok(mut hits) => {
+                    if let (Some(from), Some(to)) = (from_ms, to_ms) {
+                        let (from, to) = if from <= to { (from, to) } else { (to, from) };
+                        hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
+                    }
+                    Response::success(hits)
                 }
-                Response::success(hits)
-            }
-            Err(error) => Response::failure(error.to_string()),
-        },
-        Request::MomentGet { moment_id } => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
-            Ok(moment) => Response::success(moment),
-            Err(error) => Response::failure(error),
-        },
-        Request::MomentAt { at_ms } => match state.store.moment_nearest(at_ms) {
-            Ok(Some(moment_id)) => match tools::moment_detail(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
-                Ok(moment) => Response::success(moment),
-                Err(error) => Response::failure(error),
-            },
-            Ok(None) => Response::failure("no moment has been captured yet"),
-            Err(error) => Response::failure(error.to_string()),
-        },
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
+        }
+        Request::MomentGet { moment_id } => {
+            run_store(state, move |s| {
+                match tools::moment_detail(afterray_store::ReadOnlyVault::new(&s.store), &moment_id)
+                {
+                    Ok(moment) => Response::success(moment),
+                    Err(error) => Response::failure(error),
+                }
+            })
+            .await
+        }
+        Request::MomentAt { at_ms } => {
+            run_store(state, move |s| match s.store.moment_nearest(at_ms) {
+                Ok(Some(moment_id)) => {
+                    match tools::moment_detail(
+                        afterray_store::ReadOnlyVault::new(&s.store),
+                        &moment_id,
+                    ) {
+                        Ok(moment) => Response::success(moment),
+                        Err(error) => Response::failure(error),
+                    }
+                }
+                Ok(None) => Response::failure("no moment has been captured yet"),
+                Err(error) => Response::failure(error.to_string()),
+            })
+            .await
+        }
         Request::SlotCard { at_ms } => {
             run_store(state, move |s| into_response(slot_card_for(s, at_ms))).await
         }
@@ -845,26 +896,41 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             })
             .await
         }
-        Request::EvidenceOcr { moment_id } => match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id) {
-            Ok(evidence) => Response::success(evidence),
-            Err(error) => Response::failure(error),
-        },
+        Request::EvidenceOcr { moment_id } => {
+            run_store(state, move |s| {
+                match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&s.store), &moment_id) {
+                    Ok(evidence) => Response::success(evidence),
+                    Err(error) => Response::failure(error),
+                }
+            })
+            .await
+        }
         Request::EvidenceAx {
             moment_id,
             digest_only,
-        } => match tools::ax_evidence(afterray_store::ReadOnlyVault::new(&state.store), &moment_id, digest_only) {
-            Ok(evidence) => Response::success(evidence),
-            Err(error) => Response::failure(error),
-        },
+        } => {
+            run_store(state, move |s| {
+                match tools::ax_evidence(
+                    afterray_store::ReadOnlyVault::new(&s.store),
+                    &moment_id,
+                    digest_only,
+                ) {
+                    Ok(evidence) => Response::success(evidence),
+                    Err(error) => Response::failure(error),
+                }
+            })
+            .await
+        }
         Request::ActivitySpans {
             from_ms,
             to_ms,
             limit,
-        } => into_response(
-            state
-                .store
-                .activity_spans(from_ms, to_ms, limit.clamp(1, 500)),
-        ),
+        } => {
+            run_store(state, move |s| {
+                into_response(s.store.activity_spans(from_ms, to_ms, limit.clamp(1, 500)))
+            })
+            .await
+        }
         Request::ModelsStatus => Response::success(model_library(state)),
         Request::JobsList => Response::success(state.models.list().await),
         Request::JobRetry { job_id } => match state.models.retry(&job_id).await {
@@ -904,12 +970,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             )
             .await
         }
-        Request::ChatList => chat::handle_list(&state.store),
+        Request::ChatList => run_store(state, |s| chat::handle_list(&s.store)).await,
         Request::ChatHistory { conversation_id } => {
-            chat::handle_history(&state.store, &conversation_id)
+            run_store(state, move |s| chat::handle_history(&s.store, &conversation_id)).await
         }
         Request::ChatDelete { conversation_id } => {
-            chat::handle_delete(&state.store, &conversation_id)
+            run_store(state, move |s| chat::handle_delete(&s.store, &conversation_id)).await
         }
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
@@ -965,7 +1031,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             from_ms,
             to_ms,
             limit,
-        } => into_response(state.store.memories(from_ms, to_ms, limit.clamp(1, 200))),
+        } => {
+            run_store(state, move |s| {
+                into_response(s.store.memories(from_ms, to_ms, limit.clamp(1, 200)))
+            })
+            .await
+        }
         Request::DownloadModels { pack_id, pack_ids } => {
             start_model_downloads(state, pack_id.as_deref(), &pack_ids)
         }
@@ -985,13 +1056,13 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
 }
 
 async fn record_start(state: &Arc<AppState>) -> Response {
-    let _ = state.store.end_open_idle_spans(now_ms());
+    let _ = run_store(state, |s| s.store.end_open_idle_spans(now_ms())).await;
     let mut recording = state.recording.lock().await;
     if let Some(id) = &recording.active_session_id {
         eprintln!("record_start: already recording session {id}");
         return Response::success(serde_json::json!({"session_id": id, "already_recording": true}));
     }
-    let session = match state.store.create_session_sync(now_ms()) {
+    let session = match run_store(state, |s| s.store.create_session_sync(now_ms())).await {
         Ok(session) => session,
         Err(error) => {
             eprintln!("record_start: failed to create session: {error}");
@@ -1009,7 +1080,8 @@ async fn record_start(state: &Arc<AppState>) -> Response {
     drop(recording);
     if let Err(error) = start_capture_runtime(state, session.id.clone()).await {
         eprintln!("record_start: capture runtime failed: {error}");
-        let _ = state.store.end_session_sync(&session.id, now_ms());
+        let session_id = session.id.clone();
+        let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
         let mut recording = state.recording.lock().await;
         if recording.active_session_id.as_deref() == Some(session.id.as_str()) {
             recording.active_session_id = None;
@@ -1724,16 +1796,19 @@ async fn clear_history(state: &Arc<AppState>, scope: HistoryScope) -> Response {
         HistoryScope::Today => local_calendar_day_bounds_ms(now),
         HistoryScope::All => (0, now),
     };
-    memory::flush(&state.store, &state.memories);
-    match state.store.delete_history(from_ms, to_ms) {
-        Ok(deleted) => Response::success(serde_json::json!({
-            "scope": scope,
-            "deleted": deleted,
-            "from_ms": from_ms,
-            "to_ms": to_ms,
-        })),
-        Err(error) => Response::failure(error.to_string()),
-    }
+    run_store(state, move |s| {
+        memory::flush(&s.store, &s.memories);
+        match s.store.delete_history(from_ms, to_ms) {
+            Ok(deleted) => Response::success(serde_json::json!({
+                "scope": scope,
+                "deleted": deleted,
+                "from_ms": from_ms,
+                "to_ms": to_ms,
+            })),
+            Err(error) => Response::failure(error.to_string()),
+        }
+    })
+    .await
 }
 
 fn settings_path(data_dir: &Path) -> PathBuf {
@@ -1806,10 +1881,12 @@ fn migrate_api_key_to_keychain(
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
-    memory::flush(&state.store, &state.memories);
-    let _ = state
-        .store
-        .begin_idle_span(now_ms(), reason.unwrap_or("pause"));
+    let reason = reason.unwrap_or("pause").to_owned();
+    let _ = run_store(state, move |s| {
+        memory::flush(&s.store, &s.memories);
+        s.store.begin_idle_span(now_ms(), &reason)
+    })
+    .await;
     let (session_id, scheduler, consumer) = {
         let mut recording = state.recording.lock().await;
         let Some(session_id) = recording.active_session_id.take() else {
@@ -1830,7 +1907,9 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
     if let Some(consumer) = consumer {
         let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
     }
-    let store_result = state.store.end_session_sync(&session_id, now_ms());
+    let session_for_store = session_id.clone();
+    let store_result =
+        run_store(state, move |s| s.store.end_session_sync(&session_for_store, now_ms())).await;
     match (capture_error, store_result) {
         (None, Ok(())) => Response::success(serde_json::json!({"session_id": session_id})),
         (Some(capture_error), Ok(())) => Response::failure(format!(
@@ -1903,7 +1982,8 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
     if let Some(scheduler) = scheduler {
         scheduler.abort();
     }
-    let _ = state.store.end_session_sync(session_id, now_ms());
+    let session_id = session_id.to_owned();
+    let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
 }
 
 async fn import_artifact(
@@ -1918,13 +1998,16 @@ async fn import_artifact(
     let bytes = tokio::fs::read(path).await?;
     match kind {
         ArtifactKind::Screen => {
-            let moment =
-                state
-                    .store
-                    .insert_moment(session_id, started_at_ms, content_type, &bytes)?;
+            let session_id = session_id.to_owned();
+            let content_type = content_type.to_owned();
+            let moment = run_store(state, move |s| {
+                s.store
+                    .insert_moment(&session_id, started_at_ms, &content_type, &bytes)
+            })
+            .await?;
             {
                 let mut recording = state.recording.lock().await;
-                if recording.active_session_id.as_deref() == Some(session_id) {
+                if recording.active_session_id.as_deref() == Some(moment.session_id.as_str()) {
                     recording.captured_frame = true;
                 }
             }
@@ -1947,17 +2030,25 @@ async fn import_artifact(
                     } else {
                         serde_json::to_string(&regions).ok()
                     };
-                    if let Ok(evidence_id) = model_state.store.insert_text_evidence(
-                        &moment.session_id,
-                        Some(&moment.id),
-                        None,
-                        "ocr",
-                        &text,
-                        moment.captured_at_ms,
-                        None,
-                        &snapshot.adapter,
-                        layout_json.as_deref(),
-                    ) {
+                    let session_id = moment.session_id.clone();
+                    let moment_id = moment.id.clone();
+                    let adapter = snapshot.adapter.clone();
+                    let text_for_store = text.clone();
+                    let evidence = run_store(&model_state, move |s| {
+                        s.store.insert_text_evidence(
+                            &session_id,
+                            Some(&moment_id),
+                            None,
+                            "ocr",
+                            &text_for_store,
+                            moment.captured_at_ms,
+                            None,
+                            &adapter,
+                            layout_json.as_deref(),
+                        )
+                    })
+                    .await;
+                    if let Ok(evidence_id) = evidence {
                         submit_embedding(&model_state, evidence_id, text).await;
                     }
                 }
@@ -1971,14 +2062,19 @@ async fn import_artifact(
                     afterray_protocol::AudioTrack::System
                 }
             };
-            state.store.insert_audio_segment(
-                session_id,
-                track,
-                started_at_ms,
-                ended_at_ms,
-                content_type,
-                &bytes,
-            )?;
+            let session_id = session_id.to_owned();
+            let content_type = content_type.to_owned();
+            run_store(state, move |s| {
+                s.store.insert_audio_segment(
+                    &session_id,
+                    track,
+                    started_at_ms,
+                    ended_at_ms,
+                    &content_type,
+                    &bytes,
+                )
+            })
+            .await?;
             // The encrypted segment is the durable queue. Plaintext exists
             // again only while the sweeper owns a claimed ASR item.
             if let Err(error) = tokio::fs::remove_file(path).await {
@@ -2001,7 +2097,7 @@ async fn import_artifact(
                         "accessibility snapshot did not parse, dropping the frame it describes: {error}"
                     );
                     if let Some(moment_id) =
-                        nearest_moment_id(&state.store, session_id, started_at_ms)
+                        nearest_moment_id_async(state, session_id, started_at_ms).await
                     {
                         delete_excluded_moment(state, &moment_id).await;
                     }
@@ -2015,30 +2111,44 @@ async fn import_artifact(
             if is_excluded_bundle(state, metadata.bundle_identifier.as_deref())
                 || is_excluded_url(state, metadata.url.as_deref())
             {
-                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
+                if let Some(moment_id) =
+                    nearest_moment_id_async(state, session_id, started_at_ms).await
                 {
                     delete_excluded_moment(state, &moment_id).await;
                 }
                 tokio::fs::remove_file(path).await?;
                 return Ok(());
             }
-            let attached = attach_accessibility_artifact(
-                &state.store,
-                session_id,
-                started_at_ms,
-                content_type,
-                &bytes,
-            )?;
-            if attached.is_some() {
-                if let Some(moment_id) = nearest_moment_id(&state.store, session_id, started_at_ms)
-                {
-                    memory::observe_and_maybe_commit(
-                        &state.store,
-                        &state.memories,
+            let session_id_owned = session_id.to_owned();
+            let content_type = content_type.to_owned();
+            let attached = run_store(state, {
+                let bytes = bytes.clone();
+                move |s| {
+                    attach_accessibility_artifact(
+                        &s.store,
+                        &session_id_owned,
                         started_at_ms,
-                        &moment_id,
+                        &content_type,
                         &bytes,
-                    );
+                    )
+                }
+            })
+            .await?;
+            if attached.is_some() {
+                if let Some(moment_id) =
+                    nearest_moment_id_async(state, session_id, started_at_ms).await
+                {
+                    let moment_id = moment_id.clone();
+                    let _ = run_store(state, move |s| {
+                        memory::observe_and_maybe_commit(
+                            &s.store,
+                            &s.memories,
+                            started_at_ms,
+                            &moment_id,
+                            &bytes,
+                        );
+                    })
+                    .await;
                 }
             } else {
                 eprintln!(
@@ -2079,14 +2189,22 @@ fn attach_accessibility_artifact(
     )
 }
 
-fn nearest_moment_id(store: &Vault, session_id: &str, captured_at_ms: i64) -> Option<String> {
-    store
-        .moments_sync(session_id)
-        .ok()?
-        .into_iter()
-        .rev()
-        .find(|moment| moment.captured_at_ms.abs_diff(captured_at_ms) <= 2_000)
-        .map(|moment| moment.id)
+async fn nearest_moment_id_async(
+    state: &Arc<AppState>,
+    session_id: &str,
+    captured_at_ms: i64,
+) -> Option<String> {
+    let session_id = session_id.to_owned();
+    run_store(state, move |s| {
+        s.store
+            .moments_sync(&session_id)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|moment| moment.captured_at_ms.abs_diff(captured_at_ms) <= 2_000)
+            .map(|moment| moment.id)
+    })
+    .await
 }
 
 /// Removing the frame an exclusion just matched *is* the guarantee, so a
@@ -2099,12 +2217,22 @@ fn nearest_moment_id(store: &Vault, session_id: &str, captured_at_ms: i64) -> Op
 async fn delete_excluded_moment(state: &Arc<AppState>, moment_id: &str) {
     const RETRY_DELAY: Duration = Duration::from_millis(250);
 
-    let Err(error) = state.store.delete_moment_and_artifacts(moment_id) else {
+    let moment_id_owned = moment_id.to_owned();
+    let Err(error) = run_store(state, move |s| {
+        s.store.delete_moment_and_artifacts(&moment_id_owned)
+    })
+    .await
+    else {
         return;
     };
     eprintln!("excluded moment {moment_id} could not be deleted, retrying once: {error}");
     tokio::time::sleep(RETRY_DELAY).await;
-    if let Err(error) = state.store.delete_moment_and_artifacts(moment_id) {
+    let moment_id_owned = moment_id.to_owned();
+    if let Err(error) = run_store(state, move |s| {
+        s.store.delete_moment_and_artifacts(&moment_id_owned)
+    })
+    .await
+    {
         eprintln!("excluded moment {moment_id} survived a retry and is still recorded: {error}");
     }
 }
@@ -2119,9 +2247,11 @@ async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: Stri
     if snapshot.state == JobState::Done
         && let Some(ModelOutput::Embedding { vector }) = snapshot.output
     {
-        let _ = state
-            .store
-            .insert_embedding(&evidence_id, &vector, &snapshot.adapter);
+        let adapter = snapshot.adapter.clone();
+        let _ = run_store(state, move |s| {
+            s.store.insert_embedding(&evidence_id, &vector, &adapter)
+        })
+        .await;
     }
 }
 
@@ -2326,13 +2456,15 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
             turn.answer.chars().count()
         ));
     };
-    if let Err(error) = state.store.put_t2_summary_v2(
-        &inputs.card,
-        &t2,
-        "t2-agent",
-        now_ms(),
-        i64::try_from(latency_ms).ok(),
-    ) {
+    let latency_i64 = i64::try_from(latency_ms).ok();
+    let card = inputs.card.clone();
+    let t2_for_store = t2.clone();
+    if let Err(error) = run_store(state, move |s| {
+        s.store
+            .put_t2_summary_v2(&card, &t2_for_store, "t2-agent", now_ms(), latency_i64)
+    })
+    .await
+    {
         eprintln!("slot.t2 persist failed slot={slot_start_ms}: {error}");
     }
 
@@ -2761,7 +2893,8 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
 }
 
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
-    let text = match state.store.session_text(session_id) {
+    let session_id_owned = session_id.to_owned();
+    let text = match run_store(state, move |s| s.store.session_text(&session_id_owned)).await {
         Ok(text) if !text.is_empty() => text,
         Ok(_) => return Response::failure("the session has no OCR or transcript evidence yet"),
         Err(error) => return Response::failure(error.to_string()),

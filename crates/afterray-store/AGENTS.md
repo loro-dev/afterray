@@ -4,7 +4,7 @@ The encrypted vault (`lib.rs`, ~6400 lines): a SQLCipher database plus per-artif
 
 ## Key anchors
 
-- `lib.rs:502 Vault` — single-writer `Mutex<Connection>` + `ReadPool` (3 `PRAGMA query_only` readers, lib.rs:522) + `card_cache` + `artifact_io` mutex.
+- `Vault` — single writer + `ReadPool` (6 `query_only` readers) + `card_cache` + `artifact_io` `RwLock` (shared reads, exclusive put/delete/migrate).
 - `lib.rs:562 Vault::open` — master key from `MacOsKeychainProvider` (lib.rs:155, Keychain service `dev.afterray.v0.vault`); blake3-derives the DB key and artifact wrap key (`DATABASE_KEY_CONTEXT`/`ARTIFACT_WRAP_KEY_CONTEXT`, lib.rs:113-114); runs `migrate`, reconcile, then `enforce_retention`. Non-macOS key providers hard-error.
 - Encryption: `lib.rs:3655 encrypt_artifact` — random DEK per artifact, XChaCha20-Poly1305, AAD binds purpose+id+content_type, file magic `ARV1`; wrapped DEK in the `artifacts` table. Legacy `ARV0` files migrate in background (`run_artifact_maintenance`, lib.rs:2635, spawned by the daemon).
 - Schema: `SCHEMA_VERSION = 21`; `migrate` chains additive steps and `schema_meta` stamps the version. `vault_meta.summary_slot_cutover_ms` freezes the 30→10-minute boundary for upgraded vaults. `audio_segments.transcription_*` is the durable ASR queue: old rows with transcript evidence migrate to `done`, and rows without evidence remain recoverable. Tables also include capture/search data, `slot_summaries`, `text_df`/`text_df_meta`, conversations and the vestigial `jobs` table.

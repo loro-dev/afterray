@@ -273,7 +273,7 @@ impl Vault {
     }
 
     pub fn pack_status_counts(&self) -> Result<(u64, u64, u64, u64), StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let running = count_where(&connection, "gop_pack_jobs", "state = 'running'")?;
         let done = count_where(&connection, "gop_pack_jobs", "state = 'done'")?;
         let failed = count_where(&connection, "gop_pack_jobs", "state = 'failed'")?;
@@ -285,7 +285,7 @@ impl Vault {
         if request.moment_ids.is_empty() || request.frames.len() != request.moment_ids.len() {
             return Err(StoreError::GopStale);
         }
-        let _artifact_guard = self.artifact_io.lock().unwrap();
+        let _artifact_guard = self.artifact_io.write().unwrap();
         let staged = self.stage_artifact_unlocked("video/x-ivf; codec=av01", request.ivf)?;
         let segment_id = Uuid::now_v7().to_string();
         let result = (|| {
@@ -396,9 +396,8 @@ impl Vault {
         segment_id: &str,
         status: &str,
     ) -> Result<GopSegmentRecord, StoreError> {
-        self.connection
-            .lock()
-            .unwrap()
+        self.readers
+            .get()
             .query_row(
                 "SELECT id, artifact_id, codec, encoder, width, height,
                         frame_count, keyint, started_at_ms, ended_at_ms, status
@@ -425,7 +424,7 @@ impl Vault {
     }
 
     pub fn live_gop_frames(&self, segment_id: &str) -> Result<Vec<GopFrameRow>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT frame_index, moment_id, is_keyframe, byte_offset, byte_length
                FROM gop_frames WHERE segment_id = ?1 ORDER BY frame_index",
