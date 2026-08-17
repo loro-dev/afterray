@@ -502,6 +502,14 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 
     func show(navigatingTo summarySlot: DaySlotSummary? = nil) {
+        present(intent: summarySlot.map { .summary($0) })
+    }
+
+    func show(navigatingToMoment momentID: String) {
+        present(intent: .moment(momentID))
+    }
+
+    private func present(intent: OverlayOpenIntent? = nil) {
         guard let panel else { return }
         PermissionGuideController.shared.hide()
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
@@ -518,7 +526,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         // Publish only after the panel is key. The query bar handles this on
         // the next main-actor turn, so its text field becomes first responder
         // instead of losing a race to the panel itself.
-        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: summarySlot)
+        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: intent)
         AfterRayMenuBar.shared.setOverlayVisible(true)
         OverlayVisibility.shared.set(true)
         setCapturePaused(true)
@@ -943,11 +951,11 @@ private struct AfterRayRootView: View {
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
     @ObservedObject private var settings = AfterRaySettingsController.shared
-    // The overlay observes chat directly. Keeping it non-observed here stops a
-    // token from rebuilding the entire recall surface underneath the panel.
+    // Chat lives in its own window (`ChatWindowController`) so a token
+    // never rebuilds the recall surface. The model is shared so lock/sleep
+    // can still wipe it here.
     private let chat = AfterRayServices.shared.chat
     @State private var isLive = true
-    @State private var isChatPresented = false
     @State private var queryMode = ImmersiveQueryMode.search
     @State private var queryFocusRequest: UInt64 = 0
     private let images = AfterRayServices.shared.images
@@ -1044,26 +1052,8 @@ private struct AfterRayRootView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
         }
-        .overlay {
-            if isChatPresented {
-                AfterRayChatOverlay(
-                    model: chat,
-                    onClose: { isChatPresented = false },
-                    onOpenMoment: openChatMoment,
-                    thumbnailLoader: { momentID in
-                        try await images.thumbnail(momentID: momentID).bytes
-                    }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-            }
-        }
         .animation(.easeOut(duration: 0.16), value: settings.isPresented)
-        .animation(.easeOut(duration: 0.16), value: isChatPresented)
         .onExitCommand {
-            if isChatPresented {
-                isChatPresented = false
-                return
-            }
             audioPlayer.stop()
             RecallOverlayController.shared.hide(returnFocus: true)
         }
@@ -1108,7 +1098,7 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { notification in
             audioPlayer.stop()
-            if permissions.allGranted, !settings.isPresented, !isChatPresented {
+            if permissions.allGranted, !settings.isPresented {
                 queryFocusRequest &+= 1
             }
             // A search outlives the overlay being dismissed, and its filmstrip
@@ -1117,11 +1107,13 @@ private struct AfterRayRootView: View {
             // into a live search lands back on the selected result instead.
             let selectedSearch = control.searchSession?.selectedFrame != nil
             switch OverlayOpenRoute.resolve(
-                summarySlot: notification.object as? DaySlotSummary,
+                intent: notification.object as? OverlayOpenIntent,
                 hasSelectedSearch: selectedSearch
             ) {
             case .summary(let slot):
                 openSummarySlot(slot)
+            case .moment(let momentID):
+                openCitedMoment(momentID)
             case .selectedSearch:
                 guard let session = control.searchSession else { return }
                 selectSearchFrame(session.selectedIndex)
@@ -1151,7 +1143,7 @@ private struct AfterRayRootView: View {
             store.clearSensitiveState()
             control.clearSensitiveState()
             chat.clearSensitiveState()
-            isChatPresented = false
+            ChatWindowController.shared.close()
             clearRecallDecodedImageCache()
             RecallThumbnailCache.shared.clearSensitiveData()
             Task { await images.clearSensitiveData() }
@@ -1257,12 +1249,6 @@ private struct AfterRayRootView: View {
         }
     }
 
-    private func openSearchHit(_ hit: RecallSearchHit) {
-        control.dismissSearch()
-        enterHistory()
-        Task { await store.openSearchHit(hit) }
-    }
-
     /// Runs the query and lands on the newest match without a second click.
     /// Recall almost always means "the thing I just had open".
     private func submitSearch() {
@@ -1320,28 +1306,17 @@ private struct AfterRayRootView: View {
 
     private func openChat(draft: String = "", send: Bool = false) {
         control.dismissSearch()
-        isChatPresented = true
-        if !draft.isEmpty {
-            chat.draft = draft
-        }
-        Task {
-            await chat.refresh()
-            if send { chat.send() }
-        }
+        ChatWindowController.shared.show(draft: draft, send: send)
     }
 
-    private func openChatMoment(_ momentID: String) {
-        isChatPresented = false
-        openSearchHit(
-            RecallSearchHit(
-                momentId: momentID,
-                sessionId: "",
-                capturedAtMs: 0,
-                source: "chat",
-                text: "",
-                score: 1
-            )
-        )
+    /// A citation from the standalone chat window. The overlay comes up on
+    /// this moment; the chat window stays put so the stream can keep going.
+    private func openCitedMoment(_ momentID: String) {
+        control.dismissSearch()
+        enterHistory()
+        if !store.selectLoaded(momentID: momentID) {
+            Task { await store.openMoment(id: momentID) }
+        }
     }
 }
 

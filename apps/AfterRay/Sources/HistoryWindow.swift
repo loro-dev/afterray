@@ -2,9 +2,9 @@ import AfterRayRecall
 import AppKit
 import SwiftUI
 
-/// The services the overlay and the standalone history window share. Both
-/// faces must observe the same store — a popped-out panel showing different
-/// data from the overlay would be worse than no window at all.
+/// The services the overlay, history window, and chat window share. Every
+/// face must observe the same store and chat model — a popped-out panel
+/// showing different data from the overlay would be worse than no window.
 ///
 /// Created lazily by whichever face mounts first; the root view adopts these
 /// instead of building private copies.
@@ -31,6 +31,24 @@ final class AfterRayServices {
     }
 }
 
+/// Dock / Cmd-Tab presence for the standard pop-out windows (History, Chat).
+/// The app is menu-bar-only (`.accessory`) unless at least one of them is
+/// still visible or miniaturized. Closing History must not hide Chat from
+/// the app switcher, and vice versa.
+@MainActor
+enum AfterRayStandardWindowPresence {
+    static func activate() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    static func resignIfLast(closing: NSWindow?) {
+        if HistoryWindowController.shared.occupiesActivation(excluding: closing) { return }
+        if ChatWindowController.shared.occupiesActivation(excluding: closing) { return }
+        NSApp.setActivationPolicy(.accessory)
+    }
+}
+
 /// The history panel as a real window: normal level, normal Mission
 /// Control/Cmd-Tab behaviour, survives the overlay closing. This exists for
 /// cross-referencing — reading past summaries beside another app is
@@ -41,10 +59,14 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
 
     private var window: NSWindow?
 
+    func occupiesActivation(excluding closing: NSWindow?) -> Bool {
+        guard let window, window !== closing else { return false }
+        return window.isVisible || window.isMiniaturized
+    }
+
     func show() {
         if let window {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
+            AfterRayStandardWindowPresence.activate()
             window.makeKeyAndOrderFront(nil)
             refreshSummary()
             return
@@ -68,9 +90,8 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
 
         // A visible standard window deserves standard app behaviour: a Dock
         // icon and a Cmd-Tab entry while it is open. The app returns to
-        // menu-bar-only when it closes.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        // menu-bar-only when the last such window closes.
+        AfterRayStandardWindowPresence.activate()
         window.makeKeyAndOrderFront(nil)
         refreshSummary()
     }
@@ -93,8 +114,10 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    func windowWillClose(_: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+    func windowWillClose(_ notification: Notification) {
+        AfterRayStandardWindowPresence.resignIfLast(
+            closing: notification.object as? NSWindow
+        )
     }
 }
 

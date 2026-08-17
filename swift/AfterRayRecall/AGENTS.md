@@ -24,7 +24,7 @@ SwiftUI library holding everything cross-app: the recall surface, the Unix-socke
 - Concurrency: stores are `@MainActor` `ObservableObject`s; socket client and image repository are actors; daemon I/O runs in `Task.detached(priority: .userInitiated)` (`DaemonClient.swift:394,416`). Never block the main thread — the HangWatchdog kills the app.
 - Unary socket reads have a 30s receive deadline (`DaemonClient.swift:587`, postmortem in the comment above); streaming reads deliberately stay deadline-free. Do not remove.
 - Every async load guards completion with a generation counter (`sensitiveGeneration`, `RecallStore.swift:16`); new load paths must follow the same capture-and-compare pattern.
-- On lock/sleep the app calls `clearSensitiveState()`/`clearSensitiveData()` (zeroes cached bytes) — hook any new decrypted-content cache in (`apps/AfterRay/Sources/AfterRayApp.swift:1097`).
+- On lock/sleep the app calls `clearSensitiveState()`/`clearSensitiveData()` (zeroes cached bytes) — hook any new decrypted-content cache in (`apps/AfterRay/Sources/AfterRayApp.swift:1143`).
 - Decode artifact bytes by `contentType`, never by assumption (`DaemonClient.swift:34-35`): moments packed before thumbnails answer with raw IVF/AV1 frames.
 - Chat Markdown never loads general image URLs. Only `afterray://moment` image references may call `ReadThumbnail`; http/file/data images stay selectable text, and missing captures stay clickable citations.
 - Every surface must stay drivable by `AfterRayMockData`; `RecallView` hides daemon-only chrome when callbacks are nil.
@@ -40,5 +40,5 @@ SwiftUI library holding everything cross-app: the recall surface, the Unix-socke
 
 ## Watch out
 
-- `AfterRayServices` (the composition root) is **not** in this library — it lives in `apps/AfterRay/Sources/HistoryWindow.swift`.
+- `AfterRayServices` (the composition root) is **not** in this library — it lives in `apps/AfterRay/Sources/HistoryWindow.swift`. Shipped chat is `ChatWindowController` (`apps/AfterRay/Sources/ChatWindow.swift`), not `AfterRayChatOverlay`.
 - The packaged `.app` bundle is assembled by `scripts/build-release.sh`, not SwiftPM; don't expect `swift run afterray-app` to behave like the packaged app.
