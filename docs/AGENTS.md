@@ -16,6 +16,7 @@ Specs, plans, and design docs for AfterRay. **Plan docs are historical: when a d
 - `hot-stills-cold-gop.md` + `hot-stills-cold-gop-codex-review.md` — hot-stills / cold AV1 GOP design and a critical review of it.
 - `slot-summaries-and-ax-pipeline.md` — 30-minute slot summaries + Accessibility pipeline (draft).
 - `t1-t2-card-quality-plan.md` — T1/T2 card quality work; pairs with `scripts/t2-eval.py`.
+- `input-events-and-t1-acts-plan.md` — approved (2026-08-17, in progress): input-event capture + T1 reorganization around acts; supersedes parts of the slot-summaries doc's §7.
 - `agent-chat-plan.md`, `harness-plan.md` — agent chat / harness plans.
 - `auto-update-plan.md` — Sparkle + Cloudflare update plan (marked implemented).
 - `qwen3.5-4b-mlx-integration-plan.md` — MLX VLM integration plan.
