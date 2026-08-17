@@ -189,6 +189,27 @@ final class ChatTranscriptTests: XCTestCase {
         XCTAssertNil(ChatTranscript.bubbles(messages: messages)[1].workElapsedMs)
     }
 
+    func testConversationsGroupByLocalDayNewestFirst() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let today = Int64(calendar.startOfDay(for: now).timeIntervalSince1970 * 1_000)
+        let yesterday = today - 86_400_000
+        let older = today - 10 * 86_400_000
+        let conversations = [
+            ChatConversation(id: "old", title: "Older", createdAtMs: older + 3_600_000, updatedAtMs: older, messageCount: 1),
+            ChatConversation(id: "t2", title: "Later today", createdAtMs: today + 8_000_000, updatedAtMs: today, messageCount: 1),
+            ChatConversation(id: "y", title: "Yesterday", createdAtMs: yesterday + 1_000, updatedAtMs: yesterday, messageCount: 1),
+            ChatConversation(id: "t1", title: "Earlier today", createdAtMs: today + 1_000, updatedAtMs: today, messageCount: 1),
+        ]
+        let groups = ChatConversationGrouping.days(conversations, now: now, calendar: calendar)
+        XCTAssertEqual(groups.map(\.label).prefix(2), ["Today", "Yesterday"])
+        XCTAssertEqual(groups.count, 3)
+        XCTAssertEqual(groups[0].conversations.map(\.id), ["t2", "t1"])
+        XCTAssertEqual(groups[1].conversations.map(\.id), ["y"])
+        XCTAssertEqual(groups[2].conversations.map(\.id), ["old"])
+    }
+
     func testUnknownRoleDecodesAsAssistant() throws {
         let json = #"{"id":"m1","conversation_id":"c1","role":"system","content":"x","created_at_ms":1}"#
         let message = try JSONDecoder().decode(ChatMessage.self, from: Data(json.utf8))

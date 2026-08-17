@@ -52,6 +52,8 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var contextUsage: ChatContextUsage?
     @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
     @Published public private(set) var streamProgress: ChatProgress?
+    @Published public private(set) var chatModels: [ChatModelChoice] = ChatModelChoice.previewCatalog
+    @Published public private(set) var selectedChatModelID: String? = ChatModelChoice.previewCatalog.first?.id
 
     public private(set) var scenario: ChatScenario = .markdown
     private var store: [String: [ChatMessage]] = [:]
@@ -106,6 +108,11 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         // not survive a conversation switch.
         contextUsage = nil
         compactionNotices = ChatTranscript.compactions(in: messages)
+    }
+
+    public func selectChatModel(_ id: String) {
+        guard chatModels.contains(where: { $0.id == id }) else { return }
+        selectedChatModelID = id
     }
 
     public func startNew() {
@@ -384,7 +391,9 @@ public enum ChatFixtures {
             return (
                 [
                     conversation("c-markdown", "Afternoon in two stretches", count: 2, updated: nowMs - 120_000),
+                    conversation("c-flock", "Bugs that did not ship on Flock", count: 2, updated: nowMs - 400_000),
                     conversation("c-old", "Yesterday's meeting", count: 6, updated: nowMs - 86_400_000),
+                    conversation("c-week", "What did I ship?", count: 4, updated: nowMs - 200_000_000),
                 ],
                 [
                     "c-markdown": [

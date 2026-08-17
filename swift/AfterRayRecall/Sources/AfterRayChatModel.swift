@@ -36,6 +36,9 @@ public protocol AfterRayChatModeling: ObservableObject {
     func deleteConversation(_ id: String) async
     func send()
     func stop()
+    var chatModels: [ChatModelChoice] { get }
+    var selectedChatModelID: String? { get }
+    func selectChatModel(_ id: String)
 }
 
 public extension AfterRayChatModeling {
@@ -55,6 +58,18 @@ public extension AfterRayChatModeling {
 
     var selectedConversation: ChatConversation? {
         conversations.first(where: { $0.id == selectedID })
+    }
+
+    var chatModels: [ChatModelChoice] { ChatModelChoice.previewCatalog }
+
+    var selectedChatModelID: String? { chatModels.first?.id }
+
+    func selectChatModel(_ id: String) {}
+
+    var selectedChatModelTitle: String {
+        chatModels.first(where: { $0.id == selectedChatModelID })?.title
+            ?? chatModels.first?.title
+            ?? "Model"
     }
 
     var bubbles: [ChatBubble] {
@@ -92,6 +107,8 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
     @Published public private(set) var streamProgress: ChatProgress?
     @Published public private(set) var lastWorkElapsedMs: Int?
+    @Published public private(set) var chatModels: [ChatModelChoice] = ChatModelChoice.previewCatalog
+    @Published public private(set) var selectedChatModelID: String? = ChatModelChoice.previewCatalog.first?.id
 
     private let daemon: any AfterRayChatServing
     private var sendTask: Task<Void, Never>?
@@ -133,6 +150,11 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         contextUsage = nil
         compactionNotices = []
         await loadHistory(id)
+    }
+
+    public func selectChatModel(_ id: String) {
+        guard chatModels.contains(where: { $0.id == id }) else { return }
+        selectedChatModelID = id
     }
 
     public func startNew() {

@@ -724,7 +724,7 @@ private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
     let model = ChatPreviewModel(scenario: scenario)
     return SnapshotScene(
         name: name,
-        size: CGSize(width: 980, height: 680),
+        size: CGSize(width: 1_080, height: 720),
         settleSeconds: 1.2,
         content: AnyView(
             AfterRayChatView(
@@ -733,9 +733,10 @@ private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
                 onOpenMoment: { _ in },
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 previewLoader: MockSearchData.previewLoader,
-                momentLoader: MockSearchData.momentLoader
+                momentLoader: MockSearchData.momentLoader,
+                fillsAvailableSpace: true
             )
-                .frame(width: 980, height: 680)
+                .frame(width: 1_080, height: 720)
         )
     )
 }

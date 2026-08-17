@@ -38,6 +38,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     var fillsAvailableSpace: Bool
     @State private var autoScrollState = ChatAutoScrollState()
     @State private var scrollToLatestRequest: UInt64 = 0
+    @State private var sidebarCollapsed = false
 
     public init(
         model: Model,
@@ -59,10 +60,9 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
 
     public var body: some View {
         HStack(spacing: 0) {
-            sidebar
-            Rectangle()
-                .fill(ChatPalette.separator)
-                .frame(width: 1)
+            if !sidebarCollapsed {
+                sidebar
+            }
             thread
         }
         .frame(
@@ -85,81 +85,77 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             return .systemAction
         })
         .task { await model.refresh() }
+        .animation(.easeOut(duration: 0.16), value: sidebarCollapsed)
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 9) {
-                Rectangle()
-                    .fill(ChatPalette.accent)
-                    .frame(width: 16, height: 2)
-                Text("AFTERRAY")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .tracking(1.1)
-                    .foregroundStyle(ChatPalette.accent)
-            }
-            .padding(.horizontal, 8)
-            .padding(.top, 6)
-
-            Button(action: model.startNew) {
-                HStack(spacing: 8) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 11, weight: .semibold))
-                    Text("New conversation")
-                        .font(.system(size: 12.5, weight: .medium))
-                    Spacer(minLength: 0)
-                }
-                .foregroundStyle(ChatPalette.label)
-                .padding(.horizontal, 10)
-                .frame(height: 32)
-                .background(ChatPalette.card, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(ChatPalette.cardStroke, lineWidth: 1)
-                }
-            }
-            .buttonStyle(ChatPressStyle())
+        VStack(alignment: .leading, spacing: 10) {
+            ChatIconButton(
+                symbol: "sidebar.left",
+                help: "Hide sidebar",
+                action: { sidebarCollapsed = true }
+            )
+            .padding(.leading, 2)
 
             if model.isLoadingList, model.conversations.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.mini).tint(ChatPalette.accent)
                     Text("Loading…")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(ChatPalette.tertiary)
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 6)
             } else if model.conversations.isEmpty {
-                Text("Past conversations will land here once afterrayd can list them.")
-                    .font(.system(size: 11))
+                Text("Past chats will show up here.")
+                    .font(.system(size: 12))
                     .foregroundStyle(ChatPalette.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 6)
             } else {
                 ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(model.conversations) { conversation in
-                            ChatConversationRow(
-                                conversation: conversation,
-                                isSelected: conversation.id == model.selectedID,
-                                onSelect: { Task { await model.select(conversation.id) } },
-                                onDelete: { Task { await model.deleteConversation(conversation.id) } }
-                            )
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(conversationDays) { group in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(group.label)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(ChatPalette.tertiary)
+                                    .padding(.horizontal, 8)
+                                    .padding(.bottom, 2)
+                                ForEach(group.conversations) { conversation in
+                                    ChatConversationRow(
+                                        conversation: conversation,
+                                        isSelected: conversation.id == model.selectedID,
+                                        onSelect: { Task { await model.select(conversation.id) } },
+                                        onDelete: { Task { await model.deleteConversation(conversation.id) } }
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
             Spacer(minLength: 0)
         }
-        .padding(12)
+        .padding(.horizontal, 10)
+        .padding(.top, 10)
+        .padding(.bottom, 12)
         .frame(width: ChatMetrics.sidebarWidth, alignment: .leading)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(ChatPalette.sidebar)
+        .background(.ultraThinMaterial)
+        .background(ChatPalette.sidebar.opacity(0.55))
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(ChatPalette.separator).frame(width: 1)
+        }
+    }
+
+    /// Computed once per model change — not inside each row.
+    private var conversationDays: [ChatDayGroup] {
+        ChatConversationGrouping.days(model.conversations)
     }
 
     private var thread: some View {
         VStack(spacing: 0) {
             header
-            Divider().overlay(ChatPalette.separator)
             messageList
             statusStrip
             composer
@@ -168,39 +164,26 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.selectedTitle)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(ChatPalette.label)
-                    .lineLimit(1)
-                if let started = model.selectedConversation {
-                    Text("Started \(ChatTimeLabel.listTimestamp(ms: started.createdAtMs))")
-                        .font(.system(size: 11))
-                        .foregroundStyle(ChatPalette.secondary)
-                        .help(ChatMomentTimeLabel.format(capturedAtMs: started.createdAtMs))
-                } else {
-                    Text("Ask anything AfterRay has already seen.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(ChatPalette.secondary)
-                }
+        HStack(spacing: 8) {
+            if sidebarCollapsed {
+                ChatIconButton(
+                    symbol: "sidebar.left",
+                    help: "Show sidebar",
+                    action: { sidebarCollapsed = false }
+                )
             }
-            Spacer(minLength: 12)
-            HStack(spacing: 10) {
-                if let usage = model.contextUsage {
-                    ChatContextMeter(usage: usage)
-                }
-                if model.isLoadingHistory {
-                    ProgressView().controlSize(.small).tint(ChatPalette.accent)
-                }
-                if !fillsAvailableSpace {
-                    ChatIconButton(symbol: "xmark", help: "Close chat", action: onClose)
-                }
+            Spacer(minLength: 8)
+            if model.isLoadingHistory {
+                ProgressView().controlSize(.small).tint(ChatPalette.accent)
+            }
+            ChatIconButton(symbol: "plus", help: "New conversation", action: model.startNew)
+            if !fillsAvailableSpace {
+                ChatIconButton(symbol: "xmark", help: "Close chat", action: onClose)
             }
         }
-        .padding(.horizontal, ChatMetrics.gutter)
-        .padding(.top, 16)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
     }
 
     private var messageList: some View {
@@ -325,19 +308,10 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Rectangle()
-                .fill(ChatPalette.accent)
-                .frame(width: 22, height: 2)
-            Text("Nothing asked yet")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(ChatPalette.label)
-            Text("AfterRay will look things up as it goes — no seeded dump of your day, just the tools it needs.")
-                .font(.system(size: 12.5))
-                .foregroundStyle(ChatPalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: 420, alignment: .leading)
+        Text("Ask anything AfterRay has already seen.")
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(ChatPalette.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
@@ -365,40 +339,105 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            ChatComposerField(text: $model.draft, isEnabled: !model.isSending, onSend: model.send)
-                .frame(minHeight: 44, maxHeight: 120)
-            if model.isSending {
-                Button(action: model.stop) {
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 34, height: 34)
-                        .background(ChatPalette.accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
+                ChatComposerField(text: $model.draft, isEnabled: !model.isSending, onSend: model.send)
+                    .frame(height: 36)
+                composerAction
+            }
+            .padding(.leading, 12)
+            .padding(.trailing, 6)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+            }
+
+            HStack(spacing: 10) {
+                modelMenu
+                if let usage = model.contextUsage {
+                    ChatContextRing(usage: usage)
                 }
-                .buttonStyle(ChatPressStyle())
-                .help("Stop generating")
-            } else {
-                Button(action: model.send) {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 34, height: 34)
-                        .background(
-                            ChatPalette.accent.opacity(model.canSend ? 0.95 : 0.38),
-                            in: Circle()
-                        )
-                }
-                .buttonStyle(ChatPressStyle())
-                .disabled(!model.canSend)
-                .help("Send")
+                Spacer(minLength: 0)
             }
         }
-        .padding(.horizontal, ChatMetrics.gutter)
-        .padding(.vertical, 14)
-        .overlay(alignment: .top) {
-            Rectangle().fill(ChatPalette.separator).frame(height: 1)
+        .padding(.horizontal, 20)
+        .padding(.top, 8)
+        .padding(.bottom, 12)
+    }
+
+    @ViewBuilder
+    private var composerAction: some View {
+        if model.isSending {
+            Button(action: model.stop) {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 28, height: 28)
+                    .background(ChatPalette.accent, in: Circle())
+            }
+            .buttonStyle(ChatPressStyle())
+            .help("Stop generating")
+        } else {
+            Button(action: model.send) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        ChatPalette.accent.opacity(model.canSend ? 0.95 : 0.38),
+                        in: Circle()
+                    )
+            }
+            .buttonStyle(ChatPressStyle())
+            .disabled(!model.canSend)
+            .help("Send")
         }
+    }
+
+    private var modelMenuSections: [(group: String, models: [ChatModelChoice])] {
+        var order: [String] = []
+        var buckets: [String: [ChatModelChoice]] = [:]
+        buckets.reserveCapacity(4)
+        for choice in model.chatModels {
+            if buckets[choice.group] == nil {
+                order.append(choice.group)
+            }
+            buckets[choice.group, default: []].append(choice)
+        }
+        return order.map { ($0, buckets[$0] ?? []) }
+    }
+
+    private var modelMenu: some View {
+        Menu {
+            ForEach(modelMenuSections, id: \.group) { section in
+                Section(section.group) {
+                    ForEach(section.models) { choice in
+                        Button(choice.title) {
+                            model.selectChatModel(choice.id)
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(model.selectedChatModelTitle)
+                    .font(.system(size: 11, weight: .medium))
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .foregroundStyle(ChatPalette.secondary)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Choose a model")
     }
 }
 
@@ -418,41 +457,6 @@ private struct ChatSurfaceChrome: ViewModifier {
         } else {
             content
         }
-    }
-}
-
-/// How full the model's context window is.
-///
-/// A bar rather than a number alone: the useful question is "how much room is
-/// left", which a proportion answers at a glance and a token count does not.
-/// It only appears once the daemon has reported a round — an app that guessed
-/// would be inventing the one number the user has no way to check.
-private struct ChatContextMeter: View {
-    let usage: ChatContextUsage
-
-    var body: some View {
-        HStack(spacing: 6) {
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.white.opacity(0.10))
-                Capsule()
-                    .fill(tint)
-                    .frame(width: max(2, 44 * usage.fraction))
-            }
-            .frame(width: 44, height: 4)
-            Text(usage.shortLabel)
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(usage.isTight ? ChatPalette.coral : ChatPalette.tertiary)
-                .monospacedDigit()
-        }
-        .help("Context used this turn: \(usage.promptTokens) of \(usage.windowTokens) tokens")
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Context window")
-        .accessibilityValue("\(Int(usage.fraction * 100)) percent used")
-    }
-
-    private var tint: Color {
-        usage.isTight ? ChatPalette.coral : ChatPalette.accent.opacity(0.75)
     }
 }
 
@@ -500,20 +504,12 @@ private struct ChatConversationRow: View {
 
     var body: some View {
         Button(action: onSelect) {
-            HStack(alignment: .top, spacing: 8) {
-                RoundedRectangle(cornerRadius: 1, style: .continuous)
-                    .fill(isSelected ? ChatPalette.accent : .clear)
-                    .frame(width: 2, height: 28)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(conversation.title)
-                        .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(isSelected ? ChatPalette.label : ChatPalette.secondary)
-                        .lineLimit(2)
-                    Text("\(ChatTimeLabel.listTimestamp(ms: conversation.createdAtMs)) · \(conversation.messageCount)")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(ChatPalette.tertiary)
-                        .help(ChatMomentTimeLabel.format(capturedAtMs: conversation.createdAtMs))
-                }
+            HStack(spacing: 8) {
+                Text(conversation.title)
+                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? ChatPalette.label : ChatPalette.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Spacer(minLength: 4)
                 if isHovering {
                     Button(action: onDelete) {
@@ -526,18 +522,41 @@ private struct ChatConversationRow: View {
                     .help("Delete conversation")
                 }
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 7)
-            .background(rowFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .contentShape(Rectangle())
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(rowFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(ChatPressStyle())
         .onHover { isHovering = $0 }
+        .help(conversation.title)
     }
 
     private var rowFill: Color {
-        if isSelected { return Color.white.opacity(0.085) }
-        return isHovering ? Color.white.opacity(0.045) : .clear
+        if isSelected { return Color.white.opacity(0.10) }
+        return isHovering ? Color.white.opacity(0.05) : .clear
+    }
+}
+
+private struct ChatContextRing: View {
+    let usage: ChatContextUsage
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.white.opacity(0.12), lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: usage.fraction)
+                .stroke(
+                    usage.isTight ? ChatPalette.coral : Color.white.opacity(0.72),
+                    style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: 14, height: 14)
+        .help("Context used: \(usage.shortLabel)")
+        .accessibilityLabel("Context window")
+        .accessibilityValue("\(Int(usage.fraction * 100)) percent used")
     }
 }
 
@@ -1019,8 +1038,8 @@ private struct ChatComposerField: NSViewRepresentable {
         textView.backgroundColor = .clear
         textView.drawsBackground = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.textContainerInset = NSSize(width: 8, height: 8)
-        textView.minSize = NSSize(width: 0, height: 28)
+        textView.textContainerInset = NSSize(width: 2, height: 6)
+        textView.minSize = NSSize(width: 0, height: 22)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
@@ -1031,11 +1050,9 @@ private struct ChatComposerField: NSViewRepresentable {
         context.coordinator.textView = textView
 
         scroll.documentView = textView
+        scroll.hasVerticalScroller = false
         scroll.wantsLayer = true
-        scroll.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.075).cgColor
-        scroll.layer?.cornerRadius = 10
-        scroll.layer?.borderWidth = 1
-        scroll.layer?.borderColor = NSColor.white.withAlphaComponent(0.085).cgColor
+        scroll.layer?.backgroundColor = NSColor.clear.cgColor
         return scroll
     }
 

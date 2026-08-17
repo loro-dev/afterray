@@ -41,6 +41,78 @@ public struct ChatConversation: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// One row in the chat model menu. `group` is a section heading, not ALL CAPS.
+public struct ChatModelChoice: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let group: String
+
+    public init(id: String, title: String, group: String) {
+        self.id = id
+        self.title = title
+        self.group = group
+    }
+
+    public static let previewCatalog: [ChatModelChoice] = [
+        ChatModelChoice(id: "builtin:qwen35-4b", title: "Qwen 3.5 4B", group: "Built-in"),
+        ChatModelChoice(id: "ollama:llama3.2", title: "llama3.2", group: "Ollama"),
+        ChatModelChoice(id: "ollama:qwen2.5", title: "qwen2.5", group: "Ollama"),
+    ]
+}
+
+/// Conversations bucketed by local calendar day, newest day first.
+public struct ChatDayGroup: Identifiable, Equatable, Sendable {
+    public let id: Int64
+    public let label: String
+    public let conversations: [ChatConversation]
+}
+
+public enum ChatConversationGrouping {
+    /// Sort once, then walk — O(n log n). Callers must not re-sort inside a
+    /// view body per row.
+    public static func days(
+        _ conversations: [ChatConversation],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [ChatDayGroup] {
+        let sorted = conversations.sorted { lhs, rhs in
+            if lhs.createdAtMs != rhs.createdAtMs {
+                return lhs.createdAtMs > rhs.createdAtMs
+            }
+            return lhs.id > rhs.id
+        }
+        var groups: [ChatDayGroup] = []
+        groups.reserveCapacity(min(sorted.count, 8))
+        for conversation in sorted {
+            let start = startOfDayMs(conversation.createdAtMs, calendar: calendar)
+            if var last = groups.last, last.id == start {
+                var next = last.conversations
+                next.append(conversation)
+                groups[groups.count - 1] = ChatDayGroup(
+                    id: last.id,
+                    label: last.label,
+                    conversations: next
+                )
+            } else {
+                groups.append(
+                    ChatDayGroup(
+                        id: start,
+                        label: ChatTimeLabel.dayHeading(ms: start, now: now, calendar: calendar),
+                        conversations: [conversation]
+                    )
+                )
+            }
+        }
+        return groups
+    }
+
+    public static func startOfDayMs(_ ms: Int64, calendar: Calendar) -> Int64 {
+        let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
+        let start = calendar.startOfDay(for: date)
+        return Int64(start.timeIntervalSince1970 * 1_000)
+    }
+}
+
 public enum ChatRole: String, Codable, Equatable, Sendable {
     case user
     case assistant
@@ -1157,6 +1229,27 @@ public enum ChatTranscript {
 // MARK: - Time labels
 
 public enum ChatTimeLabel {
+    public static func dayHeading(
+        ms: Int64,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
+        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+           calendar.isDate(date, inSameDayAs: yesterday)
+        {
+            return "Yesterday"
+        }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = calendar.locale ?? Locale.current
+        let sameYear = calendar.component(.year, from: date) == calendar.component(.year, from: now)
+        formatter.setLocalizedDateFormatFromTemplate(sameYear ? "MMM d" : "MMM d yyyy")
+        return formatter.string(from: date)
+    }
+
     public static func listTimestamp(
         ms: Int64,
         now: Date = Date(),
