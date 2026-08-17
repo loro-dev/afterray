@@ -11,6 +11,8 @@ import SwiftUI
 struct ChatMarkdownView: View {
     let blocks: [MarkdownBlock]
     let thumbnailLoader: RecallThumbnailLoader?
+    var previewLoader: RecallChatPreviewLoader? = nil
+    var momentLoader: RecallMomentLoader? = nil
     let onOpenMoment: ((String) -> Void)?
 
     var body: some View {
@@ -23,6 +25,8 @@ struct ChatMarkdownView: View {
                         .markdownImageProvider(
                             ChatSecureImageProvider(
                                 thumbnailLoader: thumbnailLoader,
+                                previewLoader: previewLoader,
+                                momentLoader: momentLoader,
                                 onOpenMoment: onOpenMoment
                             )
                         )
@@ -35,6 +39,8 @@ struct ChatMarkdownView: View {
                         label: label,
                         momentID: momentID,
                         thumbnailLoader: thumbnailLoader,
+                        previewLoader: previewLoader,
+                        momentLoader: momentLoader,
                         onOpenMoment: onOpenMoment
                     )
                 case .code(let language, let text, let closed):
@@ -93,6 +99,8 @@ private struct ChatCodeBlock: View {
 /// selectable text so MarkdownUI's default NetworkImage path never runs.
 private struct ChatSecureImageProvider: ImageProvider {
     let thumbnailLoader: RecallThumbnailLoader?
+    let previewLoader: RecallChatPreviewLoader?
+    let momentLoader: RecallMomentLoader?
     let onOpenMoment: ((String) -> Void)?
 
     func makeImage(url: URL?) -> some View {
@@ -101,6 +109,8 @@ private struct ChatSecureImageProvider: ImageProvider {
                 label: url.lastPathComponent,
                 momentID: momentID,
                 thumbnailLoader: thumbnailLoader,
+                previewLoader: previewLoader,
+                momentLoader: momentLoader,
                 onOpenMoment: onOpenMoment
             )
         } else {

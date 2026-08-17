@@ -11,7 +11,7 @@ Implements AfterRayRecall's model protocols with deterministic fixture data so t
 ## Invariants
 
 - Depends only on `AfterRayRecall` (`Package.swift:40-44`); never import app/daemon code and never touch the socket, network, or filesystem outside the fixtures.
-- When a recall protocol gains a requirement or a view gains a loader closure, update the matching preview model in the same change — labs and snapshots compile against these.
+- When a recall protocol gains a requirement or a view gains a loader closure, update the matching preview model in the same change — labs and snapshots compile against these. Chat citation cards use `MockSearchData.thumbnailLoader` / `previewLoader` / `momentLoader`.
 - Fixtures must stay safe to render anywhere: no real paths, contacts, or user content.
 
 ## Build / test

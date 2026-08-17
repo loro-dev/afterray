@@ -731,7 +731,9 @@ private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
                 model: model,
                 onClose: {},
                 onOpenMoment: { _ in },
-                thumbnailLoader: MockSearchData.thumbnailLoader
+                thumbnailLoader: MockSearchData.thumbnailLoader,
+                previewLoader: MockSearchData.previewLoader,
+                momentLoader: MockSearchData.momentLoader
             )
                 .frame(width: 980, height: 680)
         )

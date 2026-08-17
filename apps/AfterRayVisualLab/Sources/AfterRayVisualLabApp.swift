@@ -358,6 +358,8 @@ private struct VisualLabView: View {
                     onClose: {},
                     onOpenMoment: { _ in },
                     thumbnailLoader: MockSearchData.thumbnailLoader,
+                    previewLoader: MockSearchData.previewLoader,
+                    momentLoader: MockSearchData.momentLoader,
                     fillsAvailableSpace: true
                 )
                 .padding(28)

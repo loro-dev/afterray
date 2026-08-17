@@ -33,6 +33,8 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     var onClose: () -> Void
     var onOpenMoment: ((String) -> Void)?
     var thumbnailLoader: RecallThumbnailLoader?
+    var previewLoader: RecallChatPreviewLoader?
+    var momentLoader: RecallMomentLoader?
     var fillsAvailableSpace: Bool
     @State private var autoScrollState = ChatAutoScrollState()
     @State private var scrollToLatestRequest: UInt64 = 0
@@ -42,12 +44,16 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         onClose: @escaping () -> Void,
         onOpenMoment: ((String) -> Void)? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
+        previewLoader: RecallChatPreviewLoader? = nil,
+        momentLoader: RecallMomentLoader? = nil,
         fillsAvailableSpace: Bool = false
     ) {
         self.model = model
         self.onClose = onClose
         self.onOpenMoment = onOpenMoment
         self.thumbnailLoader = thumbnailLoader
+        self.previewLoader = previewLoader
+        self.momentLoader = momentLoader
         self.fillsAvailableSpace = fillsAvailableSpace
     }
 
@@ -290,6 +296,8 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             ChatBubbleView(
                 bubble: bubble,
                 thumbnailLoader: thumbnailLoader,
+                previewLoader: previewLoader,
+                momentLoader: momentLoader,
                 onOpenMoment: onOpenMoment
             )
             .id(bubble.id)
@@ -539,6 +547,8 @@ private struct ChatConversationRow: View {
 private struct ChatBubbleView: View {
     let bubble: ChatBubble
     let thumbnailLoader: RecallThumbnailLoader?
+    let previewLoader: RecallChatPreviewLoader?
+    let momentLoader: RecallMomentLoader?
     let onOpenMoment: ((String) -> Void)?
     @State private var copied = false
 
@@ -605,6 +615,8 @@ private struct ChatBubbleView: View {
                     ChatMarkdownView(
                         blocks: bubble.markdownBlocks,
                         thumbnailLoader: thumbnailLoader,
+                        previewLoader: previewLoader,
+                        momentLoader: momentLoader,
                         onOpenMoment: onOpenMoment
                     )
                         .textSelection(.enabled)
@@ -980,17 +992,23 @@ public struct AfterRayChatOverlay<Model: AfterRayChatModeling>: View {
     var onClose: () -> Void
     var onOpenMoment: ((String) -> Void)?
     var thumbnailLoader: RecallThumbnailLoader?
+    var previewLoader: RecallChatPreviewLoader?
+    var momentLoader: RecallMomentLoader?
 
     public init(
         model: Model,
         onClose: @escaping () -> Void,
         onOpenMoment: ((String) -> Void)? = nil,
-        thumbnailLoader: RecallThumbnailLoader? = nil
+        thumbnailLoader: RecallThumbnailLoader? = nil,
+        previewLoader: RecallChatPreviewLoader? = nil,
+        momentLoader: RecallMomentLoader? = nil
     ) {
         self.model = model
         self.onClose = onClose
         self.onOpenMoment = onOpenMoment
         self.thumbnailLoader = thumbnailLoader
+        self.previewLoader = previewLoader
+        self.momentLoader = momentLoader
     }
 
     public var body: some View {
@@ -1003,7 +1021,9 @@ public struct AfterRayChatOverlay<Model: AfterRayChatModeling>: View {
                 model: model,
                 onClose: onClose,
                 onOpenMoment: onOpenMoment,
-                thumbnailLoader: thumbnailLoader
+                thumbnailLoader: thumbnailLoader,
+                previewLoader: previewLoader,
+                momentLoader: momentLoader
             )
                 .recallGlass(in: .rounded(14))
                 .shadow(color: .black.opacity(0.35), radius: 28, y: 12)

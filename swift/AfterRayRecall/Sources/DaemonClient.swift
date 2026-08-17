@@ -36,6 +36,8 @@ public protocol RecallDaemonServing: Sendable {
     /// always decode by `contentType`, never by assumption.
     func thumbnail(momentID: String, maxEdge: Int?) async throws -> ArtifactPayload
     func evidenceOcr(momentID: String) async throws -> OcrEvidence
+    /// One moment by id. Existing `moment_get` request; no protocol bump.
+    func moment(id: String) async throws -> RecallMoment
     func setFavorite(momentID: String, favorite: Bool) async throws
 }
 
@@ -66,6 +68,10 @@ public extension RecallDaemonServing {
 
     func evidenceOcr(momentID _: String) async throws -> OcrEvidence {
         throw DaemonClientError.rejected("ocr evidence is not available")
+    }
+
+    func moment(id _: String) async throws -> RecallMoment {
+        throw DaemonClientError.rejected("moment reads are not available")
     }
 }
 
@@ -470,6 +476,10 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
             WireRequest(type: "evidence_ocr", momentID: momentID),
             as: OcrEvidence.self
         )
+    }
+
+    public func moment(id: String) async throws -> RecallMoment {
+        try await request(WireRequest(type: "moment_get", momentID: id), as: RecallMoment.self)
     }
 
     private func framed(_ request: WireRequest) async throws -> ArtifactPayload {

@@ -14,7 +14,7 @@ The shipped macOS app (`AfterRayApp` executable target in the root `Package.swif
 ## Invariants
 
 - The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 12, which must match `afterray-protocol`.
-- Sensitive-state teardown on screen lock/sleep: `.afterRaySystemSessionWillSuspend` → `store`/`control`/`chat.clearSensitiveState()` + close the chat window + `images.clearSensitiveData()` (`AfterRayApp.swift:1143-1150`). Hook any new decrypted-content cache into this.
+- Sensitive-state teardown on screen lock/sleep: `.afterRaySystemSessionWillSuspend` → `store`/`control`/`chat.clearSensitiveState()` + close the chat window + `RecallThumbnailCache` / `RecallChatPreviewCache` / `images.clearSensitiveData()`. Hook any new decrypted-content cache into this.
 - The overlay, history window, and chat window must share `AfterRayServices.shared` stores — never construct a private `RecallStore` or `AfterRayChatModel`.
 - `RecallView` exclusively owns the opaque history backdrop because it sees transient scrub state. `AfterRayRootView` must stay transparent; an outer backdrop lags a fast flick to NOW and produces a black screen after the still unmounts.
 - Pop-out controllers retain their `NSWindow`. Every `show()`, including reuse, must ensure the daemon and force-refresh. A first-open connection refusal must not strand the window on `.empty`. Chat hosting must use `sizingOptions = [.minSize]` or resize snaps back.

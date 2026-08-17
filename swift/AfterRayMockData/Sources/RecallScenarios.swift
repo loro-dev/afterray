@@ -366,6 +366,24 @@ public enum MockSearchData {
         }.value
     }
 
+    /// Same pixels as the filmstrip mock — already 1280px — plus a fixture
+    /// moment so citation cards can show a real captured-at stamp in labs.
+    public static let previewLoader: RecallChatPreviewLoader = thumbnailLoader
+
+    public static let momentLoader: RecallMomentLoader = { momentID in
+        if let match = RecallScenario.long.moments.first(where: { $0.id == momentID }) {
+            return match
+        }
+        let index = Int(momentID.split(separator: "-").last ?? "0") ?? 0
+        return RecallMoment(
+            id: momentID,
+            sessionId: "session-today",
+            capturedAtMs: RecallScenario.baseMs + Int64(index * 42_000),
+            imageArtifactId: "mock://frame/\(index)",
+            applicationName: "Xcode"
+        )
+    }
+
     public static let ocrLoader: RecallOcrLoader = { momentID in
         OcrEvidence(
             momentId: momentID,

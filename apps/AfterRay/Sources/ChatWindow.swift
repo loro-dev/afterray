@@ -98,6 +98,13 @@ private struct ChatWindowRoot: View {
             thumbnailLoader: { momentID in
                 try await images.thumbnail(momentID: momentID).bytes
             },
+            previewLoader: { momentID in
+                let moment = try await images.moment(id: momentID)
+                return try await images.chatPreviewBytes(for: moment)
+            },
+            momentLoader: { momentID in
+                try await images.moment(id: momentID)
+            },
             fillsAvailableSpace: true
         )
         .preferredColorScheme(.dark)

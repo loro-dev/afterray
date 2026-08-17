@@ -24,7 +24,7 @@ Single-binary tokio daemon (`main.rs`, ~4100 lines — dispatch, capture loop, a
 ## Watch out
 
 - **Never call `Vault` methods directly from async code** — go through `run_store`; blocking a tokio worker historically froze socket accepts and chat streams.
-- **Thumbnails before GOP commit**: `encode_run` builds the thumbnail while the decrypted JPEG is in hand (gop_packer.rs:232); after `drop_unpinned_stills` the JPEG is gone and Rust cannot decode AV1 back. `read_moment_thumbnail` (main.rs:2777) has the thumbnail→still→GOP-frame fallback chain.
+- **Thumbnails before GOP commit**: `encode_run` builds the thumbnail while the decrypted JPEG is in hand (gop_packer.rs:232); after `drop_unpinned_stills` the JPEG is gone and Rust cannot decode AV1 back. `read_moment_thumbnail` (main.rs:3770) tries thumbnail→still→GOP-frame. A cache hit returns the stored 360px JPEG and **ignores `max_edge`** — chat cards must not treat this as a high-res preview.
 - Secrets: LLM API key goes to the Keychain via `afterray_store::store_secret(LLM_API_KEY_SECRET)`; `legacy_llm_api_key` in settings is read-once and `skip_serializing` (main.rs:446). `settings.json` is written `0600` via tmp+rename.
 - `FavoriteSet` RPC returns "favorites are disabled" (main.rs:676) even though the store has favorite/pinning machinery.
 - `T2_SYSTEM_PROMPT`/`T2Card` v1 remain for compat reads only; new summaries go through `_v2`.
