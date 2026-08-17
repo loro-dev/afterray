@@ -72,8 +72,8 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 |---|---|---|
 | 0 | shim 走树降本（菜单跳过 + 时间盒） | ✅ 2026-08-17 |
 | 1 | shim 事件流：listen-only tap、burst/命令键/点击/滚动 coalesce、现场元素解析、活性对账 | ✅ 2026-08-17（运行时行为待签名 dev 实例验证） |
-| 2 | store：`input_events` 表（48h、`delete_history` 级联）+ daemon 持久化。物化移入阶段 3（acts 的形状在那里才定义） | |
-| 3 | T1 重组：acts / run 切分 / engaged-peripheral / not_engaged / 封口物化 | |
+| 2 | store：`input_events` 表（48h、`delete_history` 级联）+ daemon 持久化。物化移入阶段 3（acts 的形状在那里才定义） | ✅ 2026-08-17 |
+| 3 | T1 重组：acts / run 切分 / engaged-peripheral / not_engaged / 封口物化 | ✅ 2026-08-17（代码落点见 [acts-join](../context/acts-join.md)；fail-open 逐字节钉死，未在真实 vault 上跑过回归语料——那是阶段 5） |
 | 4 | R3 边沿快照 | |
 | 5 | 回归：≥20 slot（IM 1:1 / 群 / triage / 编辑器 / 终端），指标 = thread 命中率、幻觉会话数、focus precision（基线 33%） | |
 | 独立 | theme_key/target_key 噪音修复、anchor 帧改选（首帧实测是噪音最集中的一帧） | |
@@ -126,6 +126,14 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 - facts 增量：`no_input_ratio: Option<f32>`（事件覆盖内无输入时长占比；无事件为 None）；`idle_ratio` 本阶段不改名不改义（UI 兼容）。
 - 物化：既有 5-min sweeper 对封口且 `acts_json IS NULL` 的 slot 写入 acts JSON；`slot_card()` 在事件已过期时读取物化值。
 - 协议/渲染：`render_t2_prompt` 的 run 对象加 `acts`，system prompt 措辞改为"acts 是用户做的事，text 是屏幕上有的东西，peripheral 可见但未被操作"。
+
+#### 阶段 3 实现偏差（2026-08-17 落地时的实际取舍）
+
+1. **timeline 的行仍按 `target_key` 切**，没有改成按 engaged scope 重切。滞回切分（`split_act_runs`）实现了并有测试，acts 按 act-run 粒度归属到 timeline 行（最大时间重叠），triage 归并因此在 acts 里可见；但重切 timeline 会牵动 `moment_id` 锚点、gaps、revisits 与既有测试，留给后续。
+2. **只改了 `T2_SYSTEM_PROMPT_V2`**；v1 常量按"仅兼容读"保持原样。
+3. **未做**（不在本阶段的验收清单里）：`facts.apps[]` 的 acts 汇总、`revisits`/`theme_key` 改从落点区域派生、`idle_ratio` 改名。
+4. 额外收紧了两处（测试逼出来的）：partition 的开关是**事件流本身**而非调用方是否清空 `ax_join`；`signal: unavailable` 连**文本 partition 也一起抑制**——把文本分成"操作过"和"只是可见"本身就是一次能动性断言。
+5. 物化只恢复 acts，**不恢复 partition**：partition 是对已删除的 rect 做命中得来的。
 
 ### 独立修复 — T1 噪音（afterray-store/slot.rs）
 
