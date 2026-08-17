@@ -8,7 +8,7 @@ import CoreGraphics
 ///
 /// Continuous stick-to-bottom runs only while a turn is streaming. When the
 /// turn ends, at most one snap is issued — and never across a large content
-/// collapse, which is what whites out a `LazyVStack` chat list.
+/// collapse, which used to dump the viewport into empty space.
 struct ChatAutoScrollState: Equatable, Sendable {
     static let nearBottomThreshold: CGFloat = 40
     /// Reasoning fold / streaming-row swap at end of turn. Scrolling across a

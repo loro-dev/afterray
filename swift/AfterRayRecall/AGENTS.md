@@ -29,7 +29,7 @@ SwiftUI library holding everything cross-app: the recall surface, the Unix-socke
 - Chat Markdown never loads general image URLs. Only `afterray://moment` image references may call `ReadThumbnail` / `MomentGet` / `ReadArtifact` / `ReadGopFrame`; http/file/data images stay selectable text, and missing captures stay clickable citations. Do not put chat-preview frames in the 360px filmstrip cache.
 - Every surface must stay drivable by `AfterRayMockData`; `RecallView` hides daemon-only chrome when callbacks are nil.
 - Panels with their own `ScrollView` inside the overlay must mount `.background(ScrollFenceView())`, or the global scroll monitor (`RecallView.swift:1597`) eats their gesture phases and kills momentum.
-- Streaming chat follows a bottom sentinel only while `isSending` and the user is following; idle frame changes never force-scroll. Only AppKit live-scroll may disable following. Do not `scrollTo` across a large content collapse — that whites out `LazyVStack`.
+- Chat transcript is an eager `VStack` (do not reintroduce `LazyVStack`: variable-height rows land the viewport in empty space). Stick-to-bottom only while `isSending` and following; idle frames never force-scroll; only AppKit live-scroll may disable following.
 - Summary exports use `slot_summary_export` and `SummaryExportFileStore`: parsed P2 only, UUID JSON files in a `0700` temp directory with `0600` files, cleared on launch, lock/sleep and exit.
 - Download progress belongs to the queue section alone; pack rows and the assistant panel show status and actions only, gated on `isQueued(packID:)`. A global "a download is running" flag is what once stopped a second pack from ever being queued.
 

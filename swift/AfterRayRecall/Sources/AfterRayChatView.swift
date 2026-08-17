@@ -200,20 +200,18 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
-                    // History is lazy; the tail (last bubble + sentinel) stays
-                    // mounted so a stream-end identity swap cannot unload the
-                    // visible answer when we refuse to scrollTo across a collapse.
+                    // Eager on purpose. LazyVStack estimates unloaded cells at
+                    // ~0 height; markdown, citations and disclosure folds then
+                    // resize the document under the viewport and the user
+                    // lands in empty space. Chat threads stay short enough
+                    // that mounting every bubble is cheaper than virtualizing
+                    // variable-height rows.
                     VStack(alignment: .leading, spacing: 14) {
-                        LazyVStack(alignment: .leading, spacing: 14) {
-                            if model.bubbles.isEmpty, !model.isSending {
-                                emptyState
-                                    .padding(.top, 48)
-                            }
-                            ForEach(historyBubbles) { bubble in
-                                messageRow(bubble)
-                            }
+                        if model.bubbles.isEmpty, !model.isSending {
+                            emptyState
+                                .padding(.top, 48)
                         }
-                        if let bubble = tailBubble {
+                        ForEach(model.bubbles) { bubble in
                             messageRow(bubble)
                         }
                         Color.clear
@@ -272,15 +270,6 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var historyBubbles: [ChatBubble] {
-        guard model.bubbles.count > 1 else { return [] }
-        return Array(model.bubbles.dropLast())
-    }
-
-    private var tailBubble: ChatBubble? {
-        model.bubbles.last
     }
 
     private var pinsToBottom: Bool {
@@ -553,7 +542,7 @@ private struct ChatBubbleView: View {
     @State private var copied = false
 
     var body: some View {
-        HStack {
+        HStack(alignment: .top) {
             if bubble.role == .user { Spacer(minLength: 48) }
             VStack(alignment: bubble.role == .user ? .trailing : .leading, spacing: 6) {
                 ForEach(bubble.parts) { part in
@@ -575,6 +564,7 @@ private struct ChatBubbleView: View {
             .frame(maxWidth: 560, alignment: bubble.role == .user ? .trailing : .leading)
             if bubble.role == .assistant { Spacer(minLength: 48) }
         }
+        .frame(maxWidth: .infinity, alignment: bubble.role == .user ? .trailing : .leading)
     }
 
     /// The thought still arriving — last reasoning part, no answer yet.
@@ -704,18 +694,23 @@ private struct ChatReasoningChip: View {
             Text(text)
                 .font(.system(size: 11.5))
                 .foregroundStyle(ChatPalette.secondary)
+                .multilineTextAlignment(.leading)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 6)
         } label: {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(ChatPalette.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
         .tint(ChatPalette.tertiary)
+        .disclosureGroupStyle(ChatLeadingDisclosureStyle())
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: isActive) { _, active in
             expanded = active
         }
@@ -745,6 +740,7 @@ private struct ChatToolChip: View {
                 Text(tool.argsJSON)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(ChatPalette.secondary)
+                    .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
                 if let chars = tool.resultChars {
                     Text(resultNote)
@@ -752,6 +748,7 @@ private struct ChatToolChip: View {
                         .foregroundStyle(tool.truncated ? ChatPalette.coral.opacity(0.85) : ChatPalette.tertiary)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 6)
         } label: {
             HStack(spacing: 5) {
@@ -769,12 +766,16 @@ private struct ChatToolChip: View {
                             in: Capsule()
                         )
                 }
+                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .tint(ChatPalette.tertiary)
+        .disclosureGroupStyle(ChatLeadingDisclosureStyle())
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Says when an answer stands on a shortened lookup. Without it, a reply
@@ -784,6 +785,36 @@ private struct ChatToolChip: View {
         guard let chars = tool.resultChars else { return "" }
         guard tool.truncated else { return "\(chars) characters back" }
         return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
+    }
+}
+
+/// macOS `DisclosureGroup` centers its content slot. Reasoning and tool
+/// cards must stay flush left with the bubble, so we own the chrome.
+private struct ChatLeadingDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    configuration.isExpanded.toggle()
+                }
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(ChatPalette.tertiary)
+                        .rotationEffect(.degrees(configuration.isExpanded ? 90 : 0))
+                    configuration.label
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if configuration.isExpanded {
+                configuration.content
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
