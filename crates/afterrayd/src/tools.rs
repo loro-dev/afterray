@@ -36,7 +36,6 @@ const DEFAULT_ACTIVITY_LIMIT: usize = 40;
 const MAX_ACTIVITY_LIMIT: usize = 200;
 const DEFAULT_TRANSCRIPT_LIMIT: usize = 60;
 const MAX_TRANSCRIPT_LIMIT: usize = 400;
-const DAY_MS: i64 = 86_400_000;
 
 /// How many individual days `get_now` spells out before switching to weeks and
 /// months. Seven covers "the day before yesterday", "last Wednesday" and a
@@ -603,13 +602,32 @@ struct ClockPeriod {
 /// The individual days come first because they are what most questions name;
 /// the aggregates after, because "last month" is asked of a month, not a day.
 fn clock_periods(now_ms: i64) -> Vec<ClockPeriod> {
+    use chrono::Days;
+
     let mut periods = Vec::new();
-    let (today_start, today_end) = local_calendar_day_bounds_ms(now_ms);
+    let Some(today) = local_date_of(now_ms) else {
+        let (from_ms, to_ms) = local_calendar_day_bounds_ms(now_ms);
+        return vec![ClockPeriod {
+            label: "today",
+            dates: local_date(from_ms),
+            from_ms,
+            to_ms,
+        }];
+    };
+    // Walked back a calendar date at a time, never by subtracting a day's worth
+    // of milliseconds. A local day is 23 or 25 hours long across a clock
+    // change, so fixed-width arithmetic lands on the wrong date — and it does
+    // so exactly where this table is least forgiving, since the model is told
+    // to copy these rows verbatim. On 2026-03-09 in America/New_York, midnight
+    // less 86_400_000 ms is 2026-03-07 23:00, which would label the 7th
+    // "yesterday" when the answer is the 8th.
     for index in 0..CLOCK_DAYS {
-        let (from_ms, to_ms) = if index == 0 {
-            (today_start, today_end)
-        } else {
-            local_calendar_day_bounds_ms(today_start.saturating_sub(index * DAY_MS))
+        let Some((from_ms, to_ms)) = u64::try_from(index)
+            .ok()
+            .and_then(|back| today.checked_sub_days(Days::new(back)))
+            .and_then(day_bounds_for_date)
+        else {
+            continue;
         };
         periods.push(ClockPeriod {
             label: match index {
@@ -632,50 +650,56 @@ fn clock_periods(now_ms: i64) -> Vec<ClockPeriod> {
             });
         }
     };
-    let this_week = local_week_bounds_ms(now_ms);
-    span("this week", this_week);
+    span("this week", week_bounds_for_date(today));
     span(
         "last week",
-        this_week.and_then(|(start, _)| local_week_bounds_ms(start.saturating_sub(DAY_MS))),
+        today
+            .checked_sub_days(Days::new(7))
+            .and_then(week_bounds_for_date),
     );
-    let this_month = local_month_bounds_ms(now_ms);
-    span("this month", this_month);
+    span("this month", month_bounds_for_date(today));
     span(
         "last month",
-        this_month.and_then(|(start, _)| local_month_bounds_ms(start.saturating_sub(DAY_MS))),
+        first_of_month(today)
+            .and_then(|first| first.checked_sub_days(Days::new(1)))
+            .and_then(month_bounds_for_date),
     );
     periods
 }
 
-/// The local calendar week containing `at_ms`, Monday through Sunday.
+/// The local calendar week containing `date`, Monday through Sunday.
 ///
 /// Monday because that is what both ISO-8601 and the languages this is asked
 /// in mean by "last week". A different question from a rolling seven days, not
 /// a rounder version of it: asked on a Monday, the rolling window is six days
 /// of last week and one of this one, which answers neither.
-fn local_week_bounds_ms(at_ms: i64) -> Option<(i64, i64)> {
+fn week_bounds_for_date(date: chrono::NaiveDate) -> Option<(i64, i64)> {
     use chrono::{Datelike as _, Days};
 
-    let date = local_date_of(at_ms)?;
     let monday =
         date.checked_sub_days(Days::new(u64::from(date.weekday().num_days_from_monday())))?;
     let sunday = monday.checked_add_days(Days::new(6))?;
     Some((day_bounds_for_date(monday)?.0, day_bounds_for_date(sunday)?.1))
 }
 
-/// The local calendar month containing `at_ms`.
-fn local_month_bounds_ms(at_ms: i64) -> Option<(i64, i64)> {
-    use chrono::{Datelike as _, Days};
+/// The local calendar month containing `date`.
+fn month_bounds_for_date(date: chrono::NaiveDate) -> Option<(i64, i64)> {
+    use chrono::Days;
 
-    let date = local_date_of(at_ms)?;
-    let first = date.with_day(1)?;
+    let first = first_of_month(date)?;
     // Into the next month, then back a day: month lengths and leap years are
     // chrono's problem, not ours.
     let last = first
-        .checked_add_days(Days::new(31))?
-        .with_day(1)?
+        .checked_add_days(Days::new(31))
+        .and_then(first_of_month)?
         .checked_sub_days(Days::new(1))?;
     Some((day_bounds_for_date(first)?.0, day_bounds_for_date(last)?.1))
+}
+
+fn first_of_month(date: chrono::NaiveDate) -> Option<chrono::NaiveDate> {
+    use chrono::Datelike as _;
+
+    date.with_day(1)
 }
 
 fn local_date_of(at_ms: i64) -> Option<chrono::NaiveDate> {
@@ -1734,12 +1758,51 @@ mod tests {
         }
         assert!(days[0].from_ms <= NOW && NOW <= days[0].to_ms, "today is wrong");
 
+        // The rows have to be consecutive *calendar dates*, which is a
+        // stronger claim than the tiling above and the one that broke: walking
+        // back by 86_400_000 ms skips a date wherever a local day is 23 hours
+        // long. Asserted against `NaiveDate` arithmetic so it holds in every
+        // zone, including the ones this machine is not in.
+        let today = local_date_of(NOW).expect("NOW is a readable instant");
+        for (index, day) in days.iter().enumerate() {
+            let expected = today
+                .checked_sub_days(chrono::Days::new(index as u64))
+                .expect("seven days back is in range");
+            assert_eq!(
+                day.dates,
+                expected.format("%Y-%m-%d").to_string(),
+                "row {index} is not {expected}"
+            );
+        }
+
         let (this_week_start, _) = find("this week");
         let (_, last_week_end) = find("last week");
         assert_eq!(last_week_end + 1, this_week_start, "the weeks do not meet");
         let (this_month_start, _) = find("this month");
         let (_, last_month_end) = find("last month");
         assert_eq!(last_month_end + 1, this_month_start, "the months do not meet");
+
+        // And the aggregates are reached the same way — by date, not by
+        // stepping a day's worth of milliseconds off the start of the period.
+        assert_eq!(
+            week_bounds_for_date(
+                today
+                    .checked_sub_days(chrono::Days::new(7))
+                    .expect("a week back is in range")
+            ),
+            Some(find("last week")),
+            "last week was not derived by calendar date"
+        );
+        let first_of_this_month = first_of_month(today).expect("every date has a first");
+        assert_eq!(
+            month_bounds_for_date(
+                first_of_this_month
+                    .checked_sub_days(chrono::Days::new(1))
+                    .expect("a day back is in range")
+            ),
+            Some(find("last month")),
+            "last month was not derived by calendar date"
+        );
 
         let weekday = chrono::DateTime::from_timestamp_millis(this_week_start)
             .unwrap()
