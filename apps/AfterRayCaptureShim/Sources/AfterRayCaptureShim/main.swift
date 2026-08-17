@@ -499,23 +499,12 @@ private final class AccessibilityTreeEncoder {
     }
 
     private func frame(_ element: AXUIElement) -> AccessibilityFrame? {
-        guard
-            let positionValue = attribute(element, kAXPositionAttribute),
-            let sizeValue = attribute(element, kAXSizeAttribute),
-            CFGetTypeID(positionValue) == AXValueGetTypeID(),
-            CFGetTypeID(sizeValue) == AXValueGetTypeID()
-        else { return nil }
-        var position = CGPoint.zero
-        var size = CGSize.zero
-        guard
-            AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
-            AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
-        else { return nil }
+        guard let frame = accessibilityFrame(element) else { return nil }
         return AccessibilityFrame(
-            x: position.x,
-            y: position.y,
-            width: size.width,
-            height: size.height
+            x: frame.origin.x,
+            y: frame.origin.y,
+            width: frame.width,
+            height: frame.height
         )
     }
 }
@@ -566,7 +555,8 @@ private enum AccessibilityCapture {
 
 private struct ForegroundCaptureContext {
     let processId: pid_t
-    let browserWindowId: CGWindowID?
+    let windowId: CGWindowID?
+    let windowFrame: CGRect?
 }
 
 private enum BrowserAutomationProbe {
@@ -687,23 +677,28 @@ private func captureAccessibilityTree(
     }
     let appElement = AXUIElementCreateApplication(application.processIdentifier)
     let preflightDetector = BrowserPrivacyDetector(bundleIdentifier: application.bundleIdentifier)
-    let browserWindow = preflightDetector.isKnownBrowser ? frontWindowElement(appElement) : nil
+    let foregroundWindow = frontWindowElement(appElement)
+    let browserWindow = preflightDetector.isKnownBrowser ? foregroundWindow : nil
+    let windowId = cgFrontWindowId(for: application.processIdentifier)
+    let windowFrame = foregroundWindow.flatMap(accessibilityFrame)
     let context: ForegroundCaptureContext
     let captureRoot: AXUIElement
     if preflightDetector.isKnownBrowser {
         guard
             let browserWindow,
-            let browserWindowId = cgFrontWindowId(for: application.processIdentifier)
+            let windowId
         else { return .foregroundChanged }
         context = ForegroundCaptureContext(
             processId: application.processIdentifier,
-            browserWindowId: browserWindowId
+            windowId: windowId,
+            windowFrame: windowFrame
         )
         captureRoot = browserWindow
     } else {
         context = ForegroundCaptureContext(
             processId: application.processIdentifier,
-            browserWindowId: nil
+            windowId: windowId,
+            windowFrame: windowFrame
         )
         captureRoot = appElement
     }
@@ -832,6 +827,22 @@ private func axElement(_ element: AXUIElement, _ name: String) -> AXUIElement? {
     axAttribute(element, name).map { $0 as! AXUIElement }
 }
 
+private func accessibilityFrame(_ element: AXUIElement) -> CGRect? {
+    guard
+        let positionValue = axAttribute(element, kAXPositionAttribute),
+        let sizeValue = axAttribute(element, kAXSizeAttribute),
+        CFGetTypeID(positionValue) == AXValueGetTypeID(),
+        CFGetTypeID(sizeValue) == AXValueGetTypeID()
+    else { return nil }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard
+        AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+        AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+    else { return nil }
+    return CGRect(origin: position, size: size)
+}
+
 private func cgFrontWindowInfo(for processId: pid_t) -> [String: Any]? {
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
@@ -856,9 +867,20 @@ private func cgWindowName(for processId: pid_t) -> String? {
 }
 
 private func foregroundCaptureContextIsCurrent(_ context: ForegroundCaptureContext) -> Bool {
-    guard capturedForegroundApplication()?.processIdentifier == context.processId else { return false }
-    guard let browserWindowId = context.browserWindowId else { return true }
-    return cgFrontWindowId(for: context.processId) == browserWindowId
+    guard let application = capturedForegroundApplication(),
+          application.processIdentifier == context.processId
+    else { return false }
+    if let windowId = context.windowId,
+       cgFrontWindowId(for: context.processId) != windowId
+    {
+        return false
+    }
+    guard let windowFrame = context.windowFrame else { return true }
+    let appElement = AXUIElementCreateApplication(application.processIdentifier)
+    guard let currentWindow = frontWindowElement(appElement),
+          let currentWindowFrame = accessibilityFrame(currentWindow)
+    else { return false }
+    return currentWindowFrame == windowFrame
 }
 
 private final class EventWriter: @unchecked Sendable {
@@ -1229,8 +1251,6 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
 @MainActor
 private func captureScreen(
     requestId: String,
-    filter: SCContentFilter,
-    configuration: SCStreamConfiguration,
     options: Options,
     events: EventWriter
 ) async throws {
@@ -1252,9 +1272,8 @@ private func captureScreen(
     if case .foregroundChanged = accessibility {
         return
     }
-    if case let .artifact(accessibilityURL, context) = accessibility,
-       !foregroundCaptureContextIsCurrent(context)
-    {
+    guard case let .artifact(accessibilityURL, context) = accessibility else { return }
+    guard foregroundCaptureContextIsCurrent(context) else {
         try? FileManager.default.removeItem(at: accessibilityURL)
         return
     }
@@ -1262,13 +1281,32 @@ private func captureScreen(
         .appendingPathComponent("screen-\(UUID().uuidString)")
         .appendingPathExtension("jpg")
     do {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: true
+        )
+        guard let display = captureDisplay(for: context, displays: content.displays) else {
+            throw ShimError.noDisplay
+        }
+        guard foregroundCaptureContextIsCurrent(context) else {
+            try? FileManager.default.removeItem(at: accessibilityURL)
+            return
+        }
+        let excludedApplications = content.applications.filter {
+            $0.bundleIdentifier == afterRayAppBundleIdentifier
+        }
+        let filter = SCContentFilter(
+            display: display,
+            excludingApplications: excludedApplications,
+            exceptingWindows: []
+        )
+        let configuration = screenshotConfiguration(for: display)
+        log("capture_screen focused display id=\(display.displayID) \(display.width)x\(display.height)")
         let image = try await SCScreenshotManager.captureImage(
             contentFilter: filter,
             configuration: configuration
         )
-        if case let .artifact(accessibilityURL, context) = accessibility,
-           !foregroundCaptureContextIsCurrent(context)
-        {
+        if !foregroundCaptureContextIsCurrent(context) {
             try? FileManager.default.removeItem(at: accessibilityURL)
             return
         }
@@ -1285,20 +1323,16 @@ private func captureScreen(
             endedAtMs: now,
             requestId: requestId
         ))
-        if case let .artifact(accessibilityURL, _) = accessibility {
-            events.send(.artifact(
-                kind: .accessibility,
-                url: accessibilityURL,
-                startedAtMs: now,
-                endedAtMs: now,
-                requestId: requestId
-            ))
-        }
+        events.send(.artifact(
+            kind: .accessibility,
+            url: accessibilityURL,
+            startedAtMs: now,
+            endedAtMs: now,
+            requestId: requestId
+        ))
     } catch {
         try? FileManager.default.removeItem(at: screenURL)
-        if case let .artifact(accessibilityURL, _) = accessibility {
-            try? FileManager.default.removeItem(at: accessibilityURL)
-        }
+        try? FileManager.default.removeItem(at: accessibilityURL)
         throw error
     }
 }
@@ -1332,12 +1366,15 @@ private enum AfterRayCaptureShim {
                 false,
                 onScreenWindowsOnly: true
             )
-            guard let display = content.displays.first else { throw ShimError.noDisplay }
-            log("got display id=\(display.displayID) \(display.width)x\(display.height) apps=\(content.applications.count)")
+            guard let streamDisplay = content.displays.first else { throw ShimError.noDisplay }
+            log(
+                "got audio stream display id=\(streamDisplay.displayID) "
+                    + "\(streamDisplay.width)x\(streamDisplay.height) apps=\(content.applications.count)"
+            )
 
             let configuration = SCStreamConfiguration()
-            configuration.width = display.width
-            configuration.height = display.height
+            configuration.width = streamDisplay.width
+            configuration.height = streamDisplay.height
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: 5)
             configuration.queueDepth = 3
             configuration.showsCursor = true
@@ -1347,23 +1384,16 @@ private enum AfterRayCaptureShim {
             configuration.channelCount = 2
             configuration.captureMicrophone = options.recordAudio
 
-            let screenshotConfiguration = SCStreamConfiguration()
-            let screenshotPixelSize = nativePixelSize(for: display)
-            screenshotConfiguration.width = screenshotPixelSize.width
-            screenshotConfiguration.height = screenshotPixelSize.height
-            screenshotConfiguration.captureResolution = .best
-            screenshotConfiguration.showsCursor = true
-
             let excludedApplications = content.applications.filter {
                 $0.bundleIdentifier == afterRayAppBundleIdentifier
             }
-            let filter = SCContentFilter(
-                display: display,
+            let streamFilter = SCContentFilter(
+                display: streamDisplay,
                 excludingApplications: excludedApplications,
                 exceptingWindows: []
             )
             let output = CaptureOutput(options: options, events: events)
-            let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
+            let stream = SCStream(filter: streamFilter, configuration: configuration, delegate: output)
             let callbackQueue = DispatchQueue(label: "dev.afterray.capture.samples", qos: .userInitiated)
             if options.recordAudio {
                 // Its own queue: the sample handler must never wait on this,
@@ -1377,7 +1407,7 @@ private enum AfterRayCaptureShim {
             log("calling SCStream.startCapture")
             try await stream.startCapture()
             log("startCapture returned, sending ready")
-            events.send(.ready(display: display))
+            events.send(.ready(display: streamDisplay))
 
             let decoder = JSONDecoder()
             while let line = readLine(strippingNewline: true) {
@@ -1392,8 +1422,6 @@ private enum AfterRayCaptureShim {
                         }
                         try await captureScreen(
                             requestId: requestId,
-                            filter: filter,
-                            configuration: screenshotConfiguration,
                             options: options,
                             events: events
                         )
@@ -1427,6 +1455,33 @@ private func log(_ message: String) {
     if let data = line.data(using: .utf8) {
         FileHandle.standardError.write(data)
     }
+}
+
+private func captureDisplay(
+    for context: ForegroundCaptureContext,
+    displays: [SCDisplay]
+) -> SCDisplay? {
+    let fallbackDisplayID = displays.first {
+        $0.displayID == CGMainDisplayID()
+    }?.displayID ?? displays.first?.displayID
+    let displayID = CaptureDisplaySelection.displayID(
+        for: context.windowFrame,
+        displays: displays.map {
+            CaptureDisplayGeometry(id: $0.displayID, frame: CGDisplayBounds($0.displayID))
+        },
+        fallbackDisplayID: fallbackDisplayID
+    )
+    return displays.first { $0.displayID == displayID }
+}
+
+private func screenshotConfiguration(for display: SCDisplay) -> SCStreamConfiguration {
+    let configuration = SCStreamConfiguration()
+    let pixelSize = nativePixelSize(for: display)
+    configuration.width = pixelSize.width
+    configuration.height = pixelSize.height
+    configuration.captureResolution = .best
+    configuration.showsCursor = true
+    return configuration
 }
 
 private func nativePixelSize(for display: SCDisplay) -> (width: Int, height: Int) {

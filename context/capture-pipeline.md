@@ -1,6 +1,6 @@
 # Capture pipeline: screen → vault → search/recall
 
-Verified against code 2026-08-15.
+Verified against code 2026-08-17.
 
 End-to-end map of how a captured frame becomes searchable, summarizable history. Follow the stages in order; each stage lists the owning file and the symbols that matter. Owners: `apps/AfterRayCaptureShim` (capture), `crates/afterray-platform-macos` (shim process), `crates/afterrayd` (scheduling + import + background passes), `crates/afterray-store` (vault + indexes), `crates/afterray-models` / `crates/afterray-infer` + Swift workers (OCR/ASR/embedding/LLM).
 
@@ -9,6 +9,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - Screen capture is **not** in Rust. `apps/AfterRayCaptureShim` is a standalone SwiftPM package (macOS 15, not a target of the root `Package.swift`) using ScreenCaptureKit; the whole shim is one file, `Sources/AfterRayCaptureShim/main.swift`.
 - Pull-based: Rust decides timing. stdin commands `capture_screen` (requires `request_id`) and `stop` (main.swift:962-990); stdout carries JSON-line `Event`s only (`ready`/`artifact`/`warning`/`failed`/`stopped`); logs go to stderr.
 - Output dir is `0700`, artifact files `0600`; the shim excludes AfterRay's own windows from capture.
+- Screenshot and Accessibility evidence share one `ForegroundCaptureContext`. AX selects the frontmost app and its focused window (`main window` fallback); the screenshot refreshes `SCShareableContent` and selects the display with the largest intersection with that window's global frame, falling back to `CGMainDisplayID` when AX has no usable frame. PID, window id, and frame are rechecked before and after the screenshot, and a changed context drops the whole tick. The continuous audio stream remains separate and is never duplicated or restarted as focus crosses displays.
 - The shim exists because the Rust workspace denies `unsafe_code` and ScreenCaptureKit delegates need unsafe FFI. Build it with `make capture-shim`.
 
 ## 2. Shim process ownership — afterray-platform-macos
