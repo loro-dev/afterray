@@ -218,11 +218,26 @@ private final class AfterRayMenuBar: NSObject {
 
     private var statusItem: NSStatusItem?
     private var pauseItem: NSMenuItem?
+    private var computeItem: NSMenuItem?
     private var isRecording = false
     private var shortcut = RecallHotKeyStore.shared.hotKey
+    private var preferenceObserver: NSObjectProtocol?
 
     private override init() {
         super.init()
+        // The compute dashboard is off by default and toggled in Advanced
+        // settings; the menu has to follow without being rebuilt.
+        preferenceObserver = NotificationCenter.default.addObserver(
+            forName: .afterRayPreferencesDidChange,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in AfterRayMenuBar.shared.refreshComputeItem() }
+        }
+    }
+
+    func refreshComputeItem() {
+        computeItem?.isHidden = !AfterRayPreferences.computeDashboardEnabled
     }
 
     func install() {
@@ -268,7 +283,10 @@ private final class AfterRayMenuBar: NSObject {
             keyEquivalent: ""
         )
         computeItem.target = self
+        // Hidden unless the user asked for the dashboard in Advanced settings.
+        computeItem.isHidden = !AfterRayPreferences.computeDashboardEnabled
         menu.addItem(computeItem)
+        self.computeItem = computeItem
         let clearHour = NSMenuItem(
             title: "Delete Last Hour",
             action: #selector(deleteLastHour),
@@ -323,7 +341,7 @@ private final class AfterRayMenuBar: NSObject {
     }
 
     @objc private func openComputeActivity() {
-        ComputeActivityController.shared.show()
+        ComputeActivityWindowController.shared.show()
     }
 
     @objc private func toggleCapture() {
@@ -453,7 +471,11 @@ final class RecallOverlayController: RecallHotKeyBinding {
             queue: .main
         ) { _ in
             Task { @MainActor in
-                if AfterRaySettingsController.shared.isPresented { return }
+                // Settings, the compute dashboard and chat are their own windows
+                // now. Losing key to one of them is not a reason to tear the
+                // overlay down behind it.
+                if AfterRaySettingsController.shared.isVisible { return }
+                if ComputeActivityWindowController.shared.isVisible { return }
                 RecallOverlayController.shared.hide(returnFocus: false)
             }
         }
@@ -614,14 +636,6 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 
     fileprivate func closeFromKeyboard() {
-        if AfterRaySettingsController.shared.isPresented {
-            AfterRaySettingsController.shared.hide()
-            return
-        }
-        if ComputeActivityController.shared.isPresented {
-            ComputeActivityController.shared.hide()
-            return
-        }
         if PermissionGuideController.shared.isVisible {
             PermissionGuideController.shared.hide()
             return
@@ -965,9 +979,11 @@ private struct AfterRayRootView: View {
     @ObservedObject private var audioPlayer = AfterRayServices.shared.audioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
-    @ObservedObject private var settings = AfterRaySettingsController.shared
-    @ObservedObject private var compute = ComputeActivityController.shared
     @ObservedObject private var computeModel = AfterRayServices.shared.compute
+    /// Mirrors the Advanced-settings switch. Off by default, so the overlay's
+    /// chrome cluster carries one fewer button for everyone who never asked
+    /// what their machine is doing.
+    @State private var showsComputeButton = AfterRayPreferences.computeDashboardEnabled
     // Chat lives in its own window (`ChatWindowController`) so a token
     // never rebuilds the recall surface. The model is shared so lock/sleep
     // can still wipe it here.
@@ -1002,7 +1018,9 @@ private struct AfterRayRootView: View {
             playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
-            onOpenCompute: { ComputeActivityController.shared.toggle() },
+            onOpenCompute: showsComputeButton
+                ? { ComputeActivityWindowController.shared.toggle() }
+                : nil,
             computeIndicator: computeModel.indicator,
             recordingState: control.status?.recordingState,
             isChangingRecording: control.isChangingRecording,
@@ -1062,35 +1080,28 @@ private struct AfterRayRootView: View {
                     .transition(.opacity)
             }
         }
-        .overlay {
-            if settings.isPresented {
-                AfterRaySettingsOverlay(
-                    model: settings.model,
-                    onClose: { settings.hide() }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-            }
-        }
-        .overlay {
-            if compute.isPresented {
-                ComputeActivityOverlay(
-                    model: computeModel,
-                    onClose: { compute.hide() }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-            }
-        }
-        .animation(.easeOut(duration: 0.16), value: settings.isPresented)
-        .animation(.easeOut(duration: 0.16), value: compute.isPresented)
         // Tied to the overlay being *visible*, not to this view's lifetime: the
         // panel is `orderOut`-ed rather than torn down, so `onDisappear` never
         // fires and an `onAppear` watcher would poll for the life of the process
         // — the exact background load this dashboard exists to report on.
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
-            computeModel.startWatching()
+            if showsComputeButton { computeModel.startWatching() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
-            computeModel.stopWatching()
+            if showsComputeButton { computeModel.stopWatching() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayPreferencesDidChange)) { _ in
+            let enabled = AfterRayPreferences.computeDashboardEnabled
+            guard enabled != showsComputeButton else { return }
+            showsComputeButton = enabled
+            // Start or stop the button's own poll with the switch, not just its
+            // visibility: an invisible watcher is the whole failure mode this
+            // panel exists to warn about.
+            if enabled {
+                if RecallOverlayController.shared.isVisible { computeModel.startWatching() }
+            } else {
+                computeModel.stopWatching()
+            }
         }
         .onExitCommand {
             audioPlayer.stop()
@@ -1137,7 +1148,7 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { notification in
             audioPlayer.stop()
-            if permissions.allGranted, !settings.isPresented {
+            if permissions.allGranted, !AfterRaySettingsController.shared.isVisible {
                 queryFocusRequest &+= 1
             }
             // A search outlives the overlay being dismissed, and its filmstrip
@@ -1493,25 +1504,6 @@ private struct PermissionPanel: View {
         }
     }
 }
-
-private struct AfterRaySettingsOverlay: View {
-    @ObservedObject var model: AfterRaySettingsModel
-    let onClose: () -> Void
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.42)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onClose)
-            AfterRaySettingsView(model: model, onClose: onClose)
-                .recallGlass(in: .rounded(14))
-                .shadow(color: .black.opacity(0.35), radius: 28, y: 12)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
 
 /// One line for both ways of asking the vault a question. It stays one line in
 /// either mode — the chat panel is where an answer goes, and it opens on send

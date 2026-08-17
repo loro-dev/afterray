@@ -105,7 +105,7 @@ struct SnapshotScene {
     @MainActor
     static var all: [SnapshotScene] {
         chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
-            + mixedHistoryScene + captionScenes + chatScenes
+            + mixedHistoryScene + captionScenes + chatScenes + computeScenes
     }
 }
 
@@ -556,6 +556,23 @@ private var mixedHistoryScene: [SnapshotScene] {
 
 MainActor.assumeIsolated { SnapshotRunner.main() }
 
+
+/// The compute dashboard in the states that actually shape it: work held back
+/// with a backlog to start, and a summary running with an estimate.
+@MainActor
+private var computeScenes: [SnapshotScene] {
+    [
+        ("30-compute-held-on-battery", ComputeFixtures.onBattery),
+        ("31-compute-summarising", ComputeFixtures.summarising),
+    ].map { name, status in
+        SnapshotScene(
+            name: name,
+            size: CGSize(width: 420, height: 620),
+            settleSeconds: 0.6,
+            content: AnyView(ComputeActivityPanel(model: ComputePreviewModel(status: status)))
+        )
+    }
+}
 
 /// Privacy exclusions and gated developer controls, rendered offscreen so
 /// settings layout changes are checked against pixels rather than assumed.

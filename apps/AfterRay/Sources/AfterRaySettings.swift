@@ -10,6 +10,22 @@ enum AfterRayPreferences {
     static let recordAudioKey = "dev.afterray.recordAudio"
     static let developerOptionsUnlockedKey = "dev.afterray.developer-options.unlocked"
     static let developerOptionsEnabledKey = "dev.afterray.developer-options.enabled"
+    static let computeDashboardKey = "dev.afterray.compute-dashboard.enabled"
+
+    /// Whether the local-computation dashboard is offered at all.
+    ///
+    /// Off by default. It exposes worker processes, lane assignments, queue
+    /// depths and gate thresholds — real answers for someone whose fans are
+    /// loud, and implementation detail nobody else asked to see. The controls it
+    /// carries all have sane automatic behaviour, so hiding it costs a default
+    /// user nothing.
+    static var computeDashboardEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: computeDashboardKey) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: computeDashboardKey)
+            NotificationCenter.default.post(name: .afterRayPreferencesDidChange, object: nil)
+        }
+    }
 
     static var recordAudio: Bool {
         get {
@@ -23,26 +39,73 @@ enum AfterRayPreferences {
     }
 }
 
+/// Settings as a real window, alongside History, Chat and the compute dashboard.
+///
+/// It used to render inside the recall overlay and force that overlay open to be
+/// reachable, which made changing a setting a full-screen event and left Esc
+/// ambiguous between "close settings" and "close AfterRay". A window is also the
+/// only way to read a setting while looking at the thing it affects.
 @MainActor
-final class AfterRaySettingsController: ObservableObject {
+final class AfterRaySettingsController: NSObject, NSWindowDelegate {
     static let shared = AfterRaySettingsController()
 
     let model = AfterRaySettingsModel()
-    @Published private(set) var isPresented = false
+    private var window: NSWindow?
 
-    var isVisible: Bool { isPresented }
+    var isVisible: Bool { window?.isVisible == true }
 
-    func show() {
-        isPresented = true
-        if !RecallOverlayController.shared.isVisible {
-            RecallOverlayController.shared.show()
+    func occupiesActivation(excluding closing: NSWindow?) -> Bool {
+        guard let window, window !== closing else { return false }
+        return window.isVisible || window.isMiniaturized
+    }
+
+    func show(page: AfterRaySettingsPage = .general) {
+        if let window {
+            AfterRayStandardWindowPresence.activate()
+            window.makeKeyAndOrderFront(nil)
+            Task { await model.refresh() }
+            return
         }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 860, height: 640),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "AfterRay Settings"
+        window.minSize = NSSize(width: 820, height: 520)
+        window.isReleasedWhenClosed = false
+        window.titlebarAppearsTransparent = true
+        window.backgroundColor = NSColor(red: 0.055, green: 0.05, blue: 0.06, alpha: 1)
+        window.contentView = NSHostingView(
+            rootView: AfterRaySettingsView(
+                model: model,
+                onClose: { [weak self] in self?.hide() },
+                initialPage: page,
+                style: .window
+            )
+        )
+        window.center()
+        window.delegate = self
+        window.setFrameAutosaveName("dev.afterray.settings-window")
+        self.window = window
+
+        AfterRayStandardWindowPresence.activate()
+        window.makeKeyAndOrderFront(nil)
         Task { await model.refresh() }
     }
 
     func hide() {
-        isPresented = false
+        window?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        // Download progress polling exists for the models page; nothing watches
+        // it once the window is gone.
         model.pauseDownloadMonitoring()
+        AfterRayStandardWindowPresence.resignIfLast(
+            closing: notification.object as? NSWindow
+        )
     }
 }
 
@@ -77,6 +140,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published private(set) var developerOptionsUnlocked = UserDefaults.standard.bool(
         forKey: AfterRayPreferences.developerOptionsUnlockedKey
     )
+    @Published private(set) var computeDashboardEnabled = AfterRayPreferences.computeDashboardEnabled
     @Published private(set) var developerOptionsEnabled = UserDefaults.standard.bool(
         forKey: AfterRayPreferences.developerOptionsUnlockedKey
     ) && UserDefaults.standard.bool(
@@ -200,6 +264,19 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         guard developerOptionsUnlocked else { return }
         developerOptionsEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: AfterRayPreferences.developerOptionsEnabledKey)
+    }
+
+    func setComputeDashboardEnabled(_ enabled: Bool) {
+        computeDashboardEnabled = enabled
+        // The setter posts `afterRayPreferencesDidChange`; the menu bar and the
+        // overlay chrome pick the new value up from there.
+        AfterRayPreferences.computeDashboardEnabled = enabled
+        if !enabled {
+            // Take the window away with the switch, and stop the poll it owns:
+            // leaving it open would keep sampling for a surface the user just
+            // said they do not want.
+            ComputeActivityWindowController.shared.close()
+        }
     }
 
     func replayOnboarding() {

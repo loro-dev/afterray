@@ -36,7 +36,8 @@ final class AfterRayServices {
     }
 }
 
-/// Dock / Cmd-Tab presence for the standard pop-out windows (History, Chat).
+/// Dock / Cmd-Tab presence for the standard pop-out windows (History, Chat,
+/// Settings, Local Computation).
 /// The app is menu-bar-only (`.accessory`) unless at least one of them is
 /// still visible or miniaturized. Closing History must not hide Chat from
 /// the app switcher, and vice versa.
@@ -50,6 +51,8 @@ enum AfterRayStandardWindowPresence {
     static func resignIfLast(closing: NSWindow?) {
         if HistoryWindowController.shared.occupiesActivation(excluding: closing) { return }
         if ChatWindowController.shared.occupiesActivation(excluding: closing) { return }
+        if ComputeActivityWindowController.shared.occupiesActivation(excluding: closing) { return }
+        if AfterRaySettingsController.shared.occupiesActivation(excluding: closing) { return }
         NSApp.setActivationPolicy(.accessory)
     }
 }

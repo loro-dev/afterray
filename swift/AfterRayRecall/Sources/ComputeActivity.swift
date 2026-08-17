@@ -10,11 +10,13 @@ public enum ComputeMode: String, Codable, Equatable, Sendable, CaseIterable {
     case essential
     case off
 
+    /// One word each. As phrases these were wider than the control that held
+    /// them, and the detail line underneath already said the rest.
     public var title: String {
         switch self {
-        case .full: "Full speed"
-        case .essential: "Essential only"
-        case .off: "Paused entirely"
+        case .full: "Full"
+        case .essential: "Essential"
+        case .off: "Off"
         }
     }
 
@@ -613,13 +615,17 @@ public enum ComputeIndicator: Equatable, Sendable {
         }
     }
 
+    /// Filled only while something is actually running: outline is the resting
+    /// variant, fill marks the active state, and nothing else in the cluster
+    /// should read as "busy" when the machine is not.
     public var symbol: String {
         switch self {
-        case .idle: "gauge.with.dots.needle.0percent"
-        case .working: "gauge.with.dots.needle.67percent"
+        case .working: "hammer.fill"
+        // Idle and waiting are both "not working right now"; the tooltip is
+        // what distinguishes them, not a second glyph.
+        case .idle, .waiting: "hammer"
         case .paused: "pause.circle"
         case .off: "moon.zzz"
-        case .waiting: "clock.arrow.circlepath"
         }
     }
 

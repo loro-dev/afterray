@@ -376,7 +376,14 @@ private struct VisualLabView: View {
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.7))
                 }
-                ComputeActivityPanel(model: computeModel, onClose: {})
+                // Framed like the window that hosts it in the app.
+                ComputeActivityPanel(model: computeModel)
+                    .frame(width: 420, height: 620)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(.white.opacity(0.09), lineWidth: 1)
+                    }
             }
             .padding(40)
         }

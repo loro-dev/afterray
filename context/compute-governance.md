@@ -211,12 +211,21 @@ machine. It reads:
   daemon do not share a clock and "an hour from when I pressed it" is what the
   user means. `0` resumes. Every mutating call answers with the fresh report, so
   the UI never shows a switch in a position the daemon does not hold.
+- **Off by default, opt-in from Advanced settings.** The panel answers "why are my
+  fans loud" for the people who ask; for everyone else it is worker pids and gate
+  thresholds nobody requested. The governor does the right thing unsupervised, so
+  the default costs a normal user nothing.
+- **A window, not an overlay.** The dashboard opens as a standalone window, like
+  History and Chat. Inside the recall overlay it could not be read beside the app
+  that was making the machine slow, Esc was ambiguous between the two panels, and
+  answering "what is my Mac doing" forced the whole recall surface open. The
+  window controller owns the poll lifecycle, because an `orderOut`-ed window never
+  fires the view's `onDisappear`.
 - Two entry points, deliberately: the menu bar (`Local Computation…`) is where
-  someone goes to free the machine without opening a full-screen recall surface,
-  but menu-bar space is scarce and that icon is often hidden — so the overlay
-  carries a copy in its top-right cluster, left of the gear, which cannot be
-  crowded out. Both share one `ComputeActivityModel`; three pollers would triple
-  the sampling the panel exists to report on.
+  someone goes to free the machine, and the overlay's top-right cluster carries a
+  copy — menu-bar space is scarce and that icon is often hidden behind the notch.
+  Both share one `ComputeActivityModel`; three pollers would triple the sampling
+  the panel exists to report on.
 - The button carries state (`ComputeIndicator`) so the overlay answers "is
   AfterRay busy" without being opened. It accents only for *working*: a hold the
   user chose is not a problem to report back to them.
