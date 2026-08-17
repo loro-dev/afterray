@@ -28,7 +28,6 @@ use afterray_protocol::{
 };
 use afterray_store::{
     LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig,
-    fuse_search_results,
 };
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -2048,9 +2047,10 @@ async fn import_artifact(
                         )
                     })
                     .await;
-                    if let Ok(evidence_id) = evidence {
-                        submit_embedding(&model_state, evidence_id, text).await;
-                    }
+                    // Embeddings are switched off; see `search_hits`. The
+                    // text itself is stored, so vectors stay re-derivable
+                    // whenever the redesign lands.
+                    let _ = evidence;
                 }
                 let _ = tokio::fs::remove_file(path).await;
             });
@@ -2237,24 +2237,6 @@ async fn delete_excluded_moment(state: &Arc<AppState>, moment_id: &str) {
     }
 }
 
-async fn submit_embedding(state: &Arc<AppState>, evidence_id: String, text: String) {
-    let Ok(job_id) = state.models.submit(ModelInput::Embedding { text }).await else {
-        return;
-    };
-    let Ok(snapshot) = state.models.wait(&job_id).await else {
-        return;
-    };
-    if snapshot.state == JobState::Done
-        && let Some(ModelOutput::Embedding { vector }) = snapshot.output
-    {
-        let adapter = snapshot.adapter.clone();
-        let _ = run_store(state, move |s| {
-            s.store.insert_embedding(&evidence_id, &vector, &adapter)
-        })
-        .await;
-    }
-}
-
 /// What the recall UI searches with: exact text, and nothing else.
 ///
 /// A person typing into the search field is looking for words they remember
@@ -2270,76 +2252,26 @@ pub(crate) fn text_hits(
     store.search(query, limit)
 }
 
-/// Exact text fused with semantic recall, for callers that can weigh a loose
-/// match: the chat agent and the `search_evidence` tool.
+/// What the agent searches with.
 ///
-/// The semantic side is floored by `SEMANTIC_MIN_SIMILARITY`, so a query with
-/// nothing near it comes back short rather than padded.
-pub(crate) async fn search_hits(
+/// Exact text only. This used to fuse in semantic neighbours, and that path is
+/// switched off: `Vault::semantic_search` has no vector index — it reads every
+/// stored vector out of `SQLite` as JSON and scores it in Rust, which measures
+/// 683 ms over one week of capture and grows linearly from there. See the
+/// embedding redesign before turning it back on.
+///
+/// `filter` is applied **in SQL**, before ranking. Taking the best matches in
+/// the vault and then dropping the ones outside the range answers a different
+/// question than the caller asked, and answers it with silence: a term used
+/// often enough to fill the ranking with recent hits made older ones
+/// unreachable.
+pub(crate) fn search_hits(
     store: afterray_store::ReadOnlyVault<'_>,
-    models: &ModelQueue,
     query: &str,
+    filter: &afterray_store::SearchFilter,
     limit: usize,
 ) -> Result<Vec<SearchHit>, StoreError> {
-    let candidate_limit = limit.saturating_mul(4).clamp(limit, 400);
-    let full_text = match store.search(query, candidate_limit) {
-        Ok(hits) => hits,
-        Err(error) => {
-            eprintln!("full-text search unavailable; continuing with semantic search: {error}");
-            Vec::new()
-        }
-    };
-    let job_id = match models
-        .submit(ModelInput::Embedding {
-            text: query.to_owned(),
-        })
-        .await
-    {
-        Ok(job_id) => job_id,
-        Err(error) => {
-            eprintln!("semantic search unavailable; returning FTS results: {error}");
-            return Ok(limit_hits(full_text, limit));
-        }
-    };
-    let snapshot = match models.wait(&job_id).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!(
-                "semantic search job {job_id} could not be read; returning FTS results: {error}"
-            );
-            return Ok(limit_hits(full_text, limit));
-        }
-    };
-    let ModelOutput::Embedding { vector } = (match snapshot.output {
-        Some(output) if snapshot.state == JobState::Done => output,
-        _ => {
-            eprintln!(
-                "semantic search job {job_id} did not complete; returning FTS results: {}",
-                snapshot
-                    .last_error
-                    .unwrap_or_else(|| format!("state was {:?}", snapshot.state))
-            );
-            return Ok(limit_hits(full_text, limit));
-        }
-    }) else {
-        eprintln!(
-            "semantic search job {job_id} returned the wrong output type; returning FTS results"
-        );
-        return Ok(limit_hits(full_text, limit));
-    };
-    let semantic = match store.semantic_search(&vector, &snapshot.adapter, candidate_limit) {
-        Ok(hits) => hits,
-        Err(error) => {
-            eprintln!("semantic search scoring failed; returning FTS results: {error}");
-            return Ok(limit_hits(full_text, limit));
-        }
-    };
-    Ok(fuse_search_results(full_text, semantic, limit))
-}
-
-fn limit_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
-    hits.truncate(limit);
-    hits
+    store.search_filtered(query, filter, limit)
 }
 
 /// Runs the T2 pass: T1 card → configured model → parsed card.
@@ -2740,9 +2672,8 @@ async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, Stri
                         &stored_segment, &stored_text, &adapter, now_ms(),
                     )
                 }).await.map_err(|error| error.to_string())?;
-                if let Some(evidence_id) = evidence_id {
-                    submit_embedding(state, evidence_id, text).await;
-                }
+                // Embeddings are switched off; see `search_hits`.
+                let _ = evidence_id;
                 Ok(())
             }
             Some(_) => Err(format!(
@@ -3975,7 +3906,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use afterray_models::{ModelAdapter, ModelCapability, ProcessAdapter, ProcessAdapterConfig};
+
     use tokio::io::AsyncReadExt;
 
     #[test]
@@ -4599,12 +4530,8 @@ mod tests {
         }
     }
 
-    fn queue(adapters: Vec<Arc<dyn ModelAdapter>>) -> ModelQueue {
-        ModelQueue::new(adapters, QueueConfig::default()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn search_returns_fts_when_embedding_adapter_is_unavailable() {
+    #[test]
+    fn agent_search_is_exact_text_only() {
         let (_directory, vault) = test_vault();
         let session = vault.create_session_sync(1).unwrap();
         vault
@@ -4621,11 +4548,50 @@ mod tests {
             )
             .unwrap();
 
-        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &queue(Vec::new()), "needle", 10)
-            .await
-            .unwrap();
+        let hits = search_hits(
+            afterray_store::ReadOnlyVault::new(&vault),
+            "needle",
+            &afterray_store::SearchFilter::default(),
+            10,
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "needle in local memory");
+    }
+
+    /// The narrowing that used to happen after ranking, and therefore did not
+    /// work: the vault holds the same word in two months, the ranking prefers
+    /// the recent one, and a question about the older month came back empty
+    /// while its evidence sat in the vault.
+    #[test]
+    fn a_narrowed_search_reaches_evidence_the_ranking_would_have_buried() {
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let july = 1_783_000_000_000_i64;
+        let august = 1_786_000_000_000_i64;
+        for (at_ms, text) in [
+            (july, "lody notes from july"),
+            (august, "lody notes from august"),
+            (august + 1, "lody again in august"),
+            (august + 2, "lody once more in august"),
+        ] {
+            vault
+                .insert_text_evidence(
+                    &session.id, None, None, "ocr", text, at_ms, None, "ocr-model", None,
+                )
+                .unwrap();
+        }
+
+        // One result, and the ranking alone would not have chosen July's.
+        let hits = search_hits(
+            afterray_store::ReadOnlyVault::new(&vault),
+            "lody",
+            &afterray_store::SearchFilter::range(Some(july - 1), Some(july + 1)),
+            1,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].text, "lody notes from july");
     }
 
     /// The recall UI reads this path, and a hit it shows is a hit it promises
@@ -4655,67 +4621,29 @@ mod tests {
         assert_eq!(text_hits(&vault, "conceptual", 10).unwrap().len(), 1);
     }
 
-    #[tokio::test]
-    async fn search_embeds_query_and_fuses_semantic_results() {
-        let (_directory, vault) = test_vault();
-        let session = vault.create_session_sync(1).unwrap();
-        let exact_id = vault
-            .insert_text_evidence(
-                &session.id,
-                None,
-                None,
-                "ocr",
-                "needle exact words",
-                1,
-                None,
-                "ocr-model",
-                None,
-            )
-            .unwrap();
-        let semantic_id = vault
-            .insert_text_evidence(
-                &session.id,
-                None,
-                None,
-                "ocr",
-                "conceptual local context",
-                2,
-                None,
-                "ocr-model",
-                None,
-            )
-            .unwrap();
-        vault
-            .insert_embedding(&exact_id, &[0.0, 1.0], "test-embedding")
-            .unwrap();
-        vault
-            .insert_embedding(&semantic_id, &[1.0, 0.0], "test-embedding")
-            .unwrap();
-
-        let script = r#"
-import json, sys
-json.load(sys.stdin)
-print(json.dumps({
-  "protocol_version": 1,
-  "output": {"type": "embedding", "vector": [1.0, 0.0]},
-  "retryable": False
-}))
-"#;
-        let mut config = ProcessAdapterConfig::new(
-            "test-embedding",
-            ModelCapability::Embedding,
-            "/usr/bin/python3",
-        );
-        config.args = vec!["-c".to_owned(), script.to_owned()];
-        let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
-        let hits = search_hits(afterray_store::ReadOnlyVault::new(&vault), &models, "needle", 10).await.unwrap();
-
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().any(|hit| hit.text == "needle exact words"));
-        assert!(
-            hits.iter()
-                .any(|hit| hit.text == "conceptual local context")
-        );
+    /// Embeddings are switched off, and this is the assertion that they stay
+    /// off until the redesign lands: `Vault::semantic_search` reads every
+    /// stored vector out of `SQLite` as JSON and scores it in Rust, which
+    /// measures 683 ms over a week of capture and grows linearly.
+    ///
+    /// Written against the source rather than behaviour, because the failure
+    /// this guards against is someone re-adding the call, not a wrong answer.
+    #[test]
+    fn nothing_in_the_daemon_computes_or_stores_an_embedding() {
+        let production = include_str!("main.rs")
+            .split_once("\n#[cfg(test)]")
+            .map_or(include_str!("main.rs"), |(before, _)| before);
+        for needle in [
+            concat!("semantic_", "search("),
+            concat!("insert_", "embedding("),
+            concat!("ModelInput::", "Embedding"),
+        ] {
+            assert!(
+                !production.contains(needle),
+                "`{needle}` is back. Embedding retrieval has no index; see the \
+                 redesign before wiring it up again."
+            );
+        }
     }
 
     #[tokio::test]

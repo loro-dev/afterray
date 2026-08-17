@@ -152,19 +152,30 @@ impl<'a> ReadOnlyVault<'a> {
 
     /// # Errors
     /// Propagates the underlying query failure.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
-        self.inner.search(query, limit)
+    pub fn slot_title_covering(&self, at_ms: i64) -> Result<Option<(i64, String)>, StoreError> {
+        self.inner.slot_title_covering(at_ms)
     }
 
     /// # Errors
     /// Propagates the underlying query failure.
-    pub fn semantic_search(
+    pub fn find_slot_mentions(
         &self,
-        query_vector: &[f32],
-        model_version: &str,
+        query: &str,
+        filter: &crate::SearchFilter,
+        limit: usize,
+    ) -> Result<Vec<slot::SlotMention>, StoreError> {
+        self.inner.find_slot_mentions(query, filter, limit)
+    }
+
+    /// # Errors
+    /// Propagates the underlying query failure.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        filter: &crate::SearchFilter,
         limit: usize,
     ) -> Result<Vec<SearchHit>, StoreError> {
-        self.inner.semantic_search(query_vector, model_version, limit)
+        self.inner.search_filtered(query, filter, limit)
     }
 }
 

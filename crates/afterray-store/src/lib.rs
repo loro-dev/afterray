@@ -72,21 +72,51 @@ pub type TranscriptLine = (i64, String, String);
 pub type MomentAt = (String, i64);
 
 pub use slot::{
-    AppFact, CURRENT_SLOT_DURATION_MS, DaySlot, DaySummary, GapEntry, PrevCard, Revisit, RunRow,
-    LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, SLOT_DURATION_MS, SLOT_SUMMARY_SCHEMA_VERSION, SlotCard,
-    SlotEvidence, SlotExportFacts, SlotFacts, SlotMomentRow, SlotState, SlotSummaryExport,
-    SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, T2Card, T2CardV2,
-    T2Entity, T2Thread, T2VerifyReport, TimelineEntry, assemble_day_summary,
-    attach_entity_candidates, build_slot_card, build_slot_card_with_end, dedup_key_of,
-    extract_json_object, local_day_bounds, local_day_for, next_legacy_slot_boundary,
-    parse_t2_card, parse_t2_card_v2, render_t2_prompt, shorten_place, slot_bounds_for,
-    slot_clock_label, slot_start_for, verify_t2_card,
+    AppFact, CURRENT_SLOT_DURATION_MS, DaySlot, DaySummary, GapEntry, MentionKind, PrevCard,
+    Revisit, RunRow, LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, SLOT_DURATION_MS,
+    SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotExportFacts, SlotFacts, SlotMention,
+    SlotMomentRow, SlotState, SlotSummaryExport, SlotSummaryState, StoredSlotOverlay,
+    T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport,
+    TimelineEntry, assemble_day_summary, attach_entity_candidates, build_slot_card,
+    build_slot_card_with_end, dedup_key_of, extract_json_object, local_day_bounds, local_day_for,
+    match_slot_mention, next_legacy_slot_boundary, parse_t2_card, parse_t2_card_v2,
+    render_t2_prompt, shorten_place, slot_bounds_for, slot_clock_label, slot_start_for,
+    verify_t2_card,
 };
 
 mod readonly;
 pub use readonly::ReadOnlyVault;
 
 pub const SCHEMA_VERSION: u32 = 21;
+
+/// How a search is narrowed before anything is ranked.
+///
+/// Every field is optional and an unset field means "do not narrow on this".
+/// Passed as a struct rather than three arguments because the two searches —
+/// evidence and summaries — must offer the same narrowing or the agent has to
+/// remember which one can do what.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFilter {
+    /// Inclusive lower bound on when the evidence was captured.
+    pub from_ms: Option<i64>,
+    /// Inclusive upper bound.
+    pub to_ms: Option<i64>,
+    /// Application name, matched case-insensitively. Transcripts belong to no
+    /// application, so setting this excludes them.
+    pub app: Option<String>,
+}
+
+impl SearchFilter {
+    /// A range with no application constraint.
+    #[must_use]
+    pub const fn range(from_ms: Option<i64>, to_ms: Option<i64>) -> Self {
+        Self {
+            from_ms,
+            to_ms,
+            app: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ClaimedAudioTranscription {
@@ -1527,6 +1557,134 @@ impl Vault {
         Ok(cards)
     }
 
+    /// The stored summary covering `at_ms`, if a model has titled it.
+    ///
+    /// Keyed off the row's own `slot_end_ms` rather than recomputed bounds, so
+    /// callers never have to know whether this vault is 30- or 10-minute-wide
+    /// at that instant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn slot_title_covering(&self, at_ms: i64) -> Result<Option<(i64, String)>, StoreError> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT slot_start_ms, title FROM slot_summaries
+                  WHERE slot_start_ms <= ?1 AND slot_end_ms > ?1
+                    AND title IS NOT NULL AND TRIM(title) != ''
+                  ORDER BY slot_start_ms DESC
+                  LIMIT 1",
+                params![at_ms],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Stretches of work whose stored summary names `query`, oldest first.
+    ///
+    /// The index the agent had no way to ask for: answering "which Lody issues
+    /// did I handle" meant reading every slot of the day and scanning the prose.
+    /// The v2 card already writes grounded `entities` and named `threads`, so
+    /// this searches those directly and hands back the frames they cite.
+    ///
+    /// `SQL LIKE` is only a prefilter — [`slot::match_slot_mention`] decides,
+    /// in the same folded space `verify_t2_card` grounds entities in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn find_slot_mentions(
+        &self,
+        query: &str,
+        filter: &SearchFilter,
+        limit: usize,
+    ) -> Result<Vec<slot::SlotMention>, StoreError> {
+        let Some(pattern) = like_prefilter(query) else {
+            return Ok(Vec::new());
+        };
+        // Wider than `limit` so ranking has something to choose from, and
+        // capped so a one-letter query cannot walk a year of summaries.
+        let candidate_limit = i64::try_from(limit.saturating_mul(8).clamp(limit, 400)).unwrap_or(400);
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, slot_end_ms, local_day, title,
+                    threads_json, entities_json, decisions_json
+               FROM slot_summaries
+              WHERE schema_version >= ?1
+                AND (?2 IS NULL OR slot_start_ms >= ?2)
+                AND (?3 IS NULL OR slot_start_ms <= ?3)
+                AND (title LIKE ?4 ESCAPE '\\'
+                     OR threads_json LIKE ?4 ESCAPE '\\'
+                     OR entities_json LIKE ?4 ESCAPE '\\')
+                AND (?6 IS NULL OR EXISTS (
+                      SELECT 1 FROM moments frame
+                       WHERE frame.captured_at_ms >= slot_start_ms
+                         AND frame.captured_at_ms < slot_end_ms
+                         AND frame.application_name = ?6 COLLATE NOCASE))
+              ORDER BY slot_start_ms DESC
+              LIMIT ?5",
+        )?;
+        let rows = statement.query_map(
+            params![
+                slot::SLOT_SUMMARY_SCHEMA_VERSION,
+                filter.from_ms,
+                filter.to_ms,
+                pattern,
+                candidate_limit,
+                filter.app.as_deref(),
+            ],
+            |row| {
+                let threads: Option<String> = row.get(4)?;
+                let entities: Option<String> = row.get(5)?;
+                let decisions: Option<String> = row.get(6)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    threads
+                        .and_then(|raw| serde_json::from_str::<Vec<slot::T2Thread>>(&raw).ok())
+                        .unwrap_or_default(),
+                    entities
+                        .and_then(|raw| serde_json::from_str::<Vec<slot::T2Entity>>(&raw).ok())
+                        .unwrap_or_default(),
+                    decisions
+                        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+                        .unwrap_or_default(),
+                ))
+            },
+        )?;
+
+        let mut ranked: Vec<(slot::MentionKind, slot::SlotMention)> = Vec::new();
+        for row in rows {
+            let (start, end, day, title, threads, entities, decisions) = row?;
+            if let Some((mention, kind)) = slot::match_slot_mention(
+                query,
+                start,
+                end,
+                &day,
+                title.as_deref(),
+                &threads,
+                &entities,
+                &decisions,
+            ) {
+                ranked.push((kind, mention));
+            }
+        }
+        // Rank to decide *what* survives the cut — a verbatim entity beats
+        // prose that happens to contain the letters — then restore time order,
+        // because what comes back is read as a timeline.
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(b.1.slot_start_ms.cmp(&a.1.slot_start_ms))
+        });
+        ranked.truncate(limit);
+        ranked.sort_by_key(|(_, mention)| mention.slot_start_ms);
+        Ok(ranked.into_iter().map(|(_, mention)| mention).collect())
+    }
+
     /// Returns one slot's user-visible facts and parsed persisted `P2`. The
     /// query deliberately does not select evidence_json, artifacts, prompts,
     /// tool results, or model completion text.
@@ -2738,6 +2896,28 @@ impl Vault {
     /// dialect the index was written in, and so FTS5 operators the user did not
     /// mean to type cannot reach the parser.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
+        self.search_filtered(query, &SearchFilter::default(), limit)
+    }
+
+    /// Full-text search narrowed to a time range and an application.
+    ///
+    /// The narrowing happens **in SQL**, which is a correctness property and
+    /// not only a speed one. Ranking then filtering — take the best `n` in the
+    /// whole vault, drop the ones outside the range — answers "the best
+    /// matches, if any happen to fall in this month" when the question was
+    /// "the best matches in this month". A term used often enough to fill the
+    /// ranking with recent hits made older ones unreachable: the tool returned
+    /// nothing while the evidence sat in the vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        filter: &SearchFilter,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, StoreError> {
         let Some(expression) = match_query(query) else {
             return Ok(Vec::new());
         };
@@ -2756,12 +2936,22 @@ impl Vault {
                     bm25(evidence_fts)
              FROM evidence_fts
              JOIN text_evidence te ON te.id = evidence_fts.evidence_id
+             LEFT JOIN moments frame ON frame.id = te.moment_id
              WHERE evidence_fts MATCH ?1
+               AND (?3 IS NULL OR te.started_at_ms >= ?3)
+               AND (?4 IS NULL OR te.started_at_ms <= ?4)
+               AND (?5 IS NULL OR frame.application_name = ?5 COLLATE NOCASE)
              ORDER BY bm25(evidence_fts), te.started_at_ms DESC, te.id ASC
              LIMIT ?2",
         )?;
         let rows = statement.query_map(
-            params![expression, i64::try_from(limit).unwrap_or(20)],
+            params![
+                expression,
+                i64::try_from(limit).unwrap_or(20),
+                filter.from_ms,
+                filter.to_ms,
+                filter.app.as_deref(),
+            ],
             |row| {
                 Ok(SearchHit {
                     moment_id: row.get(0)?,
@@ -3498,6 +3688,32 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
         return None;
     }
     Some((dot / (left_norm.sqrt() * right_norm.sqrt())) as f32)
+}
+
+/// `LIKE` pattern that prefilters summary rows for [`Vault::find_slot_mentions`].
+///
+/// Built from the longest whitespace-free run of the query rather than the
+/// whole string, because the decision is made later in a folded space that
+/// ignores whitespace: searching `qwen3.5: 4b` must still reach the row that
+/// stored `qwen3.5:4b`. A prefilter narrower than the decision loses rows
+/// silently, so this one is deliberately looser.
+///
+/// `None` when the query has nothing to match on.
+fn like_prefilter(query: &str) -> Option<String> {
+    let token = query.split_whitespace().max_by_key(|part| part.len())?;
+    if token.is_empty() {
+        return None;
+    }
+    let mut pattern = String::with_capacity(token.len() + 2);
+    pattern.push('%');
+    for character in token.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    Some(pattern)
 }
 
 fn sort_hits(hits: &mut [SearchHit]) {
@@ -7389,6 +7605,149 @@ mod tests {
             .unwrap();
         stamp_app(vault, &moment.id, app, bundle, title);
         moment
+    }
+
+    /// The index over what the summariser already writes.
+    ///
+    /// v2 cards carry grounded entities and named threads; nothing could ask
+    /// across them, so "which stretches touched rav1e" meant reading every
+    /// stretch of every day and scanning the prose.
+    #[test]
+    fn find_slot_mentions_searches_entities_threads_and_titles() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (day_start, _) = local_day_bounds(1_786_698_000_000);
+        let slot_at = slot_start_for(day_start + 10 * 3_600_000);
+        for offset in [0_i64, 20_000] {
+            insert_named_moment(
+                &vault,
+                &session.id,
+                slot_at + offset,
+                "Zed",
+                "dev.zed.Zed",
+                "gop.rs",
+            );
+        }
+        let card = vault.slot_card(slot_at + 1_000, 10_000).unwrap();
+        let frames = card.evidence.moment_ids.clone();
+        vault
+            .put_t2_summary_v2(
+                &card,
+                &T2CardV2 {
+                    title: "Chased a GOP header bug".into(),
+                    description: "The IVF length field was off by one.".into(),
+                    threads: vec![T2Thread {
+                        name: "rav1e encode".into(),
+                        prose: "read the IVF header writer".into(),
+                        moment_ids: frames.clone(),
+                    }],
+                    entities: vec![T2Entity {
+                        text: "rav1e".into(),
+                        kind: Some("crate".into()),
+                        moment_id: frames.first().cloned(),
+                    }],
+                    decisions: vec!["Keep the length check in the packer".into()],
+                    not_captured: vec![],
+                    category: Some("coding".into()),
+                    confidence: Some(0.8),
+                },
+                "test",
+                slot_at,
+                Some(10),
+            )
+            .unwrap();
+
+        // By entity, by thread prose, and by title.
+        for needle in ["rav1e", "IVF header writer", "GOP header"] {
+            let hits = vault.find_slot_mentions(needle, &SearchFilter::default(), 10).unwrap();
+            assert_eq!(hits.len(), 1, "`{needle}` found {hits:?}");
+            assert_eq!(hits[0].slot_start_ms, slot_at);
+        }
+        let hit = &vault.find_slot_mentions("rav1e", &SearchFilter::default(), 10).unwrap()[0];
+        assert_eq!(hit.matched_entities, vec!["rav1e".to_owned()]);
+        assert_eq!(hit.moment_ids, frames, "the frames to cite came back");
+        assert_eq!(hit.decisions, vec!["Keep the length check in the packer".to_owned()]);
+
+        // Case and spacing fold, an unrelated word does not.
+        assert_eq!(vault.find_slot_mentions("RAV1E", &SearchFilter::default(), 10).unwrap().len(), 1);
+        assert!(vault.find_slot_mentions("kubernetes", &SearchFilter::default(), 10).unwrap().is_empty());
+
+        // A window that excludes the slot excludes the hit.
+        assert!(
+            vault
+                .find_slot_mentions(
+                    "rav1e",
+                    &SearchFilter::range(Some(slot_at + 1), None),
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The matching rule itself, without a database: `LIKE` is the prefilter,
+    /// this is the decision, and the two must not disagree about whitespace.
+    #[test]
+    fn match_slot_mention_folds_whitespace_and_case() {
+        let threads = vec![T2Thread {
+            name: "worker".into(),
+            prose: "swapped the model".into(),
+            moment_ids: vec!["m1".into()],
+        }];
+        let entities = vec![T2Entity {
+            text: "qwen3.5:4b".into(),
+            kind: None,
+            moment_id: Some("m2".into()),
+        }];
+        let matched = |needle: &str| {
+            match_slot_mention(needle, 10, 20, "2026-08-16", Some("Ran a worker"), &threads, &entities, &[])
+        };
+
+        let (mention, kind) = matched("Qwen3.5: 4B").expect("folded match");
+        assert_eq!(kind, MentionKind::Entity);
+        assert_eq!(mention.matched_entities, vec!["qwen3.5:4b".to_owned()]);
+        assert_eq!(mention.moment_ids, vec!["m2".to_owned()]);
+
+        // Prose ranks below a verbatim entity, and title below neither.
+        assert_eq!(matched("swapped").unwrap().1, MentionKind::Prose);
+        assert_eq!(matched("Ran a").unwrap().1, MentionKind::Title);
+        assert!(matched("nothing here").is_none());
+        assert!(matched("   ").is_none());
+
+        // The prefilter must be no narrower than the decision above.
+        assert_eq!(like_prefilter("Qwen3.5: 4B").as_deref(), Some("%Qwen3.5:%"));
+        assert_eq!(like_prefilter("100%_sure").as_deref(), Some("%100\\%\\_sure%"));
+        assert_eq!(like_prefilter("   "), None);
+    }
+
+    #[test]
+    fn slot_title_covering_uses_the_rows_own_bounds() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (day_start, _) = local_day_bounds(1_786_698_000_000);
+        let slot_at = slot_start_for(day_start + 10 * 3_600_000);
+        insert_named_moment(&vault, &session.id, slot_at, "Zed", "dev.zed.Zed", "gop.rs");
+        let card = vault.slot_card(slot_at + 1_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &T2Card {
+                    artifacts: vec![],
+                    title: "Chased a GOP header bug".into(),
+                    bullets: vec![],
+                    category: None,
+                    confidence: None,
+                },
+                "test",
+                slot_at,
+                None,
+            )
+            .unwrap();
+
+        let (start, title) = vault.slot_title_covering(slot_at + 5_000).unwrap().unwrap();
+        assert_eq!(start, card.slot_start_ms);
+        assert_eq!(title, "Chased a GOP header bug");
+        assert!(vault.slot_title_covering(slot_at - 1).unwrap().is_none());
     }
 
     #[test]

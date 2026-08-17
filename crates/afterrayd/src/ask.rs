@@ -88,12 +88,6 @@ pub(crate) fn resolve_ask_range(
     if from <= to { (from, to) } else { (to, from) }
 }
 
-pub(crate) fn hits_in_range(hits: &[SearchHit], from_ms: i64, to_ms: i64) -> Vec<SearchHit> {
-    hits.iter()
-        .filter(|hit| hit.captured_at_ms >= from_ms && hit.captured_at_ms <= to_ms)
-        .cloned()
-        .collect()
-}
 
 fn span_moment_id(span: &ActivitySpan) -> Option<&str> {
     span.moment_ids
@@ -415,22 +409,20 @@ pub(crate) async fn handle_ask(
         }
     };
 
-    let search =
-        match search_hits(
-            afterray_store::ReadOnlyVault::new(store),
-            models,
-            question,
-            SEARCH_HIT_LIMIT.saturating_mul(2),
-        )
-        .await
-        {
-            Ok(hits) => hits_in_range(&hits, from_ms, to_ms),
-            Err(error) => {
-                eprintln!("ask search failed; continuing without hits: {error}");
-                Vec::new()
-            }
-        };
-    let hits: Vec<SearchHit> = search.into_iter().take(SEARCH_HIT_LIMIT).collect();
+    // Narrowed in SQL rather than ranked-then-filtered: the range is the
+    // question here, so hits from outside it must never displace hits inside.
+    let hits: Vec<SearchHit> = match search_hits(
+        afterray_store::ReadOnlyVault::new(store),
+        question,
+        &afterray_store::SearchFilter::range(Some(from_ms), Some(to_ms)),
+        SEARCH_HIT_LIMIT,
+    ) {
+        Ok(hits) => hits,
+        Err(error) => {
+            eprintln!("ask search failed; continuing without hits: {error}");
+            Vec::new()
+        }
+    };
     let citations = citations_from_evidence(&memories, &spans, &hits);
 
     if !model.present {
@@ -456,7 +448,6 @@ pub(crate) async fn handle_ask(
     };
     let host = ToolHost {
         store: afterray_store::ReadOnlyVault::new(store),
-        models,
         now_ms,
         budget: model.budget,
     };

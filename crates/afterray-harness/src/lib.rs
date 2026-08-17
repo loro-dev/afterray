@@ -41,4 +41,5 @@ pub use run::{
     TurnUsage, run_turn,
 };
 pub use transcript::{Pruned, Transcript};
+pub use tokens::estimate_tokens;
 pub use truncate::{Budgeted, truncate_head, truncate_tail};
