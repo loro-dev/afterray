@@ -17,6 +17,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var isControllingDownload: Bool { get }
     var isUpdatingAudio: Bool { get }
     var isUpdatingStorageLimit: Bool { get }
+    var isUpdatingSummarySlot: Bool { get }
     var isUpdatingLanguage: Bool { get }
     var recordAudio: Bool { get }
     var excludedBundleIds: [String] { get }
@@ -49,6 +50,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
     func setStorageLimitBytes(_ bytes: UInt64) async
+    /// Changes how much wall-clock one summary covers, from now on.
+    func setSummarySlotMinutes(_ minutes: UInt32) async
     func setUiLanguage(_ code: String) async
     func setSummaryLanguage(_ code: String) async
     func excludeBundle(_ bundleID: String) async
@@ -552,6 +555,33 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
+        SettingsSection(
+            title: "Summaries",
+            // The honest caveat: the control looks retroactive, and is not.
+            footnote: "Summaries already written keep the length they were written at."
+        ) {
+            SettingsRow(
+                title: "Summary length",
+                subtitle: "How much of the day one card on the summary panel covers."
+            ) {
+                HStack(spacing: 8) {
+                    if model.isUpdatingSummarySlot {
+                        ProgressView().controlSize(.mini)
+                    }
+                    Picker("Summary length", selection: summarySlotMinutesBinding) {
+                        ForEach(summarySlotMinutesOptions, id: \.self) { minutes in
+                            Text(AppSettings.summaryLengthLabel(minutes)).tag(minutes)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 118)
+                    .disabled(model.isUpdatingSummarySlot)
+                    .accessibilityLabel("Summary length")
+                }
+            }
+        }
+
         SettingsSection(title: "Language") {
             SettingsRow(
                 title: "Interface",
@@ -765,6 +795,18 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         Binding(
             get: { model.settings?.storageLimitBytes ?? AppSettings.defaultStorageLimitBytes },
             set: { bytes in Task { await model.setStorageLimitBytes(bytes) } }
+        )
+    }
+
+    private var summarySlotMinutesOptions: [UInt32] {
+        model.settings?.summarySlotMinutesPickerOptions
+            ?? [AppSettings.defaultSummarySlotMinutes]
+    }
+
+    private var summarySlotMinutesBinding: Binding<UInt32> {
+        Binding(
+            get: { model.settings?.summarySlotMinutes ?? AppSettings.defaultSummarySlotMinutes },
+            set: { minutes in Task { await model.setSummarySlotMinutes(minutes) } }
         )
     }
 

@@ -115,7 +115,8 @@ window now buys two rounds rather than four.
 
 `get_day_summary` renders at two densities and chooses by measuring against
 `tool_result_tokens` (~1 790; CJK costs a token per character, not a quarter).
-A worked day is ~48 ten-minute stretches; the rich form — threads, cited
+A worked day is ~48 stretches at the default ten-minute length (fewer if the
+user has widened it in Settings); the rich form — threads, cited
 frames, entities, decisions — overflows about fourfold, and `truncate_head`
 cuts the *tail*, which deletes the afternoon from an answer about the day. The
 compact form keeps every stretch's time, `at_ms` and title, and says

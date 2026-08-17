@@ -54,7 +54,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 
 - Keyword: `Vault::search` (lib.rs:2310) → FTS5 bm25 through `search_index.rs:110 match_query`. **Index and query must both go through `index_text`/`match_query`** (CJK bigram folding) or CJK substring search silently breaks.
 - Semantic: `lib.rs:2379 semantic_search` — cosine ≥ `SEMANTIC_MIN_SIMILARITY = 0.72` (lib.rs:93), same `model_version` only. Agent-side fusion: `fuse_search_results` (RRF k=60, lib.rs:2893). The user-facing `Search` RPC is FTS-only on purpose.
-- T1 slot cards: `slot.rs` — new vaults use 10-minute wall-clock slots; upgraded vaults preserve 30-minute history before a persisted cutover. Every consumer receives explicit bounds; T1 remains pure and deterministic (no model spend).
+- T1 slot cards: `slot.rs` — slot length is a user setting (10/20/30/60 min, default 10). The vault persists the whole history as `SlotSegment`s, so old cards keep the length they were summarised at; `slot_bounds_in` clips a slot at a segment boundary rather than letting it straddle two geometries. Every consumer receives explicit bounds; T1 remains pure and deterministic (no model spend).
 - T2 LLM summaries: `run_slot_t2` (daemon main.rs:1944) driven by a 5-min sweeper (`spawn_slot_summarizer`, main.rs:2238), gated fail-closed by `t2_may_run` (main.rs:2102: AC power, ≥30% battery, ≥30s idle, load/core ≤0.7) and yielding to in-flight OCR.
 - Cold storage: `gop_packer.rs` packs stills past the 2-hour hot window into closed AV1 GOPs (`afterray-codec`, rav1e, encode-only). Thumbnails are built in `encode_run` (gop_packer.rs:224) **before** `drop_unpinned_stills` deletes the JPEG, because nothing in Rust can decode AV1 back. Reads follow the thumbnail → still → GOP-frame fallback chain in `read_moment_thumbnail` (main.rs:2777).
 
@@ -63,4 +63,4 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - No AV1 **decode** exists in Rust anywhere; clients decode GOP frames themselves (Swift `RecallYUVDisplay` / VideoToolbox).
 - `afterray-core` is only two trait definitions — the real store is `afterray-store::Vault`, the real capture is `MacOsCaptureBackend`.
 - Background LLM submitters (T2, backfills, agent loops) must use `JobPriority::Background` and multi-round loops must hold `ModelQueue::hold_llm_lease()` (queue.rs:351), or rounds starve behind rivals.
-- Timestamps are epoch-ms `i64` everywhere; "day" is local-calendar; slot alignment is wall-clock 30-minute boundaries.
+- Timestamps are epoch-ms `i64` everywhere; "day" is local-calendar; slots align to wall-clock boundaries of whatever length is in force (every offered length divides an hour).

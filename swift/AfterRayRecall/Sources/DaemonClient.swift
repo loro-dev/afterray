@@ -132,6 +132,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
         llmModel: String?,
         llmApiKey: String?,
         storageLimitBytes: UInt64?,
+        summarySlotMinutes: UInt32?,
         uiLanguage: String?,
         summaryLanguage: String?,
         cliEvidenceAccess: Bool?
@@ -178,6 +179,7 @@ public extension AfterRayDaemonServing {
             llmModel: nil,
             llmApiKey: nil,
             storageLimitBytes: nil,
+            summarySlotMinutes: nil,
             uiLanguage: nil,
             summaryLanguage: nil,
             cliEvidenceAccess: nil
@@ -186,7 +188,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 13
+    public static let protocolVersion = 14
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -250,6 +252,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         llmModel: String? = nil,
         llmApiKey: String? = nil,
         storageLimitBytes: UInt64? = nil,
+        summarySlotMinutes: UInt32? = nil,
         uiLanguage: String? = nil,
         summaryLanguage: String? = nil,
         cliEvidenceAccess: Bool? = nil
@@ -265,6 +268,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 llmModel: llmModel,
                 llmApiKey: llmApiKey,
                 storageLimitBytes: storageLimitBytes,
+                summarySlotMinutes: summarySlotMinutes,
                 uiLanguage: uiLanguage,
                 summaryLanguage: summaryLanguage,
                 cliEvidenceAccess: cliEvidenceAccess
@@ -562,6 +566,7 @@ struct WireRequest: Encodable, Equatable {
     var llmModel: String?
     var llmApiKey: String?
     var storageLimitBytes: UInt64?
+    var summarySlotMinutes: UInt32?
     var uiLanguage: String?
     var summaryLanguage: String?
     var modelDownloadEndpoint: String?
@@ -604,6 +609,7 @@ struct WireRequest: Encodable, Equatable {
         case llmModel = "llm_model"
         case llmApiKey = "llm_api_key"
         case storageLimitBytes = "storage_limit_bytes"
+        case summarySlotMinutes = "summary_slot_minutes"
         case uiLanguage = "ui_language"
         case summaryLanguage = "summary_language"
         case modelDownloadEndpoint = "model_download_endpoint"
@@ -650,6 +656,7 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(llmModel, forKey: .llmModel)
         try container.encodeIfPresent(llmApiKey, forKey: .llmApiKey)
         try container.encodeIfPresent(storageLimitBytes, forKey: .storageLimitBytes)
+        try container.encodeIfPresent(summarySlotMinutes, forKey: .summarySlotMinutes)
         try container.encodeIfPresent(uiLanguage, forKey: .uiLanguage)
         try container.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
         try container.encodeIfPresent(modelDownloadEndpoint, forKey: .modelDownloadEndpoint)

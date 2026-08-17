@@ -5,7 +5,7 @@ Nine crates (`Cargo.toml` workspace, edition 2024, rust 1.85). The daemon `after
 ## Shared conventions
 
 - Workspace lints (root `Cargo.toml:44-49`): `unsafe_code = "deny"` — the only exception is `afterray-platform-macos` (`#![allow(unsafe_code)]`, FFI boundary); clippy `all` + `pedantic` = warn.
-- Timestamps are epoch-ms `i64` everywhere; "day" means local-calendar day (`slot::local_day_bounds`). New vaults use wall-clock 10-minute summary slots; upgraded vaults persist a clean 30→10-minute cutover and all consumers use explicit bounds.
+- Timestamps are epoch-ms `i64` everywhere; "day" means local-calendar day (`slot::local_day_bounds`). Summary slot length is a user setting (10/20/30/60 min, default 10); the vault persists the whole geometry history and all consumers use explicit bounds, never a constant.
 - Tests are inline `#[cfg(test)]` modules — no `tests/` dirs, no CI workflows in this repo.
 - Secrets live in the macOS Keychain (`MacOsKeychainProvider`, store lib.rs:155), never in files.
 
