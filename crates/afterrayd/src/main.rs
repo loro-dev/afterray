@@ -2047,6 +2047,29 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
             }
             Ok(CaptureEvent::Warning { code, message }) => {
                 eprintln!("capture warning [{code}]: {message}");
+                // A dead input tap is a hole in one of the two fact streams,
+                // and it has to be recorded *in* that stream: T1 reads the
+                // absence of events as "the user did nothing here", which is
+                // exactly the inference this pipeline exists to prevent. The
+                // marker rides the same table (the vault stores `kind`
+                // uninterpreted) so the gap arrives in its place in time.
+                if matches!(code.as_str(), "input_tap_stalled" | "input_tap_unavailable") {
+                    let marker = InputEventRow {
+                        at_ms: now_ms(),
+                        end_ms: None,
+                        kind: afterray_store::acts::SIGNAL_GAP_KIND.to_owned(),
+                        count: None,
+                        ended_with: None,
+                        command: Some(code.clone()),
+                        bundle_identifier: None,
+                        target_json: None,
+                    };
+                    if let Err(error) =
+                        run_store(&state, move |s| s.store.insert_input_events(&[marker])).await
+                    {
+                        eprintln!("input signal gap store failed: {error}");
+                    }
+                }
             }
             Ok(CaptureEvent::InputEvents { events, dropped }) => {
                 if !events.is_empty() || dropped > 0 {
@@ -2887,6 +2910,68 @@ async fn fail_claimed_audio(
     }
 }
 
+/// How far back the freeze looks for slots whose acts are not yet frozen.
+///
+/// Comfortably inside the 48-hour event retention: the work only exists while
+/// the events do, and a longer window would just re-check slots whose events
+/// are already gone.
+const ACTS_FREEZE_LOOKBACK_MS: i64 = 36 * 60 * 60 * 1000;
+
+/// Ceiling per tick. One freeze rebuilds a card (per-frame AX decryption), so
+/// the backlog drains over several ticks rather than stalling one.
+const ACTS_FREEZE_PER_TICK: usize = 4;
+
+/// Freezes the acts of every sealed slot that still has events and no frozen
+/// copy.
+///
+/// "Sealed" is the same settle window T2 uses: a slot still gaining OCR is
+/// still gaining runs, and acts are attributed to runs.
+async fn freeze_slot_acts(state: &Arc<AppState>, now: i64) {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+    let from = now.saturating_sub(ACTS_FREEZE_LOOKBACK_MS);
+    let due = match run_store(state, move |s| s.store.slots_missing_acts(from, now)).await {
+        Ok(due) => due,
+        Err(error) => {
+            eprintln!("slot.acts freeze: listing slots failed: {error}");
+            return;
+        }
+    };
+    let mut frozen = 0_usize;
+    for slot_start_ms in due {
+        if frozen >= ACTS_FREEZE_PER_TICK {
+            break;
+        }
+        let bounds = match run_store(state, move |s| {
+            Ok::<_, StoreError>(s.store.summary_slot_bounds(slot_start_ms))
+        })
+        .await
+        {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                eprintln!("slot.acts freeze: slot={slot_start_ms} bounds failed: {error}");
+                continue;
+            }
+        };
+        if bounds.end_ms + T2_SETTLE_MS > now {
+            continue;
+        }
+        match run_store(state, move |s| {
+            s.store.materialize_slot_acts(slot_start_ms, interval_ms)
+        })
+        .await
+        {
+            Ok(true) => {
+                frozen += 1;
+                eprintln!("slot.acts freeze: froze slot={slot_start_ms}");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("slot.acts freeze: slot={slot_start_ms} failed: {error}");
+            }
+        }
+    }
+}
+
 fn spawn_slot_summarizer(state: Arc<AppState>) {
     let period = Duration::from_secs(
         std::env::var("AFTERRAY_T2_SWEEP_SECONDS")
@@ -2919,6 +3004,14 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 }
                 _ = timer.tick() => {}
             }
+
+            // Freezing acts runs before — and independently of — the T2 gate.
+            // It is a short read and one small write with no model in it, and
+            // the deadline it races is physical: the events expire in 48 hours
+            // whether or not the machine was ever on AC power with a charged
+            // battery. Gating it behind T2's conditions would lose acts on
+            // exactly the laptops that stay unplugged.
+            freeze_slot_acts(&state, now_ms()).await;
 
             // OCR is on the critical path for the frames still arriving; T2 is
             // not. Yield the queue and pick the backlog up next tick.

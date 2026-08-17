@@ -2882,6 +2882,136 @@ impl Vault {
             .and_then(|json| serde_json::from_str(&json).ok()))
     }
 
+    /// Freezes a sealed slot's acts into `slot_summaries.acts_json`.
+    ///
+    /// Events are deleted after 48 hours and T1 is computed lazily, so without
+    /// this the acts of every slot older than two days would simply vanish —
+    /// the card would silently lose the half of itself that says what the user
+    /// did, while keeping the half that says what was on screen.
+    ///
+    /// Idempotent by design: a slot that already has acts is left alone, so the
+    /// five-minute sweeper can revisit it forever at the cost of one indexed
+    /// read. Returns whether anything was written.
+    ///
+    /// The caller decides what "sealed" means — it owns the clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be read or written.
+    pub fn materialize_slot_acts(
+        &self,
+        at_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let bounds = self.summary_slot_bounds(at_ms);
+        if self.slot_acts(bounds.start_ms)?.is_some() {
+            return Ok(false);
+        }
+        if self
+            .input_events_between(bounds.start_ms, bounds.end_ms)?
+            .is_empty()
+        {
+            // Nothing to freeze. Deliberately not written as an empty record:
+            // "no events were ever stored" and "the events said nothing" are
+            // different claims, and only the second one is a fact.
+            return Ok(false);
+        }
+        let card = self.slot_card(at_ms, capture_interval_ms)?;
+        let frozen = acts::MaterializedActs {
+            runs: card
+                .timeline
+                .iter()
+                .filter_map(|entry| match entry {
+                    slot::TimelineEntry::Run(run) => Some(run),
+                    slot::TimelineEntry::Gap(_) => None,
+                })
+                .filter_map(|run| {
+                    Some(acts::MaterializedRun {
+                        id: run.moment_id.clone(),
+                        acts: run.acts.clone()?,
+                    })
+                })
+                .collect(),
+            no_input_ratio: card.facts.no_input_ratio,
+        };
+        if frozen.runs.is_empty() && frozen.no_input_ratio.is_none() {
+            return Ok(false);
+        }
+        // Plain counts and labels: this cannot fail. If it somehow did, losing
+        // the freeze is better than failing the sweep that also freezes others.
+        let Ok(json) = serde_json::to_string(&frozen) else {
+            return Ok(false);
+        };
+        self.put_slot_acts(&card, &json)?;
+        Ok(true)
+    }
+
+    /// Writes the frozen acts, creating the summary row when a model has not
+    /// written one yet.
+    ///
+    /// A row created here carries `degraded` and no title, which is what the day
+    /// panel already renders for a slot T2 has not summarised: the panel takes
+    /// its state from the live card, and a titleless row for a slot with no
+    /// frames is skipped outright. So this cannot conjure a phantom slot, and it
+    /// cannot stop T2 from running later.
+    ///
+    /// The `WHERE acts_json IS NULL` guard makes a concurrent second sweep a
+    /// no-op rather than a rewrite.
+    fn put_slot_acts(&self, card: &slot::SlotCard, acts_json: &str) -> Result<(), StoreError> {
+        let facts_json = serde_json::to_string(&card.facts).unwrap_or_else(|_| "{}".to_owned());
+        let evidence_json =
+            serde_json::to_string(&card.evidence).unwrap_or_else(|_| "{}".to_owned());
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO slot_summaries (
+                id, slot_start_ms, slot_end_ms, local_day, state, generation,
+                schema_version, facts_json, evidence_json, acts_json
+             ) VALUES (?1, ?2, ?3, ?4, 'degraded', 1, ?5, ?6, ?7, ?8)
+             ON CONFLICT(slot_start_ms) DO UPDATE SET
+                acts_json = excluded.acts_json
+              WHERE slot_summaries.acts_json IS NULL",
+            params![
+                Uuid::now_v7().to_string(),
+                card.slot_start_ms,
+                card.slot_end_ms,
+                card.local_day,
+                slot::SLOT_SUMMARY_SCHEMA_VERSION,
+                facts_json,
+                evidence_json,
+                acts_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Slot starts in `[from_ms, to_ms)` that hold input events but no frozen
+    /// acts yet — the sweeper's work list.
+    ///
+    /// Answered from the event table rather than from the frames, because the
+    /// events are what expires: a slot with no events has nothing to lose.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn slots_missing_acts(&self, from_ms: i64, to_ms: i64) -> Result<Vec<i64>, StoreError> {
+        if from_ms >= to_ms {
+            return Ok(Vec::new());
+        }
+        let events = self.input_events_between(from_ms, to_ms)?;
+        let mut starts: Vec<i64> = events
+            .iter()
+            .map(|event| self.summary_slot_bounds(event.at_ms).start_ms)
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let mut due = Vec::new();
+        for start in starts {
+            if self.slot_acts(start)?.is_none() {
+                due.push(start);
+            }
+        }
+        Ok(due)
+    }
+
     /// Drops observations older than [`INPUT_EVENT_RETENTION_MS`].
     ///
     /// A span is judged by its end, so a burst still inside the window survives
@@ -8808,6 +8938,220 @@ mod tests {
         assert!(run.acts.is_none());
         assert!(card.not_engaged.is_empty());
         assert_eq!(card.facts.no_input_ratio, None);
+    }
+
+    /// Builds a slot of Feishu frames with one click in the chat pane and a
+    /// typing burst, and returns its start.
+    fn acts_slot(vault: &Vault, session_id: &str) -> i64 {
+        // Frames sit a minute into the slot; the caller gets the slot's own
+        // start, which is what `slot_acts` and `slots_missing_acts` key on.
+        let first_at = slot_start_for(1_786_698_000_000) + 60_000;
+        let slot = vault.summary_slot_bounds(first_at).start_ms;
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let snapshot = two_pane_snapshot(&sidebar_refs, &["赵亮: shipped the fix", "me: thanks"]);
+        for step in 0..3_i64 {
+            let at = first_at + step * 10_000;
+            insert_named_moment(
+                vault,
+                session_id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    session_id,
+                    at,
+                    "application/json",
+                    &snapshot,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let mut click = input_event(first_at + 5_000, None, "click");
+        click.bundle_identifier = Some("com.electron.lark".to_owned());
+        click.target_json = Some(
+            r#"{"role":"AXStaticText","label":"赵亮",
+                "frame":{"x":300,"y":100,"width":200,"height":20}}"#
+                .to_owned(),
+        );
+        let mut burst = input_event(first_at + 6_000, Some(first_at + 12_000), "burst");
+        burst.count = Some(24);
+        burst.bundle_identifier = Some("com.electron.lark".to_owned());
+        burst.target_json = Some(
+            r#"{"role":"AXTextArea","label":"Message",
+                "frame":{"x":300,"y":900,"width":400,"height":40}}"#
+                .to_owned(),
+        );
+        vault.insert_input_events(&[click, burst]).unwrap();
+        slot
+    }
+
+    /// The reason materialisation exists: events are deleted after 48 hours and
+    /// T1 is lazy, so acts that are not frozen simply disappear from history.
+    #[test]
+    fn frozen_acts_outlive_the_events_they_came_from() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+
+        let live = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        let live_run = live
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("a run");
+        let live_acts = live_run.acts.clone().expect("the slot has events");
+        assert_eq!(live_acts.keys, 24);
+        assert_eq!(live_acts.clicks[0].label, "赵亮");
+
+        assert!(
+            vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap(),
+            "a slot with events and no frozen acts is work to do"
+        );
+        vault.flush_card_cache();
+
+        // 48 hours pass.
+        let removed = vault
+            .prune_input_events(slot + SLOT_DURATION_MS + INPUT_EVENT_RETENTION_MS)
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert!(
+            vault
+                .input_events_between(slot, slot + SLOT_DURATION_MS)
+                .unwrap()
+                .is_empty()
+        );
+
+        let after = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        let after_run = after
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("a run");
+        let frozen = after_run
+            .acts
+            .clone()
+            .expect("the frozen copy stands in for the events");
+        assert_eq!(frozen, live_acts, "the same acts, minus their source");
+        assert_eq!(after.facts.no_input_ratio, live.facts.no_input_ratio);
+        // What the freeze does not restore: the partition was computed against
+        // rects that no longer exist, so the text is whole again.
+        assert!(after_run.peripheral.is_empty());
+        assert_eq!(after_run.lines.len(), 22);
+        assert!(after.not_engaged.is_empty());
+    }
+
+    /// The sweeper revisits every slot every five minutes forever.
+    #[test]
+    fn freezing_a_slot_twice_changes_nothing() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+
+        assert!(vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap());
+        let first = vault.slot_acts(slot).unwrap().expect("frozen");
+        assert!(
+            !vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap(),
+            "already frozen"
+        );
+        assert_eq!(vault.slot_acts(slot).unwrap(), Some(first));
+
+        // And a later T2 card does not erase them.
+        let card = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &T2Card {
+                    artifacts: vec![],
+                    title: "Answering 赵亮".into(),
+                    bullets: vec![],
+                    category: Some("comms".into()),
+                    confidence: Some(0.9),
+                },
+                "test",
+                slot,
+                None,
+            )
+            .unwrap();
+        assert!(
+            vault.slot_acts(slot).unwrap().is_some(),
+            "a model writing the card must not drop the acts under it"
+        );
+        let day = vault.day_summary(slot, 10_000).unwrap();
+        assert_eq!(day.slots.len(), 1, "no phantom slot from the acts row");
+        assert_eq!(day.slots[0].title.as_deref(), Some("Answering 赵亮"));
+    }
+
+    #[test]
+    fn a_slot_with_no_events_is_never_frozen() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let at = slot_start_for(1_786_698_000_000) + 60_000;
+        let slot = vault.summary_slot_bounds(at).start_ms;
+        insert_named_moment(&vault, &session.id, at, "Zed", "dev.zed.Zed", "slot.rs");
+        assert!(
+            !vault.materialize_slot_acts(at, 10_000).unwrap(),
+            "no events stored and events that said nothing are different claims"
+        );
+        assert_eq!(vault.slot_acts(slot).unwrap(), None);
+        assert!(
+            vault
+                .slots_missing_acts(slot, slot + SLOT_DURATION_MS)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn slots_missing_acts_lists_slots_with_events_until_they_are_frozen() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+        let window_end = slot + SLOT_DURATION_MS;
+
+        assert_eq!(
+            vault.slots_missing_acts(slot, window_end).unwrap(),
+            vec![slot]
+        );
+        vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap();
+        assert!(
+            vault.slots_missing_acts(slot, window_end).unwrap().is_empty(),
+            "frozen slots leave the work list"
+        );
+    }
+
+    /// One privacy invariant, three layers: forgetting a window takes the
+    /// frames, the cards, and the acts derived from the events.
+    #[test]
+    fn deleting_history_takes_the_frozen_acts_with_it() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+        assert!(vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap());
+        assert!(vault.slot_acts(slot).unwrap().is_some());
+
+        vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap();
+
+        assert_eq!(vault.slot_acts(slot).unwrap(), None);
+        assert!(
+            vault
+                .input_events_between(slot, slot + SLOT_DURATION_MS)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A window owns an event when the two intervals touch at all: a burst that
