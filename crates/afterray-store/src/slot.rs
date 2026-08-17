@@ -108,6 +108,24 @@ pub struct SlotMomentRow {
     pub ax_join: Option<crate::acts::FrameJoin>,
 }
 
+/// One R3 edge tree, ready to partition text with.
+///
+/// It is **not** a moment: no id, no app identity, no OCR, no audio. The
+/// heartbeat misses content a person only looked at between two ticks, and this
+/// is that content — extra lines for the run it fell inside, partitioned by its
+/// own join exactly like a frame's. It contributes to no `moment_id`, no anchor,
+/// no evidence list, and no count in [`SlotFacts`]: those all answer "which
+/// frames does this card stand on", and an edge tree is not one.
+#[derive(Debug, Clone, Default)]
+pub struct EdgeFrame {
+    pub captured_at_ms: i64,
+    /// The tree's text lines, in tree order — the same vector the join indexes.
+    pub lines: Vec<String>,
+    /// Where this tree says the input landed. `None` (or a scopeless join)
+    /// leaves every line in the main bucket, like an unpartitionable frame.
+    pub join: Option<crate::acts::FrameJoin>,
+}
+
 impl SlotMomentRow {
     fn app_label(&self) -> &str {
         self.application_name
@@ -1195,8 +1213,6 @@ pub fn build_slot_card_with_end(
 /// With `events` empty and `materialized` `None` this is byte-for-byte the
 /// pre-acts card: nothing below may key off anything but those two inputs.
 #[must_use]
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
 pub fn build_slot_card_with_acts(
     slot_start_ms: i64,
     slot_end_ms: i64,
@@ -1205,6 +1221,41 @@ pub fn build_slot_card_with_acts(
     capture_interval_ms: i64,
     events: &[crate::acts::ActEvent],
     materialized: Option<&crate::acts::MaterializedActs>,
+) -> SlotCard {
+    build_slot_card_with_edges(
+        slot_start_ms,
+        slot_end_ms,
+        rows,
+        idle_ms,
+        capture_interval_ms,
+        events,
+        materialized,
+        &[],
+    )
+}
+
+/// Builds a T1 card from frames, input events, and R3 edge trees.
+///
+/// `edges` add text to the run they fell inside and take part in the engaged /
+/// peripheral split exactly as frames do. They add nothing else: no
+/// `moment_id`, no anchor, no OCR evidence, no `facts` count. And like the
+/// partition itself they are gated on the **event stream** — with no events
+/// there is nothing to partition by, so a slot holding edge trees and no events
+/// produces the same card as one holding neither. (By construction it cannot
+/// hold them, since only input triggers a walk; the gate is here so a card can
+/// never depend on that staying true.)
+#[must_use]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+pub fn build_slot_card_with_edges(
+    slot_start_ms: i64,
+    slot_end_ms: i64,
+    rows: &[SlotMomentRow],
+    idle_ms: i64,
+    capture_interval_ms: i64,
+    events: &[crate::acts::ActEvent],
+    materialized: Option<&crate::acts::MaterializedActs>,
+    edges: &[EdgeFrame],
 ) -> SlotCard {
     let local_day = local_day_for(slot_start_ms);
     let step = capture_interval_ms.max(1_000);
@@ -1312,6 +1363,7 @@ pub fn build_slot_card_with_acts(
     let mut run_selected: Vec<Option<String>> = vec![None; pieces.len()];
     let mut run_typing: Vec<Option<String>> = vec![None; pieces.len()];
     let unobservable = crate::acts::unavailable_spans(events, slot_end_ms);
+    let piece_edges = assign_edges_to_pieces(&pieces, edges, events);
     for (piece_index, piece) in pieces.iter().enumerate() {
         for &row_index in &piece.rows {
             let row = &rows[row_index];
@@ -1352,6 +1404,31 @@ pub fn build_slot_card_with_acts(
                 let n = normalise_line(typing);
                 if n.chars().count() >= 4 && seen_typing.insert(n.clone()) {
                     run_typing[piece_index] = Some(clip(&n, SEL_TYPING_CAP_CHARS));
+                }
+            }
+        }
+        // R3 edge trees for this run, after its frames: a line both a frame and
+        // an edge tree showed belongs to the frame that had it first, and only
+        // the lines no frame ever carried are new. Chronology across runs is
+        // preserved, which is what line attribution actually turns on.
+        //
+        // Deliberately not gated on `text_from_ax`: that gate chooses between a
+        // frame's accessibility text and its OCR, and an edge tree has no OCR to
+        // choose against — it is accessibility text or nothing.
+        for &edge_index in &piece_edges[piece_index] {
+            let edge = &edges[edge_index];
+            let join = edge
+                .join
+                .as_ref()
+                .filter(|_| !crate::acts::is_unavailable_at(&unobservable, edge.captured_at_ms))
+                .filter(|join| join.has_scope());
+            for (line_index, line) in edge.lines.iter().enumerate() {
+                if let Some(id) = dedup.observe(line) {
+                    if join.is_some_and(|held| !held.line_is_engaged(line_index)) {
+                        run_peripheral_ids[piece_index].push(id);
+                    } else {
+                        run_line_ids[piece_index].push(id);
+                    }
                 }
             }
         }
@@ -1456,6 +1533,33 @@ pub fn build_slot_card_with_acts(
             moment_ids: rows.iter().map(|row| row.id.clone()).collect(),
         },
     }
+}
+
+/// Which run each R3 edge tree falls inside, by index.
+///
+/// A tree that lands in a capture gap belongs to no run and is dropped: runs are
+/// stretches of captured frames, and attaching a tree to the nearest one would
+/// place a window's worth of text in a stretch it was never on screen during.
+/// Boundaries resolve to the earlier run, since runs meet at an instant.
+///
+/// Empty for every run when the slot has no event stream — the fail-open gate.
+fn assign_edges_to_pieces(
+    pieces: &[Piece],
+    edges: &[EdgeFrame],
+    events: &[crate::acts::ActEvent],
+) -> Vec<Vec<usize>> {
+    let mut assigned = vec![Vec::new(); pieces.len()];
+    if events.is_empty() {
+        return assigned;
+    }
+    for (index, edge) in edges.iter().enumerate() {
+        if let Some(piece_index) = pieces.iter().position(|piece| {
+            edge.captured_at_ms >= piece.start_ms && edge.captured_at_ms <= piece.end_ms
+        }) {
+            assigned[piece_index].push(index);
+        }
+    }
+    assigned
 }
 
 /// Which run each stretch of acts belongs to.
@@ -3003,6 +3107,139 @@ mod tests {
             "the frozen copy restores acts, never the partition: the rects it \
              was hit-tested against are gone"
         );
+    }
+
+    // ------------------------------------------------- R3 edge trees
+
+    /// An R3 tree, already partitioned: `(line, engaged)`.
+    fn edge_frame(at_ms: i64, lines: &[(&str, bool)], scope: &str) -> EdgeFrame {
+        EdgeFrame {
+            captured_at_ms: at_ms,
+            lines: lines.iter().map(|(line, _)| (*line).to_owned()).collect(),
+            join: Some(FrameJoin {
+                scope: Some(scope.to_owned()),
+                engaged: lines.iter().map(|(_, engaged)| *engaged).collect(),
+                regions: Vec::new(),
+            }),
+        }
+    }
+
+    /// The hole R3 exists to fill: a message that arrived and was read between
+    /// two heartbeats. Its lines join the run's engaged bucket, and its own
+    /// untouched pane stays peripheral.
+    #[test]
+    fn an_edge_tree_adds_lines_only_it_saw_to_the_run_it_fell_in() {
+        let (rows, events) = im_slot();
+        let edges = [edge_frame(
+            5_000,
+            &[
+                ("Lody Team", false),
+                ("赵亮: shipped the fix", true),
+                ("赵亮: staging looks clean", true),
+                ("me: merging then", true),
+            ],
+            "AXWindow:Lark>AXGroup:Chat",
+        )];
+        let card =
+            build_slot_card_with_edges(0, 600_000, &rows, 0, 10_000, &events, None, &edges);
+        let run = runs(&card)[0];
+        assert_eq!(
+            run.lines,
+            [
+                "赵亮: shipped the fix",
+                "me: thanks, deploying now",
+                "me: rolling it out to staging",
+                "赵亮: staging looks clean",
+                "me: merging then",
+            ],
+            "the two lines no frame ever carried are in, once each, after the \
+             run's own frames"
+        );
+        assert_eq!(
+            run.peripheral,
+            ["Lody Team", "Design 设计组", "Ops on call", "Infra weekly"],
+            "an edge tree's untouched pane is still merely visible"
+        );
+    }
+
+    /// An edge tree is text, and only text: the card's frames, counts, anchor and
+    /// acts must read exactly as they do without it.
+    #[test]
+    fn an_edge_tree_changes_no_frame_facts_and_no_acts() {
+        let (rows, events) = im_slot();
+        let edges = [edge_frame(
+            5_000,
+            &[("赵亮: staging looks clean", true)],
+            "AXWindow:Lark>AXGroup:Chat",
+        )];
+        let bare = build_slot_card_with_acts(0, 600_000, &rows, 0, 10_000, &events, None);
+        let with =
+            build_slot_card_with_edges(0, 600_000, &rows, 0, 10_000, &events, None, &edges);
+
+        assert_eq!(with.facts.moment_count, bare.facts.moment_count);
+        assert_eq!(with.facts.ax_moment_count, bare.facts.ax_moment_count);
+        assert_eq!(with.facts.ocr_moment_count, bare.facts.ocr_moment_count);
+        assert_eq!(with.facts.no_input_ratio, bare.facts.no_input_ratio);
+        assert_eq!(with.evidence.moment_ids, bare.evidence.moment_ids);
+        assert_eq!(with.anchor_moment_id, bare.anchor_moment_id);
+        assert_eq!(with.theme_key, bare.theme_key);
+        assert_eq!(with.not_engaged, bare.not_engaged);
+        assert_eq!(runs(&with)[0].moment_id, runs(&bare)[0].moment_id);
+        assert_eq!(runs(&with)[0].acts, runs(&bare)[0].acts);
+        assert_eq!(runs(&with)[0].text_source, runs(&bare)[0].text_source);
+        assert_eq!(
+            runs(&with)[0].lines.len(),
+            runs(&bare)[0].lines.len() + 1,
+            "text is the one thing it does add"
+        );
+    }
+
+    /// A tree that landed in a capture gap belongs to no run: attaching it to the
+    /// nearest one would claim a window was on screen during a stretch nothing
+    /// was captured in.
+    #[test]
+    fn an_edge_tree_inside_a_capture_gap_is_dropped() {
+        let (rows, events) = im_slot();
+        let edges = [edge_frame(
+            300_000,
+            &[("赵亮: staging looks clean", true)],
+            "AXWindow:Lark>AXGroup:Chat",
+        )];
+        let card =
+            build_slot_card_with_edges(0, 600_000, &rows, 0, 10_000, &events, None, &edges);
+        assert!(
+            !runs(&card)[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("staging looks clean")),
+            "no run may claim it"
+        );
+    }
+
+    /// The fail-open pin, one layer out: edge trees are gated on the event
+    /// stream too. A slot with no events cannot hold them by construction — only
+    /// input triggers a walk — and this makes a card unable to depend on that.
+    #[test]
+    fn edge_trees_without_an_event_stream_leave_the_pinned_card_untouched() {
+        let rows = fail_open_fixture();
+        let edges = [edge_frame(
+            5_000,
+            &[("a line no frame ever carried", true)],
+            "AXWindow:Zed>AXGroup:Editor",
+        )];
+        let card = build_slot_card_with_edges(0, 600_000, &rows, 0, 10_000, &[], None, &edges);
+        let card_json = serde_json::to_string(&card).expect("card serialises");
+        let prompt = render_t2_prompt(
+            &card,
+            &[PrevCard {
+                from_label: "14:20".to_owned(),
+                title: "previous card".to_owned(),
+            }],
+            "English",
+            &crate::infoscore::BackgroundStats::empty(),
+        );
+        assert_eq!(normalise_clock(&card_json), FAIL_OPEN_CARD);
+        assert_eq!(normalise_clock(&prompt), FAIL_OPEN_PROMPT);
     }
 
     #[test]

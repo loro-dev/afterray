@@ -1492,8 +1492,17 @@ impl Vault {
         } else {
             None
         };
+        // R3 edge trees: the content the heartbeat missed between two ticks.
+        // Only fetched when there is an event stream to partition by — with no
+        // events they would be text the card never used to have and could not
+        // attribute. They expire with the events, so history loses both at once.
+        let edges = if events.is_empty() {
+            Vec::new()
+        } else {
+            self.edge_frames_between(slot_start_ms, slot_end_ms, step, &events)?
+        };
         let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
-        let card = slot::build_slot_card_with_acts(
+        let card = slot::build_slot_card_with_edges(
             slot_start_ms,
             slot_end_ms,
             &rows,
@@ -1501,6 +1510,7 @@ impl Vault {
             capture_interval_ms,
             &events,
             materialized.as_ref(),
+            &edges,
         );
         if settled {
             let mut cache = self.card_cache.lock().unwrap();
@@ -1510,6 +1520,46 @@ impl Vault {
             cache.insert(slot_start_ms, card.clone());
         }
         Ok(card)
+    }
+
+    /// Decrypts the slot's R3 edge trees and joins each against the events it
+    /// can speak for — the same hit-test the frame loop runs, on trees that have
+    /// no frame.
+    ///
+    /// A tree that will not decrypt or parse is skipped, not raised: an edge
+    /// snapshot is an addition to a card, and losing one must never cost the
+    /// card. Unlike the frame loop this does **not** write resolved scopes back
+    /// onto the events: run splitting segments on those scopes, and R3's job is
+    /// to widen the text a run shows, not to re-cut the runs.
+    fn edge_frames_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        step_ms: i64,
+        events: &[acts::ActEvent],
+    ) -> Result<Vec<slot::EdgeFrame>, StoreError> {
+        let stored = self.edge_snapshots_between(from_ms, to_ms)?;
+        let mut frames = Vec::with_capacity(stored.len());
+        for row in stored {
+            let Ok(payload) = self.read_artifact(&row.artifact_id) else {
+                continue;
+            };
+            let Some(tree) = accessibility_scope_tree(&payload.bytes) else {
+                continue;
+            };
+            let bundle = activity::parse_accessibility_context(&payload.bytes).bundle_identifier;
+            let rects: Vec<acts::AxRect> =
+                acts::frame_event_indices(events, row.captured_at_ms, step_ms, bundle.as_deref())
+                    .into_iter()
+                    .filter_map(|index| events[index].frame)
+                    .collect();
+            frames.push(slot::EdgeFrame {
+                captured_at_ms: row.captured_at_ms,
+                join: acts::join_frame(&tree, &rects),
+                lines: tree.lines,
+            });
+        }
+        Ok(frames)
     }
 
     /// Every path that removes moments must call this: a cached card for a
@@ -9702,6 +9752,96 @@ mod tests {
         assert!(!vault.artifact_path(&inside.artifact_id).exists());
         assert!(vault.artifact_path(&before.artifact_id).exists());
         assert!(vault.artifact_path(&after.artifact_id).exists());
+    }
+
+    /// End to end: a stored edge tree reaches the card as extra engaged text for
+    /// the run it fell in, and changes nothing else about that card.
+    #[test]
+    fn a_stored_edge_snapshot_widens_the_text_of_the_run_it_fell_in() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = slot_start_for(1_786_698_000_000) + 60_000;
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let heartbeat = two_pane_snapshot(&sidebar_refs, &["赵亮: shipped the fix", "me: thanks"]);
+        for step in 0..3_i64 {
+            let at = slot + step * 10_000;
+            insert_named_moment(
+                &vault,
+                &session.id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &heartbeat,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let mut click = input_event(slot + 5_000, None, "click");
+        click.bundle_identifier = Some("com.electron.lark".to_owned());
+        click.target_json = Some(
+            r#"{"role":"AXStaticText","label":"赵亮",
+                "frame":{"x":300,"y":100,"width":200,"height":20}}"#
+                .to_owned(),
+        );
+        vault.insert_input_events(&[click]).unwrap();
+        let before = vault.slot_card(slot + 1_000, 10_000).unwrap();
+
+        // The message that arrived and was read between two heartbeats.
+        let edge = two_pane_snapshot(
+            &sidebar_refs,
+            &[
+                "赵亮: shipped the fix",
+                "me: thanks",
+                "赵亮: staging looks clean",
+            ],
+        );
+        vault.insert_edge_snapshot(slot + 5_000, &edge).unwrap();
+
+        let card = vault.slot_card(slot + 1_000, 10_000).unwrap();
+        let run = card
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot has a run");
+        assert_eq!(
+            run.lines,
+            ["赵亮: shipped the fix", "me: thanks", "赵亮: staging looks clean"],
+            "the edge tree's new chat line joins the engaged bucket"
+        );
+        assert_eq!(
+            run.peripheral.len(),
+            20,
+            "the sidebar the edge tree also saw stays peripheral, not doubled"
+        );
+
+        let bare = before
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot had a run before the edge tree too");
+        assert_eq!(card.facts.moment_count, before.facts.moment_count, "3 frames");
+        assert_eq!(card.evidence.moment_ids, before.evidence.moment_ids);
+        assert_eq!(card.anchor_moment_id, before.anchor_moment_id);
+        assert_eq!(run.moment_id, bare.moment_id);
+        assert_eq!(run.acts, bare.acts);
     }
 
     #[test]
