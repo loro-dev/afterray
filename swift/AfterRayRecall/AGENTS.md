@@ -1,6 +1,6 @@
 # AfterRayRecall — recall UI library
 
-Dependency-free (system frameworks only) SwiftUI library holding everything cross-app: the recall surface, the Unix-socket daemon client, wire models, and settings/chat chrome. Consumed by `apps/AfterRay`, the Visual Lab, and the snapshot tool; tests and previews drive it through `AfterRayMockData`, so views take loader closures and protocol models, not a live daemon.
+SwiftUI library holding everything cross-app: the recall surface, the Unix-socket daemon client, wire models, and settings/chat chrome. Chat Markdown uses MarkdownUI 2.4.1 (MIT) — Textual needs macOS 15 / Swift 6 and cannot ship here. Consumed by `apps/AfterRay`, the Visual Lab, and the snapshot tool; tests and previews drive it through `AfterRayMockData`, so views take loader closures and protocol models, not a live daemon.
 
 ## Key files
 
@@ -9,7 +9,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - `Sources/RecallModels.swift` — `RecallSession` (:3), `RecallMoment` (:21), `RecallGopRef` (:133), `ArtifactPayload` (:163); all `Codable` with explicit snake_case `CodingKeys`.
 - `Sources/RecallView.swift:9` `RecallView` — the main recall surface (`RecallPalette` at :2211).
 - `Sources/AfterRayControlModel.swift:4` — recording/search state; `Sources/AfterRayChatModel.swift` + `ChatModels.swift` — chat model; `ChatMessagePart` keeps think/tool arrival order (`reconstruct` from stored columns is ReAct-only).
-- `Sources/StreamingMarkdown.swift` + `Sources/ChatMomentCitationView.swift` — streaming-safe chat Markdown and protocol-backed screenshot citations; only standalone `![label](afterray://moment/ID)` loads media.
+- `Sources/StreamingMarkdown.swift` + `Sources/ChatMarkdownView.swift` + `Sources/ChatMomentCitationView.swift` — thin streaming splitter + MarkdownUI; only standalone `![label](afterray://moment/ID)` loads media; image providers refuse http/file/data.
 - `Sources/ChatAutoScrollState.swift` + `Sources/ChatScrollObserver.swift` — macOS 14 chat bottom-follow state machine and the narrow AppKit live-scroll/geometry bridge; content growth follows only until the user scrolls away.
 - `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:327) — settings UI generic over the protocol, so mock and real models share it; `downloadQueueSection` draws the models page's downloads; `downloadSourceSection` picks the Hugging Face mirror (official / hf-mirror / custom).
 - `Sources/ModelDownloadQueue.swift:116` `ModelLibrary.downloadQueue` — the daemon's active-pack + waiting-ids report flattened into queue rows; `isQueued` (:160) gates per-pack buttons.

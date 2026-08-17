@@ -12,7 +12,7 @@ final class StreamingMarkdownTests: XCTestCase {
         """
         let blocks = StreamingMarkdown.blocks(from: source)
         XCTAssertEqual(blocks.count, 2)
-        XCTAssertEqual(blocks[0], .paragraph("Before"))
+        XCTAssertEqual(blocks[0], .markdown("Before"))
         guard case .code(let language, let text, let closed) = blocks[1] else {
             return XCTFail("expected an unclosed code block")
         }
@@ -32,18 +32,17 @@ final class StreamingMarkdownTests: XCTestCase {
         let blocks = StreamingMarkdown.blocks(from: source)
         XCTAssertEqual(blocks.count, 2)
         XCTAssertEqual(blocks[0], .code(language: "", text: "a", closed: true))
-        XCTAssertEqual(blocks[1], .paragraph("after"))
+        XCTAssertEqual(blocks[1], .markdown("after"))
     }
 
     func testPartialListRendersCompletedItems() {
         let blocks = StreamingMarkdown.blocks(from: "- one\n- two\n- ")
-        XCTAssertEqual(blocks, [.bulletedList(["one", "two", ""])])
+        XCTAssertEqual(blocks, [.markdown("- one\n- two\n- ")])
     }
 
     func testNumberedListAndHeadingSurviveHalfwayThrough() {
         let blocks = StreamingMarkdown.blocks(from: "# Title\n\n1. first\n2. sec")
-        XCTAssertEqual(blocks[0], .heading(level: 1, text: "Title"))
-        XCTAssertEqual(blocks[1], .numberedList(["first", "sec"]))
+        XCTAssertEqual(blocks, [.markdown("# Title\n\n1. first\n2. sec")])
     }
 
     func testIncrementalAppendNeverThrowsAndKeepsAnOpenFence() {
@@ -67,6 +66,24 @@ final class StreamingMarkdownTests: XCTestCase {
         XCTAssertTrue(text.contains("let x = 1"))
     }
 
+    func testClosedPrefixIdentityStaysStableWhileTheTailGrows() {
+        let prefix = "Before\n\n"
+        let first = StreamingMarkdown.blocks(from: prefix)
+        let withMoment = StreamingMarkdown.blocks(
+            from: prefix + "![2:14 Safari](afterray://moment/moment-123)\n\nAfter"
+        )
+        XCTAssertEqual(first.first, withMoment.first)
+        XCTAssertEqual(first.first, .markdown("Before"))
+        XCTAssertEqual(
+            withMoment,
+            [
+                .markdown("Before"),
+                .momentImage(label: "2:14 Safari", momentID: "moment-123"),
+                .markdown("After"),
+            ]
+        )
+    }
+
     func testCloseDanglingBoldAndInlineCode() {
         XCTAssertEqual(StreamingMarkdown.closeDanglingInlineMarkup("hello **wo"), "hello **wo**")
         XCTAssertEqual(StreamingMarkdown.closeDanglingInlineMarkup("use `code"), "use `code`")
@@ -79,9 +96,9 @@ final class StreamingMarkdownTests: XCTestCase {
         _ = StreamingMarkdown.attributedInline("see [docs](http")
     }
 
-    func testQuoteAndRule() {
+    func testQuoteAndRuleStayInTheLibraryChunk() {
         let blocks = StreamingMarkdown.blocks(from: "> leftover light\n\n---")
-        XCTAssertEqual(blocks, [.quote("leftover light"), .rule])
+        XCTAssertEqual(blocks, [.markdown("> leftover light\n\n---")])
     }
 
     func testStandaloneMomentImageBecomesTrustedMediaBlock() {
@@ -89,9 +106,9 @@ final class StreamingMarkdownTests: XCTestCase {
         XCTAssertEqual(
             StreamingMarkdown.blocks(from: source),
             [
-                .paragraph("Before"),
+                .markdown("Before"),
                 .momentImage(label: "2:14 Safari", momentID: "moment-123"),
-                .paragraph("After"),
+                .markdown("After"),
             ]
         )
     }
@@ -102,18 +119,69 @@ final class StreamingMarkdownTests: XCTestCase {
             "![local](file:///tmp/private.png)",
             "![inline](data:image/png;base64,AAAA)",
         ] {
-            XCTAssertEqual(StreamingMarkdown.blocks(from: source), [.paragraph(source)])
+            let blocks = StreamingMarkdown.blocks(from: source)
+            XCTAssertEqual(blocks.count, 1)
+            guard case .markdown(let text) = blocks[0] else {
+                return XCTFail("external image should stay a markdown text slice")
+            }
+            XCTAssertFalse(text.hasPrefix("!["), "unescaped image syntax would load media")
+            XCTAssertTrue(text.contains("\\!\\["))
+            XCTAssertEqual(blocks, [.markdown(StreamingMarkdown.escapeUntrustedImages(source))])
         }
     }
 
+    func testEscapeUntrustedImagesLeavesTheOriginalCharactersSelectable() {
+        let escaped = StreamingMarkdown.escapeUntrustedImages("![remote](https://example.com/a.png)")
+        XCTAssertEqual(escaped, "\\!\\[remote](https://example.com/a.png)")
+    }
+
     func testPartialOrEmbeddedMomentImageDoesNotLoadMedia() {
+        let partial = StreamingMarkdown.blocks(from: "![still streaming](afterray://moment/abc")
+        XCTAssertEqual(partial.count, 1)
+        guard case .markdown(let partialText) = partial[0] else {
+            return XCTFail("incomplete moment image must not become media")
+        }
+        XCTAssertTrue(partialText.contains("afterray://moment/abc"))
+        XCTAssertFalse(partial.contains { if case .momentImage = $0 { return true } else { return false } })
+
+        let embedded = StreamingMarkdown.blocks(from: "See ![frame](afterray://moment/abc) here")
+        XCTAssertEqual(embedded.count, 1)
+        guard case .markdown(let embeddedText) = embedded[0] else {
+            return XCTFail("embedded moment image must stay text")
+        }
+        XCTAssertFalse(embeddedText.contains("![frame]"))
+        XCTAssertTrue(embeddedText.contains("frame"))
+        XCTAssertFalse(embedded.contains { if case .momentImage = $0 { return true } else { return false } })
+    }
+
+    func testMomentURLParserAcceptsOnlyTheAfterrayScheme() {
         XCTAssertEqual(
-            StreamingMarkdown.blocks(from: "![still streaming](afterray://moment/abc"),
-            [.paragraph("![still streaming](afterray://moment/abc")]
+            StreamingMarkdown.momentID(from: URL(string: "afterray://moment/moment-123")!),
+            "moment-123"
         )
-        XCTAssertEqual(
-            StreamingMarkdown.blocks(from: "See ![frame](afterray://moment/abc) here"),
-            [.paragraph("See ![frame](afterray://moment/abc) here")]
-        )
+        XCTAssertNil(StreamingMarkdown.momentID(from: URL(string: "https://example.com/moment/abc")!))
+        XCTAssertNil(StreamingMarkdown.momentID(from: URL(string: "file:///tmp/private.png")!))
+        XCTAssertNil(StreamingMarkdown.momentID(from: URL(string: "afterray://other/moment-123")!))
+    }
+
+    func testIncompleteTableDoesNotPoisonLaterParagraphsOnceClosed() {
+        var source = """
+        | a | b
+        """
+        XCTAssertEqual(StreamingMarkdown.blocks(from: source).count, 1)
+        source += """
+
+        | --- | --- |
+        | 1 | 2 |
+
+        after
+        """
+        let blocks = StreamingMarkdown.blocks(from: source)
+        XCTAssertEqual(blocks.count, 1)
+        guard case .markdown(let text) = blocks[0] else {
+            return XCTFail("closed table should stay in the library chunk")
+        }
+        XCTAssertTrue(text.contains("| 1 | 2 |"))
+        XCTAssertTrue(text.contains("after"))
     }
 }

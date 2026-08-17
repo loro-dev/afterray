@@ -11,7 +11,7 @@ private enum ChatMetrics {
     static let bottomAnchorID = "afterray-chat-bottom-anchor"
 }
 
-private enum ChatPalette {
+enum ChatPalette {
     static let accent = RecallPalette.ray
     static let coral = Color(red: 1.0, green: 0.38, blue: 0.28)
     static let panel = Color(red: 0.055, green: 0.052, blue: 0.060)
@@ -761,132 +761,6 @@ private struct ChatToolChip: View {
         guard let chars = tool.resultChars else { return "" }
         guard tool.truncated else { return "\(chars) characters back" }
         return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
-    }
-}
-
-private struct ChatMarkdownView: View {
-    let blocks: [MarkdownBlock]
-    let thumbnailLoader: RecallThumbnailLoader?
-    let onOpenMoment: ((String) -> Void)?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                switch block {
-                case .heading(let level, let text):
-                    Text(StreamingMarkdown.attributedInline(text))
-                        .font(.system(size: headingSize(level), weight: .semibold))
-                        .foregroundStyle(ChatPalette.label)
-                        .fixedSize(horizontal: false, vertical: true)
-                case .paragraph(let text):
-                    Text(StreamingMarkdown.attributedInline(text))
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(ChatPalette.label)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                case .momentImage(let label, let momentID):
-                    ChatMomentCitationView(
-                        label: label,
-                        momentID: momentID,
-                        thumbnailLoader: thumbnailLoader,
-                        onOpenMoment: onOpenMoment
-                    )
-                case .bulletedList(let items):
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Circle()
-                                    .fill(ChatPalette.coral.opacity(0.85))
-                                    .frame(width: 4, height: 4)
-                                    .padding(.bottom, 1)
-                                Text(StreamingMarkdown.attributedInline(item))
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(ChatPalette.label)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                case .numberedList(let items):
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(items.enumerated()), id: \.offset) { index, item in
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text("\(index + 1).")
-                                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                    .foregroundStyle(ChatPalette.coral)
-                                    .monospacedDigit()
-                                Text(StreamingMarkdown.attributedInline(item))
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(ChatPalette.label)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                case .code(let language, let text, let closed):
-                    ChatCodeBlock(language: language, text: text, closed: closed)
-                case .quote(let text):
-                    HStack(alignment: .top, spacing: 8) {
-                        Rectangle()
-                            .fill(ChatPalette.accent.opacity(0.7))
-                            .frame(width: 2)
-                        Text(StreamingMarkdown.attributedInline(text))
-                            .font(.system(size: 13, weight: .medium))
-                            .italic()
-                            .foregroundStyle(ChatPalette.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                case .rule:
-                    Rectangle()
-                        .fill(ChatPalette.separator)
-                        .frame(height: 1)
-                        .padding(.vertical, 4)
-                }
-            }
-        }
-    }
-
-    private func headingSize(_ level: Int) -> CGFloat {
-        switch level {
-        case 1: 20
-        case 2: 17
-        case 3: 15
-        default: 13.5
-        }
-    }
-}
-
-private struct ChatCodeBlock: View {
-    let language: String?
-    let text: String
-    let closed: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text((language?.isEmpty == false ? language! : "code").uppercased())
-                    .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
-                    .tracking(0.8)
-                    .foregroundStyle(ChatPalette.coral.opacity(0.9))
-                Spacer()
-                if !closed {
-                    Text("streaming")
-                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(ChatPalette.tertiary)
-                }
-            }
-            Text(text.isEmpty ? " " : text)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.9))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(10)
-        .background(ChatPalette.codeFill)
-        .overlay(alignment: .leading) {
-            Rectangle()
-                .fill(ChatPalette.accent.opacity(0.75))
-                .frame(width: 2)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 

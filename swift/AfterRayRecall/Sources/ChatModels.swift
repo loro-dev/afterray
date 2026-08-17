@@ -986,11 +986,11 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
 
     public var markdownBlocks: [MarkdownBlock] {
         switch role {
-        case .user: [.paragraph(text)]
+        case .user: [.markdown(text)]
         case .assistant: StreamingMarkdown.blocks(from: text)
         // Never markdown: a compaction row is the daemon's own prose and is
         // drawn as a rule, not a message.
-        case .compaction: [.paragraph(text)]
+        case .compaction: [.markdown(text)]
         }
     }
 
