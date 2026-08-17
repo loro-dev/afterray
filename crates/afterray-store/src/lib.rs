@@ -1724,10 +1724,23 @@ impl Vault {
         let Some(pattern) = like_prefilter(query) else {
             return Ok(Vec::new());
         };
-        // Wider than `limit` so ranking has something to choose from, and
-        // capped so a one-letter query cannot walk a year of summaries.
+        // Wider than `limit` so the exact match below has slack when a `LIKE`
+        // hit turns out not to be one, and capped so a one-letter query cannot
+        // walk a year of summaries.
         let candidate_limit = i64::try_from(limit.saturating_mul(8).clamp(limit, 400)).unwrap_or(400);
         let connection = self.readers.get();
+        // The candidate window is chosen by **match kind first, recency
+        // second, across the whole filtered range**. Ordering by recency alone
+        // and ranking afterwards ranked only the survivors: with four hundred
+        // recent summaries mentioning a long-running project in passing, the
+        // one old summary that recorded it as a grounded entity fell outside
+        // the window and became unreachable, however small the limit.
+        //
+        // This `CASE` is prefilter-grade, like the `LIKE` it reuses — it reads
+        // raw JSON, so it can call a row an entity match that
+        // `match_slot_mention` later classifies as prose. That direction is
+        // harmless: it only decides which rows are read, and the classification
+        // below is what the caller sees.
         let mut statement = connection.prepare(
             "SELECT slot_start_ms, slot_end_ms, local_day, title,
                     threads_json, entities_json, decisions_json
@@ -1743,7 +1756,12 @@ impl Vault {
                        WHERE frame.captured_at_ms >= slot_start_ms
                          AND frame.captured_at_ms < slot_end_ms
                          AND frame.application_name = ?6 COLLATE NOCASE))
-              ORDER BY slot_start_ms DESC
+              ORDER BY CASE
+                         WHEN entities_json LIKE ?4 ESCAPE '\\' THEN 2
+                         WHEN title LIKE ?4 ESCAPE '\\' THEN 1
+                         ELSE 0
+                       END DESC,
+                       slot_start_ms DESC
               LIMIT ?5",
         )?;
         let rows = statement.query_map(
@@ -1795,7 +1813,10 @@ impl Vault {
         }
         // Rank to decide *what* survives the cut — a verbatim entity beats
         // prose that happens to contain the letters — then restore time order,
-        // because what comes back is read as a timeline.
+        // because what comes back is read as a timeline. The `CASE` above has
+        // already ordered the candidates this way over the whole range; this
+        // repeats it on the exact classification, which is what corrects a row
+        // the raw-JSON `LIKE` over-ranked.
         ranked.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then(b.1.slot_start_ms.cmp(&a.1.slot_start_ms))
@@ -7803,6 +7824,88 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The strongest match has to be reachable however old it is.
+    ///
+    /// Candidates used to be taken newest-first and ranked afterwards, so the
+    /// ranking only ever saw the survivors. A project named in passing by
+    /// hundreds of recent summaries buried the one old summary that recorded
+    /// it as a grounded entity — and no limit, however small, could reach it.
+    #[test]
+    fn find_slot_mentions_ranks_across_the_whole_range_not_the_newest_page() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let (day_start, _) = local_day_bounds(1_786_698_000_000);
+
+        // Spaced a whole legacy slot apart so each write lands on its own row
+        // under either slot geometry; `slot_start_for` would fold ten-minute
+        // spacing back onto one slot and overwrite the row under test.
+        let oldest = day_start;
+        insert_named_moment(&vault, &session.id, oldest, "Zed", "dev.zed.Zed", "tools.rs");
+        let card = vault.slot_card(oldest, 10_000).unwrap();
+        vault
+            .put_t2_summary_v2(
+                &card,
+                &T2CardV2 {
+                    title: "Shipped the recall panel".into(),
+                    description: String::new(),
+                    threads: vec![],
+                    entities: vec![T2Entity {
+                        text: "lody".into(),
+                        kind: Some("project".into()),
+                        moment_id: None,
+                    }],
+                    decisions: vec![],
+                    not_captured: vec![],
+                    category: None,
+                    confidence: Some(0.9),
+                },
+                "test",
+                oldest,
+                None,
+            )
+            .unwrap();
+
+        // Then 401 newer summaries that only mention it in passing, in prose —
+        // more than the candidate window the query is allowed to read.
+        for index in 1..=401_i64 {
+            let at_ms = day_start + index * SLOT_DURATION_MS;
+            insert_named_moment(&vault, &session.id, at_ms, "Zed", "dev.zed.Zed", "notes.md");
+            let card = vault.slot_card(at_ms, 10_000).unwrap();
+            vault
+                .put_t2_summary_v2(
+                    &card,
+                    &T2CardV2 {
+                        title: format!("Unrelated work {index}"),
+                        description: String::new(),
+                        threads: vec![T2Thread {
+                            name: "notes".into(),
+                            prose: "mentioned lody in passing".into(),
+                            moment_ids: vec![],
+                        }],
+                        entities: vec![],
+                        decisions: vec![],
+                        not_captured: vec![],
+                        category: None,
+                        confidence: Some(0.3),
+                    },
+                    "test",
+                    at_ms,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let hits = vault
+            .find_slot_mentions("lody", &SearchFilter::default(), 1)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].slot_start_ms, oldest,
+            "the entity match was buried under newer prose: {hits:?}"
+        );
+        assert_eq!(hits[0].matched_entities, vec!["lody".to_owned()]);
     }
 
     /// The matching rule itself, without a database: `LIKE` is the prefilter,

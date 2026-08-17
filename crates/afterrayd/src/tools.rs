@@ -285,6 +285,15 @@ impl ToolHost<'_> {
                 ));
             }
         }
+        // Say when the answer was cut. These come back strongest-first across
+        // the whole range, so what is missing is weaker rather than older —
+        // but a silent cut still reads as "that is all there is".
+        if mentions.len() >= limit {
+            lines.push(format!(
+                "// the {limit} strongest matches; there may be more. Raise limit, \
+                 or narrow with from_ms/to_ms or app."
+            ));
+        }
         Ok(lines.join("\n"))
     }
 
@@ -2031,6 +2040,34 @@ mod tests {
         assert!(text.contains(&format!("at_ms={noon}")), "{text}");
         assert!(text.contains(&ids[0]), "no frame to cite: {text}");
         assert!(text.contains("decided: Hide idle slots"), "{text}");
+    }
+
+    /// A cut answer says it was cut. These come back strongest-first across
+    /// the whole range, so silence here would read as "that is all there is"
+    /// while the weaker matches sit unmentioned.
+    #[tokio::test]
+    async fn search_summaries_says_when_it_returned_only_the_strongest() {
+        let (_dir, vault) = host_fixture();
+        let day_start = local_calendar_day_bounds_ms(NOW).0;
+        seed_summarised(&vault, day_start + 3_600_000);
+        seed_summarised(&vault, day_start + 5 * 3_600_000);
+        let host = host_for(&vault);
+
+        let cut = host
+            .invoke("search_summaries", &json!({"query": "lody", "limit": 1}))
+            .await
+            .unwrap()
+            .text;
+        assert!(cut.contains("there may be more"), "{cut}");
+        assert!(cut.contains("Raise limit"), "{cut}");
+
+        // And a complete answer does not claim to be partial.
+        let whole = host
+            .invoke("search_summaries", &json!({"query": "lody", "limit": 10}))
+            .await
+            .unwrap()
+            .text;
+        assert!(!whole.contains("there may be more"), "{whole}");
     }
 
     /// Only summarised stretches are searchable this way, so an empty answer
