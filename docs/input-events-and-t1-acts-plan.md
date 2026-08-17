@@ -135,6 +135,14 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 4. 额外收紧了两处（测试逼出来的）：partition 的开关是**事件流本身**而非调用方是否清空 `ax_join`；`signal: unavailable` 连**文本 partition 也一起抑制**——把文本分成"操作过"和"只是可见"本身就是一次能动性断言。
 5. 物化只恢复 acts，**不恢复 partition**：partition 是对已删除的 rect 做命中得来的。
 
+### 阶段 4 — R3 边沿快照（shim + afterrayd + afterray-store）
+
+- **触发（shim `InputEventMonitor` worker）**：候选 = 前台 bundle 变化，或 click 事件。settle 去抖 500ms（新输入到达则重新计时——绝不在交互中走树）；令牌桶 ≥5s 间隔、≤6/min。v1 简化两处（记为偏差）：① 走树范围 = 触发元素所在的 **AXWindow**（focused window 兜底），不是 engaged 子树——窗口是其超集，shim 侧无需几何逻辑，菜单跳过 + 时间盒照常生效；② 负载/电池降级暂不做 shim 侧开关，令牌桶已把上界钉死（≤6/min × ~窗口级树），降级钩子留给后续。
+- **发射**：`ArtifactKind` 新增 `accessibility_edge`（Swift + Rust 两侧），照常走 artifact 事件；**绝不触发截图**（事件驱动截图的时序泄漏论证仍然成立）。
+- **daemon 导入**：exclusion 判定与 accessibility 分支完全一致（解析不了 → 删文件，fail-closed）；通过后存为 purpose `edge-ax` 的加密 artifact + 新表 `edge_snapshots(id, captured_at_ms, artifact_id)` 一行。**不建 moment、不出缩略图、不跑 OCR。**
+- **store**：`SCHEMA_VERSION` 22 → 23（`edge_snapshots` 表 + 索引）。保留期 **48h 与事件同寿**（`prune_input_events` 同点执行，连带删除 artifact 文件）；`delete_history` 级联（隐私不变量第四层）。`slot_card()` 的 acts join 把落在 slot 内的 edge 树作为**额外帧**参与 engaged/peripheral partition 与文本抽取——仅此而已，不参与 anchor/缩略图/OCR 证据。
+- **测试**：导入路径（exclusion fail-closed / 正常入库）、48h prune 连带 artifact 删除、级联、join 纳入 edge 帧；IO 测试过 `make test-repeat N=10` ≥5 连绿。shim 侧去抖/令牌桶逻辑提成可单测的纯函数为佳，做不到则如实报告未验证面。
+
 ### 独立修复 — T1 噪音（afterray-store/slot.rs）
 
 - `target_key` / `place_label` / `theme_key` / `top_documents` 的候选一律过 `is_chrome_noise` + `is_opaque_id`，并新增：`file://` 路径含 `.app/`（应用包内资源）判为 app 资源而非用户文档。实测靶子：`file:///Applications/Lark.app/…/en-US.html` 不得成为 target 身份或 top_documents；`native-resource://sdk/avatar?…` 不得成为 theme_key。全部候选皆噪音时退化为 app-only key。
