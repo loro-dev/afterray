@@ -88,7 +88,49 @@ pub use slot::{
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
+
+/// How long the raw input-event stream lives.
+///
+/// Events are the sharpest thing the vault holds about what the user *did*, so
+/// they are deliberately the shortest-lived fact stream: two days is long
+/// enough for the sweeper to seal a slot and freeze its acts into
+/// `slot_summaries.acts_json`, and short enough that the keystroke-level
+/// stream never becomes a standing record. Anything derived from events must
+/// be materialised before this expires — see
+/// `docs/input-events-and-t1-acts-plan.md`.
+pub const INPUT_EVENT_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
+
+/// One coalesced input observation, as the vault holds it.
+///
+/// A verbatim mirror of the shim's record (`InputEventRecord` in
+/// `afterray-platform-macos`): `kind` stays an uninterpreted string and
+/// `target_json` an uninterpreted blob because the vault is not the layer that
+/// decides what an act means — the T1 join is. A `kind` this build has never
+/// heard of must still round-trip; the shim can ship ahead of its reader.
+///
+/// Never carries typed characters: a typing burst is a count, an end instant,
+/// and the key that ended it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputEventRow {
+    /// When the observation began.
+    pub at_ms: i64,
+    /// When it ended, for spans (typing bursts, coalesced scrolls). `None`
+    /// makes the row a point at `at_ms`.
+    pub end_ms: Option<i64>,
+    /// `burst` | `command` | `click` | `scroll` — and whatever a newer shim
+    /// invents.
+    pub kind: String,
+    /// Keystrokes in a burst, or coalesced scroll ticks.
+    pub count: Option<u32>,
+    /// The command key that closed a burst ("submit/execute" semantics).
+    pub ended_with: Option<String>,
+    /// The named command for a `command` event.
+    pub command: Option<String>,
+    pub bundle_identifier: Option<String>,
+    /// The platform layer's resolved element identity, serialised verbatim.
+    pub target_json: Option<String>,
+}
 
 /// How a search is narrowed before anything is ranked.
 ///
@@ -2666,7 +2708,117 @@ impl Vault {
               WHERE slot_start_ms <= ?2 AND slot_end_ms > ?1",
             params![from_ms, to_ms],
         )?;
+        // Same invariant one layer down: the events say what the user did in
+        // the window they just asked to forget, in finer detail than any frame.
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM input_events
+              WHERE at_ms <= ?2 AND MAX(at_ms, COALESCE(end_ms, at_ms)) >= ?1",
+            params![from_ms, to_ms],
+        )?;
         Ok(count)
+    }
+
+    /// Appends a batch of the shim's input observations.
+    ///
+    /// One transaction for the whole batch: the shim coalesces and ships events
+    /// in groups, and a half-stored group is worse than none, because T1 would
+    /// then join against a stream whose gap is invisible — reading "the user did
+    /// nothing here" off a failed write is exactly the inference this pipeline
+    /// exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch cannot be committed.
+    pub fn insert_input_events(&self, events: &[InputEventRow]) -> Result<usize, StoreError> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO input_events
+                   (at_ms, end_ms, kind, count, ended_with, command,
+                    bundle_identifier, target_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for event in events {
+                statement.execute(params![
+                    event.at_ms,
+                    event.end_ms,
+                    event.kind,
+                    event.count,
+                    event.ended_with,
+                    event.command,
+                    event.bundle_identifier,
+                    event.target_json,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(events.len())
+    }
+
+    /// Every observation overlapping `[from_ms, to_ms)`, oldest first.
+    ///
+    /// Half-open like slot bounds, so consecutive slots partition the stream
+    /// without double-counting an instant. A span (`end_ms` set) counts as
+    /// present whenever any part of it falls inside the window — a burst that
+    /// began before the slot opened is still typing that happened in the slot.
+    /// `end_ms` absent makes the row a point at `at_ms`; a nonsensical
+    /// `end_ms < at_ms` from a future shim degrades to the same point rather
+    /// than vanishing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn input_events_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<InputEventRow>, StoreError> {
+        if from_ms >= to_ms {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT at_ms, end_ms, kind, count, ended_with, command,
+                    bundle_identifier, target_json
+               FROM input_events
+              WHERE at_ms < ?2 AND MAX(at_ms, COALESCE(end_ms, at_ms)) >= ?1
+              ORDER BY at_ms ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(InputEventRow {
+                at_ms: row.get(0)?,
+                end_ms: row.get(1)?,
+                kind: row.get(2)?,
+                count: row.get(3)?,
+                ended_with: row.get(4)?,
+                command: row.get(5)?,
+                bundle_identifier: row.get(6)?,
+                target_json: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Drops observations older than [`INPUT_EVENT_RETENTION_MS`].
+    ///
+    /// A span is judged by its end, so a burst still inside the window survives
+    /// even when it started before the cutoff. The cutoff instant itself is
+    /// kept: retention is "the last 48 hours", inclusive of its own edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delete cannot be executed.
+    pub fn prune_input_events(&self, now_ms: i64) -> Result<usize, StoreError> {
+        let cutoff = now_ms.saturating_sub(INPUT_EVENT_RETENTION_MS);
+        let removed = self.connection.lock().unwrap().execute(
+            "DELETE FROM input_events WHERE MAX(at_ms, COALESCE(end_ms, at_ms)) < ?1",
+            [cutoff],
+        )?;
+        Ok(removed)
     }
 
     pub fn audio_segments_sync(&self, session_id: &str) -> Result<Vec<AudioSegment>, StoreError> {
@@ -3999,6 +4151,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_19(connection)?;
     migrate_schema_20(connection, from_version)?;
     migrate_schema_21(connection)?;
+    migrate_schema_22(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -4545,6 +4698,46 @@ fn migrate_schema_21(connection: &Connection) -> Result<(), StoreError> {
          CREATE INDEX IF NOT EXISTS audio_segments_transcription_queue
            ON audio_segments(transcription_state, transcription_next_attempt_ms, started_at_ms);",
     )?;
+    Ok(())
+}
+
+/// The second fact stream: what the user *did*, beside what was on screen.
+///
+/// Rows are the shim's coalesced observations stored as they arrived — `kind`
+/// and `target_json` are not parsed here. The index is on `at_ms` alone
+/// because every reader asks the same question, "what happened in this
+/// window", and both spans and points start there.
+///
+/// `slot_summaries.acts_json` migrates in the same step even though nothing
+/// writes it yet: events expire after [`INPUT_EVENT_RETENTION_MS`] while T1
+/// cards are computed lazily and forever, so the acts a sealed slot derived
+/// must have somewhere to be frozen before the events they came from are gone.
+///
+/// Purely additive; existing rows read back as `acts_json = NULL`, meaning
+/// "never materialised".
+fn migrate_schema_22(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS input_events (
+           id INTEGER PRIMARY KEY,
+           at_ms INTEGER NOT NULL,
+           end_ms INTEGER,
+           kind TEXT NOT NULL,
+           count INTEGER,
+           ended_with TEXT,
+           command TEXT,
+           bundle_identifier TEXT,
+           target_json TEXT
+         );
+         CREATE INDEX IF NOT EXISTS input_events_at ON input_events(at_ms);",
+    )?;
+    let mut statement = connection.prepare("PRAGMA table_info(slot_summaries)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if !existing.iter().any(|held| held == "acts_json") {
+        connection.execute("ALTER TABLE slot_summaries ADD COLUMN acts_json TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -8328,5 +8521,279 @@ mod tests {
             .unwrap();
         assert_eq!(version, i64::from(SCHEMA_VERSION));
         assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+    }
+
+    fn input_event(at_ms: i64, end_ms: Option<i64>, kind: &str) -> InputEventRow {
+        InputEventRow {
+            at_ms,
+            end_ms,
+            kind: kind.to_owned(),
+            count: None,
+            ended_with: None,
+            command: None,
+            bundle_identifier: None,
+            target_json: None,
+        }
+    }
+
+    /// A window owns an event when the two intervals touch at all: a burst that
+    /// started before the slot opened is still typing that happened inside it.
+    /// The window is half-open so consecutive slots partition the stream.
+    #[test]
+    fn input_events_between_returns_every_overlapping_row_in_order() {
+        let (_directory, vault) = test_vault(10);
+        let rows = vec![
+            input_event(999, None, "click"),          // before the window
+            input_event(1_000, None, "click"),        // on the lower edge
+            input_event(1_999, None, "scroll"),       // last instant inside
+            input_event(2_000, None, "click"),        // on the open upper edge
+            input_event(500, Some(999), "burst"),     // ends before the window
+            input_event(400, Some(1_000), "burst"),   // ends on the lower edge
+            input_event(600, Some(1_500), "burst"),   // straddles the opening
+            input_event(1_900, Some(2_600), "burst"), // straddles the close
+            input_event(2_000, Some(2_600), "burst"), // starts at the close
+            input_event(1_200, Some(1_100), "burst"), // nonsense end: a point
+        ];
+        assert_eq!(vault.insert_input_events(&rows).unwrap(), rows.len());
+
+        let found = vault.input_events_between(1_000, 2_000).unwrap();
+        let shape: Vec<(i64, Option<i64>)> = found
+            .iter()
+            .map(|event| (event.at_ms, event.end_ms))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (400, Some(1_000)),
+                (600, Some(1_500)),
+                (1_000, None),
+                (1_200, Some(1_100)),
+                (1_900, Some(2_600)),
+                (1_999, None),
+            ]
+        );
+
+        // Half-open: the next slot picks up exactly what this one left.
+        let next = vault.input_events_between(2_000, 3_000).unwrap();
+        assert_eq!(
+            next.iter()
+                .map(|event| (event.at_ms, event.end_ms))
+                .collect::<Vec<_>>(),
+            vec![(1_900, Some(2_600)), (2_000, None), (2_000, Some(2_600))]
+        );
+        assert!(vault.input_events_between(2_000, 2_000).unwrap().is_empty());
+    }
+
+    /// The shim can ship ahead of its reader, and the store is not the layer
+    /// that decides what an act means: an unrecognised `kind` must survive the
+    /// round trip untouched rather than be rejected or normalised.
+    #[test]
+    fn input_events_round_trip_unknown_kinds_and_every_field() {
+        let (_directory, vault) = test_vault(10);
+        let stored = InputEventRow {
+            at_ms: 5_000,
+            end_ms: Some(7_500),
+            kind: "pinch-from-a-newer-shim".to_owned(),
+            count: Some(42),
+            ended_with: Some("return".to_owned()),
+            command: Some("cmd+s".to_owned()),
+            bundle_identifier: Some("dev.zed.Zed".to_owned()),
+            target_json: Some(
+                r#"{"role":"AXTextArea","label":"lib.rs","frame":{"x":1,"y":2,"width":3,"height":4}}"#
+                    .to_owned(),
+            ),
+        };
+        vault
+            .insert_input_events(std::slice::from_ref(&stored))
+            .unwrap();
+        let found = vault.input_events_between(0, 10_000).unwrap();
+        assert_eq!(found, vec![stored]);
+        assert_eq!(vault.insert_input_events(&[]).unwrap(), 0);
+    }
+
+    /// Retention is "the last 48 hours", inclusive of its own edge, and a span
+    /// is judged by its end: a burst reaching into the window outlives its
+    /// start.
+    #[test]
+    fn prune_input_events_keeps_the_retention_edge() {
+        let (_directory, vault) = test_vault(10);
+        let now = 1_786_698_000_000;
+        let cutoff = now - INPUT_EVENT_RETENTION_MS;
+        let rows = vec![
+            input_event(cutoff - 1, None, "click"),
+            input_event(cutoff, None, "click"),
+            input_event(cutoff + 1, None, "click"),
+            input_event(cutoff - 5_000, Some(cutoff - 1), "burst"),
+            input_event(cutoff - 5_000, Some(cutoff), "burst"),
+        ];
+        vault.insert_input_events(&rows).unwrap();
+
+        assert_eq!(vault.prune_input_events(now).unwrap(), 2);
+        let remaining = vault.input_events_between(0, now + 1).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|event| (event.at_ms, event.end_ms))
+                .collect::<Vec<_>>(),
+            vec![
+                (cutoff - 5_000, Some(cutoff)),
+                (cutoff, None),
+                (cutoff + 1, None),
+            ]
+        );
+        // Idempotent: nothing left to drop on a second pass at the same instant.
+        assert_eq!(vault.prune_input_events(now).unwrap(), 0);
+    }
+
+    /// Forgetting a stretch of history must take the events with it: they say
+    /// what the user did in that window in finer detail than any frame does.
+    #[test]
+    fn delete_history_removes_overlapping_input_events() {
+        let (_directory, vault) = test_vault(10);
+        let at = 1_786_698_000_000;
+        let slot = slot_start_for(at);
+        let rows = vec![
+            input_event(slot - 1, None, "click"),
+            input_event(slot, None, "click"),
+            input_event(slot + 5_000, Some(slot + 9_000), "burst"),
+            input_event(slot - 5_000, Some(slot + 1_000), "burst"),
+            input_event(slot + SLOT_DURATION_MS, None, "click"),
+            input_event(slot + SLOT_DURATION_MS + 1, None, "click"),
+        ];
+        vault.insert_input_events(&rows).unwrap();
+
+        vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap();
+
+        let remaining = vault.input_events_between(0, at + SLOT_DURATION_MS * 4).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|event| (event.at_ms, event.end_ms))
+                .collect::<Vec<_>>(),
+            vec![
+                (slot - 1, None),
+                (slot + SLOT_DURATION_MS + 1, None),
+            ],
+            "only rows entirely outside the deleted window may survive"
+        );
+    }
+
+    #[test]
+    fn schema_22_adds_input_events_to_an_existing_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [23_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS input_events_at;
+                     DROP TABLE IF EXISTS input_events;
+                     ALTER TABLE slot_summaries DROP COLUMN acts_json;
+                     UPDATE schema_meta SET version = 21;",
+                )
+                .unwrap();
+            session.id
+        };
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let connection = vault.connection.lock().unwrap();
+        let objects: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('input_events', 'input_events_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 2, "table and its index must both come back");
+        let version: i64 = connection
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+        let acts_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('slot_summaries')
+                  WHERE name = 'acts_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acts_column, 1);
+        drop(connection);
+        // The upgrade is additive: what was already there is still there.
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+        assert!(vault.input_events_between(0, 10).unwrap().is_empty());
+    }
+
+    /// Events arrive at interaction rate while T1 reads the same window from
+    /// the reader pool. A reader must never see a half-written batch and the
+    /// writer must never be blocked out by readers.
+    #[test]
+    fn input_event_writes_and_reader_pool_queries_do_not_collide() {
+        let (_directory, vault) = test_vault(10);
+        let vault = std::sync::Arc::new(vault);
+        let batches = 40_i64;
+        let per_batch = 8_i64;
+        let base = 1_700_000_000_000_i64;
+
+        std::thread::scope(|scope| {
+            let writer = {
+                let vault = std::sync::Arc::clone(&vault);
+                scope.spawn(move || {
+                    for batch in 0..batches {
+                        let rows: Vec<InputEventRow> = (0..per_batch)
+                            .map(|index| {
+                                let at = base + batch * 1_000 + index;
+                                let mut row = input_event(at, Some(at + 10), "burst");
+                                row.count = Some(u32::try_from(index).unwrap());
+                                row
+                            })
+                            .collect();
+                        assert_eq!(
+                            vault.insert_input_events(&rows).unwrap(),
+                            usize::try_from(per_batch).unwrap()
+                        );
+                    }
+                })
+            };
+            for _ in 0..3 {
+                let vault = std::sync::Arc::clone(&vault);
+                scope.spawn(move || {
+                    for _ in 0..60 {
+                        let found = vault
+                            .input_events_between(base, base + batches * 1_000)
+                            .expect("reader query must not fail while a batch commits");
+                        // Batches commit whole, so a partial group is never
+                        // visible: the count is always a multiple of the batch.
+                        assert_eq!(
+                            i64::try_from(found.len()).unwrap() % per_batch,
+                            0,
+                            "reader saw a half-committed batch"
+                        );
+                        assert!(
+                            found.windows(2).all(|pair| pair[0].at_ms <= pair[1].at_ms),
+                            "rows must come back ordered by at_ms"
+                        );
+                    }
+                });
+            }
+            writer.join().unwrap();
+        });
+
+        let all = vault
+            .input_events_between(base, base + batches * 1_000)
+            .unwrap();
+        assert_eq!(i64::try_from(all.len()).unwrap(), batches * per_batch);
     }
 }

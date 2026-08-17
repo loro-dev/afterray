@@ -18,7 +18,7 @@ use afterray_models::{
     qwen35_mlx_manifest, remove_pack, spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
-    ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
+    ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, InputEventRecord, MacOsCaptureBackend,
     apply_background_qos, parent_app_anchor, peer_is_afterray_app,
 };
 use afterray_protocol::{
@@ -28,7 +28,8 @@ use afterray_protocol::{
     redact_cli_response_data,
 };
 use afterray_store::{
-    LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig,
+    InputEventRow, LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault,
+    VaultConfig,
 };
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -2048,11 +2049,19 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
                 eprintln!("capture warning [{code}]: {message}");
             }
             Ok(CaptureEvent::InputEvents { events, dropped }) => {
-                // Phase 1: observe only. Persistence (events table, 48h
-                // retention, seal-time acts materialization) lands with
-                // docs/input-events-and-t1-acts-plan.md phase 2.
                 if !events.is_empty() || dropped > 0 {
                     eprintln!("capture input events batch={} dropped={dropped}", events.len());
+                }
+                if !events.is_empty() {
+                    let rows: Vec<InputEventRow> = events.iter().map(input_event_row).collect();
+                    // A failed batch is logged and dropped, never retried: the
+                    // events are one of two independent fact streams, and
+                    // stalling capture over the softer one would cost frames.
+                    if let Err(error) =
+                        run_store(&state, move |s| s.store.insert_input_events(&rows)).await
+                    {
+                        eprintln!("capture input events store failed: {error}");
+                    }
                 }
             }
             Ok(CaptureEvent::Failed { code, message }) => {
@@ -2089,6 +2098,29 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
     let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
 }
 
+/// Maps one shim observation onto its vault row.
+///
+/// `target` is stored as the platform layer's own JSON. The vault does not
+/// interpret element identities and this phase does not either; the T1 join is
+/// the first reader that will. A target that somehow cannot be encoded is
+/// stored as absent rather than dropping the event — that an input happened is
+/// the load-bearing fact; where it landed is the refinement.
+fn input_event_row(record: &InputEventRecord) -> InputEventRow {
+    InputEventRow {
+        at_ms: record.at_ms,
+        end_ms: record.end_ms,
+        kind: record.kind.clone(),
+        count: record.count,
+        ended_with: record.ended_with.clone(),
+        command: record.command.clone(),
+        bundle_identifier: record.bundle_identifier.clone(),
+        target_json: record
+            .target
+            .as_ref()
+            .and_then(|target| serde_json::to_string(target).ok()),
+    }
+}
+
 async fn import_artifact(
     state: &Arc<AppState>,
     session_id: &str,
@@ -2104,8 +2136,17 @@ async fn import_artifact(
             let session_id = session_id.to_owned();
             let content_type = content_type.to_owned();
             let moment = run_store(state, move |s| {
-                s.store
-                    .insert_moment(&session_id, started_at_ms, &content_type, &bytes)
+                let moment =
+                    s.store
+                        .insert_moment(&session_id, started_at_ms, &content_type, &bytes)?;
+                // Event retention rides the frame-retention path `insert_moment`
+                // already runs: one call site, no extra timer, and it can only
+                // fire while capture is actually recording. Its failure must not
+                // fail the frame that was just stored.
+                if let Err(error) = s.store.prune_input_events(now_ms()) {
+                    eprintln!("input event retention failed: {error}");
+                }
+                Ok::<_, StoreError>(moment)
             })
             .await?;
             {

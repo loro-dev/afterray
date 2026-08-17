@@ -154,19 +154,26 @@ pub struct InputEventRecord {
 /// The resolved identity of the element an input landed on. `label` is the
 /// element's title/description, never its value; `frame` is UI geometry in
 /// global top-left screen points, rounded — not a pointer coordinate.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// `Serialize` exists so the daemon can store this shape verbatim in the
+/// vault's `input_events.target_json`: the store deliberately does not model
+/// element identity, and re-encoding it into a second schema on the way in
+/// would be a second thing to keep in step with the shim. Empty fields are
+/// skipped — the round trip is lossless either way, and these rows are written
+/// at interaction rate.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InputTargetRef {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<InputTargetFrame>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ancestors: Vec<InputAncestorRef>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InputTargetFrame {
     pub x: i32,
     pub y: i32,
@@ -174,11 +181,11 @@ pub struct InputTargetFrame {
     pub height: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InputAncestorRef {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
 
