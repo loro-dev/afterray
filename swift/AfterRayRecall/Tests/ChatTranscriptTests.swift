@@ -125,6 +125,70 @@ final class ChatTranscriptTests: XCTestCase {
         XCTAssertEqual(second.name, "get_transcript")
     }
 
+    func testFinishedAssistantGetsWorkElapsedFromUserGap() {
+        let messages = [
+            ChatMessage(
+                id: "u1",
+                conversationId: "c1",
+                role: .user,
+                content: "what",
+                createdAtMs: 1_000
+            ),
+            ChatMessage(
+                id: "a1",
+                conversationId: "c1",
+                role: .assistant,
+                content: "that",
+                toolLog: #"[{"name":"get_slot_card","args":{}}]"#,
+                createdAtMs: 13_500,
+                reasoning: #"[{"round":1,"text":"look"}]"#
+            ),
+        ]
+        let bubble = ChatTranscript.bubbles(messages: messages)[1]
+        XCTAssertEqual(bubble.workElapsedMs, 12_500)
+        XCTAssertEqual(
+            ChatWorkSummary.label(thoughts: 1, lookups: 1, elapsedMs: bubble.workElapsedMs),
+            "Worked for 13s · 1 thought · 1 lookup"
+        )
+    }
+
+    func testLiveElapsedOverridesCreatedAtGap() {
+        let messages = [
+            ChatMessage(
+                id: "u1",
+                conversationId: "c1",
+                role: .user,
+                content: "what",
+                createdAtMs: 1_000
+            ),
+            ChatMessage(
+                id: "a1",
+                conversationId: "c1",
+                role: .assistant,
+                content: "that",
+                toolLog: #"[{"name":"list_moments","args":{}}]"#,
+                createdAtMs: 1_100
+            ),
+        ]
+        let bubble = ChatTranscript.bubbles(
+            messages: messages,
+            lastWorkElapsedMs: 8_400
+        )[1]
+        XCTAssertEqual(bubble.workElapsedMs, 8_400)
+        XCTAssertEqual(
+            ChatWorkSummary.label(thoughts: 0, lookups: 1, elapsedMs: 8_400),
+            "Worked for 8.4s · 1 lookup"
+        )
+    }
+
+    func testTinyCreatedAtGapIsNotADuration() {
+        let messages = [
+            ChatMessage(id: "u1", conversationId: "c1", role: .user, content: "q", createdAtMs: 10),
+            ChatMessage(id: "a1", conversationId: "c1", role: .assistant, content: "a", createdAtMs: 20),
+        ]
+        XCTAssertNil(ChatTranscript.bubbles(messages: messages)[1].workElapsedMs)
+    }
+
     func testUnknownRoleDecodesAsAssistant() throws {
         let json = #"{"id":"m1","conversation_id":"c1","role":"system","content":"x","created_at_ms":1}"#
         let message = try JSONDecoder().decode(ChatMessage.self, from: Data(json.utf8))

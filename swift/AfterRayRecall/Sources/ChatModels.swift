@@ -391,11 +391,11 @@ public struct ChatProgress: Equatable, Sendable {
     /// activity, not a count of semantic steps, so it must not be presented as
     /// one to the user.
     public var detail: String {
-        seconds
+        Self.formatElapsed(elapsedMs)
     }
 
-    private var seconds: String {
-        let value = Double(elapsedMs) / 1_000
+    public static func formatElapsed(_ elapsedMs: Int) -> String {
+        let value = Double(max(elapsedMs, 0)) / 1_000
         return value < 10
             ? String(format: "%.1fs", value)
             : "\(Int(value.rounded()))s"
@@ -657,6 +657,10 @@ public struct ChatStreamState: Equatable, Sendable {
     /// Set while the turn is alive with nothing to show, cleared the moment
     /// there is something. Nil is the normal state, not an error.
     public var progress: ChatProgress?
+    /// Highest elapsed the daemon reported this turn. `progress` is cleared
+    /// when the first token arrives, so the folded summary after the answer
+    /// still needs this.
+    public var lastElapsedMs: Int
 
     public init(
         text: String = "",
@@ -669,7 +673,8 @@ public struct ChatStreamState: Equatable, Sendable {
         isFinished: Bool = false,
         usage: ChatContextUsage? = nil,
         compactions: [ChatCompactionNotice] = [],
-        progress: ChatProgress? = nil
+        progress: ChatProgress? = nil,
+        lastElapsedMs: Int = 0
     ) {
         self.text = text
         self.parts = parts ?? ChatMessagePart.reconstruct(reasoning: reasoning, tools: tools)
@@ -680,6 +685,7 @@ public struct ChatStreamState: Equatable, Sendable {
         self.usage = usage
         self.compactions = compactions
         self.progress = progress
+        self.lastElapsedMs = lastElapsedMs
     }
 
     public var tools: [ChatToolCall] { ChatMessagePart.tools(in: parts) }
@@ -744,6 +750,9 @@ public enum ChatStreamReducer {
             if !conversationId.isEmpty { state.conversationId = conversationId }
         case .progress(let progress):
             state.progress = progress
+            if progress.elapsedMs > state.lastElapsedMs {
+                state.lastElapsedMs = progress.elapsedMs
+            }
         case .compaction(let notice):
             // A pass can be reported more than once across rounds; the range is
             // the identity, so a repeat replaces rather than stacks.
@@ -942,6 +951,33 @@ public enum ChatToolSummary {
     }
 }
 
+/// Collapsed label for think / tool work after the answer is in.
+public enum ChatWorkSummary {
+    /// Prefer the live daemon clock. Otherwise use the user→assistant gap
+    /// only when it is long enough to be a real turn, not a same-ms write.
+    public static func elapsedMs(fromUserMs: Int64?, toAssistantMs: Int64) -> Int? {
+        guard let fromUserMs, fromUserMs > 0, toAssistantMs > fromUserMs else { return nil }
+        let delta = toAssistantMs - fromUserMs
+        return delta >= 400 ? Int(delta) : nil
+    }
+
+    public static func label(thoughts: Int, lookups: Int, elapsedMs: Int?) -> String {
+        var bits: [String] = []
+        if let elapsedMs, elapsedMs > 0 {
+            bits.append("Worked for \(ChatProgress.formatElapsed(elapsedMs))")
+        } else if thoughts + lookups > 0 {
+            bits.append("Worked")
+        }
+        if thoughts > 0 {
+            bits.append(thoughts == 1 ? "1 thought" : "\(thoughts) thoughts")
+        }
+        if lookups > 0 {
+            bits.append(lookups == 1 ? "1 lookup" : "\(lookups) lookups")
+        }
+        return bits.isEmpty ? "Worked" : bits.joined(separator: " · ")
+    }
+}
+
 // MARK: - Transcript assembly
 
 public struct ChatBubble: Equatable, Identifiable, Sendable {
@@ -957,6 +993,9 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
     public let progress: ChatProgress?
     /// Whether the turn behind this bubble was stopped part-way.
     public let wasAborted: Bool
+    /// How long the agent spent working, when we know. Nil if the turn
+    /// had no intermediate work or the clock cannot be recovered.
+    public let workElapsedMs: Int?
 
     public var tools: [ChatToolCall] { ChatMessagePart.tools(in: parts) }
 
@@ -972,7 +1011,8 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         progress: ChatProgress? = nil,
         reasoning: [ChatReasoningRound] = [],
         wasAborted: Bool = false,
-        parts: [ChatMessagePart]? = nil
+        parts: [ChatMessagePart]? = nil,
+        workElapsedMs: Int? = nil
     ) {
         self.id = id
         self.role = role
@@ -982,6 +1022,7 @@ public struct ChatBubble: Equatable, Identifiable, Sendable {
         self.createdAtMs = createdAtMs
         self.progress = progress
         self.wasAborted = wasAborted
+        self.workElapsedMs = workElapsedMs
     }
 
     public var markdownBlocks: [MarkdownBlock] {
@@ -1008,14 +1049,25 @@ public enum ChatTranscript {
         isSending: Bool = false,
         nowMs: Int64 = 0,
         liveCompactions: [ChatCompactionNotice] = [],
-        progress: ChatProgress? = nil
+        progress: ChatProgress? = nil,
+        lastWorkElapsedMs: Int? = nil
     ) -> [ChatBubble] {
+        var previousUserMs: Int64?
         var items = messages
             // The row for the turn in flight is already on screen as the
             // streaming bubble; showing the half-written row too would double it.
             .filter { !(isSending && $0.status == "streaming") }
-            .map { message in
-            ChatBubble(
+            .map { message -> ChatBubble in
+            if message.role == .user {
+                previousUserMs = message.createdAtMs
+            }
+            let elapsed = message.role == .assistant
+                ? ChatWorkSummary.elapsedMs(
+                    fromUserMs: previousUserMs,
+                    toAssistantMs: message.createdAtMs
+                )
+                : nil
+            return ChatBubble(
                 id: message.id,
                 role: message.role,
                 text: message.content,
@@ -1023,7 +1075,8 @@ public enum ChatTranscript {
                 createdAtMs: message.createdAtMs,
                 reasoning: message.reasoningRounds,
                 wasAborted: message.wasAborted,
-                parts: message.parts
+                parts: message.parts,
+                workElapsedMs: elapsed
             )
         }
         if isSending {
@@ -1056,8 +1109,26 @@ public enum ChatTranscript {
                     createdAtMs: nowMs,
                     progress: progress,
                     reasoning: streamingReasoning,
-                    parts: liveParts
+                    parts: liveParts,
+                    workElapsedMs: progress?.elapsedMs
                 )
+            )
+        } else if let lastWorkElapsedMs, lastWorkElapsedMs > 0,
+                  let index = items.lastIndex(where: { $0.role == .assistant })
+        {
+            // The just-finished turn's clock is more honest than the
+            // user→assistant created_at gap (the assistant row is written
+            // when the turn starts).
+            let finished = items[index]
+            items[index] = ChatBubble(
+                id: finished.id,
+                role: finished.role,
+                text: finished.text,
+                isStreaming: false,
+                createdAtMs: finished.createdAtMs,
+                wasAborted: finished.wasAborted,
+                parts: finished.parts,
+                workElapsedMs: lastWorkElapsedMs
             )
         }
         return items

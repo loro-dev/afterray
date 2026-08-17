@@ -174,9 +174,16 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(ChatPalette.label)
                     .lineLimit(1)
-                Text("Ask anything AfterRay has already seen.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(ChatPalette.secondary)
+                if let started = model.selectedConversation {
+                    Text("Started \(ChatTimeLabel.listTimestamp(ms: started.createdAtMs))")
+                        .font(.system(size: 11))
+                        .foregroundStyle(ChatPalette.secondary)
+                        .help(ChatMomentTimeLabel.format(capturedAtMs: started.createdAtMs))
+                } else {
+                    Text("Ask anything AfterRay has already seen.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(ChatPalette.secondary)
+                }
             }
             Spacer(minLength: 12)
             HStack(spacing: 10) {
@@ -502,9 +509,10 @@ private struct ChatConversationRow: View {
                         .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
                         .foregroundStyle(isSelected ? ChatPalette.label : ChatPalette.secondary)
                         .lineLimit(2)
-                    Text("\(ChatTimeLabel.listTimestamp(ms: conversation.updatedAtMs)) · \(conversation.messageCount)")
+                    Text("\(ChatTimeLabel.listTimestamp(ms: conversation.createdAtMs)) · \(conversation.messageCount)")
                         .font(.system(size: 10.5))
                         .foregroundStyle(ChatPalette.tertiary)
+                        .help(ChatMomentTimeLabel.format(capturedAtMs: conversation.createdAtMs))
                 }
                 Spacer(minLength: 4)
                 if isHovering {
@@ -545,16 +553,19 @@ private struct ChatBubbleView: View {
         HStack(alignment: .top) {
             if bubble.role == .user { Spacer(minLength: 48) }
             VStack(alignment: bubble.role == .user ? .trailing : .leading, spacing: 6) {
-                ForEach(bubble.parts) { part in
-                    switch part {
-                    case .reasoning(let id, _, let text):
-                        ChatReasoningChip(
-                            text: text,
-                            isActive: isActiveReasoning(id),
-                            progress: isActiveReasoning(id) ? bubble.progress : nil
-                        )
-                    case .tool(let tool):
-                        ChatToolChip(tool: tool)
+                if !bubble.parts.isEmpty {
+                    if bubble.isStreaming {
+                        ForEach(bubble.parts) { part in
+                            workPart(part)
+                        }
+                    } else {
+                        ChatWorkProcessCard(
+                            parts: bubble.parts,
+                            elapsedMs: bubble.workElapsedMs,
+                            isStreaming: false
+                        ) { part in
+                            workPart(part)
+                        }
                     }
                 }
                 if shouldShowBody {
@@ -565,6 +576,20 @@ private struct ChatBubbleView: View {
             if bubble.role == .assistant { Spacer(minLength: 48) }
         }
         .frame(maxWidth: .infinity, alignment: bubble.role == .user ? .trailing : .leading)
+    }
+
+    @ViewBuilder
+    private func workPart(_ part: ChatMessagePart) -> some View {
+        switch part {
+        case .reasoning(let id, _, let text):
+            ChatReasoningChip(
+                text: text,
+                isActive: isActiveReasoning(id),
+                progress: isActiveReasoning(id) ? bubble.progress : nil
+            )
+        case .tool(let tool):
+            ChatToolChip(tool: tool)
+        }
     }
 
     /// The thought still arriving — last reasoning part, no answer yet.
@@ -671,6 +696,59 @@ private struct ChatBubbleView: View {
 
     private var bubbleStroke: Color {
         bubble.role == .user ? ChatPalette.userStroke : ChatPalette.cardStroke
+    }
+}
+
+/// After the answer lands, every thought and tool folds into one row so
+/// a long ReAct trace does not sit open above the reply.
+private struct ChatWorkProcessCard<PartView: View>: View {
+    let parts: [ChatMessagePart]
+    let elapsedMs: Int?
+    let isStreaming: Bool
+    @ViewBuilder var partView: (ChatMessagePart) -> PartView
+    @State private var expanded: Bool
+
+    init(
+        parts: [ChatMessagePart],
+        elapsedMs: Int?,
+        isStreaming: Bool,
+        @ViewBuilder partView: @escaping (ChatMessagePart) -> PartView
+    ) {
+        self.parts = parts
+        self.elapsedMs = elapsedMs
+        self.isStreaming = isStreaming
+        self.partView = partView
+        _expanded = State(initialValue: isStreaming)
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(parts) { part in
+                    partView(part)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 6)
+        } label: {
+            Text(ChatWorkSummary.label(
+                thoughts: ChatMessagePart.reasoning(in: parts).count,
+                lookups: ChatMessagePart.tools(in: parts).count,
+                elapsedMs: elapsedMs
+            ))
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(ChatPalette.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .tint(ChatPalette.tertiary)
+        .disclosureGroupStyle(ChatLeadingDisclosureStyle())
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: isStreaming) { _, streaming in
+            if !streaming { expanded = false }
+        }
     }
 }
 

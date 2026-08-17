@@ -94,8 +94,10 @@ final class ChatWireTests: XCTestCase {
 
         ChatStreamReducer.apply(.progress(progress), to: &state)
         XCTAssertNotNil(state.progress)
+        XCTAssertEqual(state.lastElapsedMs, 800)
         ChatStreamReducer.apply(.token(text: "OK"), to: &state)
         XCTAssertNil(state.progress)
+        XCTAssertEqual(state.lastElapsedMs, 800, "token must not wipe the turn clock")
 
         ChatStreamReducer.apply(.progress(progress), to: &state)
         ChatStreamReducer.apply(.toolCall(name: "get_now", argsJSON: "{}"), to: &state)
