@@ -190,9 +190,11 @@ final class RecallHotKeyStoreTests: XCTestCase {
 
     func testRestoreDefaultComesBackFromACustomShortcut() {
         let store = makeStore()
-        store.binding = StubBinding()
+        let binding = StubBinding()
+        store.binding = binding
         store.commit(RecallHotKey(keyCode: 15, modifiers: [.command, .option], keyLabel: "R"))
         store.restoreDefault()
+        XCTAssertNotNil(store.binding)
         XCTAssertEqual(store.hotKey, .default)
         XCTAssertTrue(store.isDefault)
     }

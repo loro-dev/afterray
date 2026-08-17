@@ -882,7 +882,7 @@ private struct ChatToolChip: View {
                     .foregroundStyle(ChatPalette.secondary)
                     .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
-                if let chars = tool.resultChars {
+                if tool.resultChars != nil {
                     Text(resultNote)
                         .font(.system(size: 10.5))
                         .foregroundStyle(tool.truncated ? ChatPalette.coral.opacity(0.85) : ChatPalette.tertiary)

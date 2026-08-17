@@ -42,8 +42,9 @@ public final class RecallChatPreviewCache {
         let requestGeneration = generation
         let task = Task { @MainActor () -> CGImage? in
             guard let data = try? await loader(momentID) else { return nil }
+            let maxEdge = Self.maxEdge
             return await Task.detached(priority: .userInitiated) {
-                RecallChatPreviewDecoder.decode(data, maxEdge: Self.maxEdge)
+                RecallChatPreviewDecoder.decode(data, maxEdge: maxEdge)
             }.value
         }
         inFlight[momentID] = task

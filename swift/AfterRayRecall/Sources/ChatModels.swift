@@ -95,7 +95,7 @@ public enum ChatConversationGrouping {
         groups.reserveCapacity(min(sorted.count, 8))
         for conversation in sorted {
             let start = startOfDayMs(conversation.createdAtMs, calendar: calendar)
-            if var last = groups.last, last.id == start {
+            if let last = groups.last, last.id == start {
                 var next = last.conversations
                 next.append(conversation)
                 groups[groups.count - 1] = ChatDayGroup(

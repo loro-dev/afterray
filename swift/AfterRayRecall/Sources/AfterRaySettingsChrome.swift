@@ -5,6 +5,7 @@ import SwiftUI
 private let settingsMirrorEndpoint = "https://hf-mirror.com"
 private let settingsCustomEndpointTag = "custom"
 
+@MainActor
 public protocol AfterRaySettingsModeling: ObservableObject {
     var settings: AppSettings? { get }
     var library: ModelLibrary? { get }
