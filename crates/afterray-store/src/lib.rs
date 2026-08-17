@@ -89,7 +89,7 @@ pub use slot::{
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// How long the raw input-event stream lives.
 ///
@@ -131,6 +131,31 @@ pub struct InputEventRow {
     pub bundle_identifier: Option<String>,
     /// The platform layer's resolved element identity, serialised verbatim.
     pub target_json: Option<String>,
+}
+
+/// Content type of a stored R3 edge snapshot.
+///
+/// The payload is the shim's ordinary accessibility snapshot; the
+/// `purpose=edge-ax` parameter is what separates an edge tree from a heartbeat
+/// tree in the `artifacts` table, which has no purpose column of its own. It is
+/// a constant rather than a value copied off the capture event because the
+/// encryption AAD binds the content type: an artifact stored under one string
+/// and read back under another is undecryptable.
+pub const EDGE_SNAPSHOT_CONTENT_TYPE: &str = "application/vnd.afterray.ax+json; purpose=edge-ax";
+
+/// One R3 edge snapshot: an accessibility tree walked because the user changed
+/// scope, not because the capture heartbeat came round.
+///
+/// It has no moment, no thumbnail, and no OCR — it is not a frame of the screen,
+/// it is extra tree for the join to partition text against. It lives exactly as
+/// long as the input events that triggered it
+/// ([`INPUT_EVENT_RETENTION_MS`]): a frame driven by an event and outliving it
+/// would still expose the instant of an interaction whose record was erased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSnapshotRow {
+    pub id: String,
+    pub captured_at_ms: i64,
+    pub artifact_id: String,
 }
 
 /// How a search is narrowed before anything is ranked.
@@ -2768,6 +2793,21 @@ impl Vault {
               WHERE at_ms <= ?2 AND MAX(at_ms, COALESCE(end_ms, at_ms)) >= ?1",
             params![from_ms, to_ms],
         )?;
+        // And the fourth layer: an R3 tree is a full window's worth of text
+        // from inside the forgotten window, attached to no moment, so no
+        // frame deletion above can have reached it.
+        let edges: Vec<(String, String)> = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT id, artifact_id FROM edge_snapshots
+                  WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2",
+            )?;
+            let rows = statement.query_map(params![from_ms, to_ms], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        self.delete_edge_snapshots(&edges)?;
         Ok(count)
     }
 
@@ -3028,6 +3068,123 @@ impl Vault {
             [cutoff],
         )?;
         Ok(removed)
+    }
+
+    /// Stores one R3 edge snapshot: the encrypted tree plus its row.
+    ///
+    /// No moment, no thumbnail, no OCR job — an edge snapshot is not a frame of
+    /// the screen. The artifact is written under
+    /// [`EDGE_SNAPSHOT_CONTENT_TYPE`], and a failed row insert takes the
+    /// artifact back out with it: an orphaned encrypted file would be
+    /// unreachable and unprunable, since pruning walks the rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact cannot be written or the row inserted.
+    pub fn insert_edge_snapshot(
+        &self,
+        captured_at_ms: i64,
+        snapshot: &[u8],
+    ) -> Result<EdgeSnapshotRow, StoreError> {
+        let artifact_id = self.put_artifact(EDGE_SNAPSHOT_CONTENT_TYPE, snapshot)?;
+        let row = EdgeSnapshotRow {
+            id: Uuid::now_v7().to_string(),
+            captured_at_ms,
+            artifact_id,
+        };
+        let result = self.connection.lock().unwrap().execute(
+            "INSERT INTO edge_snapshots (id, captured_at_ms, artifact_id)
+             VALUES (?1, ?2, ?3)",
+            params![row.id, row.captured_at_ms, row.artifact_id],
+        );
+        if let Err(error) = result {
+            let _ = self.delete_artifact_record_and_file(&row.artifact_id);
+            return Err(error.into());
+        }
+        // A card already cached for this slot was built without this tree.
+        self.flush_card_cache();
+        Ok(row)
+    }
+
+    /// Edge snapshots captured in `[from_ms, to_ms)`, oldest first.
+    ///
+    /// Half-open like slot bounds and like `input_events_between`, so
+    /// consecutive slots partition the stream without one tree landing in two
+    /// cards. A snapshot is a point in time — it has no span to overlap with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn edge_snapshots_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<EdgeSnapshotRow>, StoreError> {
+        if from_ms >= to_ms {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, captured_at_ms, artifact_id
+               FROM edge_snapshots
+              WHERE captured_at_ms >= ?1 AND captured_at_ms < ?2
+              ORDER BY captured_at_ms ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(EdgeSnapshotRow {
+                id: row.get(0)?,
+                captured_at_ms: row.get(1)?,
+                artifact_id: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Drops edge snapshots older than [`INPUT_EVENT_RETENTION_MS`], files and
+    /// all.
+    ///
+    /// Same constant and the same call site as [`Self::prune_input_events`], and
+    /// that is the point: an event-triggered tree that outlived its events would
+    /// still say "the user was here at 03:14" after the record of the input was
+    /// erased. The cutoff instant itself is kept, matching event retention.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be read or written.
+    pub fn prune_edge_snapshots(&self, now_ms: i64) -> Result<usize, StoreError> {
+        let cutoff = now_ms.saturating_sub(INPUT_EVENT_RETENTION_MS);
+        let doomed: Vec<(String, String)> = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT id, artifact_id FROM edge_snapshots WHERE captured_at_ms < ?1",
+            )?;
+            let rows = statement.query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        self.delete_edge_snapshots(&doomed)?;
+        Ok(doomed.len())
+    }
+
+    /// Removes edge snapshot rows and their encrypted files.
+    ///
+    /// The row goes first: a row pointing at a missing file is a decrypt error
+    /// on some later read, while a file with no row is invisible to every
+    /// prune and stays on disk forever.
+    fn delete_edge_snapshots(&self, rows: &[(String, String)]) -> Result<(), StoreError> {
+        self.flush_card_cache();
+        {
+            let connection = self.connection.lock().unwrap();
+            for (id, _) in rows {
+                connection.execute("DELETE FROM edge_snapshots WHERE id = ?1", [id])?;
+            }
+        }
+        for (_, artifact_id) in rows {
+            self.delete_artifact_record_and_file(artifact_id)?;
+        }
+        Ok(())
     }
 
     pub fn audio_segments_sync(&self, session_id: &str) -> Result<Vec<AudioSegment>, StoreError> {
@@ -4361,6 +4518,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_20(connection, from_version)?;
     migrate_schema_21(connection)?;
     migrate_schema_22(connection)?;
+    migrate_schema_23(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -4947,6 +5105,29 @@ fn migrate_schema_22(connection: &Connection) -> Result<(), StoreError> {
     if !existing.iter().any(|held| held == "acts_json") {
         connection.execute("ALTER TABLE slot_summaries ADD COLUMN acts_json TEXT", [])?;
     }
+    Ok(())
+}
+
+/// R3 edge snapshots: accessibility trees captured because the user changed
+/// scope, with no moment of their own.
+///
+/// Deliberately not a column on `moments`: an edge snapshot has no screenshot,
+/// no thumbnail and no OCR, and hanging it off a frame would put it inside every
+/// frame-shaped retention and export path that treats a moment as a picture of
+/// the screen. The index is on `captured_at_ms` because both readers — the slot
+/// join and the 48h prune — ask only when.
+///
+/// Purely additive.
+fn migrate_schema_23(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edge_snapshots (
+           id TEXT PRIMARY KEY,
+           captured_at_ms INTEGER NOT NULL,
+           artifact_id TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS edge_snapshots_at
+           ON edge_snapshots(captured_at_ms);",
+    )?;
     Ok(())
 }
 
@@ -9413,5 +9594,164 @@ mod tests {
             .input_events_between(base, base + batches * 1_000)
             .unwrap();
         assert_eq!(i64::try_from(all.len()).unwrap(), batches * per_batch);
+    }
+
+    // ------------------------------------------------- R3 edge snapshots
+
+    /// An edge snapshot is stored bytes-in / bytes-out, and its window is
+    /// half-open on the same rule as slots and events, so one tree can never be
+    /// read into two cards.
+    #[test]
+    fn edge_snapshots_round_trip_within_a_half_open_window() {
+        let (_directory, vault) = test_vault(10);
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+
+        let first = vault.insert_edge_snapshot(1_000, &tree).unwrap();
+        let edge = vault.insert_edge_snapshot(1_999, &tree).unwrap();
+        let next_slot = vault.insert_edge_snapshot(2_000, &tree).unwrap();
+
+        let found = vault.edge_snapshots_between(1_000, 2_000).unwrap();
+        assert_eq!(
+            found.iter().map(|row| row.captured_at_ms).collect::<Vec<_>>(),
+            vec![1_000, 1_999],
+            "the upper bound is open"
+        );
+        assert_eq!(found[0], first);
+        assert_eq!(found[1], edge);
+        assert_eq!(
+            vault.edge_snapshots_between(2_000, 3_000).unwrap(),
+            vec![next_slot.clone()],
+            "the next window picks up exactly what this one left"
+        );
+        assert!(vault.edge_snapshots_between(2_000, 2_000).unwrap().is_empty());
+
+        let payload = vault.read_artifact(&edge.artifact_id).unwrap();
+        assert_eq!(payload.bytes, tree, "the encrypted tree decrypts unchanged");
+        assert_eq!(payload.content_type, EDGE_SNAPSHOT_CONTENT_TYPE);
+    }
+
+    /// Edge snapshots share the events' 48h lifetime, files included: a tree
+    /// triggered by an event and outliving it would still say when the user
+    /// interacted after the record of the interaction was erased.
+    #[test]
+    fn prune_edge_snapshots_deletes_rows_and_their_artifact_files() {
+        let (_directory, vault) = test_vault(10);
+        let now = 1_786_698_000_000;
+        let cutoff = now - INPUT_EVENT_RETENTION_MS;
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+
+        let expired = vault.insert_edge_snapshot(cutoff - 1, &tree).unwrap();
+        let edge = vault.insert_edge_snapshot(cutoff, &tree).unwrap();
+        let fresh = vault.insert_edge_snapshot(cutoff + 1, &tree).unwrap();
+        for row in [&expired, &edge, &fresh] {
+            assert!(vault.artifact_path(&row.artifact_id).exists());
+        }
+
+        assert_eq!(vault.prune_edge_snapshots(now).unwrap(), 1);
+
+        assert_eq!(
+            vault
+                .edge_snapshots_between(0, now)
+                .unwrap()
+                .iter()
+                .map(|row| row.captured_at_ms)
+                .collect::<Vec<_>>(),
+            vec![cutoff, cutoff + 1],
+            "retention keeps its own edge, like the events'"
+        );
+        assert!(
+            !vault.artifact_path(&expired.artifact_id).exists(),
+            "the encrypted file must go with the row"
+        );
+        assert!(matches!(
+            vault.read_artifact(&expired.artifact_id),
+            Err(StoreError::ArtifactNotFound(_))
+        ));
+        assert!(vault.artifact_path(&edge.artifact_id).exists());
+        // Idempotent: nothing left to drop at the same instant.
+        assert_eq!(vault.prune_edge_snapshots(now).unwrap(), 0);
+    }
+
+    /// One privacy invariant, four layers: forgetting a window takes the frames,
+    /// the cards, the acts, and the R3 trees. Edge snapshots hang off no moment,
+    /// so no frame deletion can reach them.
+    #[test]
+    fn delete_history_takes_edge_snapshots_and_their_artifacts() {
+        let (_directory, vault) = test_vault(10);
+        let slot = slot_start_for(1_786_698_000_000);
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+
+        let before = vault.insert_edge_snapshot(slot - 1, &tree).unwrap();
+        let inside = vault.insert_edge_snapshot(slot + 5_000, &tree).unwrap();
+        let after = vault
+            .insert_edge_snapshot(slot + SLOT_DURATION_MS + 1, &tree)
+            .unwrap();
+
+        vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap();
+
+        assert_eq!(
+            vault
+                .edge_snapshots_between(0, slot + SLOT_DURATION_MS * 4)
+                .unwrap()
+                .iter()
+                .map(|row| row.captured_at_ms)
+                .collect::<Vec<_>>(),
+            vec![before.captured_at_ms, after.captured_at_ms],
+            "only trees entirely outside the forgotten window may survive"
+        );
+        assert!(!vault.artifact_path(&inside.artifact_id).exists());
+        assert!(vault.artifact_path(&before.artifact_id).exists());
+        assert!(vault.artifact_path(&after.artifact_id).exists());
+    }
+
+    #[test]
+    fn schema_23_adds_edge_snapshots_to_an_existing_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [24_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS edge_snapshots_at;
+                     DROP TABLE IF EXISTS edge_snapshots;
+                     UPDATE schema_meta SET version = 22;",
+                )
+                .unwrap();
+            session.id
+        };
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        {
+            let connection = vault.connection.lock().unwrap();
+            let objects: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE name IN ('edge_snapshots', 'edge_snapshots_at')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(objects, 2, "table and its index must both come back");
+            let version: i64 = connection
+                .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, i64::from(SCHEMA_VERSION));
+        }
+        // The upgrade is additive, and the new table is usable straight away.
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+        vault.insert_edge_snapshot(5_000, &tree).unwrap();
+        assert_eq!(vault.edge_snapshots_between(0, 10_000).unwrap().len(), 1);
     }
 }
