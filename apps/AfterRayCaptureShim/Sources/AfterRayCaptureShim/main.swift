@@ -95,6 +95,10 @@ private enum ArtifactKind: String, Encodable {
     case systemAudio = "system_audio"
     case microphone
     case accessibility
+    /// An R3 edge snapshot: the same accessibility payload, walked because the
+    /// user changed scope rather than because the heartbeat came round, and
+    /// deliberately unpaired with any screenshot.
+    case accessibilityEdge = "accessibility_edge"
 }
 
 private struct Event: Encodable {
@@ -144,7 +148,7 @@ private struct Event: Encodable {
         switch kind {
         case .screen: contentType = "image/jpeg"
         case .systemAudio, .microphone: contentType = "audio/mp4"
-        case .accessibility: contentType = "application/vnd.afterray.ax+json"
+        case .accessibility, .accessibilityEdge: contentType = "application/vnd.afterray.ax+json"
         }
         return Self(
             event: "artifact",
@@ -1473,6 +1477,7 @@ private final class InputEventMonitor: @unchecked Sendable {
 
     private let events: EventWriter
     private let excludedVerdict: (String?) -> Bool?
+    private let outputDirectory: URL
     private let worker = DispatchQueue(label: "dev.afterray.capture.input", qos: .utility)
     private let tapLock = NSLock()
     private var tap: CFMachPort?
@@ -1487,10 +1492,24 @@ private final class InputEventMonitor: @unchecked Sendable {
     private var lastRawMs: Int64 = 0
     private var timer: DispatchSourceTimer?
     private var livenessTick = 0
+    /// R3 pacing (see `EdgeSnapshotPacing`).
+    private var edgePacing = EdgeSnapshotPacing()
+    /// Frontmost bundle as of the last tick; a change is an R3 candidate the
+    /// tap itself cannot observe (⌘Tab is a key, not a scope the tap resolves).
+    private var lastFrontmostBundle: String?
+    /// The window the most recent trigger click landed in, with the pid it
+    /// belonged to. The pid is what makes it safe to reuse: an app switch
+    /// invalidates the window without the shim having to observe the switch.
+    private var pendingEdgeWindow: (window: AXUIElement, pid: pid_t)?
 
-    init(events: EventWriter, excludedVerdict: @escaping (String?) -> Bool?) {
+    init(
+        events: EventWriter,
+        excludedVerdict: @escaping (String?) -> Bool?,
+        outputDirectory: URL
+    ) {
         self.events = events
         self.excludedVerdict = excludedVerdict
+        self.outputDirectory = outputDirectory
     }
 
     func start() {
@@ -1599,6 +1618,7 @@ private final class InputEventMonitor: @unchecked Sendable {
 
     private func onKey(atMs: Int64, classified: KeyClass) {
         lastRawMs = atMs
+        edgePacing.observeInput(atMs: atMs)
         switch classified {
         case .autorepeat:
             if burst != nil { burst?.endMs = atMs }
@@ -1627,12 +1647,22 @@ private final class InputEventMonitor: @unchecked Sendable {
         closeBurst(endedWith: nil)
         var record = InputEventRecord(atMs: atMs, kind: "click")
         record.bundleIdentifier = frontmostBundle()
-        record.target = resolveTarget(x: x, y: y)
+        let element = elementAt(x: x, y: y)
+        record.target = element.map(targetRef(for:))
+        // R3: a click is a candidate scope change, and the window it landed in
+        // is the walk root. The coordinates are already gone by here.
+        if isRecordable(record.bundleIdentifier) {
+            pendingEdgeWindow = element
+                .flatMap(enclosingWindow(of:))
+                .flatMap { window in elementPid(window).map { (window, $0) } }
+            edgePacing.arm(atMs: atMs)
+        }
         append(record)
     }
 
     private func onScroll(atMs: Int64, x: Double, y: Double, momentum: Bool) {
         lastRawMs = atMs
+        edgePacing.observeInput(atMs: atMs)
         if scroll != nil, atMs - (scroll?.endMs ?? 0) <= Self.scrollGapMs {
             scroll?.endMs = atMs
             scroll?.count += 1
@@ -1667,12 +1697,17 @@ private final class InputEventMonitor: @unchecked Sendable {
         append(record)
     }
 
+    /// The shim never records its own host app, and fails closed for excluded
+    /// apps exactly like the audio hold: before the daemon's list arrives,
+    /// nothing can be judged, so nothing is recorded. Gates the event stream
+    /// and R3 alike — an excluded app's tree is never even walked.
+    private func isRecordable(_ bundleIdentifier: String?) -> Bool {
+        bundleIdentifier != afterRayAppBundleIdentifier
+            && excludedVerdict(bundleIdentifier) == false
+    }
+
     private func append(_ record: InputEventRecord) {
-        // The shim never records its own host app, and fails closed for
-        // excluded apps exactly like the audio hold: before the daemon's
-        // list arrives, nothing can be judged, so nothing is recorded.
-        if record.bundleIdentifier == afterRayAppBundleIdentifier { return }
-        guard excludedVerdict(record.bundleIdentifier) == false else { return }
+        guard isRecordable(record.bundleIdentifier) else { return }
         guard records.count < Self.recordsPerFlushCap else {
             dropped += 1
             return
@@ -1691,6 +1726,7 @@ private final class InputEventMonitor: @unchecked Sendable {
         if !records.isEmpty || dropped > 0, now - lastFlushMs >= Self.flushIntervalMs {
             flush(nowMs: now)
         }
+        considerEdgeSnapshot(nowMs: now)
         livenessTick += 1
         if livenessTick >= 60 {
             livenessTick = 0
@@ -1727,6 +1763,103 @@ private final class InputEventMonitor: @unchecked Sendable {
         }
     }
 
+    // MARK: R3 edge snapshots — worker queue only
+
+    /// Decides whether this tick owes an edge snapshot, and takes it.
+    ///
+    /// The frontmost-app poll lives here rather than in a notification: the main
+    /// thread blocks in `readLine` and never services a run loop, so
+    /// `NSWorkspace` notifications would not arrive — the same reason the audio
+    /// gate polls. One call a second on a queue that is already awake.
+    private func considerEdgeSnapshot(nowMs: Int64) {
+        let bundle = frontmostBundle()
+        if bundle != lastFrontmostBundle {
+            lastFrontmostBundle = bundle
+            if isRecordable(bundle) {
+                // A switch invalidates the click's window; the new app's
+                // focused window is the honest root.
+                pendingEdgeWindow = nil
+                edgePacing.arm(atMs: nowMs)
+            }
+        }
+        guard edgePacing.shouldFire(nowMs: nowMs) else { return }
+        captureEdgeSnapshot(nowMs: nowMs)
+    }
+
+    /// Walks the window the trigger landed in and emits it as an
+    /// `accessibility_edge` artifact.
+    ///
+    /// **Never a screenshot.** An event-driven frame would outlive the events
+    /// that triggered it (events are deleted after 48h, frames are not) and so
+    /// would keep exposing the instants a person interacted long after the
+    /// record of that interaction was erased. Edge snapshots share the events'
+    /// 48h lifetime for the same reason.
+    ///
+    /// Walk cost is bounded by exactly what bounds the heartbeat:
+    /// `AccessibilityTreeEncoder`'s 500ms deadline, the menu-bar stub, and the
+    /// process-global 100ms messaging timeout.
+    private func captureEdgeSnapshot(nowMs: Int64) {
+        guard
+            let application = NSWorkspace.shared.frontmostApplication,
+            let bundle = application.bundleIdentifier,
+            isRecordable(bundle)
+        else { return }
+        // Private-browsing detection needs the async automation probe plus a
+        // chrome-only pre-walk that the heartbeat runs before it touches a
+        // browser tree; neither fits a 1s worker tick. v1 therefore takes no
+        // edge snapshots of browsers at all — fail closed, heartbeat covers it.
+        guard !BrowserPrivacyDetector(bundleIdentifier: bundle).isKnownBrowser else { return }
+        let pid = application.processIdentifier
+        guard let root = edgeWalkRoot(pid: pid) else { return }
+        let encoder = AccessibilityTreeEncoder()
+        let encodedRoot = encoder.encode(root)
+        let snapshot = AccessibilitySnapshot(
+            capturedAtMs: nowMs,
+            processId: pid,
+            bundleIdentifier: bundle,
+            applicationName: application.localizedName,
+            windowTitle: encoder.windowTitle,
+            url: encoder.url,
+            document: encoder.document,
+            privateBrowsing: false,
+            truncated: encoder.truncated,
+            digest: encoder.digest(
+                applicationName: application.localizedName,
+                bundleIdentifier: bundle,
+                windowTitle: encoder.windowTitle,
+                privateBrowsing: false
+            ),
+            root: encodedRoot
+        )
+        let url = outputDirectory
+            .appendingPathComponent("accessibility-edge-\(UUID().uuidString)")
+            .appendingPathExtension("json")
+        do {
+            try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+            try hardenPrivateFile(url)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            log("edge snapshot could not be written: \(String(describing: error))")
+            return
+        }
+        events.send(
+            .artifact(kind: .accessibilityEdge, url: url, startedAtMs: nowMs, endedAtMs: nowMs)
+        )
+    }
+
+    /// The trigger click's own `AXWindow` when it still belongs to the app in
+    /// front, else that app's focused window.
+    ///
+    /// v1 walks the whole window rather than the engaged subtree: the window is
+    /// a superset of it, so nothing the join wants is missing, and the geometry
+    /// that decides the subtree lives in the store's pure join, not here.
+    private func edgeWalkRoot(pid: pid_t) -> AXUIElement? {
+        if let pending = pendingEdgeWindow, pending.pid == pid {
+            return pending.window
+        }
+        return frontWindowElement(AXUIElementCreateApplication(pid))
+    }
+
     // MARK: resolution — worker queue only
 
     private func frontmostBundle() -> String? {
@@ -1734,15 +1867,38 @@ private final class InputEventMonitor: @unchecked Sendable {
     }
 
     private func resolveTarget(x: Double, y: Double) -> InputTargetRef? {
+        elementAt(x: x, y: y).map(targetRef(for:))
+    }
+
+    /// The element under a pointer position. The coordinates die with this
+    /// stack frame — every caller keeps element identity, never a location.
+    private func elementAt(x: Double, y: Double) -> AXUIElement? {
         var element: AXUIElement?
         guard
             AXUIElementCopyElementAtPosition(
                 AXUIElementCreateSystemWide(), Float(x), Float(y), &element
-            ) == .success,
-            let element
+            ) == .success
         else { return nil }
-        // The coordinates die with this stack frame.
-        return targetRef(for: element)
+        return element
+    }
+
+    /// The `AXWindow` an element belongs to, walking parents. Bounded: a
+    /// pathological tree must not turn one click into an unbounded climb.
+    private func enclosingWindow(of element: AXUIElement) -> AXUIElement? {
+        var cursor: AXUIElement? = element
+        var hops = 0
+        while let current = cursor, hops < 12 {
+            if isWindowRole(axString(current, kAXRoleAttribute)) { return current }
+            cursor = axElement(current, kAXParentAttribute)
+            hops += 1
+        }
+        return nil
+    }
+
+    private func elementPid(_ element: AXUIElement) -> pid_t? {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return nil }
+        return pid
     }
 
     private func resolveFocusedTarget() -> InputTargetRef? {
@@ -1906,7 +2062,8 @@ private enum AfterRayCaptureShim {
             // when the tap cannot be created.
             let inputMonitor = InputEventMonitor(
                 events: events,
-                excludedVerdict: { output.audioGate.excludedVerdict(for: $0) }
+                excludedVerdict: { output.audioGate.excludedVerdict(for: $0) },
+                outputDirectory: options.outputDirectory
             )
             inputMonitor.start()
 
