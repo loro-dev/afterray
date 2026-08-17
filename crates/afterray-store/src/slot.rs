@@ -103,25 +103,8 @@ impl SlotMomentRow {
             .unwrap_or("unknown")
     }
 
-    /// Stable key for "the same place in the same app".
-    fn target_key(&self) -> String {
-        format!(
-            "{}|{}",
-            self.bundle_identifier
-                .as_deref()
-                .or(self.application_name.as_deref())
-                .unwrap_or(""),
-            self.url
-                .as_deref()
-                .or(self.document.as_deref())
-                .or(self.window_title.as_deref())
-                .unwrap_or("")
-        )
-    }
-
-    /// Human-facing place: first of url/document/title that is not an opaque
-    /// id or app chrome. Electron apps expose session UUIDs as paths.
-    fn place_label(&self) -> String {
+    /// url/document/title in preference order, before any filtering.
+    fn place_candidates(&self) -> impl Iterator<Item = &str> {
         [
             self.url.as_deref(),
             self.document.as_deref(),
@@ -129,10 +112,34 @@ impl SlotMomentRow {
         ]
         .into_iter()
         .flatten()
-        .map(shorten_place)
-        .find(|place| !is_opaque_id(place) && !is_chrome_noise(place))
-        .map(|place| clip(&place, 80))
-        .unwrap_or_default()
+    }
+
+    /// Stable key for "the same place in the same app". Candidates run through
+    /// the same noise gate as the label, so an Electron shell reporting an
+    /// avatar blob or a resource inside its own `.app` bundle does not become
+    /// the slot's identity; with every candidate rejected the key degrades to
+    /// the app-only form.
+    fn target_key(&self) -> String {
+        format!(
+            "{}|{}",
+            self.bundle_identifier
+                .as_deref()
+                .or(self.application_name.as_deref())
+                .unwrap_or(""),
+            self.place_candidates()
+                .find(|place| !is_place_noise(place))
+                .unwrap_or("")
+        )
+    }
+
+    /// Human-facing place: first of url/document/title that is not an opaque
+    /// id, app chrome, or a resource inside an application bundle. Electron
+    /// apps expose session UUIDs as paths.
+    fn place_label(&self) -> String {
+        self.place_candidates()
+            .find_map(place_candidate)
+            .map(|place| clip(&place, 80))
+            .unwrap_or_default()
     }
 
     fn ocr_chars(&self) -> usize {
@@ -267,6 +274,10 @@ pub struct SlotCard {
     pub state: SlotState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme_key: Option<String>,
+    /// The frame that represents this slot: the middle frame of its longest
+    /// run (`anchor_frame_id`). `None` only when nothing was captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_moment_id: Option<String>,
     /// Identifier-shaped strings characteristic of this slot against the
     /// user's history (G² keyness). Deterministic: the strings a T2 model may
     /// cite but must never spell on its own.
@@ -853,7 +864,13 @@ pub fn assemble_day_summary(
                 |card| card.slot_end_ms,
             ),
             state,
-            anchor_moment_id: card.and_then(|card| card.evidence.moment_ids.first().cloned()),
+            // The middle frame of the longest run; the first captured moment
+            // only stands in for a card built without one.
+            anchor_moment_id: card.and_then(|card| {
+                card.anchor_moment_id
+                    .clone()
+                    .or_else(|| card.evidence.moment_ids.first().cloned())
+            }),
             facts,
             title,
             bullets: overlay.and_then(|row| row.bullets.clone()),
@@ -1121,6 +1138,7 @@ pub fn build_slot_card_with_end(
             local_day,
             state: SlotState::NoData,
             theme_key: None,
+            anchor_moment_id: None,
             entity_candidates: Vec::new(),
             facts: empty_facts(),
             timeline: Vec::new(),
@@ -1308,6 +1326,7 @@ pub fn build_slot_card_with_end(
         local_day,
         state,
         theme_key,
+        anchor_moment_id: anchor_frame_id(&pieces, rows),
         entity_candidates: Vec::new(),
         facts,
         timeline,
@@ -1386,6 +1405,27 @@ pub fn attach_entity_candidates(
     card.entity_candidates = crate::infoscore::entity_candidates(&counts, background, 16);
 }
 
+/// The frame that represents a slot — its thumbnail anchor: the middle frame
+/// of the longest run. The slot's *opening* frame, which this replaces, is the
+/// worst candidate on real data: a window that has just gained focus dumps its
+/// whole sidebar into that one frame (measured at 1399 characters of
+/// navigation), while the work the slot is about happens in later frames.
+/// Pure and deterministic — ties go to the earliest run, and a slot with no
+/// runs has no anchor.
+fn anchor_frame_id(pieces: &[Piece], rows: &[SlotMomentRow]) -> Option<String> {
+    let longest = pieces.iter().fold(None::<&Piece>, |best, piece| match best {
+        Some(current) if current.end_ms - current.start_ms >= piece.end_ms - piece.start_ms => {
+            Some(current)
+        }
+        _ => Some(piece),
+    })?;
+    longest
+        .rows
+        .get(longest.rows.len() / 2)
+        .and_then(|&index| rows.get(index))
+        .map(|row| row.id.clone())
+}
+
 fn empty_facts() -> SlotFacts {
     SlotFacts {
         apps: Vec::new(),
@@ -1449,8 +1489,11 @@ fn build_facts(
                 .as_deref()
                 .map(|title| clip(title.trim(), 90))
         }),
-        top_documents: top_values(rows, |row| row.document.as_deref().map(shorten_place)),
-        top_urls: top_values(rows, |row| row.url.as_deref().map(shorten_place)),
+        // `place_candidate`, not `shorten_place`: the noise evidence is in the
+        // raw value, and the shortened tail of an app-bundle resource
+        // (`en-US.html`) reads exactly like a real document.
+        top_documents: top_values(rows, |row| row.document.as_deref().and_then(place_candidate)),
+        top_urls: top_values(rows, |row| row.url.as_deref().and_then(place_candidate)),
         has_audio: rows.iter().any(|row| row.has_audio),
         audio_moment_count: rows.iter().filter(|row| row.has_audio).count(),
         moment_count: rows.len(),
@@ -1866,6 +1909,45 @@ pub fn is_chrome_noise(value: &str) -> bool {
     PREFIXES.iter().any(|prefix| value.starts_with(prefix)) || value.is_empty()
 }
 
+/// True for a `file://` URL that points *inside* a macOS application bundle,
+/// i.e. whose path holds a `Something.app/` segment. Electron shells report
+/// their own packaged HTML as the focused document — Feishu's
+/// `file:///Applications/Lark.app/Contents/Frameworks/…/en-US.html` shortens
+/// to a plausible-looking `en-US.html`, but it is app plumbing, never a
+/// document a person opened. A bundle path with nothing after `.app` is the
+/// application itself and is left to the other filters.
+#[must_use]
+pub fn is_app_bundle_resource(value: &str) -> bool {
+    let Some(path) = value.trim().strip_prefix("file://") else {
+        return false;
+    };
+    let Some((parents, _leaf)) = path.rsplit_once('/') else {
+        return false;
+    };
+    parents
+        .split('/')
+        .any(|segment| segment.len() > 4 && segment.to_ascii_lowercase().ends_with(".app"))
+}
+
+/// Whether a raw url/document/window-title candidate is unusable as identity
+/// or as a label. Applied to the raw value *and* to its shortened form:
+/// `shorten_place` keeps only the last path segment, so the app-bundle and
+/// opaque-id evidence lives in the raw value while chrome schemes can survive
+/// into the short one.
+fn is_place_noise(value: &str) -> bool {
+    let noisy = |candidate: &str| {
+        is_chrome_noise(candidate) || is_opaque_id(candidate) || is_app_bundle_resource(candidate)
+    };
+    noisy(value) || noisy(&shorten_place(value))
+}
+
+/// The display form of a candidate, or `None` when it is noise. Single gate
+/// for every place-derived string: run titles, `target_key`/`theme_key`
+/// identity, and the `top_documents`/`top_urls` facts.
+fn place_candidate(value: &str) -> Option<String> {
+    (!is_place_noise(value)).then(|| shorten_place(value))
+}
+
 /// True for UUIDs, hex blobs and similar identifiers that carry no meaning
 /// for a reader. Electron apps expose these as document paths constantly.
 #[must_use]
@@ -1965,6 +2047,19 @@ mod tests {
                 TimelineEntry::Gap(_) => None,
             })
             .collect()
+    }
+
+    /// Verbatim from the production vault (2026-08-17 15:20 slot): Feishu
+    /// reports a resource inside its own application bundle as the focused
+    /// document, and an avatar blob as the url.
+    const LARK_BUNDLE_DOC: &str = "file:///Applications/Lark.app/Contents/Frameworks/Lark%20Framework.framework/Versions/143.0.7499.203/Resources/webcontent/messenger/messenger/en-US.html";
+    const LARK_AVATAR_URL: &str = "native-resource://sdk/avatar?key=default-avatar_v2_a1b2c3&entityId=0&format=webp&dpSize=36";
+
+    fn feishu_row(id: &str, at: i64, title: &str, ocr: &str) -> SlotMomentRow {
+        let mut moment = row(id, at, "Feishu", title, Some(ocr));
+        moment.url = Some(LARK_AVATAR_URL.to_owned());
+        moment.document = Some(LARK_BUNDLE_DOC.to_owned());
+        moment
     }
 
     #[test]
@@ -2414,6 +2509,146 @@ mod tests {
         assert_eq!(runs(&card)[0].title, "AfterRay 开发规划 - Lody");
     }
 
+    /// The bundle resource shortens to `en-US.html`, which on its own reads
+    /// like a document the user opened: it became the run title and a
+    /// `top_documents` entry, and the avatar blob became `theme_key`.
+    #[test]
+    fn app_bundle_resources_and_blobs_never_become_place_identity() {
+        assert!(is_app_bundle_resource(LARK_BUNDLE_DOC));
+        assert!(!is_app_bundle_resource(
+            "file:///Users/zx/afterray/crates/afterray-store/src/slot.rs"
+        ));
+        // The bundle itself, with nothing after `.app`, is not a resource.
+        assert!(!is_app_bundle_resource("file:///Applications/Lark.app"));
+        assert!(!is_app_bundle_resource(
+            "https://example.com/Lark.app/index.html"
+        ));
+
+        let rows = vec![
+            feishu_row("f0", 0, "群聊 - 飞书", "讨论 T1 噪音过滤"),
+            feishu_row("f1", 10_000, "群聊 - 飞书", "先修 target_key"),
+            feishu_row("f2", 20_000, "群聊 - 飞书", "再修 anchor"),
+        ];
+        let card = build_slot_card(0, &rows, 0, 10_000);
+
+        assert_eq!(runs(&card).len(), 1, "noise must not fork the run");
+        assert_eq!(runs(&card)[0].title, "群聊 - 飞书", "run title is the window");
+        assert_eq!(
+            card.theme_key.as_deref(),
+            Some("com.test.feishu|群聊 - 飞书"),
+            "theme_key must not be the avatar blob"
+        );
+        assert!(
+            card.facts.top_documents.is_empty(),
+            "{:?}",
+            card.facts.top_documents
+        );
+        assert!(card.facts.top_urls.is_empty(), "{:?}", card.facts.top_urls);
+        let serialised = serde_json::to_string(&card).expect("card serialises");
+        assert!(
+            !serialised.contains("en-US.html"),
+            "app bundle resource leaked into the card"
+        );
+        assert!(
+            !serialised.contains("native-resource:"),
+            "avatar blob leaked into the card"
+        );
+    }
+
+    #[test]
+    fn a_target_with_only_noisy_candidates_degrades_to_the_app_only_key() {
+        // Empty window title: nothing but the bundle resource and the blob is
+        // left, so identity has to fall back to the application.
+        let card = build_slot_card(0, &[feishu_row("f0", 0, "", "讨论")], 0, 10_000);
+        assert_eq!(card.theme_key.as_deref(), Some("com.test.feishu|"));
+        assert!(runs(&card)[0].title.is_empty(), "no label to invent");
+        assert!(card.facts.top_documents.is_empty());
+        assert!(card.facts.top_urls.is_empty());
+    }
+
+    /// The old rule — the slot's opening frame — lands on the frame where a
+    /// freshly focused window dumped its whole sidebar. The middle frame of
+    /// the longest run is what the slot actually looked like, and it is not
+    /// the run's text-richest probe frame either.
+    #[test]
+    fn the_thumbnail_anchor_is_the_middle_frame_of_the_longest_run() {
+        let sidebar_dump = "收件箱\n草稿\n已发送\n星标\n".repeat(40);
+        let mut rows = vec![
+            row("mail-0", 0, "Mail", "收件箱", Some("邮件一")),
+            row("mail-1", 10_000, "Mail", "收件箱", Some("邮件二")),
+        ];
+        // Longest run, in the middle of the slot; its opening frame carries the
+        // one-time dump so it also wins `moment_id`.
+        rows.push(row("code-0", 20_000, "Xcode", "slot.rs", Some(&sidebar_dump)));
+        for (index, at) in [30_000_i64, 40_000, 50_000, 60_000].into_iter().enumerate() {
+            rows.push(row(
+                &format!("code-{}", index + 1),
+                at,
+                "Xcode",
+                "slot.rs",
+                Some(&format!("fn build_{index}")),
+            ));
+        }
+        rows.push(row("safari-0", 70_000, "Safari", "docs.rs", Some("Config")));
+        rows.push(row("safari-1", 80_000, "Safari", "docs.rs", Some("Vault")));
+
+        let card = build_slot_card(0, &rows, 0, 10_000);
+        let timeline = runs(&card);
+        assert_eq!(timeline.len(), 3, "three runs");
+        assert_eq!(
+            timeline[1].moment_id, "code-0",
+            "the run's probe frame is still its text-richest one"
+        );
+        assert_eq!(
+            card.anchor_moment_id.as_deref(),
+            Some("code-2"),
+            "anchor is the middle frame of the longest run, not the opening \
+             frame and not the text-richest one"
+        );
+
+        let summary = assemble_day_summary(
+            "2026-08-17".into(),
+            0,
+            86_400_000,
+            std::slice::from_ref(&card),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            summary.slots[0].anchor_moment_id.as_deref(),
+            Some("code-2"),
+            "the day summary carries the card's anchor through"
+        );
+
+        // A card built without an anchor still gets one: the first moment.
+        let mut legacy = card.clone();
+        legacy.anchor_moment_id = None;
+        let fallback = assemble_day_summary(
+            "2026-08-17".into(),
+            0,
+            86_400_000,
+            std::slice::from_ref(&legacy),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            fallback.slots[0].anchor_moment_id.as_deref(),
+            Some("mail-0")
+        );
+
+        // Equal-length runs resolve to the earliest, deterministically.
+        let tied = build_slot_card(
+            0,
+            &[
+                row("a-0", 0, "Mail", "收件箱", Some("one")),
+                row("a-1", 10_000, "Mail", "收件箱", Some("two")),
+                row("b-0", 20_000, "Safari", "docs.rs", Some("three")),
+                row("b-1", 30_000, "Safari", "docs.rs", Some("four")),
+            ],
+            0,
+            10_000,
+        );
+        assert_eq!(tied.anchor_moment_id.as_deref(), Some("a-1"));
+    }
+
     #[test]
     fn url_keeps_query_and_collapses_opaque_segments() {
         let shortened = shorten_place(
@@ -2496,9 +2731,13 @@ mod tests {
             summary.slots[1].title.as_deref(),
             Some("GOP header still stuck")
         );
-        assert!(
-            summary.slots[0].anchor_moment_id.is_some(),
-            "a slot with captures must expose its opening frame as the thumbnail anchor"
+        // Runs are Xcode (a, b) then Safari (c); the Xcode run is the longer
+        // one, so its middle frame — `b`, not the slot's opening frame `a` —
+        // is the anchor.
+        assert_eq!(
+            summary.slots[0].anchor_moment_id.as_deref(),
+            Some("b"),
+            "a slot with captures must anchor on the middle frame of its longest run"
         );
         assert_eq!(summary.slots[1].state, SlotSummaryState::Done);
         assert_eq!(summary.slots[1].category.as_deref(), Some("coding"));
