@@ -10,6 +10,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - Pull-based: Rust decides timing. stdin commands `capture_screen` (requires `request_id`) and `stop` (main.swift:962-990); stdout carries JSON-line `Event`s only (`ready`/`artifact`/`warning`/`failed`/`stopped`); logs go to stderr.
 - Output dir is `0700`, artifact files `0600`; the shim excludes AfterRay's own windows from capture.
 - Screenshot and Accessibility evidence share one `ForegroundCaptureContext`. AX selects the frontmost app and its focused window (`main window` fallback); the screenshot refreshes `SCShareableContent` and selects the display with the largest intersection with that window's global frame, falling back to `CGMainDisplayID` when AX has no usable frame. PID, window id, and frame are rechecked before and after the screenshot, and a changed context drops the whole tick. The continuous audio stream remains separate and is never duplicated or restarted as focus crosses displays.
+- The AX walk stubs the `AXMenuBar` subtree (menus were 80–90% of walked nodes in native apps; no consumer reads them) and is time-boxed: 100ms per AX call process-wide plus a 500ms whole-walk deadline that sets `truncated` like the 20k node cap.
 - The shim exists because the Rust workspace denies `unsafe_code` and ScreenCaptureKit delegates need unsafe FFI. Build it with `make capture-shim`.
 
 ## 2. Shim process ownership — afterray-platform-macos

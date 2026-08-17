@@ -290,6 +290,13 @@ private struct AccessibilityDigest: Encodable {
 
 private final class AccessibilityTreeEncoder {
     private let maximumNodes = 20_000
+    /// Whole-walk wall-clock budget. Every AX attribute read is synchronous
+    /// IPC into the target app's main thread; without a deadline one busy
+    /// Electron process can stall a tick for seconds while also lagging the
+    /// very app the user is working in. Overrun sets `truncated`, exactly
+    /// like the node cap. The per-call bound that makes this deadline real
+    /// is the process-global messaging timeout set at startup.
+    private let walkDeadline = ContinuousClock.now + .milliseconds(500)
     private var nodeCount = 0
     private var visited = Set<CFHashCode>()
     private(set) var truncated = false
@@ -307,7 +314,10 @@ private final class AccessibilityTreeEncoder {
     func encode(_ element: AXUIElement) -> AccessibilityNode {
         nodeCount += 1
         let identity = CFHash(element)
-        guard nodeCount <= maximumNodes, visited.insert(identity).inserted else {
+        guard nodeCount <= maximumNodes,
+            ContinuousClock.now < walkDeadline,
+            visited.insert(identity).inserted
+        else {
             truncated = true
             return AccessibilityNode(
                 role: string(element, kAXRoleAttribute),
@@ -326,6 +336,29 @@ private final class AccessibilityTreeEncoder {
 
         let role = string(element, kAXRoleAttribute)
         let subrole = string(element, kAXSubroleAttribute)
+        // The menu bar is most of the walk in native apps (measured: 205 of
+        // 257 nodes in Ghostty, 245 of 276 in Zed, ~170 of 1115 in Feishu)
+        // and no consumer reads it: digests collect text roles only, the
+        // store's text extraction treats menus as chrome, and exclusion
+        // checks use app identity. Stub it instead of descending. This is
+        // deliberately not `truncated` — nothing of value was cut. An open
+        // menu-bar menu is skipped with it; a 10s heartbeat rarely lands on
+        // one and menu labels are chrome either way.
+        if role == "AXMenuBar" {
+            return AccessibilityNode(
+                role: role,
+                subrole: subrole,
+                title: nil,
+                nodeDescription: nil,
+                identifier: nil,
+                value: nil,
+                valueRedacted: false,
+                url: nil,
+                document: nil,
+                frame: nil,
+                children: []
+            )
+        }
         let secure = subrole == "AXSecureTextField"
         let title = string(element, kAXTitleAttribute)
         let nodeDescription = string(element, kAXDescriptionAttribute)
@@ -1360,6 +1393,15 @@ private enum AfterRayCaptureShim {
                 withIntermediateDirectories: true
             )
             try hardenPrivateDirectory(options.outputDirectory)
+            // Bound every AX attribute read process-wide. Each read is
+            // synchronous IPC into the target app; the system default is 6s
+            // per call, so one wedged app could stall a tick — and the paired
+            // screenshot behind it — essentially unboundedly. 100ms per call
+            // is what makes AccessibilityTreeEncoder's 500ms walk budget
+            // real. Known cost: the very first snapshot of a freshly
+            // launched Electron app can time out while it builds its AX
+            // tree, degrading that one tick; the next heartbeat recovers.
+            AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.1)
             log("starting recordAudio=\(options.recordAudio) output=\(options.outputDirectory.path)")
             log("requesting SCShareableContent")
             let content = try await SCShareableContent.excludingDesktopWindows(
