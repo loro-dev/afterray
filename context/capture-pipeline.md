@@ -16,7 +16,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 ## 2. Shim process ownership — afterray-platform-macos
 
 - `crates/afterray-platform-macos/src/lib.rs:151 MacOsCaptureBackend` spawns and owns the shim child: writes commands to stdin, reads the `CaptureEvent` stream from stdout, bounded channel (128) for backpressure, single-consumer `next_event` (lib.rs:285).
-- `ArtifactKind` (lib.rs:108): `screen | system_audio | microphone | accessibility`.
+- `ArtifactKind` (lib.rs:108): `screen | system_audio | microphone | accessibility | accessibility_edge`.
 - `power.rs` — `on_ac_power` / `battery_fraction` / `seconds_since_user_input` / `load_per_core` probes; these feed the daemon's fail-closed gates (T2, GOP packing). They return `None` on failure, never a guess.
 - This is the only workspace crate allowed `#![allow(unsafe_code)]`.
 
@@ -30,6 +30,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 - Screen exclusions (bundle id / URL domain) are enforced **after** the screenshot lands, by deleting the stored moment (`main.rs:1956` → `delete_excluded_moment` → `delete_moment_and_artifacts`, store lib.rs:2064) — only the AX snapshot carries the URL. Keep the delete-after-capture ordering. The delete is logged and retried once; an AX snapshot that will not parse takes the same path, since an unnamed app cannot be checked.
 - **Audio exclusions cannot work that way** — a finished five-minute `m4a` cannot be sliced — so the bundle list is pushed to the shim (`push_audio_exclusions`, main.rs:1537 → `MacOsCaptureBackend::set_excluded_bundle_ids`) and the shim holds every sample until a foreground check vouches for the moment it arrived, dropping the rest (`ExcludedAudioGate`, main.swift:901). Audio is therefore never written and later cut — nothing unvouched-for reaches a file.
 - Input events (`input_events` batches from the shim's listen-only tap) are persisted via `insert_input_events` into the `input_events` table — 48h retention (`prune_input_events`, run beside `enforce_retention`), cascaded by `delete_history`.
+- R3 edge snapshots (`accessibility_edge`) are AX-only and **unpaired**: no moment, no thumbnail, no OCR — `edge_snapshot_identity` fails them closed when they name no app, then `insert_edge_snapshot` stores tree + row with the events' own 48h life ([acts-join](acts-join.md)).
 - The pairing is load-bearing: the daemon evaluates exclusions **only** in the accessibility branch, so the shim must never emit a screen artifact without one (`main.swift:1157`).
 - Every sync `Vault` call from async code goes through `run_store` (`afterrayd` main, a `spawn_blocking` wrapper). Blocking a tokio worker on SQLite/encryption has historically frozen socket accepts and chat streams. The daemon also oversizes its Tokio worker pool (`2 × cores`, min 8) so UI accepts stay free under load.
 

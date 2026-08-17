@@ -109,6 +109,30 @@ overlap), never per event — splitting a stretch across two rows would undo the
 hysteresis. Timeline rows themselves are still cut by `target_key`; re-cutting
 the timeline by scope is later work.
 
+## R3 edge frames
+
+The 10s heartbeat misses whatever a person only looked at *between* two ticks —
+stepping into a conversation for eight seconds and leaving. R3 fills that hole:
+the shim walks the window a trigger landed in (frontmost-app change or a click,
+after a 500ms settle any further input re-arms, bucketed to ≥5s apart and ≤6 a
+minute) and emits it as an unpaired `accessibility_edge` artifact. **Never a
+screenshot** — an event-driven frame outliving its events would keep exposing
+interaction instants after the record of the interaction was erased, which is
+also why `edge_snapshots` share `INPUT_EVENT_RETENTION_MS`.
+
+In the join (`Vault::edge_frames_between` → `slot::EdgeFrame`) an edge tree is
+**text and only text**: its lines go to the run whose span contains it,
+partitioned engaged/peripheral by its own `join_frame`, and it contributes no
+`moment_id`, no anchor, no OCR evidence, and no `facts` count — every one of
+those answers "which frames does this card stand on", and an edge tree is not
+one. Pinned by `an_edge_tree_changes_no_frame_facts_and_no_acts`.
+
+Three deliberate limits: edge trees do **not** write resolved scopes back onto
+the events (run splitting segments on those, and R3 widens what a run shows
+rather than re-cutting the runs); a tree landing in a capture gap belongs to no
+run and is dropped, never attached to the nearest one; and they are gated on the
+event stream exactly like the partition, so invariant 1 below covers them too.
+
 ## Signal — `unavailable` is not idle
 
 The daemon turns shim warnings `input_tap_stalled` / `input_tap_unavailable`

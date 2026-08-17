@@ -74,7 +74,7 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 | 1 | shim 事件流：listen-only tap、burst/命令键/点击/滚动 coalesce、现场元素解析、活性对账 | ✅ 2026-08-17（运行时行为待签名 dev 实例验证） |
 | 2 | store：`input_events` 表（48h、`delete_history` 级联）+ daemon 持久化。物化移入阶段 3（acts 的形状在那里才定义） | ✅ 2026-08-17 |
 | 3 | T1 重组：acts / run 切分 / engaged-peripheral / not_engaged / 封口物化 | ✅ 2026-08-17（代码落点见 [acts-join](../context/acts-join.md)；fail-open 逐字节钉死，未在真实 vault 上跑过回归语料——那是阶段 5） |
-| 4 | R3 边沿快照 | |
+| 4 | R3 边沿快照 | ✅ 2026-08-18（偏差见下；shim 运行时行为待签名 dev 实例验证） |
 | 5 | 回归：≥20 slot（IM 1:1 / 群 / triage / 编辑器 / 终端），指标 = thread 命中率、幻觉会话数、focus precision（基线 33%） | |
 | 独立 | theme_key/target_key 噪音修复、anchor 帧改选（首帧实测是噪音最集中的一帧） | |
 
@@ -142,6 +142,18 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 - **daemon 导入**：exclusion 判定与 accessibility 分支完全一致（解析不了 → 删文件，fail-closed）；通过后存为 purpose `edge-ax` 的加密 artifact + 新表 `edge_snapshots(id, captured_at_ms, artifact_id)` 一行。**不建 moment、不出缩略图、不跑 OCR。**
 - **store**：`SCHEMA_VERSION` 22 → 23（`edge_snapshots` 表 + 索引）。保留期 **48h 与事件同寿**（`prune_input_events` 同点执行，连带删除 artifact 文件）；`delete_history` 级联（隐私不变量第四层）。`slot_card()` 的 acts join 把落在 slot 内的 edge 树作为**额外帧**参与 engaged/peripheral partition 与文本抽取——仅此而已，不参与 anchor/缩略图/OCR 证据。
 - **测试**：导入路径（exclusion fail-closed / 正常入库）、48h prune 连带 artifact 删除、级联、join 纳入 edge 帧；IO 测试过 `make test-repeat N=10` ≥5 连绿。shim 侧去抖/令牌桶逻辑提成可单测的纯函数为佳，做不到则如实报告未验证面。
+
+#### 阶段 4 实现偏差（2026-08-18 落地时的实际取舍）
+
+计划里已记的两处 v1 简化照原样落地（走树范围 = 触发元素所在 AXWindow，focused window 兜底；不做负载/电池降级开关）。此外：
+
+1. **已知浏览器一律不取边沿快照**。心跳路径的隐私浏览判定要一次 async automation 探针（osascript，1s 超时）加一次 chrome-only 预走树；两者都塞不进 1 秒一跳的 worker tick。取"不拍"而不是"少判一步"——浏览器仍有心跳覆盖。落点：`captureEdgeSnapshot` 的 `isKnownBrowser` 早退。
+2. **导入侧比 accessibility 分支更严一格**：`edge_snapshot_identity` 对"能解析但没写 bundle identifier"的快照也判为不可入库。exclusion 列表按 bundle 键，没写就无从判断；心跳分支有一张已落盘的截图要处置，边沿快照丢了不亏——下一个触发只隔一次交互。
+3. **artifact 没有 purpose 列**，`edge-ax` 因此挂在 content type 的参数上（`EDGE_SNAPSHOT_CONTENT_TYPE`，常量而非从事件抄来的值——AAD 绑 content type，存读不同拼法即无法解密）。
+4. **edge 帧不回写事件的 scope**：run 切分按 scope 分段，R3 的职责是把某个 run 展示的文本补全，不是重切 run。落在采集空洞（capture gap）里的 edge 树不属于任何 run，直接丢弃——挂到最近的 run 上等于声称那扇窗在没有采集的那段时间在屏幕上。
+5. **edge 帧不进 `not_engaged`**：卡片级"可见但全程无输入的区域"仍只由心跳帧的 join 得出。
+6. edge 帧的文本**不过** `AX_TEXT_MIN_CHARS` 门槛（那道门是在一帧的 AX 文本与 OCR 之间做选择，edge 树没有 OCR 可选）；一个 run 内的顺序是"先本 run 的帧、再 edge 树"，跨 run 的时序不变。
+7. **shim 侧去抖/令牌桶已提成可单测纯函数**（`EdgeSnapshotPacing`，在 `AfterRayCapturePolicy` 目标里，6 个 XCTest）。真正未验证面：tap 触发到落盘的整条运行时链路，需签名 dev 实例。
 
 ### 独立修复 — T1 噪音（afterray-store/slot.rs）
 
