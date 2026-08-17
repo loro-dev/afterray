@@ -84,7 +84,7 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 
 ### 阶段 2 — events 持久化（afterray-store + afterrayd）
 
-- `SCHEMA_VERSION` 21 → 22，新增 `migrate` 步骤：
+- `SCHEMA_VERSION` +1，新增 `migrate` 步骤（落地时为 22 → 23：main 的 slot 时长设置先占了 22）：
 
   ```sql
   CREATE TABLE IF NOT EXISTS input_events (
@@ -140,7 +140,7 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 - **触发（shim `InputEventMonitor` worker）**：候选 = 前台 bundle 变化，或 click 事件。settle 去抖 500ms（新输入到达则重新计时——绝不在交互中走树）；令牌桶 ≥5s 间隔、≤6/min。v1 简化两处（记为偏差）：① 走树范围 = 触发元素所在的 **AXWindow**（focused window 兜底），不是 engaged 子树——窗口是其超集，shim 侧无需几何逻辑，菜单跳过 + 时间盒照常生效；② 负载/电池降级暂不做 shim 侧开关，令牌桶已把上界钉死（≤6/min × ~窗口级树），降级钩子留给后续。
 - **发射**：`ArtifactKind` 新增 `accessibility_edge`（Swift + Rust 两侧），照常走 artifact 事件；**绝不触发截图**（事件驱动截图的时序泄漏论证仍然成立）。
 - **daemon 导入**：exclusion 判定与 accessibility 分支完全一致（解析不了 → 删文件，fail-closed）；通过后存为 purpose `edge-ax` 的加密 artifact + 新表 `edge_snapshots(id, captured_at_ms, artifact_id)` 一行。**不建 moment、不出缩略图、不跑 OCR。**
-- **store**：`SCHEMA_VERSION` 22 → 23（`edge_snapshots` 表 + 索引）。保留期 **48h 与事件同寿**（`prune_input_events` 同点执行，连带删除 artifact 文件）；`delete_history` 级联（隐私不变量第四层）。`slot_card()` 的 acts join 把落在 slot 内的 edge 树作为**额外帧**参与 engaged/peripheral partition 与文本抽取——仅此而已，不参与 anchor/缩略图/OCR 证据。
+- **store**：`SCHEMA_VERSION` +1（落地时 23 → 24）（`edge_snapshots` 表 + 索引）。保留期 **48h 与事件同寿**（`prune_input_events` 同点执行，连带删除 artifact 文件）；`delete_history` 级联（隐私不变量第四层）。`slot_card()` 的 acts join 把落在 slot 内的 edge 树作为**额外帧**参与 engaged/peripheral partition 与文本抽取——仅此而已，不参与 anchor/缩略图/OCR 证据。
 - **测试**：导入路径（exclusion fail-closed / 正常入库）、48h prune 连带 artifact 删除、级联、join 纳入 edge 帧；IO 测试过 `make test-repeat N=10` ≥5 连绿。shim 侧去抖/令牌桶逻辑提成可单测的纯函数为佳，做不到则如实报告未验证面。
 
 #### 阶段 4 实现偏差（2026-08-18 落地时的实际取舍）

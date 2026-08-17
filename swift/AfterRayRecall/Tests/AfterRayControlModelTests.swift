@@ -215,6 +215,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
         llmModel: String?,
         llmApiKey _: String?,
         storageLimitBytes: UInt64?,
+        summarySlotMinutes: UInt32?,
         uiLanguage: String?,
         summaryLanguage: String?,
         cliEvidenceAccess _: Bool?
@@ -225,6 +226,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
             recordAudio: recordAudio ?? true,
             captureIntervalSeconds: 10,
             storageLimitBytes: storageLimitBytes ?? AppSettings.defaultStorageLimitBytes,
+            summarySlotMinutes: summarySlotMinutes ?? AppSettings.defaultSummarySlotMinutes,
             llmProvider: llmProvider ?? .mlxLocal,
             llmBaseUrl: llmBaseUrl ?? "",
             llmModel: llmModel ?? "",

@@ -222,6 +222,7 @@ mod tests {
                 ui_language: None,
                 summary_language: None,
                 storage_limit_bytes: None,
+                summary_slot_minutes: None,
                 excluded_bundle_ids: None,
                 excluded_domains: None,
                 llm_provider: None,

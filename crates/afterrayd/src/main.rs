@@ -1046,6 +1046,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             ui_language,
             summary_language,
             storage_limit_bytes,
+            summary_slot_minutes,
             excluded_bundle_ids,
             excluded_domains,
             llm_provider,
@@ -1062,6 +1063,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     ui_language,
                     summary_language,
                     storage_limit_bytes,
+                    summary_slot_minutes,
                     excluded_bundle_ids,
                     excluded_domains,
                     llm_provider,
@@ -1373,6 +1375,11 @@ fn current_settings(state: &AppState) -> AppSettings {
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
         storage_limit_bytes: state.store.storage_limit_bytes(),
+        // Read from the vault, not `settings.json`: the geometry history lives
+        // beside the cards it describes, so there is one source of truth even
+        // if the two files ever disagree.
+        summary_slot_minutes: summary_slot_minutes(state),
+        summary_slot_minutes_options: afterray_protocol::summary_slot_minutes_options(),
         excluded_bundle_ids: state
             .excluded_bundle_ids
             .lock()
@@ -1407,6 +1414,15 @@ fn current_settings(state: &AppState) -> AppSettings {
             .unwrap_or_default(),
         cli_evidence_until_ms: cli_evidence_until_ms(state),
     }
+}
+
+/// The slot length currently in force, in whole minutes. Rounded up so a
+/// geometry the daemon cannot name still renders as *something* in the picker
+/// rather than as `0`.
+fn summary_slot_minutes(state: &AppState) -> u32 {
+    u32::try_from(state.store.summary_slot_duration_ms().div_euclid(60_000))
+        .unwrap_or(afterray_protocol::DEFAULT_SUMMARY_SLOT_MINUTES)
+        .max(1)
 }
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
@@ -1473,6 +1489,7 @@ struct SettingsPatch {
     ui_language: Option<String>,
     summary_language: Option<String>,
     storage_limit_bytes: Option<u64>,
+    summary_slot_minutes: Option<u32>,
     excluded_bundle_ids: Option<Vec<String>>,
     excluded_domains: Option<Vec<String>>,
     llm_provider: Option<LlmProvider>,
@@ -1489,6 +1506,7 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         ui_language,
         summary_language,
         storage_limit_bytes,
+        summary_slot_minutes,
         excluded_bundle_ids,
         excluded_domains,
         llm_provider,
@@ -1557,6 +1575,25 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
             rollback.storage_limit_bytes = previous;
             let _ = save_persisted_settings(&state.data_dir, &rollback);
             return Response::failure(format!("could not apply storage limit: {error}"));
+        }
+    }
+    if let Some(minutes) = summary_slot_minutes {
+        let duration_ms = i64::from(minutes).saturating_mul(60_000);
+        let store = Arc::clone(state);
+        let applied = tokio::task::spawn_blocking(move || {
+            store
+                .store
+                .set_summary_slot_duration_ms(duration_ms, now_ms())
+        })
+        .await;
+        match applied {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Response::failure(format!("could not change the summary length: {error}"));
+            }
+            Err(error) => {
+                return Response::failure(format!("could not change the summary length: {error}"));
+            }
         }
     }
     if let Some(enabled) = record_audio {
@@ -4218,6 +4255,31 @@ mod tests {
                 Some("https://example.com/x".to_owned())
             )),
             "the URL must reach the domain exclusion check"
+        );
+    }
+
+    /// The picker's list and the vault's accepted lengths are declared in two
+    /// crates that cannot see each other — the protocol must not depend on the
+    /// vault. This is the seam where they are checked to agree; without it the
+    /// app can offer a length every save then rejects.
+    #[test]
+    fn every_offered_summary_length_is_one_the_vault_accepts() {
+        let offered = afterray_protocol::summary_slot_minutes_options();
+        for minutes in &offered {
+            assert!(
+                afterray_store::slot_duration_ms_for_minutes(i64::from(*minutes)).is_some(),
+                "the settings UI offers {minutes} minutes, which the vault rejects"
+            );
+        }
+        let accepted: Vec<u32> = afterray_store::SLOT_DURATION_CHOICES_MINUTES
+            .iter()
+            .map(|minutes| u32::try_from(*minutes).expect("positive minute count"))
+            .collect();
+        assert_eq!(offered, accepted);
+        assert!(offered.contains(&afterray_protocol::DEFAULT_SUMMARY_SLOT_MINUTES));
+        assert_eq!(
+            i64::from(afterray_protocol::DEFAULT_SUMMARY_SLOT_MINUTES) * 60_000,
+            afterray_store::CURRENT_SLOT_DURATION_MS
         );
     }
 
