@@ -1,6 +1,6 @@
 # 输入事件与 T1 acts 重组计划
 
-> 状态：已批准（2026-08-17 拍板），实施中。
+> 状态：已批准（2026-08-17 拍板）；阶段 0–4 已落地（PR #41）。**部分被 [`event-capture-v2-plan.md`](./event-capture-v2-plan.md) 取代（2026-08-18）**：R3 边沿快照被 keyframe 策略吸收；acts 的 typing 布尔方案被 `text_input.value` 取代；CAP-005 击键禁令在本地信任模型下取消。
 > 关系：修订 [`slot-summaries-and-ax-pipeline.md`](./slot-summaries-and-ax-pipeline.md) §7 的若干"已决定"条目（本文为准，修订处已回改）；实现落点见文末阶段表。
 > 起因：IM 类应用（飞书等）的 T1 卡片把侧边栏噪音当成用户行为 —— 实测 2026-08-17 15:20 slot 的 prompt 预算 67% 花在用户从未触碰的会话列表上，T2 卡片写成 "multi-group scan"，真实的 1:1 对话一字未提。
 
