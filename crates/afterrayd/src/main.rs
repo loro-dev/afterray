@@ -31,8 +31,8 @@ use afterray_protocol::{
     redact_cli_response_data,
 };
 use afterray_store::{
-    InputEventRow, LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault,
-    VaultConfig,
+    AsrHealth, InputEventRow, LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState,
+    StoreError, Vault, VaultConfig,
 };
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -3366,37 +3366,266 @@ const T2_MAX_ATTEMPTS: u32 = 3;
 /// gradually instead of monopolising the model for minutes at a time.
 const T2_PER_TICK: usize = 2;
 
+/// The longest a summary will wait for a transcript that has not arrived.
+///
+/// Measured, not guessed: on a loaded machine the ASR queue reached ten jobs —
+/// about fifty minutes of audio — behind a summariser sweeping every five
+/// minutes. So a backlog *can* outlive any cap worth having, which is the
+/// whole reason there is one. Past half an hour the honest thing is a card
+/// that arrives saying the transcript was unavailable, rather than a card that
+/// never arrives at all; the user cannot read a summary that is still waiting.
+const ASR_WAIT_CAP_MS: i64 = 30 * 60 * 1000;
+
+/// The wall-clock backstop on "ASR is alive", and *only* a backstop.
+///
+/// Liveness is decided by comparing the last success against the last failure,
+/// never against the clock alone: a machine that slept eight hours wakes with
+/// an eight-hour-old success and a perfectly healthy worker, and a laptop shut
+/// on Friday has a three-day-old one on Monday morning. Judging those stale
+/// would drop the wait exactly when the user's first meeting of the week needs
+/// it.
+///
+/// So this catches only the case no other branch can see: a worker that
+/// stopped succeeding without ever recording a failure (nothing claims, so
+/// nothing fails) — a model file deleted, a runtime that no longer starts.
+/// A week is deliberately generous, because the asymmetry is: too generous
+/// costs at most one [`ASR_WAIT_CAP_MS`] delay, too strict costs a card that
+/// is permanently missing its transcript.
+const ASR_ALIVE_STALENESS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Why a slot was summarised without waiting for its transcript.
+///
+/// Each variant is a different way ASR can fail to arrive, and each is named
+/// because the alternative — folding them into one "not waiting" — is what
+/// makes an unconditional wait look reasonable right up until the machine
+/// where the model was never downloaded produces cards that never come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsrProceed {
+    /// Nothing in this window is owed a transcript (including: no audio).
+    NoTranscriptPending,
+    /// Waited long enough. The card goes out honestly incomplete.
+    CapElapsed,
+    /// Transcription never once succeeded on this vault: cold start, model
+    /// absent, worker that cannot run.
+    NeverSucceeded,
+    /// The most recent thing ASR did was fail.
+    FailingNotSucceeding,
+    /// It last succeeded so long ago that "alive" is no longer a claim the
+    /// vault supports.
+    SuccessTooStale,
+    /// Every segment still owed a transcript has run its backoff out to
+    /// saturation; retries continue, but not on a timescale a card can wait for.
+    AllPendingExhausted,
+}
+
+impl AsrProceed {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::NoTranscriptPending => "no transcript pending",
+            Self::CapElapsed => "waited out the ASR cap",
+            Self::NeverSucceeded => "ASR has never succeeded",
+            Self::FailingNotSucceeding => "ASR is failing, not succeeding",
+            Self::SuccessTooStale => "ASR's last success is too old to trust",
+            Self::AllPendingExhausted => "every pending transcript has exhausted its backoff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsrWait {
+    /// Summarise now.
+    Proceed(AsrProceed),
+    /// Skip this slot this round and look again next sweep. Not a state
+    /// change: the slot stays `Degraded`, which is the only state
+    /// [`due_slot_starts`] ever picks back up.
+    Wait,
+}
+
+/// Whether a summary should hold off until this window's audio is transcribed.
+///
+/// The rule the product asked for is "rather two minutes late than a summary
+/// that missed the meeting" — but only while waiting is justified. Waiting
+/// requires all of: something is actually pending, ASR is demonstrably alive
+/// (its last success is more recent than its last failure, one exists at all,
+/// and it is not absurdly old), and the cap has not elapsed. Everything else
+/// proceeds, with a named reason.
+///
+/// Pure: the vault reads happen in the caller so this can be tested against
+/// every shape of a broken ASR without one.
+const fn asr_wait_verdict(
+    health: &AsrHealth,
+    has_untranscribed: bool,
+    slot_end_ms: i64,
+    now_ms: i64,
+) -> AsrWait {
+    if !has_untranscribed {
+        return AsrWait::Proceed(AsrProceed::NoTranscriptPending);
+    }
+    if slot_end_ms.saturating_add(ASR_WAIT_CAP_MS) <= now_ms {
+        return AsrWait::Proceed(AsrProceed::CapElapsed);
+    }
+    // Global counts against a per-slot fact, so `waiting_segments == 0` here
+    // means the two reads raced; that is not evidence of exhaustion.
+    if health.waiting_segments > 0 && health.exhausted_segments >= health.waiting_segments {
+        return AsrWait::Proceed(AsrProceed::AllPendingExhausted);
+    }
+    let Some(last_success_ms) = health.last_success_ms else {
+        return AsrWait::Proceed(AsrProceed::NeverSucceeded);
+    };
+    if let Some(last_failure_ms) = health.last_failure_ms
+        && last_failure_ms > last_success_ms
+    {
+        return AsrWait::Proceed(AsrProceed::FailingNotSucceeding);
+    }
+    if now_ms.saturating_sub(last_success_ms) > ASR_ALIVE_STALENESS_MS {
+        return AsrWait::Proceed(AsrProceed::SuccessTooStale);
+    }
+    AsrWait::Wait
+}
+
 /// Every occupied slot that T1 marked ready, has closed and settled, and has no
 /// T2 card yet — oldest first, so a backlog fills in the order it happened.
+///
+/// No ASR gate: this is the list of slots that *want* summarising, which is
+/// what the backlog count reports and what `slot backfill` works through. The
+/// sweeper takes [`slots_ready_for_t2`] instead.
 fn slots_awaiting_t2(
     store: &Vault,
     interval_ms: i64,
     now: i64,
     lookback_days: i64,
 ) -> Vec<i64> {
+    slot_windows_awaiting_t2(store, interval_ms, now, lookback_days)
+        .into_iter()
+        .map(|(slot_start_ms, _)| slot_start_ms)
+        .collect()
+}
+
+/// The same walk, keeping each slot's end — the ASR gate needs it to know how
+/// long this particular card has already been waiting.
+fn slot_windows_awaiting_t2(
+    store: &Vault,
+    interval_ms: i64,
+    now: i64,
+    lookback_days: i64,
+) -> Vec<(i64, i64)> {
     let mut due = Vec::new();
     let mut day_ms = now;
     for _ in 0..=lookback_days.max(0) {
         let Ok(summary) = store.day_summary(day_ms, interval_ms) else {
             continue;
         };
-        due.extend(due_slot_starts(&summary.slots, now));
+        due.extend(due_slot_windows(&summary.slots, now));
         day_ms = summary.day_start_ms.saturating_sub(1);
     }
     due.sort_unstable();
-    due.dedup();
+    due.dedup_by_key(|(slot_start_ms, _)| *slot_start_ms);
     due
 }
 
-/// The selection rule on its own, so the two things that make it wrong — the
-/// state filter and the settle window — can be tested without a vault.
-fn due_slot_starts(slots: &[afterray_store::DaySlot], now: i64) -> Vec<i64> {
+/// The automatic sweeper's list: due slots, minus the ones whose transcript is
+/// still worth waiting for.
+///
+/// Blocking, and it must stay that way — every call here is a synchronous
+/// `Vault` read, so async callers reach it through `run_store`.
+///
+/// The health snapshot is taken once for the whole sweep (ASR is one worker
+/// with one model; its health is not a property of a slot), and doubles as the
+/// short circuit: with nothing anywhere owed a transcript, no slot needs the
+/// per-slot query at all.
+fn slots_ready_for_t2(
+    store: &Vault,
+    interval_ms: i64,
+    now: i64,
+    lookback_days: i64,
+) -> T2Sweep {
+    let windows = slot_windows_awaiting_t2(store, interval_ms, now, lookback_days);
+    if windows.is_empty() {
+        return T2Sweep::default();
+    }
+    // Fail open. A summary held back by a query that will not run is a card
+    // the user never sees, which is worse than the incomplete card this whole
+    // gate exists to prevent.
+    let health = match store.asr_health(now) {
+        Ok(health) => health,
+        Err(error) => {
+            eprintln!("slot.t2 sweeper: could not read ASR health, not waiting: {error}");
+            return T2Sweep {
+                ready: windows
+                    .into_iter()
+                    .map(|(slot_start_ms, _)| slot_start_ms)
+                    .collect(),
+                waiting_on_asr: 0,
+            };
+        }
+    };
+    let mut waiting_on_asr = 0_usize;
+    let ready = windows
+        .into_iter()
+        .filter(|&(slot_start_ms, slot_end_ms)| {
+            let has_untranscribed = health.waiting_segments > 0
+                && store
+                    .has_untranscribed_audio_between(slot_start_ms, slot_end_ms)
+                    .unwrap_or(false);
+            match asr_wait_verdict(&health, has_untranscribed, slot_end_ms, now) {
+                AsrWait::Wait => {
+                    eprintln!(
+                        "slot.t2 sweeper: slot={slot_start_ms} waiting for a transcript \
+                         ({} segment(s) queued, up to {} more)",
+                        health.waiting_segments,
+                        human_duration(Duration::from_millis(
+                            u64::try_from(
+                                slot_end_ms.saturating_add(ASR_WAIT_CAP_MS).saturating_sub(now)
+                            )
+                            .unwrap_or_default()
+                        ))
+                    );
+                    waiting_on_asr += 1;
+                    false
+                }
+                // The line that would have explained the card written before
+                // its transcript existed: why this one is not waiting.
+                AsrWait::Proceed(AsrProceed::NoTranscriptPending) => true,
+                AsrWait::Proceed(reason) => {
+                    eprintln!(
+                        "slot.t2 sweeper: slot={slot_start_ms} summarising without its \
+                         transcript — {}",
+                        reason.reason()
+                    );
+                    true
+                }
+            }
+        })
+        .map(|(slot_start_ms, _)| slot_start_ms)
+        .collect();
+    T2Sweep {
+        ready,
+        waiting_on_asr,
+    }
+}
+
+/// What one sweep found: the slots to summarise now, and how many were held
+/// back for a transcript.
+///
+/// The second number exists so the sweeper does not report a backlog it is
+/// deliberately holding as "drained" and cancel the user's "run now" override
+/// on the strength of it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct T2Sweep {
+    ready: Vec<i64>,
+    waiting_on_asr: usize,
+}
+
+/// The selection rule on its own, so the three things that make it wrong — the
+/// state filter, the settle window, and the ASR gate that reads the end it
+/// returns — can be tested without a vault.
+fn due_slot_windows(slots: &[afterray_store::DaySlot], now: i64) -> Vec<(i64, i64)> {
     slots
         .iter()
         // Degraded is precisely "T1 said summarise me, nothing has".
         .filter(|slot| slot.state == SlotSummaryState::Degraded)
         .filter(|slot| slot.slot_end_ms + T2_SETTLE_MS <= now)
-        .map(|slot| slot.slot_start_ms)
+        .map(|slot| (slot.slot_start_ms, slot.slot_end_ms))
         .collect()
 }
 
@@ -3625,7 +3854,9 @@ async fn fail_claimed_audio(
     attempts: u32,
     error: &str,
 ) {
-    let delay_minutes = 1_i64 << attempts.min(6);
+    // The saturation point is shared with the store: past it the delay stops
+    // growing, which is what `AsrHealth::exhausted_segments` counts.
+    let delay_minutes = 1_i64 << attempts.min(afterray_store::AUDIO_BACKOFF_SATURATION_ATTEMPTS);
     let now = now_ms();
     let next = now.saturating_add(delay_minutes * 60 * 1_000);
     let segment_id = segment_id.to_owned();
@@ -3773,13 +4004,20 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 eprintln!("slot.t2 sweeper: conditions met, resuming");
             }
 
-            let due = slots_awaiting_t2(
-                &state.store,
-                capture_interval_ms(&state),
-                now_ms(),
-                T2_LOOKBACK_DAYS,
-            );
-            if due.is_empty()
+            // Through `run_store`: this walks up to three days of slot cards
+            // and now also asks the ASR queue where it stands, all of it
+            // synchronous vault work that must not run on a tokio worker.
+            let interval_ms = capture_interval_ms(&state);
+            let now = now_ms();
+            let due = run_store(&state, move |s| {
+                slots_ready_for_t2(&s.store, interval_ms, now, T2_LOOKBACK_DAYS)
+            })
+            .await;
+            // A slot held back for its transcript is not a drained backlog:
+            // ending the override here would put the work the user pointed at
+            // back under the usual gates the moment it becomes runnable.
+            if due.ready.is_empty()
+                && due.waiting_on_asr == 0
                 && state
                     .compute
                     .clear_force(afterray_protocol::ComputeWorkload::Summary)
@@ -3790,7 +4028,7 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 eprintln!("slot.t2 sweeper: backlog drained, override ended");
             }
             let mut ran = 0;
-            for slot_start_ms in due {
+            for slot_start_ms in due.ready {
                 // A forced run is draining a backlog the user is watching, so it
                 // works through the lot instead of two slots every five minutes —
                 // and it stops the moment the override expires or is withdrawn,
@@ -5464,6 +5702,15 @@ mod tests {
         }
     }
 
+    /// The selection rule carries each slot's end now (the ASR gate needs it);
+    /// these three tests are about which slots come back, so they read starts.
+    fn due_slot_starts(slots: &[afterray_store::DaySlot], now: i64) -> Vec<i64> {
+        due_slot_windows(slots, now)
+            .into_iter()
+            .map(|(slot_start_ms, _)| slot_start_ms)
+            .collect()
+    }
+
     /// Everything except `Degraded` is either already summarised, deliberately
     /// skipped, or has nothing to summarise. Picking any of them up would mean
     /// re-running the model over work it already did.
@@ -5507,6 +5754,300 @@ mod tests {
         let slots = [day_slot(start, SlotSummaryState::Degraded)];
         let midway = start + afterray_store::SLOT_DURATION_MS / 2;
         assert!(due_slot_starts(&slots, midway).is_empty());
+    }
+
+    /// ASR that transcribed something a minute ago and has failed nothing.
+    fn healthy_asr(now: i64) -> AsrHealth {
+        AsrHealth {
+            last_success_ms: Some(now - 60_000),
+            last_failure_ms: None,
+            waiting_segments: 1,
+            exhausted_segments: 0,
+        }
+    }
+
+    #[test]
+    fn a_slot_with_nothing_pending_never_waits() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), false, slot_end, now),
+            AsrWait::Proceed(AsrProceed::NoTranscriptPending),
+        );
+    }
+
+    /// The whole point: a card that would otherwise say "the transcript was
+    /// unavailable" — permanently, because a written card is never re-run —
+    /// while the transcript was minutes away.
+    #[test]
+    fn a_slot_holds_back_while_a_live_asr_still_owes_it_a_transcript() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), true, slot_end, now),
+            AsrWait::Wait,
+        );
+    }
+
+    /// Freshness is measured against the last *failure*, not the clock. A
+    /// machine that slept eight hours wakes with an eight-hour-old success and
+    /// a perfectly healthy worker; judging that dead would drop the wait on
+    /// exactly the first meeting after the lid opens.
+    #[test]
+    fn sleeping_does_not_make_a_healthy_asr_look_dead() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let slept = AsrHealth {
+            last_success_ms: Some(now - 8 * 60 * 60 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(asr_wait_verdict(&slept, true, slot_end, now), AsrWait::Wait);
+
+        // A long weekend, too — the wall clock is only ever a backstop.
+        let weekend = AsrHealth {
+            last_success_ms: Some(now - 3 * 24 * 60 * 60 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(asr_wait_verdict(&weekend, true, slot_end, now), AsrWait::Wait);
+    }
+
+    /// The failure an unconditional wait would produce: a machine where the
+    /// model was never downloaded would hold every audio-bearing card forever.
+    #[test]
+    fn asr_that_never_succeeded_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let cold = AsrHealth {
+            last_success_ms: None,
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&cold, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::NeverSucceeded),
+        );
+    }
+
+    #[test]
+    fn asr_failing_more_recently_than_it_succeeds_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let broken = AsrHealth {
+            last_success_ms: Some(now - 60 * 60 * 1000),
+            last_failure_ms: Some(now - 30 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&broken, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::FailingNotSucceeding),
+        );
+        // The other order is the ordinary one: a failure, then a recovery.
+        let recovered = AsrHealth {
+            last_success_ms: Some(now - 30 * 1000),
+            last_failure_ms: Some(now - 60 * 60 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(asr_wait_verdict(&recovered, true, slot_end, now), AsrWait::Wait);
+    }
+
+    /// The only case wall-clock staleness can see: a worker that stopped
+    /// succeeding without recording a failure, because nothing claims and so
+    /// nothing fails.
+    #[test]
+    fn an_ancient_success_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let abandoned = AsrHealth {
+            last_success_ms: Some(now - ASR_ALIVE_STALENESS_MS - 1),
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&abandoned, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::SuccessTooStale),
+        );
+    }
+
+    #[test]
+    fn a_pile_that_has_run_its_backoff_out_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let stuck = AsrHealth {
+            waiting_segments: 3,
+            exhausted_segments: 3,
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&stuck, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::AllPendingExhausted),
+        );
+        let partly = AsrHealth {
+            exhausted_segments: 2,
+            ..stuck
+        };
+        assert_eq!(asr_wait_verdict(&partly, true, slot_end, now), AsrWait::Wait);
+    }
+
+    /// Measured: a ten-job backlog is about fifty minutes of audio, so the cap
+    /// is reachable and must expire. Past it the card arrives honestly
+    /// incomplete rather than never arriving at all.
+    #[test]
+    fn the_wait_expires_at_the_cap() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - ASR_WAIT_CAP_MS;
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::CapElapsed),
+        );
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), true, slot_end + 1, now),
+            AsrWait::Wait,
+            "one millisecond inside the cap is still worth waiting for"
+        );
+    }
+
+    /// A vault with real audio in it, end to end: the sweeper holds the slot
+    /// back while its transcript is coming, `slot backfill` does not, and the
+    /// slot stays `Degraded` throughout — waiting is "skip this round", not a
+    /// state transition, and `Degraded` is the only state the sweeper ever
+    /// picks back up.
+    #[test]
+    fn the_sweeper_waits_for_a_transcript_and_backfill_does_not() {
+        let (_directory, vault) = test_vault();
+        let base = 1_786_698_000_000_i64;
+        let session = vault.create_session_sync(base).unwrap();
+        for (index, offset) in [0_i64, 20_000, 40_000].into_iter().enumerate() {
+            let moment = vault
+                .insert_moment(&session.id, base + offset, "image/jpeg", b"screen")
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    &format!("cargo test -p afterrayd, run {index}"),
+                    base + offset,
+                    None,
+                    "test-ocr",
+                    None,
+                )
+                .unwrap();
+        }
+        let interval_ms = 10_000;
+        let settled = base + afterray_store::SLOT_DURATION_MS + T2_SETTLE_MS + 60_000;
+        let windows = slot_windows_awaiting_t2(&vault, interval_ms, settled, 1);
+        assert_eq!(windows.len(), 1, "one degraded slot to summarise");
+        let (slot_start_ms, slot_end_ms) = windows[0];
+
+        // ASR is alive: something transcribed successfully a minute ago.
+        let elsewhere = vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::System,
+                slot_start_ms - 3_600_000,
+                slot_start_ms - 3_500_000,
+                "audio/mp4",
+                b"earlier",
+            )
+            .unwrap();
+        vault
+            .complete_audio_transcription(&elsewhere, "an earlier meeting", "test-asr", settled - 60_000)
+            .unwrap();
+        // …and this slot's own audio has not been transcribed yet.
+        let pending = vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::Microphone,
+                slot_start_ms + 1_000,
+                slot_end_ms - 1_000,
+                "audio/mp4",
+                b"the meeting",
+            )
+            .unwrap();
+
+        let swept = slots_ready_for_t2(&vault, interval_ms, settled, 1);
+        assert!(swept.ready.is_empty(), "the transcript is still coming");
+        assert_eq!(swept.waiting_on_asr, 1);
+        assert_eq!(
+            slots_awaiting_t2(&vault, interval_ms, settled, 1),
+            vec![slot_start_ms],
+            "backfill is an explicit request to fill history and never waits"
+        );
+        let day = vault.day_summary(settled, interval_ms).unwrap();
+        assert_eq!(
+            day.slots
+                .iter()
+                .find(|slot| slot.slot_start_ms == slot_start_ms)
+                .map(|slot| slot.state),
+            Some(SlotSummaryState::Degraded),
+            "waiting is skipping a round, not a state change"
+        );
+
+        // The transcript lands: the slot is swept on the next round.
+        vault
+            .complete_audio_transcription(&pending, "we agreed to ship on Friday", "test-asr", settled)
+            .unwrap();
+        assert_eq!(
+            slots_ready_for_t2(&vault, interval_ms, settled, 1).ready,
+            vec![slot_start_ms],
+        );
+    }
+
+    /// Past the cap the same vault stops waiting — otherwise a machine whose
+    /// ASR is merely slow would go quiet instead of late.
+    #[test]
+    fn the_sweeper_gives_up_on_a_transcript_after_the_cap() {
+        let (_directory, vault) = test_vault();
+        let base = 1_786_698_000_000_i64;
+        let session = vault.create_session_sync(base).unwrap();
+        for (index, offset) in [0_i64, 20_000, 40_000].into_iter().enumerate() {
+            let moment = vault
+                .insert_moment(&session.id, base + offset, "image/jpeg", b"screen")
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    &format!("cargo test -p afterrayd, run {index}"),
+                    base + offset,
+                    None,
+                    "test-ocr",
+                    None,
+                )
+                .unwrap();
+        }
+        let interval_ms = 10_000;
+        let settled = base + afterray_store::SLOT_DURATION_MS + T2_SETTLE_MS + 60_000;
+        let (slot_start_ms, slot_end_ms) = slot_windows_awaiting_t2(&vault, interval_ms, settled, 1)[0];
+        let alive = vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::System,
+                slot_start_ms - 3_600_000,
+                slot_start_ms - 3_500_000,
+                "audio/mp4",
+                b"earlier",
+            )
+            .unwrap();
+        vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::Microphone,
+                slot_start_ms + 1_000,
+                slot_end_ms - 1_000,
+                "audio/mp4",
+                b"the meeting",
+            )
+            .unwrap();
+        let expired = slot_end_ms + ASR_WAIT_CAP_MS;
+        vault
+            .complete_audio_transcription(&alive, "an earlier meeting", "test-asr", expired - 60_000)
+            .unwrap();
+        assert_eq!(
+            slots_ready_for_t2(&vault, interval_ms, expired, 1).ready,
+            vec![slot_start_ms],
+        );
     }
 
     #[test]
