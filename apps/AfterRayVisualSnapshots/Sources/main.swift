@@ -675,9 +675,8 @@ private extension SettingsPreviewModel {
     }
 }
 
-/// The transcript caption with the summary panel open. The panel is the
-/// tallest thing in the bottom stack, so this is where the caption either
-/// stays with the timeline or gets pushed away from it.
+/// The transcript caption with the summary panel open. The caption overlays
+/// the timeline and must not lift the panel when ASR text is present.
 @MainActor
 private var captionScenes: [SnapshotScene] {
     let long = """

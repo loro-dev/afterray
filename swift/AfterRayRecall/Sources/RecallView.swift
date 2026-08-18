@@ -313,53 +313,55 @@ public struct RecallView: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
 
-                // Last thing above the timeline chrome, so the line you heard
-                // stays next to the moment it was heard at. Above the summary
-                // panel it drifted to the top of the screen whenever the panel
-                // was open, which is where a caption reads as unrelated.
-                if !renderedIsLive, selectedMoment?.hasVisibleTranscript == true {
-                    TranscriptCaption(
-                        text: selectedMoment?.transcriptText,
-                        canPlay: selectedMoment?.audioArtifactId != nil,
-                        isPlaying: isAudioPlaying && selectedAudioIsActive,
-                        isBuffering: isAudioBuffering && selectedAudioIsActive,
-                        onToggleAudio: {
-                            if let moment = selectedMoment {
-                                onToggleAudio?(moment)
-                            }
-                        }
-                    )
-                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-                    .padding(.bottom, 12)
+                // Caption floats just above the timeline and does not
+                // participate in this VStack. In-flow it was a full-width
+                // row that lifted DaySummaryPanel whenever ASR was present.
+                VStack(spacing: 0) {
+                    timelineChromeRow
+                        .padding(.bottom, 9)
+
+                    if let searchSession, let thumbnailLoader {
+                        SearchFilmstrip(
+                            session: searchSession,
+                            tuning: tuning,
+                            selectedDate: selectedDate,
+                            isScrubbing: isScrubbing,
+                            thumbnailLoader: thumbnailLoader,
+                            onSelectIndex: { onSelectSearchFrame?($0) },
+                            onViewportWidthChange: { timelineViewportWidth = $0 }
+                        )
+                        .padding(.bottom, 18)
+                    } else {
+                        AppUsageTimeline(
+                            layout: timelineLayout,
+                            playheadMs: renderedPlayheadMs,
+                            isLive: renderedIsLive,
+                            selectedMoment: selectedMoment,
+                            tuning: tuning,
+                            zoom: $timelineZoom,
+                            isZooming: $isZoomingTimeline,
+                            onSelectMs: { selectPlayhead(playheadMs: $0) },
+                            onViewportWidthChange: { timelineViewportWidth = $0 }
+                        )
+                        .padding(.bottom, 18)
+                    }
                 }
-
-                timelineChromeRow
-                    .padding(.bottom, 9)
-
-                if let searchSession, let thumbnailLoader {
-                    SearchFilmstrip(
-                        session: searchSession,
-                        tuning: tuning,
-                        selectedDate: selectedDate,
-                        isScrubbing: isScrubbing,
-                        thumbnailLoader: thumbnailLoader,
-                        onSelectIndex: { onSelectSearchFrame?($0) },
-                        onViewportWidthChange: { timelineViewportWidth = $0 }
-                    )
-                    .padding(.bottom, 18)
-                } else {
-                    AppUsageTimeline(
-                        layout: timelineLayout,
-                        playheadMs: renderedPlayheadMs,
-                        isLive: renderedIsLive,
-                        selectedMoment: selectedMoment,
-                        tuning: tuning,
-                        zoom: $timelineZoom,
-                        isZooming: $isZoomingTimeline,
-                        onSelectMs: { selectPlayhead(playheadMs: $0) },
-                        onViewportWidthChange: { timelineViewportWidth = $0 }
-                    )
-                    .padding(.bottom, 18)
+                .overlay(alignment: .top) {
+                    if !renderedIsLive, selectedMoment?.hasVisibleTranscript == true {
+                        TranscriptCaption(
+                            text: selectedMoment?.transcriptText,
+                            canPlay: selectedMoment?.audioArtifactId != nil,
+                            isPlaying: isAudioPlaying && selectedAudioIsActive,
+                            isBuffering: isAudioBuffering && selectedAudioIsActive,
+                            onToggleAudio: {
+                                if let moment = selectedMoment {
+                                    onToggleAudio?(moment)
+                                }
+                            }
+                        )
+                        .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                        .alignmentGuide(.top) { $0[.bottom] + 12 }
+                    }
                 }
             }
 
@@ -2289,7 +2291,6 @@ private struct TranscriptCaption: View {
                     .strokeBorder(.white.opacity(0.10), lineWidth: 1)
             }
             .shadow(color: .black.opacity(0.28), radius: 12, y: 5)
-            .frame(maxWidth: .infinity)
         }
     }
 }
