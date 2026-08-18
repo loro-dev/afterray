@@ -1490,6 +1490,16 @@ private final class InputEventMonitor: @unchecked Sendable {
     private var burst: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
     private var scroll: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
     private var lastRawMs: Int64 = 0
+    /// Where the user last put the caret with the mouse, and when.
+    ///
+    /// System focus is only as precise as the app chooses to be, and the apps
+    /// this pipeline exists for are the imprecise ones: measured, Feishu
+    /// reports `AXWebArea` for its whole web view and Zed reports `AXWindow`.
+    /// A landing point that coarse drags the run's whole engaged scope up to
+    /// the window, which is the sidebar-noise bug this branch is here to fix.
+    /// So a burst whose focus is not a text-entry element is attributed to the
+    /// last click instead — the click resolved precisely.
+    private var lastClick: (atMs: Int64, target: InputTargetRef)?
     private var timer: DispatchSourceTimer?
     private var livenessTick = 0
     /// R3 pacing (see `EdgeSnapshotPacing`).
@@ -1628,14 +1638,14 @@ private final class InputEventMonitor: @unchecked Sendable {
                 burst?.count += 1
             } else {
                 closeBurst(endedWith: nil)
-                burst = (atMs, atMs, 1, frontmostBundle(), resolveFocusedTarget())
+                burst = (atMs, atMs, 1, frontmostBundle(), resolveTypingTarget(atMs: atMs))
             }
         case .command(let name):
             closeBurst(endedWith: name)
             var record = InputEventRecord(atMs: atMs, kind: "command")
             record.command = name
             record.bundleIdentifier = frontmostBundle()
-            record.target = resolveFocusedTarget()
+            record.target = resolveTypingTarget(atMs: atMs)
             append(record)
         }
     }
@@ -1649,6 +1659,9 @@ private final class InputEventMonitor: @unchecked Sendable {
         record.bundleIdentifier = frontmostBundle()
         let element = elementAt(x: x, y: y)
         record.target = element.map(targetRef(for:))
+        if let target = record.target {
+            lastClick = (atMs, target)
+        }
         // R3: a click is a candidate scope change, and the window it landed in
         // is the walk root. The coordinates are already gone by here.
         if isRecordable(record.bundleIdentifier) {
@@ -1901,9 +1914,19 @@ private final class InputEventMonitor: @unchecked Sendable {
         return pid
     }
 
-    private func resolveFocusedTarget() -> InputTargetRef? {
-        axElement(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute)
+    /// Where a keystroke landed: system focus when the app named something
+    /// typeable, otherwise the last click. The rule itself lives in
+    /// `TypingTarget` so it can be tested without live Accessibility.
+    private func resolveTypingTarget(atMs: Int64) -> InputTargetRef? {
+        let focused = axElement(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute)
             .map(targetRef(for:))
+        let age = lastClick.map { atMs - $0.atMs }
+        switch TypingTarget.choose(focusedRole: focused?.role, lastClickAgeMs: age) {
+        case .focus:
+            return focused
+        case .lastClick:
+            return lastClick?.target ?? focused
+        }
     }
 
     private func targetRef(for element: AXUIElement) -> InputTargetRef {
@@ -2098,6 +2121,12 @@ private enum AfterRayCaptureShim {
                     events.send(.warning(code: "command_failed", message: error.localizedDescription))
                 }
             }
+            // Reached by the `stop` command and by stdin closing under us — a
+            // daemon crash takes the pipe with it. `stop()` is idempotent, and
+            // it is what flushes the events buffered since the last tick, so
+            // running it on both paths is what keeps a crash from silently
+            // eating the last couple of seconds of acts.
+            inputMonitor.stop()
             try await stream.stopCapture()
             callbackQueue.sync { output.finishAudio() }
             events.send(.stopped)

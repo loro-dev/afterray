@@ -4250,6 +4250,25 @@ impl Vault {
 
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
+        // Before the size sweep, and outside its early return: the 48h expiry
+        // of the input streams is a promise about time, not about disk. The
+        // size loop below returns immediately whenever the vault is under its
+        // limit, which is the normal state, so anything placed after it would
+        // effectively never run. Failure here must not stop the size sweep —
+        // a vault over its limit still has to shed frames.
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or_default(),
+        )
+        .unwrap_or(i64::MAX);
+        if let Err(error) = self.prune_input_events(now_ms) {
+            eprintln!("input event retention failed: {error}");
+        }
+        if let Err(error) = self.prune_edge_snapshots(now_ms) {
+            eprintln!("edge snapshot retention failed: {error}");
+        }
         loop {
             let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
             let mut connection = self.connection.lock().unwrap();
@@ -9730,6 +9749,59 @@ mod tests {
     /// Retention is "the last 48 hours", inclusive of its own edge, and a span
     /// is judged by its end: a burst reaching into the window outlives its
     /// start.
+    /// Expiry is a promise about time, so it cannot ride the capture path:
+    /// a vault that is merely opened — recording stopped, nothing imported —
+    /// must still shed anything past the window.
+    #[test]
+    fn opening_a_vault_expires_the_input_streams_without_any_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [31_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            vault
+                .insert_input_events(&[
+                    InputEventRow {
+                        at_ms: now - INPUT_EVENT_RETENTION_MS - 60_000,
+                        end_ms: None,
+                        kind: "click".to_owned(),
+                        count: None,
+                        ended_with: None,
+                        command: None,
+                        bundle_identifier: Some("com.electron.lark".to_owned()),
+                        target_json: None,
+                    },
+                    InputEventRow {
+                        at_ms: now - 60_000,
+                        end_ms: None,
+                        kind: "click".to_owned(),
+                        count: None,
+                        ended_with: None,
+                        command: None,
+                        bundle_identifier: Some("com.electron.lark".to_owned()),
+                        target_json: None,
+                    },
+                ])
+                .unwrap();
+            assert_eq!(vault.input_events_between(0, now + 1).unwrap().len(), 2);
+        }
+        // Reopening runs `enforce_retention`, and nothing else.
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let kept = vault.input_events_between(0, now + 1).unwrap();
+        assert_eq!(kept.len(), 1, "the expired observation outlived its window");
+        assert!(kept[0].at_ms > now - INPUT_EVENT_RETENTION_MS);
+    }
+
     #[test]
     fn prune_input_events_keeps_the_retention_edge() {
         let (_directory, vault) = test_vault(10);

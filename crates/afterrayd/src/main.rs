@@ -2055,6 +2055,34 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
     }
 }
 
+/// Marks a stretch as unobservable rather than empty.
+///
+/// The two fact streams are read very differently when one goes quiet: a slot
+/// with no frames is obviously a hole, but a slot with no input events looks
+/// exactly like a slot where the user sat and read. Whenever the daemon knows
+/// it *lost* observations — the tap died, or a batch failed to land — it says
+/// so in the stream itself, and the join downgrades that stretch to
+/// `unavailable` instead of asserting an engaged scope over it.
+///
+/// Best effort by construction: if this write fails too there is nothing
+/// further to say, and stalling capture over it would trade frames for
+/// bookkeeping.
+async fn record_signal_gap(state: &Arc<AppState>, from_ms: i64, to_ms: i64, reason: &str) {
+    let marker = InputEventRow {
+        at_ms: from_ms,
+        end_ms: (to_ms > from_ms).then_some(to_ms),
+        kind: afterray_store::acts::SIGNAL_GAP_KIND.to_owned(),
+        count: None,
+        ended_with: None,
+        command: Some(reason.to_owned()),
+        bundle_identifier: None,
+        target_json: None,
+    };
+    if let Err(error) = run_store(state, move |s| s.store.insert_input_events(&[marker])).await {
+        eprintln!("input signal gap store failed: {error}");
+    }
+}
+
 async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
     while let Some(event) = state.capture.next_event().await {
         match event {
@@ -2091,21 +2119,8 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
                 // marker rides the same table (the vault stores `kind`
                 // uninterpreted) so the gap arrives in its place in time.
                 if matches!(code.as_str(), "input_tap_stalled" | "input_tap_unavailable") {
-                    let marker = InputEventRow {
-                        at_ms: now_ms(),
-                        end_ms: None,
-                        kind: afterray_store::acts::SIGNAL_GAP_KIND.to_owned(),
-                        count: None,
-                        ended_with: None,
-                        command: Some(code.clone()),
-                        bundle_identifier: None,
-                        target_json: None,
-                    };
-                    if let Err(error) =
-                        run_store(&state, move |s| s.store.insert_input_events(&[marker])).await
-                    {
-                        eprintln!("input signal gap store failed: {error}");
-                    }
+                    let at = now_ms();
+                    record_signal_gap(&state, at, at, &code).await;
                 }
             }
             Ok(CaptureEvent::InputEvents { events, dropped }) => {
@@ -2114,13 +2129,23 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
                 }
                 if !events.is_empty() {
                     let rows: Vec<InputEventRow> = events.iter().map(input_event_row).collect();
-                    // A failed batch is logged and dropped, never retried: the
-                    // events are one of two independent fact streams, and
-                    // stalling capture over the softer one would cost frames.
+                    let span = rows
+                        .first()
+                        .map(|first| (first.at_ms, rows.last().map_or(first.at_ms, |l| l.at_ms)));
+                    // A failed batch is not retried: the events are one of two
+                    // independent fact streams, and stalling capture over the
+                    // softer one would cost frames. But it must not vanish
+                    // quietly either — a stretch with no rows reads as "the
+                    // user did nothing", which is the one thing this pipeline
+                    // may never say by accident. Mark the stretch unobservable
+                    // instead, the same way a dead tap is marked.
                     if let Err(error) =
                         run_store(&state, move |s| s.store.insert_input_events(&rows)).await
                     {
                         eprintln!("capture input events store failed: {error}");
+                        if let Some((from_ms, to_ms)) = span {
+                            record_signal_gap(&state, from_ms, to_ms, "input_events_store_failed").await;
+                        }
                     }
                 }
             }
@@ -2199,18 +2224,6 @@ async fn import_artifact(
                 let moment =
                     s.store
                         .insert_moment(&session_id, started_at_ms, &content_type, &bytes)?;
-                // Event retention rides the frame-retention path `insert_moment`
-                // already runs: one call site, no extra timer, and it can only
-                // fire while capture is actually recording. Its failure must not
-                // fail the frame that was just stored.
-                if let Err(error) = s.store.prune_input_events(now_ms()) {
-                    eprintln!("input event retention failed: {error}");
-                }
-                // Edge snapshots expire with the events that triggered them, so
-                // they expire here, on the same tick, from the same clock.
-                if let Err(error) = s.store.prune_edge_snapshots(now_ms()) {
-                    eprintln!("edge snapshot retention failed: {error}");
-                }
                 Ok::<_, StoreError>(moment)
             })
             .await?;
@@ -3093,6 +3106,20 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
             // battery. Gating it behind T2's conditions would lose acts on
             // exactly the laptops that stay unplugged.
             freeze_slot_acts(&state, now_ms()).await;
+
+            // The same argument, for the other half of the 48h promise: expiry
+            // is a deadline in wall-clock time, so it cannot hang off capture
+            // (which stops when the user pauses) or off the T2 gate (which
+            // waits for power). This tick runs while the daemon is up, whether
+            // or not anything is being recorded.
+            if let Err(error) = run_store(&state, |s| {
+                s.store.prune_input_events(now_ms())?;
+                s.store.prune_edge_snapshots(now_ms())
+            })
+            .await
+            {
+                eprintln!("input stream retention failed: {error}");
+            }
 
             // OCR is on the critical path for the frames still arriving; T2 is
             // not. Yield the queue and pick the backlog up next tick.

@@ -67,3 +67,53 @@ final class EdgeSnapshotPacingTests: XCTestCase {
         XCTAssertTrue(pacing.shouldFire(nowMs: 60_600))
     }
 }
+
+/// Decision 4: a typing burst must not be attributed to a landing point so
+/// coarse that it drags the run's engaged scope up to the whole window.
+final class TypingTargetTests: XCTestCase {
+    func testSpecificFocusIsUsedEvenWithAFreshClick() {
+        XCTAssertEqual(
+            TypingTarget.choose(focusedRole: "AXTextArea", lastClickAgeMs: 10),
+            .focus
+        )
+    }
+
+    /// The measured Electron and Zed cases — the ones this rule exists for.
+    func testCoarseFocusFallsBackToTheLastClick() {
+        for coarse in ["AXWebArea", "AXWindow", "AXGroup", "AXScrollArea"] {
+            XCTAssertEqual(
+                TypingTarget.choose(focusedRole: coarse, lastClickAgeMs: 5_000),
+                .lastClick,
+                "\(coarse) is the app declining to say where the caret is"
+            )
+        }
+    }
+
+    func testNoFocusAtAllFallsBackToTheLastClick() {
+        XCTAssertEqual(TypingTarget.choose(focusedRole: nil, lastClickAgeMs: 0), .lastClick)
+    }
+
+    /// A stale click describes a caret that has since moved; reporting the
+    /// coarse focus honestly is better than asserting a wrong scope.
+    func testAStaleClickIsNotUsed() {
+        XCTAssertEqual(
+            TypingTarget.choose(
+                focusedRole: "AXWebArea",
+                lastClickAgeMs: TypingTarget.lastClickMaxAgeMs + 1
+            ),
+            .focus
+        )
+        XCTAssertEqual(
+            TypingTarget.choose(
+                focusedRole: "AXWebArea",
+                lastClickAgeMs: TypingTarget.lastClickMaxAgeMs
+            ),
+            .lastClick,
+            "the boundary itself is still fresh"
+        )
+    }
+
+    func testKeyboardOnlyUserWithNoClickKeepsFocus() {
+        XCTAssertEqual(TypingTarget.choose(focusedRole: "AXWebArea", lastClickAgeMs: nil), .focus)
+    }
+}
