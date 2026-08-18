@@ -36,6 +36,12 @@ public struct RecallView: View {
     public var playingAudioArtifactID: String?
     public var onReload: (() -> Void)?
     public var onOpenSettings: (() -> Void)?
+    /// Opens the address of a recalled browser frame. The overlay panel sits
+    /// at `.statusBar` level, so the app must lower it before the browser
+    /// comes forward or the new tab opens invisibly behind a full-screen
+    /// overlay. Nil falls back to opening in place, which is right for the
+    /// labs and snapshots — they have no overlay in the way.
+    public var onOpenWebLink: ((URL) -> Void)?
     /// Opens the local-computation dashboard. Nil hides the button, which is
     /// how the Visual Lab renders scenes without a daemon to ask.
     public var onOpenCompute: (() -> Void)?
@@ -114,6 +120,7 @@ public struct RecallView: View {
         playingAudioArtifactID: String? = nil,
         onReload: (() -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil,
+        onOpenWebLink: ((URL) -> Void)? = nil,
         onOpenCompute: (() -> Void)? = nil,
         computeIndicator: ComputeIndicator = .idle,
         recordingState: DaemonRecordingState? = nil,
@@ -148,6 +155,7 @@ public struct RecallView: View {
         self.playingAudioArtifactID = playingAudioArtifactID
         self.onReload = onReload
         self.onOpenSettings = onOpenSettings
+        self.onOpenWebLink = onOpenWebLink
         self.onOpenCompute = onOpenCompute
         self.computeIndicator = computeIndicator
         self.recordingState = recordingState
@@ -566,7 +574,7 @@ public struct RecallView: View {
         // window title, and the chrome cluster must not grow with it.
         HStack(alignment: .top, spacing: RecallGeometry.overlayChromeItemGap) {
             if !renderedIsLive {
-                AppIdentity(moment: selectedMoment)
+                AppIdentity(moment: selectedMoment, onOpenWebLink: onOpenWebLink)
             }
 
             Spacer(minLength: 24)
@@ -1261,6 +1269,7 @@ public func clearRecallDecodedImageCache() {
 
 private struct AppIdentity: View {
     let moment: RecallMoment?
+    var onOpenWebLink: ((URL) -> Void)?
 
     /// The app name alone rarely identifies a frame — a day in one editor is a
     /// dozen different files. The window title is what tells them apart.
@@ -1272,6 +1281,13 @@ private struct AppIdentity: View {
         return title
     }
 
+    /// Set when this frame was a web page we can reopen. It does not replace
+    /// the window title — the title still identifies the frame — it only makes
+    /// that line openable.
+    private var webLink: RecallWebLink? { moment?.webLink }
+
+    private var hasSubline: Bool { webLink != nil || windowTitle != nil }
+
     var body: some View {
         HStack(spacing: 9) {
             ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 24)
@@ -1280,7 +1296,15 @@ private struct AppIdentity: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .lineLimit(1)
-                if let windowTitle {
+                if let webLink {
+                    // A browser can leave the title empty; the address is the
+                    // fallback so the affordance never appears unlabelled.
+                    OpenableTitle(
+                        text: windowTitle ?? webLink.display,
+                        link: webLink,
+                        onOpen: onOpenWebLink
+                    )
+                } else if let windowTitle {
                     Text(windowTitle)
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.62))
@@ -1292,9 +1316,72 @@ private struct AppIdentity: View {
         }
         .padding(.leading, 7)
         .padding(.trailing, 12)
-        .padding(.vertical, windowTitle == nil ? 0 : 6)
+        .padding(.vertical, hasSubline ? 0 : 6)
         .frame(minHeight: RecallGeometry.overlayChromeButtonSize)
         .recallGlass(in: .capsule)
+    }
+}
+
+/// The window title of a recalled browser frame, carrying a link back to the
+/// live page. The title still reads as the title; the underline and the
+/// `arrow.up.right` — the same glyph a chat moment citation uses for "open
+/// this" — are what say it can be followed.
+private struct OpenableTitle: View {
+    let text: String
+    let link: RecallWebLink
+    var onOpen: ((URL) -> Void)?
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button {
+            if let onOpen {
+                onOpen(link.url)
+            } else {
+                NSWorkspace.shared.open(link.url)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(text)
+                    .underline()
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .accessibilityHidden(true)
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(.white.opacity(isHovering ? 0.95 : 0.62))
+            .frame(maxWidth: RecallGeometry.appIdentityTitleMaxWidth, alignment: .leading)
+            // The glyphs are ~11pt in a 40pt capsule, so without this the
+            // clickable region is a sliver of the row it appears to be.
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        // `push`/`pop` rather than `set`, so the overlay's own cursor comes
+        // back when the pointer leaves. Every push must be matched exactly
+        // once or the pointing hand outlives the link: the state guard drops
+        // repeat callbacks, and `onDisappear` covers the two ways the label
+        // goes away *while* hovered — the click hides the overlay, and
+        // travelling to a non-browser frame swaps in the plain title.
+        .onHover { hovering in
+            guard hovering != isHovering else { return }
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .onDisappear {
+            guard isHovering else { return }
+            isHovering = false
+            NSCursor.pop()
+        }
+        // The visible text is normally the page title, so the tooltip is the
+        // one place the address can be read in full before clicking it.
+        .help("Open \(link.url.absoluteString)")
+        .accessibilityLabel("Open \(text) at \(link.display)")
     }
 }
 

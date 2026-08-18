@@ -78,12 +78,15 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
             "The daemon should own storage while the interface stays replaceable.",
             "We can validate this with a real day of recording before adding more product surface.",
         ]
-        let applications = [
-            ("Figma", "com.figma.Desktop"),
-            ("Safari", "com.apple.Safari"),
-            ("Xcode", "com.apple.dt.Xcode"),
-            ("Slack", "com.tinyspeck.slackmacgap"),
-            ("Notion", "notion.id"),
+        // Browser entries carry a URL so the identity capsule's clickable
+        // address is drivable from the labs and snapshots; the rest leave it
+        // nil, which is the window-title path.
+        let applications: [(name: String, bundle: String, url: String?)] = [
+            ("Figma", "com.figma.Desktop", nil),
+            ("Safari", "com.apple.Safari", "https://www.example.com/moments/capture-pipeline?ref=recall"),
+            ("Xcode", "com.apple.dt.Xcode", nil),
+            ("Slack", "com.tinyspeck.slackmacgap", nil),
+            ("Notion", "notion.id", nil),
         ]
         return (0..<count).map { index in
             let app = applications[min(index / 7, applications.count - 1) % applications.count]
@@ -96,8 +99,9 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
                 ocrText: processing && index > count - 4 ? nil : screenCopy[index % screenCopy.count],
                 transcriptText: processing && index > count - 6 ? nil : transcriptCopy[index % transcriptCopy.count],
                 audioArtifactId: index.isMultiple(of: 3) ? "mock://audio/\(index)" : nil,
-                applicationName: app.0,
-                bundleIdentifier: app.1
+                applicationName: app.name,
+                bundleIdentifier: app.bundle,
+                url: app.url
             )
         }
     }
