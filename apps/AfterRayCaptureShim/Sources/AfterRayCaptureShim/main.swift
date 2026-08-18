@@ -1360,7 +1360,8 @@ private enum AfterRayCaptureShim {
             let options = try Options.parse(CommandLine.arguments)
             let audioPlan = AudioCapturePlan(
                 recordsAudio: options.recordAudio,
-                hasMicrophoneInput: AVCaptureDevice.default(for: .audio) != nil
+                hasMicrophoneInput: AVCaptureDevice.default(for: .audio) != nil,
+                microphoneAuthorized: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
             )
             try FileManager.default.createDirectory(
                 at: options.outputDirectory,
@@ -1372,7 +1373,7 @@ private enum AfterRayCaptureShim {
                     + "microphone=\(audioPlan.capturesMicrophone) output=\(options.outputDirectory.path)"
             )
             if options.recordAudio, !audioPlan.capturesMicrophone {
-                log("no microphone input is available; continuing with system audio only")
+                log("microphone capture is off (input missing or not authorized); continuing with system audio only")
             }
             log("requesting SCShareableContent")
             let content = try await SCShareableContent.excludingDesktopWindows(

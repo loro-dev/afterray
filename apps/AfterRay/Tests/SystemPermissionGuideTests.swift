@@ -6,18 +6,42 @@ final class SystemPermissionGuideTests: XCTestCase {
         XCTAssertTrue(SystemPermissionPolicy.allGranted(
             screenRecording: true,
             microphone: false,
+            microphoneUndetermined: true,
             hasMicrophoneInput: false,
             accessibility: true,
             recordsAudio: true
         ))
     }
 
-    func testAvailableMicrophoneStillRequiresAuthorizationWhenAudioIsEnabled() {
+    func testUnansweredMicrophonePromptStillBlocksWhenAudioIsEnabled() {
         XCTAssertFalse(SystemPermissionPolicy.allGranted(
             screenRecording: true,
             microphone: false,
+            microphoneUndetermined: true,
             hasMicrophoneInput: true,
             accessibility: true,
+            recordsAudio: true
+        ))
+    }
+
+    func testDeclinedMicrophoneDoesNotBlockStart() {
+        XCTAssertTrue(SystemPermissionPolicy.allGranted(
+            screenRecording: true,
+            microphone: false,
+            microphoneUndetermined: false,
+            hasMicrophoneInput: true,
+            accessibility: true,
+            recordsAudio: true
+        ))
+    }
+
+    func testDeclinedMicrophoneStillRequiresScreenAndAccessibility() {
+        XCTAssertFalse(SystemPermissionPolicy.allGranted(
+            screenRecording: true,
+            microphone: false,
+            microphoneUndetermined: false,
+            hasMicrophoneInput: true,
+            accessibility: false,
             recordsAudio: true
         ))
     }
@@ -26,6 +50,7 @@ final class SystemPermissionGuideTests: XCTestCase {
         XCTAssertTrue(SystemPermissionPolicy.allGranted(
             screenRecording: true,
             microphone: false,
+            microphoneUndetermined: true,
             hasMicrophoneInput: true,
             accessibility: true,
             recordsAudio: false
