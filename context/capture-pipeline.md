@@ -52,6 +52,7 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
   - LLM → `LlmRouterAdapter` (MLX-local or remote).
 - Worker binaries resolve via `resolve_helper_path` (main.rs:388): env var (`AFTERRAY_MODEL_WORKER`, `AFTERRAY_NATIVE_MODEL_WORKER`, `AFTERRAY_MLX_WORKER`) → bundled next to the exe → dev build path.
 - OCR geometry is Apple Vision's bottom-left-origin unit square (`OcrRegion`, afterray-models lib.rs:106-110) — flip Y for screen coordinates.
+- Before the write, `ocr_crop.rs` drops regions whose centre falls outside the frontmost window's AX frame, then drops content-free and boundary-clipped short fragments, rebuilding `text` and `layout_json` together ([plan §7](../docs/event-capture-v2-plan.md)). The map from unit square to points needs the shim's `Ready` display size (`AppState::capture_display`, the daemon's only source) and assumes that display sits at the global origin — so a missing snapshot, window, or size, or a window frame that misses those bounds, keeps every region untouched.
 - Results are written back by a spawned task: `Vault::insert_text_evidence` (store lib.rs:2125, applies the CJK bigram fold) then `submit_embedding` (daemon main.rs:1824).
 
 ## 6. Search, summaries, cold storage

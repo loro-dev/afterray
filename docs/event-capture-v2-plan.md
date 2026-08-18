@@ -81,8 +81,18 @@
 
 ### 7. OCR 窗口裁剪（此前已批，并入本计划）
 
-- OCR 区块按前台窗口 frame 裁剪（实测一帧 47% 的区块来自窗口外：菜单栏、天气组件、背景窗口残段）；<8 字符或纯符号碎片丢弃（实测 370 条）。
+- OCR 区块按前台窗口 frame 裁剪（实测一帧 47% 的区块来自窗口外：菜单栏、天气组件、背景窗口残段）；碎片再过一道过滤（实测 370 条）。
 - 这是 AX 空白 app（WeChat/Zed/Office，实测 WeChat 196 节点 0 文本）唯一的降噪手段。
+
+已实现（WS6，`crates/afterrayd/src/ocr_crop.rs`），落在 afterrayd 导入路径上、`insert_text_evidence` 之前。实现规则逐条如下：
+
+- **几何映射**：Vision 归一化框是左下原点，按 shim `Ready` 上报的显示器逻辑尺寸（点，非像素）展开并翻转 Y，得到全局左上原点的屏幕矩形；取该矩形的**中心**判定，中心落在窗口 frame 外的区块丢弃。窗口 frame 取自该 moment 配对的 AX 快照中第一个 window 角色节点（快照本就只覆盖前台 app），复用 `accessibility_scope_tree` + `acts::window_node`，不另写解析。
+- **碎片过滤**，只作用于裁剪判定成功后保留下来的区块：
+  - (a) 既无字母、无数字、也无常用 CJK／假名／谚文字符的区块丢弃 —— `• `、分隔线，以及 Vision 对糊成一团的像素吐出的生僻字（`㗊`，扩展区汉字不计作内容字符）。**数字算内容**：角标、价格、时钟都是证据。
+  - (b) 少于 8 字符**且**贴住窗口边界（2pt 容差）的区块丢弃 —— 被前台窗口切掉的邻窗残段（`Conversatio`、`ter`、`• Gi`）。窗口内部的短文本（`Issues`、`19`）保留：长度本身不是证据，长度加位置才是。
+- **一律 fail open**：没有 AX 快照（AX 是截图之后才附上的）、快照无窗口节点、窗口 frame 不可测、没有显示器尺寸、或窗口 frame 与所设显示器边界（假定该显示器位于全局原点）无交集（多屏歧义）—— 全部区块原样保留，行为与裁剪前完全一致。几何上的不确定绝不吃掉证据。
+- `text` 与 `layout_json` 从保留区块一起重建（`\n` 连接，与 Vision worker 的拼法一致），且**只在确实丢弃了区块时**改写；同时打一行 debug 日志记录 kept/总数与 moment id。
+- 已知限制：显示器尺寸只有被采集的那一块，且假定它在全局原点；副屏上的前台窗口因此落进 fail-open 分支而不裁剪。
 
 ## 实施工作流
 
@@ -93,7 +103,7 @@
 | 3 | submit value + 截图节流 + `screenshot_id`/citable 标记 + 心跳降兜底 | shim 主循环 | 🟡 submit value + 附树分级已落（`11c401e`）、`tree_text` 落盘已落（`21246e3`）；截图节流 / `screenshot_id` / 心跳降兜底属 daemon 侧，未做 |
 | 4 | 链存储（keyframe+diff artifact 类型）、保留期统一、`INPUT_EVENT_RETENTION_MS` 废除 | afterray-store | ⬜ |
 | 5 | T1/T2 契约 v3：frontmatter+MD 解析、五段指导、`#el` 引用、预算窗口化、工具目录裁剪、prev-card 注入 | store slot.rs + afterrayd | ⬜ |
-| 6 | OCR 窗口裁剪 + 碎片过滤 | afterrayd 导入路径 | ⬜ |
+| 6 | OCR 窗口裁剪 + 碎片过滤 | afterrayd 导入路径 `ocr_crop.rs` | ✅ 2026-08-18 `1a7ed62` |
 | 7 | 语料回归（复用 phase 5 计划：≥20 slot 盲评） | scripts/t2-eval.py | ⬜ |
 
 依赖：WS1 → WS2/WS3 → WS4 → WS5；WS6 独立可先行；WS7 收尾。

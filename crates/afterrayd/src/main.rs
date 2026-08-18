@@ -3,6 +3,7 @@ mod ask;
 mod chat;
 mod gop_packer;
 mod memory;
+mod ocr_crop;
 mod stream;
 mod tools;
 mod turn_row;
@@ -11,7 +12,8 @@ use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_th
 use afterray_harness::ContextBudget;
 use afterray_models::{
     Cancellation, DownloadError, JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink,
-    ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter,
+    ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, OcrRegion,
+    PersistentMlxAdapter,
     PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID,
     QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig,
     download_packs_with_cancellation, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
@@ -256,6 +258,7 @@ async fn async_main() -> anyhow::Result<()> {
         packer,
         capture_busy,
         capture_paused,
+        capture_display: std::sync::Mutex::new(None),
         last_capture_ms,
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
@@ -473,6 +476,13 @@ struct AppState {
     /// scheduler keeps ticking but skips the screenshot, so the recording
     /// session — and the shim's audio — run on uninterrupted.
     capture_paused: Arc<AtomicBool>,
+    /// Logical size of the display the shim is capturing, from its `Ready`
+    /// event. The only place the daemon learns a screenshot's dimensions, and
+    /// therefore the only way to map Vision's normalized OCR boxes onto the
+    /// accessibility tree's screen points ([`ocr_crop`]). `None` until a
+    /// capture session has started; a stale value from a previous session is
+    /// overwritten before that session's first moment exists.
+    capture_display: std::sync::Mutex<Option<ocr_crop::DisplayPoints>>,
     last_capture_ms: Arc<AtomicI64>,
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
@@ -1183,6 +1193,7 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
             height,
         }))) => {
             eprintln!("capture runtime: shim ready display={display_id} {width}x{height}");
+            remember_capture_display(state, width, height);
         }
         Ok(Some(Ok(CaptureEvent::Failed { code, message }))) => {
             state.capture_busy.store(false, Ordering::SeqCst);
@@ -2086,7 +2097,12 @@ async fn record_signal_gap(state: &Arc<AppState>, from_ms: i64, to_ms: i64, reas
 async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
     while let Some(event) = state.capture.next_event().await {
         match event {
-            Ok(CaptureEvent::Ready { .. }) => {}
+            // The startup handshake already recorded this, but the shim may
+            // re-announce after a display change, and the OCR crop is only as
+            // good as the dimensions it maps against.
+            Ok(CaptureEvent::Ready { width, height, .. }) => {
+                remember_capture_display(&state, width, height);
+            }
             Ok(CaptureEvent::Artifact {
                 kind,
                 path,
@@ -2206,6 +2222,62 @@ fn input_event_row(record: &InputEventRecord) -> InputEventRow {
     }
 }
 
+/// Records the captured display's logical size, the only geometry the daemon
+/// ever learns about a screenshot.
+///
+/// A size that cannot be used is stored as `None` rather than as a guess: the
+/// OCR crop reads that as "do not crop" and keeps every region.
+fn remember_capture_display(state: &Arc<AppState>, width: usize, height: usize) {
+    let display = ocr_crop::DisplayPoints::new(width, height);
+    if display.is_none() {
+        eprintln!(
+            "capture runtime: shim reported a {width}x{height} display; OCR window cropping stays off"
+        );
+    }
+    *state.capture_display.lock().unwrap() = display;
+}
+
+/// Narrows a frame's OCR to the frontmost window, dropping the menu bar,
+/// desktop widgets and clipped background windows that share the screenshot.
+///
+/// Returns the text and regions to store. Every uncertainty keeps the worker's
+/// output verbatim (`docs/event-capture-v2-plan.md` §7): the accessibility
+/// snapshot is read back from the moment because it is attached *after* the
+/// screenshot lands, so a snapshot that has not arrived yet — or one that names
+/// no window — simply means no crop, never a partial one.
+async fn crop_ocr_to_window(
+    state: &Arc<AppState>,
+    moment_id: &str,
+    text: String,
+    regions: Vec<OcrRegion>,
+) -> (String, Vec<OcrRegion>) {
+    let display = *state.capture_display.lock().unwrap();
+    if regions.is_empty() || display.is_none() {
+        return (text, regions);
+    }
+    let wanted = moment_id.to_owned();
+    let snapshot = run_store(state, move |s| {
+        s.store
+            .accessibility_bytes_for_moment(&wanted)
+            .ok()
+            .flatten()
+    })
+    .await;
+    let window = snapshot
+        .as_deref()
+        .and_then(ocr_crop::frontmost_window_frame);
+    let cropped = ocr_crop::crop_to_window(regions, window, display);
+    if cropped.dropped == 0 {
+        return (text, cropped.regions);
+    }
+    eprintln!(
+        "ocr window crop: kept {} regions, dropped {}, moment {moment_id}",
+        cropped.regions.len(),
+        cropped.dropped
+    );
+    (ocr_crop::regions_text(&cropped.regions), cropped.regions)
+}
+
 async fn import_artifact(
     state: &Arc<AppState>,
     session_id: &str,
@@ -2247,6 +2319,8 @@ async fn import_artifact(
                 if let Ok(snapshot) = snapshot
                     && let Some(ModelOutput::Ocr { text, regions }) = snapshot.output
                 {
+                    let (text, regions) =
+                        crop_ocr_to_window(&model_state, &moment.id, text, regions).await;
                     let layout_json = if regions.is_empty() {
                         None
                     } else {
