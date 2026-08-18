@@ -1406,7 +1406,7 @@ private struct PermissionPanel: View {
                             .tracking(1.1)
                     }
                     .foregroundStyle(RecallPalette.ray)
-                    Text(coordinator.microphoneRequired
+                    Text(coordinator.microphoneRequired && !coordinator.microphoneDeclined
                          ? "Three local permissions are required"
                          : "Two local permissions are required")
                         .font(.title2.weight(.semibold))
@@ -1462,6 +1462,9 @@ private struct PermissionPanel: View {
         if !coordinator.hasMicrophoneInput {
             return "No microphone input is connected. AfterRay can still record screen and system audio, so microphone access is not required."
         }
+        if coordinator.microphoneDeclined {
+            return "Microphone access is declined, so transcripts use system audio only. You can turn it on anytime in System Settings."
+        }
         return "AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded."
     }
 
@@ -1491,7 +1494,10 @@ private struct PermissionPanel: View {
                         // beneath it, which reads as the click doing nothing.
                         RecallOverlayController.shared.hide(returnFocus: false)
                         await coordinator.requestAgain(permission)
-                        guard !isGranted(permission) else {
+                        // Declining the microphone resolves the gate too:
+                        // recording proceeds without it, so send the user
+                        // back to recall, not into System Settings.
+                        guard !isGranted(permission), !coordinator.allGranted else {
                             RecallOverlayController.shared.show()
                             return
                         }

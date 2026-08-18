@@ -27,6 +27,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 - **Poll lifecycles belong to the window controller, not the view.** These windows are `orderOut`-ed, not torn down, so a SwiftUI `onDisappear` never fires; a view-owned watcher polls for the life of the process. `ComputeActivityWindowController` starts/stops `AfterRayServices.shared.compute` on show/close, and the overlay button's copy rides the `afterRayRecall{DidOpen,WillHide}` notifications.
 - Daemon refresh overwrites `AfterRayPreferences.recordAudio`. Require microphone TCC only when an audio input exists; no input must not block Screen & System Audio.
 - **Never gate the microphone prompt behind the automatic-request ledger.** macOS lists the app in the Microphone pane only once the consent prompt is *answered*, and granting Screen Recording relaunches the app mid-prompt — so `.notDetermined` always re-asks (bootstrap, audio toggled on, or the permission gate's button). System consent alerts can sit beneath the `.statusBar` overlay; hide it before requesting.
+- **A declined microphone never blocks the permission gate.** Only an unanswered (`.notDetermined`) prompt holds `allGranted`; a deny proceeds with screen + system audio, and the capture shim skips the microphone stream when TCC is not authorized — otherwise `SCStream.startCapture` fails wholesale.
 
 ## Build / run
 
