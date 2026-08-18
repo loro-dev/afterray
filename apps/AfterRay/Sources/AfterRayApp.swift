@@ -1486,9 +1486,15 @@ private struct PermissionPanel: View {
             } else {
                 Button("Open Settings") {
                     Task {
-                        await coordinator.requestAgain(permission)
-                        guard !isGranted(permission) else { return }
+                        // The overlay is a full-screen `.statusBar`-level
+                        // panel; the system consent alert can be presented
+                        // beneath it, which reads as the click doing nothing.
                         RecallOverlayController.shared.hide(returnFocus: false)
+                        await coordinator.requestAgain(permission)
+                        guard !isGranted(permission) else {
+                            RecallOverlayController.shared.show()
+                            return
+                        }
                         PermissionGuideController.shared.showAfterOpeningSettings(for: permission)
                         coordinator.openSettings(for: permission)
                     }

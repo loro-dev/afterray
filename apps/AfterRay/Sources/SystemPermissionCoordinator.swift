@@ -35,7 +35,18 @@ final class SystemPermissionCoordinator: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.recordsAudio = AfterRayPreferences.recordAudio
+                guard let self else { return }
+                let wasRecordingAudio = self.recordsAudio
+                self.recordsAudio = AfterRayPreferences.recordAudio
+                // Turning audio on is the moment the user expects the mic
+                // prompt; without a request AfterRay never appears in the
+                // Microphone pane for them to grant.
+                if !wasRecordingAudio, self.recordsAudio, !self.isRequesting {
+                    self.hasMicrophoneInput = self.microphoneInputAvailable()
+                    if self.microphoneRequired {
+                        self.microphone = await self.resolveMicrophoneAuthorization()
+                    }
+                }
             }
         }
     }
@@ -76,16 +87,7 @@ final class SystemPermissionCoordinator: ObservableObject {
         }
 
         if microphoneRequired {
-            switch AVCaptureDevice.authorizationStatus(for: .audio) {
-            case .authorized:
-                microphone = true
-            case .notDetermined where reserveAutomaticRequest(for: .microphone):
-                microphone = await AVCaptureDevice.requestAccess(for: .audio)
-            case .notDetermined, .denied, .restricted:
-                microphone = false
-            @unknown default:
-                microphone = false
-            }
+            microphone = await resolveMicrophoneAuthorization()
         }
 
         if !accessibility, reserveAutomaticRequest(for: .accessibility) {
@@ -111,9 +113,7 @@ final class SystemPermissionCoordinator: ObservableObject {
             screenRecording = CGRequestScreenCaptureAccess()
         case .microphone:
             guard hasMicrophoneInput else { return }
-            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
-                microphone = await AVCaptureDevice.requestAccess(for: .audio)
-            }
+            microphone = await resolveMicrophoneAuthorization()
         case .accessibility:
             requestAccessibilityAccess()
         }
@@ -130,6 +130,25 @@ final class SystemPermissionCoordinator: ObservableObject {
             string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)"
         ) else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    /// macOS lists an app under Privacy & Security → Microphone only once the
+    /// consent prompt has been *answered*, so `.notDetermined` must always
+    /// re-ask — never gate it behind the automatic-request ledger. Granting
+    /// Screen Recording relaunches the app while the mic prompt is still open;
+    /// a ledger entry written before the answer left installs that could never
+    /// surface the prompt, or the Settings row, again.
+    private func resolveMicrophoneAuthorization() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            true
+        case .notDetermined:
+            await AVCaptureDevice.requestAccess(for: .audio)
+        case .denied, .restricted:
+            false
+        @unknown default:
+            false
+        }
     }
 
     private func requestAccessibilityAccess() {
