@@ -1490,15 +1490,8 @@ private final class InputEventMonitor: @unchecked Sendable {
     private var burst: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
     private var scroll: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
     private var lastRawMs: Int64 = 0
-    /// Where the user last put the caret with the mouse, and when.
-    ///
-    /// System focus is only as precise as the app chooses to be, and the apps
-    /// this pipeline exists for are the imprecise ones: measured, Feishu
-    /// reports `AXWebArea` for its whole web view and Zed reports `AXWindow`.
-    /// A landing point that coarse drags the run's whole engaged scope up to
-    /// the window, which is the sidebar-noise bug this branch is here to fix.
-    /// So a burst whose focus is not a text-entry element is attributed to the
-    /// last click instead — the click resolved precisely.
+    /// Where the user last put the caret with the mouse, and when. Feeds
+    /// `TypingTarget`, which owns the rule and the reasons for it.
     private var lastClick: (atMs: Int64, target: InputTargetRef)?
     private var timer: DispatchSourceTimer?
     private var livenessTick = 0
@@ -1795,8 +1788,9 @@ private final class InputEventMonitor: @unchecked Sendable {
                 edgePacing.arm(atMs: nowMs)
             }
         }
-        guard edgePacing.shouldFire(nowMs: nowMs) else { return }
-        captureEdgeSnapshot(nowMs: nowMs)
+        // The walk's own guards can still decline (browser, excluded app, no
+        // resolvable window); `fire` spends the allowance only if one happened.
+        edgePacing.fire(nowMs: nowMs) { captureEdgeSnapshot(nowMs: nowMs) }
     }
 
     /// Walks the window the trigger landed in and emits it as an
@@ -1811,19 +1805,20 @@ private final class InputEventMonitor: @unchecked Sendable {
     /// Walk cost is bounded by exactly what bounds the heartbeat:
     /// `AccessibilityTreeEncoder`'s 500ms deadline, the menu-bar stub, and the
     /// process-global 100ms messaging timeout.
-    private func captureEdgeSnapshot(nowMs: Int64) {
+    @discardableResult
+    private func captureEdgeSnapshot(nowMs: Int64) -> Bool {
         guard
             let application = NSWorkspace.shared.frontmostApplication,
             let bundle = application.bundleIdentifier,
             isRecordable(bundle)
-        else { return }
+        else { return false }
         // Private-browsing detection needs the async automation probe plus a
         // chrome-only pre-walk that the heartbeat runs before it touches a
         // browser tree; neither fits a 1s worker tick. v1 therefore takes no
         // edge snapshots of browsers at all — fail closed, heartbeat covers it.
-        guard !BrowserPrivacyDetector(bundleIdentifier: bundle).isKnownBrowser else { return }
+        guard !BrowserPrivacyDetector(bundleIdentifier: bundle).isKnownBrowser else { return false }
         let pid = application.processIdentifier
-        guard let root = edgeWalkRoot(pid: pid) else { return }
+        guard let root = edgeWalkRoot(pid: pid) else { return false }
         let encoder = AccessibilityTreeEncoder()
         let encodedRoot = encoder.encode(root)
         let snapshot = AccessibilitySnapshot(
@@ -1853,11 +1848,12 @@ private final class InputEventMonitor: @unchecked Sendable {
         } catch {
             try? FileManager.default.removeItem(at: url)
             log("edge snapshot could not be written: \(String(describing: error))")
-            return
+            return false
         }
         events.send(
             .artifact(kind: .accessibilityEdge, url: url, startedAtMs: nowMs, endedAtMs: nowMs)
         )
+        return true
     }
 
     /// The trigger click's own `AXWindow` when it still belongs to the app in

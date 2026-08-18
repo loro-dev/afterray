@@ -142,7 +142,12 @@ reads an absence of events as "the user did nothing" — the single inference th
 pipeline exists to prevent.
 
 A gap runs from its marker **to the next observed input event** (that is when
-the tap demonstrably worked again), or to the slot end. Inside such a stretch,
+the tap demonstrably worked again), or through the slot end when nothing ever
+proved recovery. The span is half-open: the recovering event is itself an
+observation, so the instant it lands is available, not lost. A batch the daemon
+failed to store writes the same marker over the batch's own span — losing rows
+and never seeing them look identical from here, and both must read as
+unobservable rather than idle. Inside such a stretch,
 **every engaged claim is suppressed**:
 
 - run `signal` becomes `unavailable`,
@@ -211,5 +216,9 @@ by hit-testing rects that no longer exist.
 3. **`unavailable` suppresses every engaged claim** (see Signal).
 4. **T1 stays pure**: no model, no network, no clock inside card building. The
    caller owns "sealed"; `Vault` is reached from async only via `run_store`.
-5. **Never holds typed characters.** Bursts are counts; targets carry labels,
+5. **Every slot a span touches owes acts.** A burst crossing a boundary is
+   typing that happened in both slots; enqueueing only the one it started in
+   leaves the other unfrozen, and once the events expire it fails open forever
+   — silently dropping work the user did.
+6. **Never holds typed characters.** Bursts are counts; targets carry labels,
    never values.

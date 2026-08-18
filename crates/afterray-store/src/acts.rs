@@ -739,10 +739,15 @@ pub fn unavailable_spans(events: &[ActEvent], to_ms: i64) -> Vec<(i64, i64)> {
         if event.kind != ActKind::SignalGap {
             continue;
         }
+        // The span ends where the signal demonstrably came back, and that
+        // instant is *observed* — the event proving it is the one at `at_ms`.
+        // So spans are half-open, `[from, until)`. With no such event the gap
+        // has no proven end and runs through the horizon inclusive, which is
+        // why the fallback is one past it rather than the horizon itself.
         let recovered = events[index + 1..]
             .iter()
             .find(|later| later.is_input())
-            .map_or(to_ms.max(event.at_ms), |later| later.at_ms);
+            .map_or(to_ms.max(event.at_ms).saturating_add(1), |later| later.at_ms);
         spans.push((event.at_ms, recovered));
     }
     spans
@@ -753,7 +758,7 @@ pub fn unavailable_spans(events: &[ActEvent], to_ms: i64) -> Vec<(i64, i64)> {
 pub fn is_unavailable_at(spans: &[(i64, i64)], at_ms: i64) -> bool {
     spans
         .iter()
-        .any(|&(from, until)| at_ms >= from && at_ms <= until)
+        .any(|&(from, until)| at_ms >= from && at_ms < until)
 }
 
 /// Share of `[from_ms, to_ms)` with no observed input.
@@ -1279,10 +1284,15 @@ mod tests {
             row(9_000, SIGNAL_GAP_KIND),
         ]);
         let spans = unavailable_spans(&events, 60_000);
-        assert_eq!(spans, vec![(1_000, 5_000), (9_000, 60_000)]);
+        assert_eq!(spans, vec![(1_000, 5_000), (9_000, 60_001)]);
         assert!(is_unavailable_at(&spans, 3_000));
         assert!(!is_unavailable_at(&spans, 6_000));
         assert!(is_unavailable_at(&spans, 30_000));
+        // The recovery instant is the proof the tap was alive again, so it is
+        // observed, not unobservable.
+        assert!(!is_unavailable_at(&spans, 5_000));
+        // A gap that never recovered covers the horizon it was measured to.
+        assert!(is_unavailable_at(&spans, 60_000));
     }
 
     #[test]

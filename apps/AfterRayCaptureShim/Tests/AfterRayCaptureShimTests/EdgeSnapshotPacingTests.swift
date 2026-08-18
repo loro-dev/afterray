@@ -5,8 +5,8 @@ final class EdgeSnapshotPacingTests: XCTestCase {
     func testFiresOnceTheSettleWindowIsQuiet() {
         var pacing = EdgeSnapshotPacing()
         pacing.arm(atMs: 1_000)
-        XCTAssertFalse(pacing.shouldFire(nowMs: 1_400), "still inside the settle window")
-        XCTAssertTrue(pacing.shouldFire(nowMs: 1_500))
+        XCTAssertFalse(pacing.fire(nowMs: 1_400) { true }, "still inside the settle window")
+        XCTAssertTrue(pacing.fire(nowMs: 1_500) { true })
         XCTAssertFalse(pacing.isArmed, "a fired candidate is consumed")
     }
 
@@ -14,28 +14,28 @@ final class EdgeSnapshotPacingTests: XCTestCase {
         var pacing = EdgeSnapshotPacing()
         pacing.arm(atMs: 1_000)
         pacing.observeInput(atMs: 1_400)
-        XCTAssertFalse(pacing.shouldFire(nowMs: 1_500), "the interaction is still going")
+        XCTAssertFalse(pacing.fire(nowMs: 1_500) { true }, "the interaction is still going")
         pacing.observeInput(atMs: 1_800)
-        XCTAssertFalse(pacing.shouldFire(nowMs: 2_100))
-        XCTAssertTrue(pacing.shouldFire(nowMs: 2_300))
+        XCTAssertFalse(pacing.fire(nowMs: 2_100) { true })
+        XCTAssertTrue(pacing.fire(nowMs: 2_300) { true })
     }
 
     func testInputWithoutACandidateNeverFires() {
         var pacing = EdgeSnapshotPacing()
         pacing.observeInput(atMs: 1_000)
         XCTAssertFalse(pacing.isArmed)
-        XCTAssertFalse(pacing.shouldFire(nowMs: 10_000), "typing alone is not a scope change")
+        XCTAssertFalse(pacing.fire(nowMs: 10_000) { true }, "typing alone is not a scope change")
     }
 
     func testHoldsFiveSecondsBetweenWalks() {
         var pacing = EdgeSnapshotPacing()
         pacing.arm(atMs: 0)
-        XCTAssertTrue(pacing.shouldFire(nowMs: 1_000))
+        XCTAssertTrue(pacing.fire(nowMs: 1_000) { true })
         pacing.arm(atMs: 2_000)
-        XCTAssertFalse(pacing.shouldFire(nowMs: 3_000), "inside the 5s floor")
+        XCTAssertFalse(pacing.fire(nowMs: 3_000) { true }, "inside the 5s floor")
         XCTAssertFalse(pacing.isArmed, "a refused candidate is dropped, not queued")
         pacing.arm(atMs: 6_000)
-        XCTAssertTrue(pacing.shouldFire(nowMs: 6_500))
+        XCTAssertTrue(pacing.fire(nowMs: 6_500) { true })
     }
 
     func testCapsSixWalksPerRollingMinute() {
@@ -46,7 +46,7 @@ final class EdgeSnapshotPacingTests: XCTestCase {
         for step in 0..<22 {
             let at = Int64(step) * 5_500
             pacing.arm(atMs: at)
-            if pacing.shouldFire(nowMs: at + EdgeSnapshotPacing.settleMs) {
+            if pacing.fire(nowMs: at + EdgeSnapshotPacing.settleMs) { true } {
                 fired += 1
             }
         }
@@ -58,13 +58,31 @@ final class EdgeSnapshotPacingTests: XCTestCase {
         for step in 0..<6 {
             let at = Int64(step) * 5_500
             pacing.arm(atMs: at)
-            XCTAssertTrue(pacing.shouldFire(nowMs: at + 500), "walk \(step) is inside the bucket")
+            XCTAssertTrue(pacing.fire(nowMs: at + 500) { true }, "walk \(step) is inside the bucket")
         }
         pacing.arm(atMs: 33_000)
-        XCTAssertFalse(pacing.shouldFire(nowMs: 33_500), "six already spent in this minute")
+        XCTAssertFalse(pacing.fire(nowMs: 33_500) { true }, "six already spent in this minute")
         // The first walk (t=500) leaves the window at t=60_500.
         pacing.arm(atMs: 60_000)
-        XCTAssertTrue(pacing.shouldFire(nowMs: 60_600))
+        XCTAssertTrue(pacing.fire(nowMs: 60_600) { true })
+    }
+
+    /// A candidate the walk declines — a browser, an excluded app, a window
+    /// that will not resolve — must not spend the minute's allowance, or one
+    /// app the shim never snapshots would starve every app it does.
+    func testADeclinedWalkDoesNotSpendTheBudget() {
+        var pacing = EdgeSnapshotPacing()
+        for index in 0..<20 {
+            let now = Int64(index) * 6_000
+            pacing.arm(atMs: now - EdgeSnapshotPacing.settleMs)
+            XCTAssertFalse(
+                pacing.fire(nowMs: now) { false },
+                "a walk that did not happen reports no fire"
+            )
+        }
+        // Twenty refusals later the budget is untouched.
+        pacing.arm(atMs: 200_000)
+        XCTAssertTrue(pacing.fire(nowMs: 200_000 + EdgeSnapshotPacing.settleMs) { true })
     }
 }
 

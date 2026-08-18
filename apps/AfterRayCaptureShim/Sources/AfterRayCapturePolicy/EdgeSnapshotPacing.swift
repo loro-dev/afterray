@@ -53,6 +53,12 @@ package struct EdgeSnapshotPacing: Equatable {
     /// otherwise fire seconds later against a screen that has moved on, and the
     /// snapshot would be attributed to a trigger it no longer describes. The
     /// next candidate is at most one interaction away.
+    ///
+    /// Answering yes does not spend the budget — `recordFire` does. The caller
+    /// still has cheap reasons to walk away (the frontmost app is a browser or
+    /// excluded, the window cannot be resolved), and a walk that never happened
+    /// must not starve the ones that would: clicking around one excluded app
+    /// would otherwise burn the whole minute's allowance.
     package mutating func shouldFire(nowMs: Int64) -> Bool {
         guard let candidate = candidateAtMs else { return false }
         guard nowMs - candidate >= Self.settleMs else { return false }
@@ -61,11 +67,28 @@ package struct EdgeSnapshotPacing: Equatable {
         if let last = fires.last, nowMs - last < Self.minSpacingMs {
             return false
         }
-        if fires.count >= Self.maxPerWindow {
-            return false
-        }
-        fires.append(nowMs)
+        return fires.count < Self.maxPerWindow
+    }
+
+    /// Runs `walk` if the budget allows, and spends a walk only when one
+    /// actually happened.
+    ///
+    /// The permission check and the accounting are exposed only through this,
+    /// so no caller can consume the minute's allowance with a walk it then
+    /// declined to do — which is how clicking around an excluded app or a
+    /// browser used to starve every other app for a minute.
+    package mutating func fire(nowMs: Int64, walk: () -> Bool) -> Bool {
+        guard shouldFire(nowMs: nowMs) else { return false }
+        guard walk() else { return false }
+        recordFire(atMs: nowMs)
         return true
+    }
+
+    /// Spends one of the window's walks. Called only once a tree has actually
+    /// been walked.
+    package mutating func recordFire(atMs: Int64) {
+        fires.removeAll { atMs - $0 >= Self.windowMs }
+        fires.append(atMs)
     }
 
     /// Whether a candidate is waiting — for logging and tests only.

@@ -3217,10 +3217,26 @@ impl Vault {
             return Ok(Vec::new());
         }
         let events = self.input_events_between(from_ms, to_ms)?;
-        let mut starts: Vec<i64> = events
-            .iter()
-            .map(|event| self.summary_slot_bounds(event.at_ms).start_ms)
-            .collect();
+        // Every slot an observation *touches*, not just the one it started in.
+        // A burst that begins at 09:59:58 and ends at 10:00:20 belongs to both,
+        // and enqueueing only its start would leave the second slot unfrozen —
+        // it would then fail open forever once the events expired, silently
+        // dropping acts the user did perform.
+        let mut starts: Vec<i64> = Vec::new();
+        for event in &events {
+            let last_ms = event.end_ms.unwrap_or(event.at_ms).max(event.at_ms);
+            let mut cursor = event.at_ms;
+            loop {
+                let bounds = self.summary_slot_bounds(cursor);
+                starts.push(bounds.start_ms);
+                // `summary_slot_bounds` always advances, so this terminates on
+                // any span; a clock jump cannot spin it.
+                if bounds.end_ms <= cursor || bounds.end_ms > last_ms {
+                    break;
+                }
+                cursor = bounds.end_ms;
+            }
+        }
         starts.sort_unstable();
         starts.dedup();
         let mut due = Vec::new();
@@ -9647,6 +9663,40 @@ mod tests {
         assert!(
             vault.slots_missing_acts(slot, window_end).unwrap().is_empty(),
             "frozen slots leave the work list"
+        );
+    }
+
+    /// A burst that straddles a boundary happened in both slots, so both owe
+    /// acts. Enqueueing only the slot it started in would leave the second one
+    /// unfrozen, and once the events expired it would fail open forever —
+    /// silently dropping typing the user did.
+    #[test]
+    fn a_span_crossing_a_boundary_enqueues_every_slot_it_touches() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+        let boundary = vault.summary_slot_bounds(slot).end_ms;
+
+        vault
+            .insert_input_events(&[InputEventRow {
+                at_ms: boundary - 2_000,
+                end_ms: Some(boundary + 20_000),
+                kind: "burst".to_owned(),
+                count: Some(34),
+                ended_with: Some("return".to_owned()),
+                command: None,
+                bundle_identifier: Some("com.electron.lark".to_owned()),
+                target_json: None,
+            }])
+            .unwrap();
+
+        let due = vault
+            .slots_missing_acts(slot, boundary + SLOT_DURATION_MS)
+            .unwrap();
+        assert!(due.contains(&slot), "the slot the burst began in");
+        assert!(
+            due.contains(&boundary),
+            "the slot it was still typing into: {due:?}"
         );
     }
 
