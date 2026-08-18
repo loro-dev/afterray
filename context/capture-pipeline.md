@@ -23,7 +23,8 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 
 ## 3. Import — afterrayd
 
-- Capture scheduler: a tokio interval task spawned in `start_capture_runtime` (`crates/afterrayd/src/main.rs:902`; the spawn is at :956), default 10s via `AFTERRAY_CAPTURE_INTERVAL_SECONDS`, calling `capture_screen(request_id)`. While `capture_paused` is set (`CaptureSetPaused` — the app raises it whenever its overlay is frontmost) the scheduler ticks but skips the screenshot; the session, shim and audio keep running, unlike `RecordStop`.
+- Capture scheduler: a tokio task spawned in `start_capture_runtime`, default 10s via `AFTERRAY_CAPTURE_INTERVAL_SECONDS`. It sleeps until `last_capture_ms + interval` rather than on a fixed interval, because the heartbeat is the **fallback**: an `input_events` batch may pull a capture forward (`event_capture_is_due`, throttled to `max(10s, interval)` since the last request), and sleeping from the atomic every capture already writes re-phases the heartbeat with no channel between the two tasks. Cadence unchanged, phase follows interaction ([plan §1](../docs/event-capture-v2-plan.md)).
+- Both paths go through `fire_capture_tick`, the only door to `capture_screen`: `capture_paused` (`CaptureSetPaused` — the app raises it whenever its overlay is frontmost; the session, shim and audio keep running, unlike `RecordStop`), `capture_busy` claimed by compare-exchange, and `recording_active`. A held tick moves nothing, so the caller decides when to ask again.
 - `main.rs:1553 consume_capture_events` → `main.rs:1616 import_artifact`:
   - screen → `Vault::insert_moment` (store lib.rs:819) + OCR job;
   - audio → `insert_audio_segment` (lib.rs:871) + ASR job;

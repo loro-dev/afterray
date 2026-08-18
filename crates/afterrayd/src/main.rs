@@ -1225,26 +1225,33 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
     }
     state.capture_busy.store(false, Ordering::SeqCst);
 
-    let capture = Arc::clone(&state.capture);
     let interval = state.capture_interval;
-    let capture_busy = Arc::clone(&state.capture_busy);
-    let capture_paused = Arc::clone(&state.capture_paused);
-    let last_capture_ms = Arc::clone(&state.last_capture_ms);
+    let scheduler_state = Arc::clone(state);
     let scheduler = tokio::spawn(async move {
-        let mut timer = tokio::time::interval(interval);
+        // Not `tokio::time::interval`: the heartbeat is the *fallback*, and its
+        // phase has to follow whatever captured last. An input batch can pull a
+        // capture forward (`consume_capture_events`), and sleeping from
+        // `last_capture_ms` is how that resets the timer without a channel
+        // between the two tasks — the atomic every tick already writes is the
+        // whole handshake.
+        let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(10_000);
         loop {
-            timer.tick().await;
-            if capture_paused.load(Ordering::SeqCst) {
+            let wait_ms = scheduler_state
+                .last_capture_ms
+                .load(Ordering::SeqCst)
+                .saturating_add(interval_ms)
+                .saturating_sub(now_ms());
+            if wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(u64::try_from(wait_ms).unwrap_or(0))).await;
                 continue;
             }
-            capture_busy.store(true, Ordering::SeqCst);
-            last_capture_ms.store(now_ms(), Ordering::SeqCst);
-            let request_id = Uuid::now_v7().to_string();
-            let result = capture.capture_screen(&request_id).await;
-            capture_busy.store(false, Ordering::SeqCst);
-            if let Err(error) = result {
-                eprintln!("capture request failed: {error}");
-                break;
+            match fire_capture_tick(&scheduler_state).await {
+                CaptureTick::Fired => {}
+                // Paused or busy leaves `last_capture_ms` where it was, so the
+                // clause above cannot compute a wait: hold off one interval
+                // before asking again, as the old interval timer did.
+                CaptureTick::Held => tokio::time::sleep(interval).await,
+                CaptureTick::Failed => break,
             }
         }
     });
@@ -1263,6 +1270,91 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
     recording.scheduler = Some(scheduler);
     recording.event_consumer = Some(event_consumer);
     Ok(())
+}
+
+/// What one attempt to take a screenshot did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTick {
+    Fired,
+    /// A gate said no. Nothing was captured and nothing was recorded as
+    /// captured — the caller decides when to ask again.
+    Held,
+    /// The shim could not be asked. The scheduler that owns this session stops.
+    Failed,
+}
+
+/// One capture tick, wherever it came from.
+///
+/// Scheduled by the heartbeat or pulled forward by an input batch, a tick is
+/// the same act, so it goes through one door with one set of gates: not while
+/// the app's overlay is up (`capture_paused`), not while a capture is already
+/// in flight (`capture_busy`), and not once the recording that owns the shim is
+/// gone (`recording_active`). Two doors would mean two chances to forget one of
+/// them.
+///
+/// The busy claim is a compare-exchange because the two callers now race: the
+/// heartbeat's own spacing used to be the only thing keeping a second request
+/// off an in-flight one.
+///
+/// `last_capture_ms` moves *before* the request, not after: it is what the
+/// heartbeat sleeps from and what the throttle measures, and both mean "when we
+/// last asked for a frame", not "when one came back".
+async fn fire_capture_tick(state: &Arc<AppState>) -> CaptureTick {
+    if state.capture_paused.load(Ordering::SeqCst) || !state.recording_active.load(Ordering::SeqCst)
+    {
+        return CaptureTick::Held;
+    }
+    if state
+        .capture_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return CaptureTick::Held;
+    }
+    state.last_capture_ms.store(now_ms(), Ordering::SeqCst);
+    let request_id = Uuid::now_v7().to_string();
+    let result = state.capture.capture_screen(&request_id).await;
+    state.capture_busy.store(false, Ordering::SeqCst);
+    if let Err(error) = result {
+        eprintln!("capture request failed: {error}");
+        return CaptureTick::Failed;
+    }
+    CaptureTick::Fired
+}
+
+/// The floor under an event-driven screenshot (`docs/event-capture-v2-plan.md`
+/// §1). Events arrive at interaction rate; without a floor a fast typist would
+/// drive the screenshot path as fast as the shim could answer.
+const EVENT_CAPTURE_MIN_INTERVAL_MS: i64 = 10_000;
+
+/// Whether an input batch should pull a screenshot forward.
+///
+/// The whole decision, as a function of the two facts it depends on, so the
+/// wiring around it stays a wiring problem. `interval_ms` is the configured
+/// heartbeat: the throttle never goes below the plan's 10s, and never goes
+/// below the cadence the user asked for either — a 60s heartbeat means the user
+/// wants fewer frames, not 10s frames whenever they type.
+///
+/// Age is measured from the last capture *request*. `last_capture_ms` of zero
+/// or less means nothing has been captured — a session just started, or one
+/// stopped and reset — and there is no age to measure, so the interaction is
+/// the first thing worth a frame. Said outright rather than left to the epoch
+/// making the subtraction large: a throttle that depends on what year it is is
+/// not a throttle.
+fn event_capture_is_due(
+    events_in_batch: usize,
+    last_capture_ms: i64,
+    now_ms: i64,
+    interval_ms: i64,
+) -> bool {
+    if events_in_batch == 0 {
+        return false;
+    }
+    if last_capture_ms <= 0 {
+        return true;
+    }
+    let throttle_ms = interval_ms.max(EVENT_CAPTURE_MIN_INTERVAL_MS);
+    now_ms.saturating_sub(last_capture_ms) >= throttle_ms
 }
 
 async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
@@ -2165,6 +2257,20 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
                             record_signal_gap(&state, from_ms, to_ms, "input_events_store_failed").await;
                         }
                     }
+                }
+                // The user did something; the heartbeat's next tick may be nine
+                // seconds away. Pull the frame forward so the screenshot lands
+                // near the interaction rather than wherever the timer's phase
+                // happened to fall — the cadence stays the same, its phase
+                // stops being arbitrary. A failed store above does not change
+                // this: the frame is worth having either way.
+                if event_capture_is_due(
+                    events.len(),
+                    state.last_capture_ms.load(Ordering::SeqCst),
+                    now_ms(),
+                    i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
+                ) {
+                    fire_capture_tick(&state).await;
                 }
             }
             Ok(CaptureEvent::Failed { code, message }) => {
@@ -4399,6 +4505,40 @@ mod tests {
             )),
             "the URL must reach the domain exclusion check"
         );
+    }
+
+    /// The screenshot throttle, as the decision it is: an input batch may pull
+    /// a frame forward, but never closer than the plan's 10s floor and never
+    /// denser than the heartbeat the user configured.
+    #[test]
+    fn an_input_batch_pulls_a_frame_forward_only_past_the_throttle() {
+        let default_ms = 10_000;
+
+        // Nothing happened: the heartbeat's phase is all there is.
+        assert!(!event_capture_is_due(0, 0, 60_000, default_ms));
+        assert!(!event_capture_is_due(0, 0, i64::MAX, default_ms));
+
+        // The common case, at the interval's own boundary and past it.
+        assert!(event_capture_is_due(1, 50_000, 60_000, default_ms));
+        assert!(event_capture_is_due(7, 50_000, 61_000, default_ms));
+        assert!(!event_capture_is_due(7, 50_000, 59_999, default_ms));
+
+        // A user who asked for fewer frames gets fewer frames: the throttle
+        // never drops below the configured cadence.
+        assert!(!event_capture_is_due(1, 50_000, 65_000, 60_000));
+        assert!(event_capture_is_due(1, 50_000, 110_000, 60_000));
+
+        // And a user who asked for more does not get the event path firing
+        // faster than the plan's floor.
+        assert!(!event_capture_is_due(1, 50_000, 53_000, 2_000));
+        assert!(event_capture_is_due(1, 50_000, 60_000, 2_000));
+
+        // Nothing captured yet — a fresh session, or one just stopped and
+        // restarted — is past any throttle, whatever the clock reads.
+        assert!(event_capture_is_due(1, 0, 1_000, default_ms));
+        assert!(event_capture_is_due(1, 0, 0, 60_000));
+        // ...but "nothing" still needs an event to justify a frame.
+        assert!(!event_capture_is_due(0, 0, 1_000, default_ms));
     }
 
     /// Every field of a v2 record has to land somewhere in the row, and the
