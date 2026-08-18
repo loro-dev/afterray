@@ -8,4 +8,4 @@ Suggested home = which `AGENTS.md` or `context/` article should carry the shortc
 
 ## Open gaps
 
-(none yet)
+2026-08-17 | `crates/afterray-store/AGENTS.md` is ~6.1k chars against the ~4000 budget | it was already 5.5k before the acts join; the join's detail went to `context/acts-join.md` rather than into it | the vault has ten subsystems and one index line each already overflows | next few `afterray-store` changes should extract `slot_summaries` schema-1-vs-2 and the search/mention rules into `context/` articles the way `acts-join` was done

@@ -119,7 +119,77 @@ pub enum CaptureEvent {
         code: String,
         message: String,
     },
+    /// Coalesced user-input observations from the shim's listen-only event
+    /// tap (docs/input-events-and-t1-acts-plan.md). Plain keystrokes arrive
+    /// only as burst counts; pointer events arrive as resolved element
+    /// identities, never coordinates. `dropped` counts records the shim's
+    /// producer-side cap discarded.
+    InputEvents {
+        #[serde(default)]
+        events: Vec<InputEventRecord>,
+        #[serde(default)]
+        dropped: u64,
+    },
     Stopped,
+}
+
+/// One coalesced input observation. `kind` is `burst` (typing, with
+/// `count`/`end_ms`/`ended_with`), `command` (⌘-combo or Return/Tab/Esc,
+/// named in `command`), `click`, or `scroll` (coalesced, with `count`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InputEventRecord {
+    pub at_ms: i64,
+    pub kind: String,
+    #[serde(default)]
+    pub end_ms: Option<i64>,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub ended_with: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub bundle_identifier: Option<String>,
+    #[serde(default)]
+    pub target: Option<InputTargetRef>,
+}
+
+/// The resolved identity of the element an input landed on. `label` is the
+/// element's title/description, never its value; `frame` is UI geometry in
+/// global top-left screen points, rounded — not a pointer coordinate.
+///
+/// `Serialize` exists so the daemon can store this shape verbatim in the
+/// vault's `input_events.target_json`: the store deliberately does not model
+/// element identity, and re-encoding it into a second schema on the way in
+/// would be a second thing to keep in step with the shim. Empty fields are
+/// skipped — the round trip is lossless either way, and these rows are written
+/// at interaction rate.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct InputTargetRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<InputTargetFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<InputAncestorRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct InputTargetFrame {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct InputAncestorRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -129,6 +199,15 @@ pub enum ArtifactKind {
     SystemAudio,
     Microphone,
     Accessibility,
+    /// An R3 edge snapshot (`docs/input-events-and-t1-acts-plan.md`): the same
+    /// accessibility payload as [`Self::Accessibility`], walked because the user
+    /// changed scope rather than because the heartbeat came round.
+    ///
+    /// Deliberately **unpaired**: it carries no screenshot, and the pairing
+    /// invariant that binds `Screen` to `Accessibility` does not apply to it. It
+    /// still needs the same exclusion check, because it is a whole window's
+    /// worth of text.
+    AccessibilityEdge,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -438,6 +517,66 @@ mod tests {
                 request_id: Some("moment-1".into()),
             }
         );
+    }
+
+    /// R3 edge snapshots ride the ordinary artifact event, with the same
+    /// content type as a heartbeat tree and no `request_id`: nothing pulled
+    /// them, and no screenshot is paired with them.
+    #[test]
+    fn parses_accessibility_edge_artifact_event() {
+        let event: CaptureEvent = serde_json::from_str(
+            r#"{"event":"artifact","kind":"accessibility_edge","path":"/tmp/accessibility-edge-1.json","content_type":"application/vnd.afterray.ax+json","started_at_ms":1786698000000,"ended_at_ms":1786698000000,"byte_count":8192}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            CaptureEvent::Artifact {
+                kind: ArtifactKind::AccessibilityEdge,
+                path: PathBuf::from("/tmp/accessibility-edge-1.json"),
+                content_type: "application/vnd.afterray.ax+json".into(),
+                started_at_ms: 1_786_698_000_000,
+                ended_at_ms: 1_786_698_000_000,
+                byte_count: 8192,
+                request_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_input_events_event() {
+        let event: CaptureEvent = serde_json::from_str(
+            r#"{"event":"input_events","dropped":2,"events":[
+                {"at_ms":100,"kind":"burst","end_ms":2100,"count":34,"ended_with":"return",
+                 "bundle_identifier":"com.electron.lark",
+                 "target":{"role":"AXTextArea","label":"Message 赵亮",
+                           "frame":{"x":831,"y":899,"width":541,"height":22},
+                           "ancestors":[{"role":"AXGroup","label":null}]}},
+                {"at_ms":150,"kind":"click","bundle_identifier":"com.electron.lark"}
+            ]}"#,
+        )
+        .unwrap();
+        let CaptureEvent::InputEvents { events, dropped } = event else {
+            panic!("expected input_events, got {event:?}");
+        };
+        assert_eq!(dropped, 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "burst");
+        assert_eq!(events[0].count, Some(34));
+        assert_eq!(events[0].ended_with.as_deref(), Some("return"));
+        let target = events[0].target.as_ref().expect("burst target");
+        assert_eq!(target.role.as_deref(), Some("AXTextArea"));
+        assert_eq!(
+            target.frame,
+            Some(InputTargetFrame {
+                x: 831,
+                y: 899,
+                width: 541,
+                height: 22
+            })
+        );
+        // A minimal record parses with every optional field absent.
+        assert_eq!(events[1].kind, "click");
+        assert_eq!(events[1].target, None);
     }
 
     #[test]

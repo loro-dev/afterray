@@ -48,6 +48,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod activity;
 pub use activity::ActivityMomentRow;
+pub mod acts;
 mod gop;
 pub mod infoscore;
 mod jpeg;
@@ -61,8 +62,8 @@ pub use gop::{
 };
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
-    AccessibilityDigest, accessibility_text_lines, digest_fingerprint, is_idle_digest,
-    parse_accessibility_digest,
+    AccessibilityDigest, AxScopeNode, AxScopeTree, accessibility_scope_tree,
+    accessibility_text_lines, digest_fingerprint, is_idle_digest, parse_accessibility_digest,
 };
 use search_index::{index_text, match_query};
 /// One stretch of transcribed speech: when it started, which track it came
@@ -89,7 +90,74 @@ pub use slot::{
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 24;
+
+/// How long the raw input-event stream lives.
+///
+/// Events are the sharpest thing the vault holds about what the user *did*, so
+/// they are deliberately the shortest-lived fact stream: two days is long
+/// enough for the sweeper to seal a slot and freeze its acts into
+/// `slot_summaries.acts_json`, and short enough that the keystroke-level
+/// stream never becomes a standing record. Anything derived from events must
+/// be materialised before this expires — see
+/// `docs/input-events-and-t1-acts-plan.md`.
+pub const INPUT_EVENT_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
+
+/// One coalesced input observation, as the vault holds it.
+///
+/// A verbatim mirror of the shim's record (`InputEventRecord` in
+/// `afterray-platform-macos`): `kind` stays an uninterpreted string and
+/// `target_json` an uninterpreted blob because the vault is not the layer that
+/// decides what an act means — the T1 join is. A `kind` this build has never
+/// heard of must still round-trip; the shim can ship ahead of its reader.
+///
+/// Never carries typed characters: a typing burst is a count, an end instant,
+/// and the key that ended it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputEventRow {
+    /// When the observation began.
+    pub at_ms: i64,
+    /// When it ended, for spans (typing bursts, coalesced scrolls). `None`
+    /// makes the row a point at `at_ms`.
+    pub end_ms: Option<i64>,
+    /// `burst` | `command` | `click` | `scroll` — and whatever a newer shim
+    /// invents.
+    pub kind: String,
+    /// Keystrokes in a burst, or coalesced scroll ticks.
+    pub count: Option<u32>,
+    /// The command key that closed a burst ("submit/execute" semantics).
+    pub ended_with: Option<String>,
+    /// The named command for a `command` event.
+    pub command: Option<String>,
+    pub bundle_identifier: Option<String>,
+    /// The platform layer's resolved element identity, serialised verbatim.
+    pub target_json: Option<String>,
+}
+
+/// Content type of a stored R3 edge snapshot.
+///
+/// The payload is the shim's ordinary accessibility snapshot; the
+/// `purpose=edge-ax` parameter is what separates an edge tree from a heartbeat
+/// tree in the `artifacts` table, which has no purpose column of its own. It is
+/// a constant rather than a value copied off the capture event because the
+/// encryption AAD binds the content type: an artifact stored under one string
+/// and read back under another is undecryptable.
+pub const EDGE_SNAPSHOT_CONTENT_TYPE: &str = "application/vnd.afterray.ax+json; purpose=edge-ax";
+
+/// One R3 edge snapshot: an accessibility tree walked because the user changed
+/// scope, not because the capture heartbeat came round.
+///
+/// It has no moment, no thumbnail, and no OCR — it is not a frame of the screen,
+/// it is extra tree for the join to partition text against. It lives exactly as
+/// long as the input events that triggered it
+/// ([`INPUT_EVENT_RETENTION_MS`]): a frame driven by an event and outliving it
+/// would still expose the instant of an interaction whose record was erased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSnapshotRow {
+    pub id: String,
+    pub captured_at_ms: i64,
+    pub artifact_id: String,
+}
 
 /// How a search is narrowed before anything is ranked.
 ///
@@ -1523,6 +1591,13 @@ impl Vault {
         }
 
         let mut rows = self.slot_moment_rows(slot_start_ms, slot_end_ms)?;
+        // The second fact stream. Fetched before the frame loop because the
+        // join happens inside it, against each frame's own tree, and an empty
+        // stream must leave that loop exactly as it was: a slot with no events
+        // is not a degraded card, it is the card this pipeline always built.
+        let mut events =
+            acts::parse_events(&self.input_events_between(slot_start_ms, slot_end_ms)?);
+        let step = capture_interval_ms.max(1_000);
         // The AX artifact is decrypted once per frame at T1 build time
         // (once per half hour). It yields the two strongest intent signals
         // (selection, composition) and, when the tree is rich enough, the
@@ -1539,21 +1614,74 @@ impl Vault {
                 let digest = parse_accessibility_digest(&bytes);
                 row.selected_text = digest.selected_text;
                 row.focused_value = digest.focused_value;
-                let lines = accessibility_text_lines(&bytes);
+                // The geometry-bearing parse yields the same line vector as
+                // `accessibility_text_lines` by construction — one traversal —
+                // so the text-source decision below still counts every line.
+                // Partitioning must never be able to flip a frame's source.
+                let tree = if events.is_empty() {
+                    None
+                } else {
+                    accessibility_scope_tree(&bytes)
+                };
+                let lines = match tree.as_ref() {
+                    Some(tree) => tree.lines.clone(),
+                    None => accessibility_text_lines(&bytes),
+                };
                 let chars: usize = lines.iter().map(|line| line.chars().count()).sum();
                 if chars >= slot::AX_TEXT_MIN_CHARS {
                     row.ocr_text = Some(lines.join("\n"));
                     row.text_from_ax = true;
                 }
+                if let Some(tree) = tree {
+                    // One pass over this frame's events serves both readers:
+                    // each event learns the region it individually landed in
+                    // (which is what run splitting segments on), and the frame
+                    // learns the region covering all of them (which is what
+                    // partitions its text).
+                    let indices = acts::frame_event_indices(
+                        &events,
+                        row.captured_at_ms,
+                        step,
+                        row.bundle_identifier.as_deref(),
+                    );
+                    let mut rects = Vec::with_capacity(indices.len());
+                    for index in indices {
+                        let Some(rect) = events[index].frame else {
+                            continue;
+                        };
+                        rects.push(rect);
+                        if events[index].scope.is_none() {
+                            events[index].scope = acts::event_scope(&tree, rect);
+                        }
+                    }
+                    row.ax_join = acts::join_frame(&tree, &rects);
+                }
             }
         }
+        let materialized = if events.is_empty() {
+            self.slot_acts(slot_start_ms)?
+        } else {
+            None
+        };
+        // R3 edge trees: the content the heartbeat missed between two ticks.
+        // Only fetched when there is an event stream to partition by — with no
+        // events they would be text the card never used to have and could not
+        // attribute. They expire with the events, so history loses both at once.
+        let edges = if events.is_empty() {
+            Vec::new()
+        } else {
+            self.edge_frames_between(slot_start_ms, slot_end_ms, step, &events)?
+        };
         let idle_ms = self.idle_overlap_ms(slot_start_ms, slot_end_ms)?;
-        let card = slot::build_slot_card_with_end(
+        let card = slot::build_slot_card_with_edges(
             slot_start_ms,
             slot_end_ms,
             &rows,
             idle_ms,
             capture_interval_ms,
+            &events,
+            materialized.as_ref(),
+            &edges,
         );
         if settled {
             let mut cache = self.card_cache.lock().unwrap();
@@ -1563,6 +1691,46 @@ impl Vault {
             cache.insert(slot_start_ms, card.clone());
         }
         Ok(card)
+    }
+
+    /// Decrypts the slot's R3 edge trees and joins each against the events it
+    /// can speak for — the same hit-test the frame loop runs, on trees that have
+    /// no frame.
+    ///
+    /// A tree that will not decrypt or parse is skipped, not raised: an edge
+    /// snapshot is an addition to a card, and losing one must never cost the
+    /// card. Unlike the frame loop this does **not** write resolved scopes back
+    /// onto the events: run splitting segments on those scopes, and R3's job is
+    /// to widen the text a run shows, not to re-cut the runs.
+    fn edge_frames_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        step_ms: i64,
+        events: &[acts::ActEvent],
+    ) -> Result<Vec<slot::EdgeFrame>, StoreError> {
+        let stored = self.edge_snapshots_between(from_ms, to_ms)?;
+        let mut frames = Vec::with_capacity(stored.len());
+        for row in stored {
+            let Ok(payload) = self.read_artifact(&row.artifact_id) else {
+                continue;
+            };
+            let Some(tree) = accessibility_scope_tree(&payload.bytes) else {
+                continue;
+            };
+            let bundle = activity::parse_accessibility_context(&payload.bytes).bundle_identifier;
+            let rects: Vec<acts::AxRect> =
+                acts::frame_event_indices(events, row.captured_at_ms, step_ms, bundle.as_deref())
+                    .into_iter()
+                    .filter_map(|index| events[index].frame)
+                    .collect();
+            frames.push(slot::EdgeFrame {
+                captured_at_ms: row.captured_at_ms,
+                join: acts::join_frame(&tree, &rects),
+                lines: tree.lines,
+            });
+        }
+        Ok(frames)
     }
 
     /// Every path that removes moments must call this: a cached card for a
@@ -2441,6 +2609,8 @@ impl Vault {
                 text_from_ax: false,
                 ax_present: row.get(8)?,
                 has_audio: row.get(9)?,
+                // Filled by `slot_card`, where the trees are decrypted.
+                ax_join: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -2936,7 +3106,421 @@ impl Vault {
               WHERE slot_start_ms <= ?2 AND slot_end_ms > ?1",
             params![from_ms, to_ms],
         )?;
+        // Same invariant one layer down: the events say what the user did in
+        // the window they just asked to forget, in finer detail than any frame.
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM input_events
+              WHERE at_ms <= ?2 AND MAX(at_ms, COALESCE(end_ms, at_ms)) >= ?1",
+            params![from_ms, to_ms],
+        )?;
+        // And the fourth layer: an R3 tree is a full window's worth of text
+        // from inside the forgotten window, attached to no moment, so no
+        // frame deletion above can have reached it.
+        let edges: Vec<(String, String)> = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT id, artifact_id FROM edge_snapshots
+                  WHERE captured_at_ms >= ?1 AND captured_at_ms <= ?2",
+            )?;
+            let rows = statement.query_map(params![from_ms, to_ms], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        self.delete_edge_snapshots(&edges)?;
         Ok(count)
+    }
+
+    /// Appends a batch of the shim's input observations.
+    ///
+    /// One transaction for the whole batch: the shim coalesces and ships events
+    /// in groups, and a half-stored group is worse than none, because T1 would
+    /// then join against a stream whose gap is invisible — reading "the user did
+    /// nothing here" off a failed write is exactly the inference this pipeline
+    /// exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch cannot be committed.
+    pub fn insert_input_events(&self, events: &[InputEventRow]) -> Result<usize, StoreError> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO input_events
+                   (at_ms, end_ms, kind, count, ended_with, command,
+                    bundle_identifier, target_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for event in events {
+                statement.execute(params![
+                    event.at_ms,
+                    event.end_ms,
+                    event.kind,
+                    event.count,
+                    event.ended_with,
+                    event.command,
+                    event.bundle_identifier,
+                    event.target_json,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(events.len())
+    }
+
+    /// Every observation overlapping `[from_ms, to_ms)`, oldest first.
+    ///
+    /// Half-open like slot bounds, so consecutive slots partition the stream
+    /// without double-counting an instant. A span (`end_ms` set) counts as
+    /// present whenever any part of it falls inside the window — a burst that
+    /// began before the slot opened is still typing that happened in the slot.
+    /// `end_ms` absent makes the row a point at `at_ms`; a nonsensical
+    /// `end_ms < at_ms` from a future shim degrades to the same point rather
+    /// than vanishing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn input_events_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<InputEventRow>, StoreError> {
+        if from_ms >= to_ms {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT at_ms, end_ms, kind, count, ended_with, command,
+                    bundle_identifier, target_json
+               FROM input_events
+              WHERE at_ms < ?2 AND MAX(at_ms, COALESCE(end_ms, at_ms)) >= ?1
+              ORDER BY at_ms ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(InputEventRow {
+                at_ms: row.get(0)?,
+                end_ms: row.get(1)?,
+                kind: row.get(2)?,
+                count: row.get(3)?,
+                ended_with: row.get(4)?,
+                command: row.get(5)?,
+                bundle_identifier: row.get(6)?,
+                target_json: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The acts frozen for a slot, if any were.
+    ///
+    /// Read only when the live event stream comes back empty: while the events
+    /// exist they are the truth, and the frozen copy is a summary of them. After
+    /// 48 hours they are gone and this is all that is left.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn slot_acts(&self, slot_start_ms: i64) -> Result<Option<acts::MaterializedActs>, StoreError> {
+        let connection = self.readers.get();
+        let raw: Option<Option<String>> = connection
+            .query_row(
+                "SELECT acts_json FROM slot_summaries WHERE slot_start_ms = ?1",
+                params![slot_start_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // A row without acts and no row at all are the same answer here; a
+        // stored blob this build cannot parse degrades to "no acts" rather than
+        // failing a card build.
+        Ok(raw
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok()))
+    }
+
+    /// Freezes a sealed slot's acts into `slot_summaries.acts_json`.
+    ///
+    /// Events are deleted after 48 hours and T1 is computed lazily, so without
+    /// this the acts of every slot older than two days would simply vanish —
+    /// the card would silently lose the half of itself that says what the user
+    /// did, while keeping the half that says what was on screen.
+    ///
+    /// Idempotent by design: a slot that already has acts is left alone, so the
+    /// five-minute sweeper can revisit it forever at the cost of one indexed
+    /// read. Returns whether anything was written.
+    ///
+    /// The caller decides what "sealed" means — it owns the clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be read or written.
+    pub fn materialize_slot_acts(
+        &self,
+        at_ms: i64,
+        capture_interval_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let bounds = self.summary_slot_bounds(at_ms);
+        if self.slot_acts(bounds.start_ms)?.is_some() {
+            return Ok(false);
+        }
+        if self
+            .input_events_between(bounds.start_ms, bounds.end_ms)?
+            .is_empty()
+        {
+            // Nothing to freeze. Deliberately not written as an empty record:
+            // "no events were ever stored" and "the events said nothing" are
+            // different claims, and only the second one is a fact.
+            return Ok(false);
+        }
+        let card = self.slot_card(at_ms, capture_interval_ms)?;
+        let frozen = acts::MaterializedActs {
+            runs: card
+                .timeline
+                .iter()
+                .filter_map(|entry| match entry {
+                    slot::TimelineEntry::Run(run) => Some(run),
+                    slot::TimelineEntry::Gap(_) => None,
+                })
+                .filter_map(|run| {
+                    Some(acts::MaterializedRun {
+                        id: run.moment_id.clone(),
+                        acts: run.acts.clone()?,
+                    })
+                })
+                .collect(),
+            no_input_ratio: card.facts.no_input_ratio,
+        };
+        if frozen.runs.is_empty() && frozen.no_input_ratio.is_none() {
+            return Ok(false);
+        }
+        // Plain counts and labels: this cannot fail. If it somehow did, losing
+        // the freeze is better than failing the sweep that also freezes others.
+        let Ok(json) = serde_json::to_string(&frozen) else {
+            return Ok(false);
+        };
+        self.put_slot_acts(&card, &json)?;
+        Ok(true)
+    }
+
+    /// Writes the frozen acts, creating the summary row when a model has not
+    /// written one yet.
+    ///
+    /// A row created here carries `degraded` and no title, which is what the day
+    /// panel already renders for a slot T2 has not summarised: the panel takes
+    /// its state from the live card, and a titleless row for a slot with no
+    /// frames is skipped outright. So this cannot conjure a phantom slot, and it
+    /// cannot stop T2 from running later.
+    ///
+    /// The `WHERE acts_json IS NULL` guard makes a concurrent second sweep a
+    /// no-op rather than a rewrite.
+    fn put_slot_acts(&self, card: &slot::SlotCard, acts_json: &str) -> Result<(), StoreError> {
+        let facts_json = serde_json::to_string(&card.facts).unwrap_or_else(|_| "{}".to_owned());
+        let evidence_json =
+            serde_json::to_string(&card.evidence).unwrap_or_else(|_| "{}".to_owned());
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO slot_summaries (
+                id, slot_start_ms, slot_end_ms, local_day, state, generation,
+                schema_version, facts_json, evidence_json, acts_json
+             ) VALUES (?1, ?2, ?3, ?4, 'degraded', 1, ?5, ?6, ?7, ?8)
+             ON CONFLICT(slot_start_ms) DO UPDATE SET
+                acts_json = excluded.acts_json
+              WHERE slot_summaries.acts_json IS NULL",
+            params![
+                Uuid::now_v7().to_string(),
+                card.slot_start_ms,
+                card.slot_end_ms,
+                card.local_day,
+                slot::SLOT_SUMMARY_SCHEMA_VERSION,
+                facts_json,
+                evidence_json,
+                acts_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Slot starts in `[from_ms, to_ms)` that hold input events but no frozen
+    /// acts yet — the sweeper's work list.
+    ///
+    /// Answered from the event table rather than from the frames, because the
+    /// events are what expires: a slot with no events has nothing to lose.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn slots_missing_acts(&self, from_ms: i64, to_ms: i64) -> Result<Vec<i64>, StoreError> {
+        if from_ms >= to_ms {
+            return Ok(Vec::new());
+        }
+        let events = self.input_events_between(from_ms, to_ms)?;
+        // Every slot an observation *touches*, not just the one it started in.
+        // A burst that begins at 09:59:58 and ends at 10:00:20 belongs to both,
+        // and enqueueing only its start would leave the second slot unfrozen —
+        // it would then fail open forever once the events expired, silently
+        // dropping acts the user did perform.
+        let mut starts: Vec<i64> = Vec::new();
+        for event in &events {
+            let last_ms = event.end_ms.unwrap_or(event.at_ms).max(event.at_ms);
+            let mut cursor = event.at_ms;
+            loop {
+                let bounds = self.summary_slot_bounds(cursor);
+                starts.push(bounds.start_ms);
+                // `summary_slot_bounds` always advances, so this terminates on
+                // any span; a clock jump cannot spin it.
+                if bounds.end_ms <= cursor || bounds.end_ms > last_ms {
+                    break;
+                }
+                cursor = bounds.end_ms;
+            }
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        let mut due = Vec::new();
+        for start in starts {
+            if self.slot_acts(start)?.is_none() {
+                due.push(start);
+            }
+        }
+        Ok(due)
+    }
+
+    /// Drops observations older than [`INPUT_EVENT_RETENTION_MS`].
+    ///
+    /// A span is judged by its end, so a burst still inside the window survives
+    /// even when it started before the cutoff. The cutoff instant itself is
+    /// kept: retention is "the last 48 hours", inclusive of its own edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delete cannot be executed.
+    pub fn prune_input_events(&self, now_ms: i64) -> Result<usize, StoreError> {
+        let cutoff = now_ms.saturating_sub(INPUT_EVENT_RETENTION_MS);
+        let removed = self.connection.lock().unwrap().execute(
+            "DELETE FROM input_events WHERE MAX(at_ms, COALESCE(end_ms, at_ms)) < ?1",
+            [cutoff],
+        )?;
+        Ok(removed)
+    }
+
+    /// Stores one R3 edge snapshot: the encrypted tree plus its row.
+    ///
+    /// No moment, no thumbnail, no OCR job — an edge snapshot is not a frame of
+    /// the screen. The artifact is written under
+    /// [`EDGE_SNAPSHOT_CONTENT_TYPE`], and a failed row insert takes the
+    /// artifact back out with it: an orphaned encrypted file would be
+    /// unreachable and unprunable, since pruning walks the rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact cannot be written or the row inserted.
+    pub fn insert_edge_snapshot(
+        &self,
+        captured_at_ms: i64,
+        snapshot: &[u8],
+    ) -> Result<EdgeSnapshotRow, StoreError> {
+        let artifact_id = self.put_artifact(EDGE_SNAPSHOT_CONTENT_TYPE, snapshot)?;
+        let row = EdgeSnapshotRow {
+            id: Uuid::now_v7().to_string(),
+            captured_at_ms,
+            artifact_id,
+        };
+        let result = self.connection.lock().unwrap().execute(
+            "INSERT INTO edge_snapshots (id, captured_at_ms, artifact_id)
+             VALUES (?1, ?2, ?3)",
+            params![row.id, row.captured_at_ms, row.artifact_id],
+        );
+        if let Err(error) = result {
+            let _ = self.delete_artifact_record_and_file(&row.artifact_id);
+            return Err(error.into());
+        }
+        // A card already cached for this slot was built without this tree.
+        self.flush_card_cache();
+        Ok(row)
+    }
+
+    /// Edge snapshots captured in `[from_ms, to_ms)`, oldest first.
+    ///
+    /// Half-open like slot bounds and like `input_events_between`, so
+    /// consecutive slots partition the stream without one tree landing in two
+    /// cards. A snapshot is a point in time — it has no span to overlap with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be queried.
+    pub fn edge_snapshots_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<EdgeSnapshotRow>, StoreError> {
+        if from_ms >= to_ms {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, captured_at_ms, artifact_id
+               FROM edge_snapshots
+              WHERE captured_at_ms >= ?1 AND captured_at_ms < ?2
+              ORDER BY captured_at_ms ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![from_ms, to_ms], |row| {
+            Ok(EdgeSnapshotRow {
+                id: row.get(0)?,
+                captured_at_ms: row.get(1)?,
+                artifact_id: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Drops edge snapshots older than [`INPUT_EVENT_RETENTION_MS`], files and
+    /// all.
+    ///
+    /// Same constant and the same call site as [`Self::prune_input_events`], and
+    /// that is the point: an event-triggered tree that outlived its events would
+    /// still say "the user was here at 03:14" after the record of the input was
+    /// erased. The cutoff instant itself is kept, matching event retention.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault cannot be read or written.
+    pub fn prune_edge_snapshots(&self, now_ms: i64) -> Result<usize, StoreError> {
+        let cutoff = now_ms.saturating_sub(INPUT_EVENT_RETENTION_MS);
+        let doomed: Vec<(String, String)> = {
+            let connection = self.connection.lock().unwrap();
+            let mut statement = connection.prepare(
+                "SELECT id, artifact_id FROM edge_snapshots WHERE captured_at_ms < ?1",
+            )?;
+            let rows = statement.query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        self.delete_edge_snapshots(&doomed)?;
+        Ok(doomed.len())
+    }
+
+    /// Removes edge snapshot rows and their encrypted files.
+    ///
+    /// The row goes first: a row pointing at a missing file is a decrypt error
+    /// on some later read, while a file with no row is invisible to every
+    /// prune and stays on disk forever.
+    fn delete_edge_snapshots(&self, rows: &[(String, String)]) -> Result<(), StoreError> {
+        self.flush_card_cache();
+        {
+            let connection = self.connection.lock().unwrap();
+            for (id, _) in rows {
+                connection.execute("DELETE FROM edge_snapshots WHERE id = ?1", [id])?;
+            }
+        }
+        for (_, artifact_id) in rows {
+            self.delete_artifact_record_and_file(artifact_id)?;
+        }
+        Ok(())
     }
 
     pub fn audio_segments_sync(&self, session_id: &str) -> Result<Vec<AudioSegment>, StoreError> {
@@ -3818,6 +4402,25 @@ impl Vault {
 
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
+        // Before the size sweep, and outside its early return: the 48h expiry
+        // of the input streams is a promise about time, not about disk. The
+        // size loop below returns immediately whenever the vault is under its
+        // limit, which is the normal state, so anything placed after it would
+        // effectively never run. Failure here must not stop the size sweep —
+        // a vault over its limit still has to shed frames.
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or_default(),
+        )
+        .unwrap_or(i64::MAX);
+        if let Err(error) = self.prune_input_events(now_ms) {
+            eprintln!("input event retention failed: {error}");
+        }
+        if let Err(error) = self.prune_edge_snapshots(now_ms) {
+            eprintln!("edge snapshot retention failed: {error}");
+        }
         loop {
             let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
             let mut connection = self.connection.lock().unwrap();
@@ -4266,6 +4869,8 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_20(connection, from_version)?;
     migrate_schema_21(connection)?;
     migrate_schema_22(connection)?;
+    migrate_schema_23(connection)?;
+    migrate_schema_24(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -4860,6 +5465,69 @@ fn migrate_schema_21(connection: &Connection) -> Result<(), StoreError> {
           );
          CREATE INDEX IF NOT EXISTS audio_segments_transcription_queue
            ON audio_segments(transcription_state, transcription_next_attempt_ms, started_at_ms);",
+    )?;
+    Ok(())
+}
+
+/// The second fact stream: what the user *did*, beside what was on screen.
+///
+/// Rows are the shim's coalesced observations stored as they arrived — `kind`
+/// and `target_json` are not parsed here. The index is on `at_ms` alone
+/// because every reader asks the same question, "what happened in this
+/// window", and both spans and points start there.
+///
+/// `slot_summaries.acts_json` migrates in the same step even though nothing
+/// writes it yet: events expire after [`INPUT_EVENT_RETENTION_MS`] while T1
+/// cards are computed lazily and forever, so the acts a sealed slot derived
+/// must have somewhere to be frozen before the events they came from are gone.
+///
+/// Purely additive; existing rows read back as `acts_json = NULL`, meaning
+/// "never materialised".
+fn migrate_schema_23(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS input_events (
+           id INTEGER PRIMARY KEY,
+           at_ms INTEGER NOT NULL,
+           end_ms INTEGER,
+           kind TEXT NOT NULL,
+           count INTEGER,
+           ended_with TEXT,
+           command TEXT,
+           bundle_identifier TEXT,
+           target_json TEXT
+         );
+         CREATE INDEX IF NOT EXISTS input_events_at ON input_events(at_ms);",
+    )?;
+    let mut statement = connection.prepare("PRAGMA table_info(slot_summaries)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if !existing.iter().any(|held| held == "acts_json") {
+        connection.execute("ALTER TABLE slot_summaries ADD COLUMN acts_json TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// R3 edge snapshots: accessibility trees captured because the user changed
+/// scope, with no moment of their own.
+///
+/// Deliberately not a column on `moments`: an edge snapshot has no screenshot,
+/// no thumbnail and no OCR, and hanging it off a frame would put it inside every
+/// frame-shaped retention and export path that treats a moment as a picture of
+/// the screen. The index is on `captured_at_ms` because both readers — the slot
+/// join and the 48h prune — ask only when.
+///
+/// Purely additive.
+fn migrate_schema_24(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edge_snapshots (
+           id TEXT PRIMARY KEY,
+           captured_at_ms INTEGER NOT NULL,
+           artifact_id TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS edge_snapshots_at
+           ON edge_snapshots(captured_at_ms);",
     )?;
     Ok(())
 }
@@ -8840,5 +9508,1024 @@ mod tests {
             .unwrap();
         assert_eq!(version, i64::from(SCHEMA_VERSION));
         assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+    }
+
+    fn input_event(at_ms: i64, end_ms: Option<i64>, kind: &str) -> InputEventRow {
+        InputEventRow {
+            at_ms,
+            end_ms,
+            kind: kind.to_owned(),
+            count: None,
+            ended_with: None,
+            command: None,
+            bundle_identifier: None,
+            target_json: None,
+        }
+    }
+
+    /// A two-pane window: a sidebar of short rows and a wide content pane whose
+    /// text is long enough to carry the frame past `AX_TEXT_MIN_CHARS` — but
+    /// only when both panes are counted together.
+    fn two_pane_snapshot(sidebar: &[&str], content: &[&str]) -> Vec<u8> {
+        let node = |role: &str, text: &str| {
+            serde_json::json!({"role": role, "value": text, "children": []})
+        };
+        serde_json::to_vec(&serde_json::json!({
+            "application_name": "Feishu",
+            "bundle_identifier": "com.electron.lark",
+            "window_title": "Lody Team",
+            "root": {
+                "role": "AXWindow",
+                "title": "Lark",
+                "frame": {"x": 0, "y": 0, "width": 1000, "height": 1000},
+                "children": [
+                    {
+                        "role": "AXGroup",
+                        "title": "Conversations",
+                        "frame": {"x": 0, "y": 0, "width": 200, "height": 1000},
+                        "children": sidebar
+                            .iter()
+                            .map(|line| node("AXStaticText", line))
+                            .collect::<Vec<_>>(),
+                    },
+                    {
+                        "role": "AXGroup",
+                        "title": "Chat",
+                        "frame": {"x": 200, "y": 0, "width": 800, "height": 1000},
+                        "children": content
+                            .iter()
+                            .map(|line| node("AXStaticText", line))
+                            .collect::<Vec<_>>(),
+                    }
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// The text-source decision and the engaged partition read the same line
+    /// vector, and they must stay independent: a frame whose engaged region is
+    /// small still uses accessibility text if the *whole* tree is rich enough.
+    ///
+    /// Get this wrong and partitioning silently demotes a frame to OCR — worse
+    /// text, whole-screen scope — for the frames the join works best on.
+    #[test]
+    fn partitioning_never_flips_a_frames_text_source() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = slot_start_for(1_786_698_000_000) + 60_000;
+
+        // 20 sidebar rows of ~24 chars carry the frame over the 400-char gate;
+        // the engaged pane alone holds well under it.
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let content = ["赵亮: shipped the fix", "me: thanks"];
+        let engaged_chars: usize = content.iter().map(|line| line.chars().count()).sum();
+        assert!(
+            engaged_chars < slot::AX_TEXT_MIN_CHARS,
+            "the engaged pane must be under the gate for this test to mean anything"
+        );
+        let snapshot = two_pane_snapshot(&sidebar_refs, &content);
+        assert!(
+            accessibility_text_lines(&snapshot)
+                .iter()
+                .map(|line| line.chars().count())
+                .sum::<usize>()
+                >= slot::AX_TEXT_MIN_CHARS,
+            "the whole tree must be over the gate"
+        );
+
+        for step in 0..3_i64 {
+            let at = slot + step * 10_000;
+            let moment = insert_named_moment(
+                &vault,
+                &session.id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &snapshot,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(!moment.id.is_empty());
+        }
+
+        // One click, inside the chat pane: engaged scope is the chat pane.
+        let mut click = input_event(slot + 5_000, None, "click");
+        click.bundle_identifier = Some("com.electron.lark".to_owned());
+        click.target_json = Some(
+            r#"{"role":"AXStaticText","label":"赵亮",
+                "frame":{"x":300,"y":100,"width":200,"height":20}}"#
+                .to_owned(),
+        );
+        vault.insert_input_events(&[click]).unwrap();
+
+        let card = vault.slot_card(slot + 1_000, 10_000).unwrap();
+        let run = card
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot has a run");
+
+        assert_eq!(
+            run.text_source, "ax",
+            "the gate counts every line, engaged or not"
+        );
+        assert_eq!(
+            run.lines,
+            ["赵亮: shipped the fix", "me: thanks"],
+            "only the pane the click landed in"
+        );
+        assert_eq!(run.peripheral.len(), 20, "the sidebar is visible, not operated");
+        assert_eq!(
+            card.not_engaged,
+            vec![acts::Region {
+                label: "Conversations".to_owned(),
+                lines: 20,
+                engaged: false,
+            }]
+        );
+        let acts = run.acts.as_ref().expect("the slot has events");
+        assert_eq!(acts.clicks.len(), 1);
+        assert_eq!(acts.clicks[0].label, "赵亮");
+        assert_eq!(acts.signal, acts::ActsSignal::Ok);
+        assert!(card.facts.no_input_ratio.is_some());
+    }
+
+    /// The same slot with its events removed: the card must be the one the
+    /// pipeline built before acts existed, sidebar text included.
+    #[test]
+    fn a_slot_whose_events_are_gone_partitions_nothing() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = slot_start_for(1_786_698_000_000) + 60_000;
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let snapshot = two_pane_snapshot(&sidebar_refs, &["赵亮: shipped the fix", "me: thanks"]);
+        for step in 0..3_i64 {
+            let at = slot + step * 10_000;
+            insert_named_moment(
+                &vault,
+                &session.id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &snapshot,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+
+        let card = vault.slot_card(slot + 1_000, 10_000).unwrap();
+        let run = card
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot has a run");
+        assert_eq!(run.text_source, "ax");
+        assert_eq!(run.lines.len(), 22, "every line, in tree order");
+        assert!(run.peripheral.is_empty());
+        assert!(run.acts.is_none());
+        assert!(card.not_engaged.is_empty());
+        assert_eq!(card.facts.no_input_ratio, None);
+    }
+
+    /// Builds a slot of Feishu frames with one click in the chat pane and a
+    /// typing burst, and returns its start.
+    fn acts_slot(vault: &Vault, session_id: &str) -> i64 {
+        // Frames sit a minute into the slot; the caller gets the slot's own
+        // start, which is what `slot_acts` and `slots_missing_acts` key on.
+        let first_at = slot_start_for(1_786_698_000_000) + 60_000;
+        let slot = vault.summary_slot_bounds(first_at).start_ms;
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let snapshot = two_pane_snapshot(&sidebar_refs, &["赵亮: shipped the fix", "me: thanks"]);
+        for step in 0..3_i64 {
+            let at = first_at + step * 10_000;
+            insert_named_moment(
+                vault,
+                session_id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    session_id,
+                    at,
+                    "application/json",
+                    &snapshot,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let mut click = input_event(first_at + 5_000, None, "click");
+        click.bundle_identifier = Some("com.electron.lark".to_owned());
+        click.target_json = Some(
+            r#"{"role":"AXStaticText","label":"赵亮",
+                "frame":{"x":300,"y":100,"width":200,"height":20}}"#
+                .to_owned(),
+        );
+        let mut burst = input_event(first_at + 6_000, Some(first_at + 12_000), "burst");
+        burst.count = Some(24);
+        burst.bundle_identifier = Some("com.electron.lark".to_owned());
+        burst.target_json = Some(
+            r#"{"role":"AXTextArea","label":"Message",
+                "frame":{"x":300,"y":900,"width":400,"height":40}}"#
+                .to_owned(),
+        );
+        vault.insert_input_events(&[click, burst]).unwrap();
+        slot
+    }
+
+    /// The reason materialisation exists: events are deleted after 48 hours and
+    /// T1 is lazy, so acts that are not frozen simply disappear from history.
+    #[test]
+    fn frozen_acts_outlive_the_events_they_came_from() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+
+        let live = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        let live_run = live
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("a run");
+        let live_acts = live_run.acts.clone().expect("the slot has events");
+        assert_eq!(live_acts.keys, 24);
+        assert_eq!(live_acts.clicks[0].label, "赵亮");
+
+        assert!(
+            vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap(),
+            "a slot with events and no frozen acts is work to do"
+        );
+        vault.flush_card_cache();
+
+        // 48 hours pass.
+        let removed = vault
+            .prune_input_events(slot + SLOT_DURATION_MS + INPUT_EVENT_RETENTION_MS)
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert!(
+            vault
+                .input_events_between(slot, slot + SLOT_DURATION_MS)
+                .unwrap()
+                .is_empty()
+        );
+
+        let after = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        let after_run = after
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("a run");
+        let frozen = after_run
+            .acts
+            .clone()
+            .expect("the frozen copy stands in for the events");
+        assert_eq!(frozen, live_acts, "the same acts, minus their source");
+        assert_eq!(after.facts.no_input_ratio, live.facts.no_input_ratio);
+        // What the freeze does not restore: the partition was computed against
+        // rects that no longer exist, so the text is whole again.
+        assert!(after_run.peripheral.is_empty());
+        assert_eq!(after_run.lines.len(), 22);
+        assert!(after.not_engaged.is_empty());
+    }
+
+    /// The sweeper revisits every slot every five minutes forever.
+    #[test]
+    fn freezing_a_slot_twice_changes_nothing() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+
+        assert!(vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap());
+        let first = vault.slot_acts(slot).unwrap().expect("frozen");
+        assert!(
+            !vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap(),
+            "already frozen"
+        );
+        assert_eq!(vault.slot_acts(slot).unwrap(), Some(first));
+
+        // And a later T2 card does not erase them.
+        let card = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        vault
+            .put_t2_summary(
+                &card,
+                &T2Card {
+                    artifacts: vec![],
+                    title: "Answering 赵亮".into(),
+                    bullets: vec![],
+                    category: Some("comms".into()),
+                    confidence: Some(0.9),
+                },
+                "test",
+                slot,
+                None,
+            )
+            .unwrap();
+        assert!(
+            vault.slot_acts(slot).unwrap().is_some(),
+            "a model writing the card must not drop the acts under it"
+        );
+        let day = vault.day_summary(slot, 10_000).unwrap();
+        assert_eq!(day.slots.len(), 1, "no phantom slot from the acts row");
+        assert_eq!(day.slots[0].title.as_deref(), Some("Answering 赵亮"));
+    }
+
+    #[test]
+    fn a_slot_with_no_events_is_never_frozen() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let at = slot_start_for(1_786_698_000_000) + 60_000;
+        let slot = vault.summary_slot_bounds(at).start_ms;
+        insert_named_moment(&vault, &session.id, at, "Zed", "dev.zed.Zed", "slot.rs");
+        assert!(
+            !vault.materialize_slot_acts(at, 10_000).unwrap(),
+            "no events stored and events that said nothing are different claims"
+        );
+        assert_eq!(vault.slot_acts(slot).unwrap(), None);
+        assert!(
+            vault
+                .slots_missing_acts(slot, slot + SLOT_DURATION_MS)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn slots_missing_acts_lists_slots_with_events_until_they_are_frozen() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+        let window_end = slot + SLOT_DURATION_MS;
+
+        assert_eq!(
+            vault.slots_missing_acts(slot, window_end).unwrap(),
+            vec![slot]
+        );
+        vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap();
+        assert!(
+            vault.slots_missing_acts(slot, window_end).unwrap().is_empty(),
+            "frozen slots leave the work list"
+        );
+    }
+
+    /// A burst that straddles a boundary happened in both slots, so both owe
+    /// acts. Enqueueing only the slot it started in would leave the second one
+    /// unfrozen, and once the events expired it would fail open forever —
+    /// silently dropping typing the user did.
+    #[test]
+    fn a_span_crossing_a_boundary_enqueues_every_slot_it_touches() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+        let boundary = vault.summary_slot_bounds(slot).end_ms;
+
+        vault
+            .insert_input_events(&[InputEventRow {
+                at_ms: boundary - 2_000,
+                end_ms: Some(boundary + 20_000),
+                kind: "burst".to_owned(),
+                count: Some(34),
+                ended_with: Some("return".to_owned()),
+                command: None,
+                bundle_identifier: Some("com.electron.lark".to_owned()),
+                target_json: None,
+            }])
+            .unwrap();
+
+        let due = vault
+            .slots_missing_acts(slot, boundary + SLOT_DURATION_MS)
+            .unwrap();
+        assert!(due.contains(&slot), "the slot the burst began in");
+        assert!(
+            due.contains(&boundary),
+            "the slot it was still typing into: {due:?}"
+        );
+    }
+
+    /// One privacy invariant, three layers: forgetting a window takes the
+    /// frames, the cards, and the acts derived from the events.
+    #[test]
+    fn deleting_history_takes_the_frozen_acts_with_it() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+        assert!(vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap());
+        assert!(vault.slot_acts(slot).unwrap().is_some());
+
+        vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap();
+
+        assert_eq!(vault.slot_acts(slot).unwrap(), None);
+        assert!(
+            vault
+                .input_events_between(slot, slot + SLOT_DURATION_MS)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A window owns an event when the two intervals touch at all: a burst that
+    /// started before the slot opened is still typing that happened inside it.
+    /// The window is half-open so consecutive slots partition the stream.
+    #[test]
+    fn input_events_between_returns_every_overlapping_row_in_order() {
+        let (_directory, vault) = test_vault(10);
+        let rows = vec![
+            input_event(999, None, "click"),          // before the window
+            input_event(1_000, None, "click"),        // on the lower edge
+            input_event(1_999, None, "scroll"),       // last instant inside
+            input_event(2_000, None, "click"),        // on the open upper edge
+            input_event(500, Some(999), "burst"),     // ends before the window
+            input_event(400, Some(1_000), "burst"),   // ends on the lower edge
+            input_event(600, Some(1_500), "burst"),   // straddles the opening
+            input_event(1_900, Some(2_600), "burst"), // straddles the close
+            input_event(2_000, Some(2_600), "burst"), // starts at the close
+            input_event(1_200, Some(1_100), "burst"), // nonsense end: a point
+        ];
+        assert_eq!(vault.insert_input_events(&rows).unwrap(), rows.len());
+
+        let found = vault.input_events_between(1_000, 2_000).unwrap();
+        let shape: Vec<(i64, Option<i64>)> = found
+            .iter()
+            .map(|event| (event.at_ms, event.end_ms))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (400, Some(1_000)),
+                (600, Some(1_500)),
+                (1_000, None),
+                (1_200, Some(1_100)),
+                (1_900, Some(2_600)),
+                (1_999, None),
+            ]
+        );
+
+        // Half-open: the next slot picks up exactly what this one left.
+        let next = vault.input_events_between(2_000, 3_000).unwrap();
+        assert_eq!(
+            next.iter()
+                .map(|event| (event.at_ms, event.end_ms))
+                .collect::<Vec<_>>(),
+            vec![(1_900, Some(2_600)), (2_000, None), (2_000, Some(2_600))]
+        );
+        assert!(vault.input_events_between(2_000, 2_000).unwrap().is_empty());
+    }
+
+    /// The shim can ship ahead of its reader, and the store is not the layer
+    /// that decides what an act means: an unrecognised `kind` must survive the
+    /// round trip untouched rather than be rejected or normalised.
+    #[test]
+    fn input_events_round_trip_unknown_kinds_and_every_field() {
+        let (_directory, vault) = test_vault(10);
+        let stored = InputEventRow {
+            at_ms: 5_000,
+            end_ms: Some(7_500),
+            kind: "pinch-from-a-newer-shim".to_owned(),
+            count: Some(42),
+            ended_with: Some("return".to_owned()),
+            command: Some("cmd+s".to_owned()),
+            bundle_identifier: Some("dev.zed.Zed".to_owned()),
+            target_json: Some(
+                r#"{"role":"AXTextArea","label":"lib.rs","frame":{"x":1,"y":2,"width":3,"height":4}}"#
+                    .to_owned(),
+            ),
+        };
+        vault
+            .insert_input_events(std::slice::from_ref(&stored))
+            .unwrap();
+        let found = vault.input_events_between(0, 10_000).unwrap();
+        assert_eq!(found, vec![stored]);
+        assert_eq!(vault.insert_input_events(&[]).unwrap(), 0);
+    }
+
+    /// Retention is "the last 48 hours", inclusive of its own edge, and a span
+    /// is judged by its end: a burst reaching into the window outlives its
+    /// start.
+    /// Expiry is a promise about time, so it cannot ride the capture path:
+    /// a vault that is merely opened — recording stopped, nothing imported —
+    /// must still shed anything past the window.
+    #[test]
+    fn opening_a_vault_expires_the_input_streams_without_any_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [31_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            vault
+                .insert_input_events(&[
+                    InputEventRow {
+                        at_ms: now - INPUT_EVENT_RETENTION_MS - 60_000,
+                        end_ms: None,
+                        kind: "click".to_owned(),
+                        count: None,
+                        ended_with: None,
+                        command: None,
+                        bundle_identifier: Some("com.electron.lark".to_owned()),
+                        target_json: None,
+                    },
+                    InputEventRow {
+                        at_ms: now - 60_000,
+                        end_ms: None,
+                        kind: "click".to_owned(),
+                        count: None,
+                        ended_with: None,
+                        command: None,
+                        bundle_identifier: Some("com.electron.lark".to_owned()),
+                        target_json: None,
+                    },
+                ])
+                .unwrap();
+            assert_eq!(vault.input_events_between(0, now + 1).unwrap().len(), 2);
+        }
+        // Reopening runs `enforce_retention`, and nothing else.
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let kept = vault.input_events_between(0, now + 1).unwrap();
+        assert_eq!(kept.len(), 1, "the expired observation outlived its window");
+        assert!(kept[0].at_ms > now - INPUT_EVENT_RETENTION_MS);
+    }
+
+    #[test]
+    fn prune_input_events_keeps_the_retention_edge() {
+        let (_directory, vault) = test_vault(10);
+        let now = 1_786_698_000_000;
+        let cutoff = now - INPUT_EVENT_RETENTION_MS;
+        let rows = vec![
+            input_event(cutoff - 1, None, "click"),
+            input_event(cutoff, None, "click"),
+            input_event(cutoff + 1, None, "click"),
+            input_event(cutoff - 5_000, Some(cutoff - 1), "burst"),
+            input_event(cutoff - 5_000, Some(cutoff), "burst"),
+        ];
+        vault.insert_input_events(&rows).unwrap();
+
+        assert_eq!(vault.prune_input_events(now).unwrap(), 2);
+        let remaining = vault.input_events_between(0, now + 1).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|event| (event.at_ms, event.end_ms))
+                .collect::<Vec<_>>(),
+            vec![
+                (cutoff - 5_000, Some(cutoff)),
+                (cutoff, None),
+                (cutoff + 1, None),
+            ]
+        );
+        // Idempotent: nothing left to drop on a second pass at the same instant.
+        assert_eq!(vault.prune_input_events(now).unwrap(), 0);
+    }
+
+    /// Forgetting a stretch of history must take the events with it: they say
+    /// what the user did in that window in finer detail than any frame does.
+    #[test]
+    fn delete_history_removes_overlapping_input_events() {
+        let (_directory, vault) = test_vault(10);
+        let at = 1_786_698_000_000;
+        let slot = slot_start_for(at);
+        let rows = vec![
+            input_event(slot - 1, None, "click"),
+            input_event(slot, None, "click"),
+            input_event(slot + 5_000, Some(slot + 9_000), "burst"),
+            input_event(slot - 5_000, Some(slot + 1_000), "burst"),
+            input_event(slot + SLOT_DURATION_MS, None, "click"),
+            input_event(slot + SLOT_DURATION_MS + 1, None, "click"),
+        ];
+        vault.insert_input_events(&rows).unwrap();
+
+        vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap();
+
+        let remaining = vault.input_events_between(0, at + SLOT_DURATION_MS * 4).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|event| (event.at_ms, event.end_ms))
+                .collect::<Vec<_>>(),
+            vec![
+                (slot - 1, None),
+                (slot + SLOT_DURATION_MS + 1, None),
+            ],
+            "only rows entirely outside the deleted window may survive"
+        );
+    }
+
+    #[test]
+    fn schema_23_adds_input_events_to_an_existing_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [23_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS input_events_at;
+                     DROP TABLE IF EXISTS input_events;
+                     ALTER TABLE slot_summaries DROP COLUMN acts_json;
+                     UPDATE schema_meta SET version = 22;",
+                )
+                .unwrap();
+            session.id
+        };
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        let connection = vault.connection.lock().unwrap();
+        let objects: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('input_events', 'input_events_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 2, "table and its index must both come back");
+        let version: i64 = connection
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+        let acts_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('slot_summaries')
+                  WHERE name = 'acts_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acts_column, 1);
+        drop(connection);
+        // The upgrade is additive: what was already there is still there.
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+        assert!(vault.input_events_between(0, 10).unwrap().is_empty());
+    }
+
+    /// Events arrive at interaction rate while T1 reads the same window from
+    /// the reader pool. A reader must never see a half-written batch and the
+    /// writer must never be blocked out by readers.
+    #[test]
+    fn input_event_writes_and_reader_pool_queries_do_not_collide() {
+        let (_directory, vault) = test_vault(10);
+        let vault = std::sync::Arc::new(vault);
+        let batches = 40_i64;
+        let per_batch = 8_i64;
+        let base = 1_700_000_000_000_i64;
+
+        std::thread::scope(|scope| {
+            let writer = {
+                let vault = std::sync::Arc::clone(&vault);
+                scope.spawn(move || {
+                    for batch in 0..batches {
+                        let rows: Vec<InputEventRow> = (0..per_batch)
+                            .map(|index| {
+                                let at = base + batch * 1_000 + index;
+                                let mut row = input_event(at, Some(at + 10), "burst");
+                                row.count = Some(u32::try_from(index).unwrap());
+                                row
+                            })
+                            .collect();
+                        assert_eq!(
+                            vault.insert_input_events(&rows).unwrap(),
+                            usize::try_from(per_batch).unwrap()
+                        );
+                    }
+                })
+            };
+            for _ in 0..3 {
+                let vault = std::sync::Arc::clone(&vault);
+                scope.spawn(move || {
+                    for _ in 0..60 {
+                        let found = vault
+                            .input_events_between(base, base + batches * 1_000)
+                            .expect("reader query must not fail while a batch commits");
+                        // Batches commit whole, so a partial group is never
+                        // visible: the count is always a multiple of the batch.
+                        assert_eq!(
+                            i64::try_from(found.len()).unwrap() % per_batch,
+                            0,
+                            "reader saw a half-committed batch"
+                        );
+                        assert!(
+                            found.windows(2).all(|pair| pair[0].at_ms <= pair[1].at_ms),
+                            "rows must come back ordered by at_ms"
+                        );
+                    }
+                });
+            }
+            writer.join().unwrap();
+        });
+
+        let all = vault
+            .input_events_between(base, base + batches * 1_000)
+            .unwrap();
+        assert_eq!(i64::try_from(all.len()).unwrap(), batches * per_batch);
+    }
+
+    // ------------------------------------------------- R3 edge snapshots
+
+    /// An edge snapshot is stored bytes-in / bytes-out, and its window is
+    /// half-open on the same rule as slots and events, so one tree can never be
+    /// read into two cards.
+    #[test]
+    fn edge_snapshots_round_trip_within_a_half_open_window() {
+        let (_directory, vault) = test_vault(10);
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+
+        let first = vault.insert_edge_snapshot(1_000, &tree).unwrap();
+        let edge = vault.insert_edge_snapshot(1_999, &tree).unwrap();
+        let next_slot = vault.insert_edge_snapshot(2_000, &tree).unwrap();
+
+        let found = vault.edge_snapshots_between(1_000, 2_000).unwrap();
+        assert_eq!(
+            found.iter().map(|row| row.captured_at_ms).collect::<Vec<_>>(),
+            vec![1_000, 1_999],
+            "the upper bound is open"
+        );
+        assert_eq!(found[0], first);
+        assert_eq!(found[1], edge);
+        assert_eq!(
+            vault.edge_snapshots_between(2_000, 3_000).unwrap(),
+            vec![next_slot.clone()],
+            "the next window picks up exactly what this one left"
+        );
+        assert!(vault.edge_snapshots_between(2_000, 2_000).unwrap().is_empty());
+
+        let payload = vault.read_artifact(&edge.artifact_id).unwrap();
+        assert_eq!(payload.bytes, tree, "the encrypted tree decrypts unchanged");
+        assert_eq!(payload.content_type, EDGE_SNAPSHOT_CONTENT_TYPE);
+    }
+
+    /// Edge snapshots share the events' 48h lifetime, files included: a tree
+    /// triggered by an event and outliving it would still say when the user
+    /// interacted after the record of the interaction was erased.
+    #[test]
+    fn prune_edge_snapshots_deletes_rows_and_their_artifact_files() {
+        let (_directory, vault) = test_vault(10);
+        let now = 1_786_698_000_000;
+        let cutoff = now - INPUT_EVENT_RETENTION_MS;
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+
+        let expired = vault.insert_edge_snapshot(cutoff - 1, &tree).unwrap();
+        let edge = vault.insert_edge_snapshot(cutoff, &tree).unwrap();
+        let fresh = vault.insert_edge_snapshot(cutoff + 1, &tree).unwrap();
+        for row in [&expired, &edge, &fresh] {
+            assert!(vault.artifact_path(&row.artifact_id).exists());
+        }
+
+        assert_eq!(vault.prune_edge_snapshots(now).unwrap(), 1);
+
+        assert_eq!(
+            vault
+                .edge_snapshots_between(0, now)
+                .unwrap()
+                .iter()
+                .map(|row| row.captured_at_ms)
+                .collect::<Vec<_>>(),
+            vec![cutoff, cutoff + 1],
+            "retention keeps its own edge, like the events'"
+        );
+        assert!(
+            !vault.artifact_path(&expired.artifact_id).exists(),
+            "the encrypted file must go with the row"
+        );
+        assert!(matches!(
+            vault.read_artifact(&expired.artifact_id),
+            Err(StoreError::ArtifactNotFound(_))
+        ));
+        assert!(vault.artifact_path(&edge.artifact_id).exists());
+        // Idempotent: nothing left to drop at the same instant.
+        assert_eq!(vault.prune_edge_snapshots(now).unwrap(), 0);
+    }
+
+    /// One privacy invariant, four layers: forgetting a window takes the frames,
+    /// the cards, the acts, and the R3 trees. Edge snapshots hang off no moment,
+    /// so no frame deletion can reach them.
+    #[test]
+    fn delete_history_takes_edge_snapshots_and_their_artifacts() {
+        let (_directory, vault) = test_vault(10);
+        let slot = slot_start_for(1_786_698_000_000);
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+
+        let before = vault.insert_edge_snapshot(slot - 1, &tree).unwrap();
+        let inside = vault.insert_edge_snapshot(slot + 5_000, &tree).unwrap();
+        let after = vault
+            .insert_edge_snapshot(slot + SLOT_DURATION_MS + 1, &tree)
+            .unwrap();
+
+        vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap();
+
+        assert_eq!(
+            vault
+                .edge_snapshots_between(0, slot + SLOT_DURATION_MS * 4)
+                .unwrap()
+                .iter()
+                .map(|row| row.captured_at_ms)
+                .collect::<Vec<_>>(),
+            vec![before.captured_at_ms, after.captured_at_ms],
+            "only trees entirely outside the forgotten window may survive"
+        );
+        assert!(!vault.artifact_path(&inside.artifact_id).exists());
+        assert!(vault.artifact_path(&before.artifact_id).exists());
+        assert!(vault.artifact_path(&after.artifact_id).exists());
+    }
+
+    /// End to end: a stored edge tree reaches the card as extra engaged text for
+    /// the run it fell in, and changes nothing else about that card.
+    #[test]
+    fn a_stored_edge_snapshot_widens_the_text_of_the_run_it_fell_in() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = slot_start_for(1_786_698_000_000) + 60_000;
+        let sidebar: Vec<String> = (0..20)
+            .map(|index| format!("conversation row {index:02} here"))
+            .collect();
+        let sidebar_refs: Vec<&str> = sidebar.iter().map(String::as_str).collect();
+        let heartbeat = two_pane_snapshot(&sidebar_refs, &["赵亮: shipped the fix", "me: thanks"]);
+        for step in 0..3_i64 {
+            let at = slot + step * 10_000;
+            insert_named_moment(
+                &vault,
+                &session.id,
+                at,
+                "Feishu",
+                "com.electron.lark",
+                "Lody Team",
+            );
+            vault
+                .attach_accessibility_snapshot(
+                    &session.id,
+                    at,
+                    "application/json",
+                    &heartbeat,
+                    Some("Feishu"),
+                    Some("com.electron.lark"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let mut click = input_event(slot + 5_000, None, "click");
+        click.bundle_identifier = Some("com.electron.lark".to_owned());
+        click.target_json = Some(
+            r#"{"role":"AXStaticText","label":"赵亮",
+                "frame":{"x":300,"y":100,"width":200,"height":20}}"#
+                .to_owned(),
+        );
+        vault.insert_input_events(&[click]).unwrap();
+        let before = vault.slot_card(slot + 1_000, 10_000).unwrap();
+
+        // The message that arrived and was read between two heartbeats.
+        let edge = two_pane_snapshot(
+            &sidebar_refs,
+            &[
+                "赵亮: shipped the fix",
+                "me: thanks",
+                "赵亮: staging looks clean",
+            ],
+        );
+        vault.insert_edge_snapshot(slot + 5_000, &edge).unwrap();
+
+        let card = vault.slot_card(slot + 1_000, 10_000).unwrap();
+        let run = card
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot has a run");
+        assert_eq!(
+            run.lines,
+            ["赵亮: shipped the fix", "me: thanks", "赵亮: staging looks clean"],
+            "the edge tree's new chat line joins the engaged bucket"
+        );
+        assert_eq!(
+            run.peripheral.len(),
+            20,
+            "the sidebar the edge tree also saw stays peripheral, not doubled"
+        );
+
+        let bare = before
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("the slot had a run before the edge tree too");
+        assert_eq!(card.facts.moment_count, before.facts.moment_count, "3 frames");
+        assert_eq!(card.evidence.moment_ids, before.evidence.moment_ids);
+        assert_eq!(card.anchor_moment_id, before.anchor_moment_id);
+        assert_eq!(run.moment_id, bare.moment_id);
+        assert_eq!(run.acts, bare.acts);
+    }
+
+    #[test]
+    fn schema_24_adds_edge_snapshots_to_an_existing_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [24_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let session_id = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"keep")
+                .unwrap();
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS edge_snapshots_at;
+                     DROP TABLE IF EXISTS edge_snapshots;
+                     UPDATE schema_meta SET version = 23;",
+                )
+                .unwrap();
+            session.id
+        };
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        {
+            let connection = vault.connection.lock().unwrap();
+            let objects: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE name IN ('edge_snapshots', 'edge_snapshots_at')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(objects, 2, "table and its index must both come back");
+            let version: i64 = connection
+                .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, i64::from(SCHEMA_VERSION));
+        }
+        // The upgrade is additive, and the new table is usable straight away.
+        assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+        vault.insert_edge_snapshot(5_000, &tree).unwrap();
+        assert_eq!(vault.edge_snapshots_between(0, 10_000).unwrap().len(), 1);
     }
 }

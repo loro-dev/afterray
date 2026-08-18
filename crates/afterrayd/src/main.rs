@@ -19,7 +19,7 @@ use afterray_models::{
     qwen35_mlx_manifest, remove_pack, spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
-    ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, MacOsCaptureBackend,
+    ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, InputEventRecord, MacOsCaptureBackend,
     apply_background_qos, parent_app_anchor, peer_is_afterray_app,
 };
 use afterray_protocol::{
@@ -29,7 +29,8 @@ use afterray_protocol::{
     redact_cli_response_data,
 };
 use afterray_store::{
-    LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault, VaultConfig,
+    InputEventRow, LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault,
+    VaultConfig,
 };
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -2178,6 +2179,34 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
     }
 }
 
+/// Marks a stretch as unobservable rather than empty.
+///
+/// The two fact streams are read very differently when one goes quiet: a slot
+/// with no frames is obviously a hole, but a slot with no input events looks
+/// exactly like a slot where the user sat and read. Whenever the daemon knows
+/// it *lost* observations — the tap died, or a batch failed to land — it says
+/// so in the stream itself, and the join downgrades that stretch to
+/// `unavailable` instead of asserting an engaged scope over it.
+///
+/// Best effort by construction: if this write fails too there is nothing
+/// further to say, and stalling capture over it would trade frames for
+/// bookkeeping.
+async fn record_signal_gap(state: &Arc<AppState>, from_ms: i64, to_ms: i64, reason: &str) {
+    let marker = InputEventRow {
+        at_ms: from_ms,
+        end_ms: (to_ms > from_ms).then_some(to_ms),
+        kind: afterray_store::acts::SIGNAL_GAP_KIND.to_owned(),
+        count: None,
+        ended_with: None,
+        command: Some(reason.to_owned()),
+        bundle_identifier: None,
+        target_json: None,
+    };
+    if let Err(error) = run_store(state, move |s| s.store.insert_input_events(&[marker])).await {
+        eprintln!("input signal gap store failed: {error}");
+    }
+}
+
 async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
     while let Some(event) = state.capture.next_event().await {
         match event {
@@ -2207,6 +2236,42 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
             }
             Ok(CaptureEvent::Warning { code, message }) => {
                 eprintln!("capture warning [{code}]: {message}");
+                // A dead input tap is a hole in one of the two fact streams,
+                // and it has to be recorded *in* that stream: T1 reads the
+                // absence of events as "the user did nothing here", which is
+                // exactly the inference this pipeline exists to prevent. The
+                // marker rides the same table (the vault stores `kind`
+                // uninterpreted) so the gap arrives in its place in time.
+                if matches!(code.as_str(), "input_tap_stalled" | "input_tap_unavailable") {
+                    let at = now_ms();
+                    record_signal_gap(&state, at, at, &code).await;
+                }
+            }
+            Ok(CaptureEvent::InputEvents { events, dropped }) => {
+                if !events.is_empty() || dropped > 0 {
+                    eprintln!("capture input events batch={} dropped={dropped}", events.len());
+                }
+                if !events.is_empty() {
+                    let rows: Vec<InputEventRow> = events.iter().map(input_event_row).collect();
+                    let span = rows
+                        .first()
+                        .map(|first| (first.at_ms, rows.last().map_or(first.at_ms, |l| l.at_ms)));
+                    // A failed batch is not retried: the events are one of two
+                    // independent fact streams, and stalling capture over the
+                    // softer one would cost frames. But it must not vanish
+                    // quietly either — a stretch with no rows reads as "the
+                    // user did nothing", which is the one thing this pipeline
+                    // may never say by accident. Mark the stretch unobservable
+                    // instead, the same way a dead tap is marked.
+                    if let Err(error) =
+                        run_store(&state, move |s| s.store.insert_input_events(&rows)).await
+                    {
+                        eprintln!("capture input events store failed: {error}");
+                        if let Some((from_ms, to_ms)) = span {
+                            record_signal_gap(&state, from_ms, to_ms, "input_events_store_failed").await;
+                        }
+                    }
+                }
             }
             Ok(CaptureEvent::Failed { code, message }) => {
                 eprintln!("capture failed [{code}]: {message}");
@@ -2242,6 +2307,29 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
     let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
 }
 
+/// Maps one shim observation onto its vault row.
+///
+/// `target` is stored as the platform layer's own JSON. The vault does not
+/// interpret element identities and this phase does not either; the T1 join is
+/// the first reader that will. A target that somehow cannot be encoded is
+/// stored as absent rather than dropping the event — that an input happened is
+/// the load-bearing fact; where it landed is the refinement.
+fn input_event_row(record: &InputEventRecord) -> InputEventRow {
+    InputEventRow {
+        at_ms: record.at_ms,
+        end_ms: record.end_ms,
+        kind: record.kind.clone(),
+        count: record.count,
+        ended_with: record.ended_with.clone(),
+        command: record.command.clone(),
+        bundle_identifier: record.bundle_identifier.clone(),
+        target_json: record
+            .target
+            .as_ref()
+            .and_then(|target| serde_json::to_string(target).ok()),
+    }
+}
+
 async fn import_artifact(
     state: &Arc<AppState>,
     session_id: &str,
@@ -2257,8 +2345,10 @@ async fn import_artifact(
             let session_id = session_id.to_owned();
             let content_type = content_type.to_owned();
             let moment = run_store(state, move |s| {
-                s.store
-                    .insert_moment(&session_id, started_at_ms, &content_type, &bytes)
+                let moment =
+                    s.store
+                        .insert_moment(&session_id, started_at_ms, &content_type, &bytes)?;
+                Ok::<_, StoreError>(moment)
             })
             .await?;
             {
@@ -2340,9 +2430,10 @@ async fn import_artifact(
         ArtifactKind::SystemAudio | ArtifactKind::Microphone => {
             let track = match kind {
                 ArtifactKind::Microphone => afterray_protocol::AudioTrack::Microphone,
-                ArtifactKind::SystemAudio | ArtifactKind::Screen | ArtifactKind::Accessibility => {
-                    afterray_protocol::AudioTrack::System
-                }
+                ArtifactKind::SystemAudio
+                | ArtifactKind::Screen
+                | ArtifactKind::Accessibility
+                | ArtifactKind::AccessibilityEdge => afterray_protocol::AudioTrack::System,
             };
             let session_id = session_id.to_owned();
             let content_type = content_type.to_owned();
@@ -2439,6 +2530,31 @@ async fn import_artifact(
             }
             tokio::fs::remove_file(path).await?;
         }
+        ArtifactKind::AccessibilityEdge => {
+            // Same exclusion posture as the accessibility branch, and for the
+            // same reason: this is a whole window's worth of text, and the app
+            // that owns it is named nowhere else. There is no moment to delete
+            // alongside it — an edge snapshot is unpaired — so an unjudgeable
+            // one is simply never stored.
+            let Some((bundle_identifier, url)) = edge_snapshot_identity(&bytes) else {
+                eprintln!("edge snapshot did not parse or named no app, dropping it unstored");
+                tokio::fs::remove_file(path).await?;
+                return Ok(());
+            };
+            if is_excluded_bundle(state, Some(&bundle_identifier))
+                || is_excluded_url(state, url.as_deref())
+            {
+                tokio::fs::remove_file(path).await?;
+                return Ok(());
+            }
+            // No moment, no thumbnail, no OCR job: an edge snapshot is not a
+            // frame of the screen, it is extra tree for the T1 join.
+            run_store(state, move |s| {
+                s.store.insert_edge_snapshot(started_at_ms, &bytes)
+            })
+            .await?;
+            tokio::fs::remove_file(path).await?;
+        }
     }
     Ok(())
 }
@@ -2451,6 +2567,19 @@ struct AccessibilityMetadata {
     /// area's `AXURL`. This is the structured address used for activity spans
     /// and website exclusions.
     url: Option<String>,
+}
+
+/// The app an R3 edge snapshot belongs to, plus the URL it exposes.
+///
+/// `None` means "do not store this": unparseable and unnamed are the same answer
+/// here, because the exclusion list is keyed by bundle identifier and a snapshot
+/// naming no app cannot be checked against it. Stricter than the heartbeat
+/// branch, which has a screenshot already on disk and must decide what to delete;
+/// an edge snapshot loses nothing by being dropped — the next trigger is one
+/// interaction away.
+fn edge_snapshot_identity(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    let metadata = serde_json::from_slice::<AccessibilityMetadata>(bytes).ok()?;
+    Some((metadata.bundle_identifier?, metadata.url))
 }
 
 fn attach_accessibility_artifact(
@@ -3238,6 +3367,68 @@ async fn fail_claimed_audio(
     }
 }
 
+/// How far back the freeze looks for slots whose acts are not yet frozen.
+///
+/// Comfortably inside the 48-hour event retention: the work only exists while
+/// the events do, and a longer window would just re-check slots whose events
+/// are already gone.
+const ACTS_FREEZE_LOOKBACK_MS: i64 = 36 * 60 * 60 * 1000;
+
+/// Ceiling per tick. One freeze rebuilds a card (per-frame AX decryption), so
+/// the backlog drains over several ticks rather than stalling one.
+const ACTS_FREEZE_PER_TICK: usize = 4;
+
+/// Freezes the acts of every sealed slot that still has events and no frozen
+/// copy.
+///
+/// "Sealed" is the same settle window T2 uses: a slot still gaining OCR is
+/// still gaining runs, and acts are attributed to runs.
+async fn freeze_slot_acts(state: &Arc<AppState>, now: i64) {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+    let from = now.saturating_sub(ACTS_FREEZE_LOOKBACK_MS);
+    let due = match run_store(state, move |s| s.store.slots_missing_acts(from, now)).await {
+        Ok(due) => due,
+        Err(error) => {
+            eprintln!("slot.acts freeze: listing slots failed: {error}");
+            return;
+        }
+    };
+    let mut frozen = 0_usize;
+    for slot_start_ms in due {
+        if frozen >= ACTS_FREEZE_PER_TICK {
+            break;
+        }
+        let bounds = match run_store(state, move |s| {
+            Ok::<_, StoreError>(s.store.summary_slot_bounds(slot_start_ms))
+        })
+        .await
+        {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                eprintln!("slot.acts freeze: slot={slot_start_ms} bounds failed: {error}");
+                continue;
+            }
+        };
+        if bounds.end_ms + T2_SETTLE_MS > now {
+            continue;
+        }
+        match run_store(state, move |s| {
+            s.store.materialize_slot_acts(slot_start_ms, interval_ms)
+        })
+        .await
+        {
+            Ok(true) => {
+                frozen += 1;
+                eprintln!("slot.acts freeze: froze slot={slot_start_ms}");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("slot.acts freeze: slot={slot_start_ms} failed: {error}");
+            }
+        }
+    }
+}
+
 fn spawn_slot_summarizer(state: Arc<AppState>) {
     let period = t2_sweep_period();
     if period.is_zero() {
@@ -3267,6 +3458,28 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 // instead of somewhere in the next five minutes.
                 () = state.t2_changed.notified() => {}
                 _ = timer.tick() => {}
+            }
+
+            // Freezing acts runs before — and independently of — the T2 gate.
+            // It is a short read and one small write with no model in it, and
+            // the deadline it races is physical: the events expire in 48 hours
+            // whether or not the machine was ever on AC power with a charged
+            // battery. Gating it behind T2's conditions would lose acts on
+            // exactly the laptops that stay unplugged.
+            freeze_slot_acts(&state, now_ms()).await;
+
+            // The same argument, for the other half of the 48h promise: expiry
+            // is a deadline in wall-clock time, so it cannot hang off capture
+            // (which stops when the user pauses) or off the T2 gate (which
+            // waits for power). This tick runs while the daemon is up, whether
+            // or not anything is being recorded.
+            if let Err(error) = run_store(&state, |s| {
+                s.store.prune_input_events(now_ms())?;
+                s.store.prune_edge_snapshots(now_ms())
+            })
+            .await
+            {
+                eprintln!("input stream retention failed: {error}");
             }
 
             // OCR is on the critical path for the frames still arriving; T2 is
@@ -4468,6 +4681,36 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
+    /// The import path for an R3 edge snapshot is fail-closed: it stores the
+    /// tree only when the snapshot names the app it came from, because that name
+    /// is the only thing the exclusion list can be checked against.
+    #[test]
+    fn an_edge_snapshot_is_only_storable_once_it_names_its_app() {
+        assert_eq!(edge_snapshot_identity(b"not json at all"), None);
+        assert_eq!(edge_snapshot_identity(b"{}"), None, "parsed but unnamed");
+        assert_eq!(
+            edge_snapshot_identity(br#"{"application_name":"Safari"}"#),
+            None,
+            "a display name is not an exclusion key"
+        );
+        assert_eq!(
+            edge_snapshot_identity(
+                br#"{"bundle_identifier":"com.electron.lark","window_title":"Lody Team","root":{}}"#
+            ),
+            Some(("com.electron.lark".to_owned(), None))
+        );
+        assert_eq!(
+            edge_snapshot_identity(
+                br#"{"bundle_identifier":"com.apple.Safari","url":"https://example.com/x"}"#
+            ),
+            Some((
+                "com.apple.Safari".to_owned(),
+                Some("https://example.com/x".to_owned())
+            )),
+            "the URL must reach the domain exclusion check"
+        );
+    }
+
     /// The sweeper log is where somebody goes to answer "how long did that
     /// take", so it must not make them convert milliseconds in their head — and
     /// it must render a duration exactly as the panel does (`ComputeFormat`
@@ -4859,6 +5102,7 @@ mod tests {
                 switch_count: 0,
                 longest_focus_ms: 0,
                 idle_ratio: 0.0,
+                no_input_ratio: None,
             },
             title: None,
             bullets: None,
