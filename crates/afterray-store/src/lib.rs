@@ -236,6 +236,62 @@ const AUDIO_CLAIMABLE_PREDICATE: &str = "a.transcription_state IN ('pending', 'f
                          WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
                     )";
 
+/// Which audio segments still owe a transcript, as one predicate over
+/// `audio_segments a`. Takes no parameters.
+///
+/// A strict superset of [`AUDIO_CLAIMABLE_PREDICATE`], and deliberately so: it
+/// drops the retry-backoff clause (a segment sitting out a backoff is still
+/// owed a transcript) and adds `running` (one being transcribed right now is
+/// the strongest possible reason to wait). Claimable answers "may the sweeper
+/// pick this up *now*"; this answers "is a transcript still coming".
+///
+/// The state list is what keeps `done` out, and it is not redundant with the
+/// `NOT EXISTS`: [`Vault::complete_audio_transcription`] marks a segment `done`
+/// even when the model returned nothing to index — silence, an empty room, a
+/// muted track — and writes no evidence row. On the `NOT EXISTS` half alone
+/// every silent segment would read as untranscribed forever, and a summary
+/// waiting on one would wait out its whole cap on every quiet slot.
+const AUDIO_UNTRANSCRIBED_PREDICATE: &str = "a.transcription_state IN ('pending', 'failed', 'running')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM text_evidence te
+                         WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
+                    )";
+
+/// The attempt count at which ASR's retry backoff stops growing.
+///
+/// There is no retry *cap* in this codebase — a failed segment is retried
+/// forever — but the daemon's delay is `1 << min(attempts, this)` minutes, so
+/// from here on every further attempt is an hour apart and the queue has, in
+/// effect, given up making progress on that segment. That is the only place in
+/// the code where retrying stops escalating, so it is the rule
+/// [`AsrHealth::exhausted_segments`] counts against rather than a fresh cap
+/// invented for the summariser. Shared with the daemon's `fail_claimed_audio`
+/// so the two cannot drift.
+pub const AUDIO_BACKOFF_SATURATION_ATTEMPTS: u32 = 6;
+
+/// Whether transcription is getting anywhere, for callers deciding if waiting
+/// on a transcript is justified.
+///
+/// One snapshot rather than four queries because every caller needs the whole
+/// picture to decide anything: "a segment is pending" only means "wait" if the
+/// worker is also demonstrably alive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsrHealth {
+    /// When a segment last reached `done`. `None` means transcription has
+    /// never once succeeded on this vault — a cold start, an absent model, or
+    /// a worker that cannot run at all.
+    pub last_success_ms: Option<i64>,
+    /// When a segment last recorded an error. Cleared on the segment when it
+    /// is re-claimed, so this is "the last thing that happened to some segment
+    /// was a failure", not "a failure ever happened".
+    pub last_failure_ms: Option<i64>,
+    /// Segments still owed a transcript, vault-wide.
+    pub waiting_segments: usize,
+    /// The subset of those whose backoff has saturated
+    /// ([`AUDIO_BACKOFF_SATURATION_ATTEMPTS`]).
+    pub exhausted_segments: usize,
+}
+
 /// Outstanding background work that survives a restart.
 ///
 /// Counted from the vault, not from the in-memory job queue: the queue only
@@ -3802,6 +3858,101 @@ impl Vault {
         ).map_err(Into::into)
     }
 
+    /// Whether any audio overlapping `from_ms..=to_ms` is still owed a
+    /// transcript.
+    ///
+    /// The question a summariser asks before writing a card it can never
+    /// revise: "is there a transcript still coming for this window?". Overlap
+    /// is inclusive at both ends, matching every other audio range query here —
+    /// a segment straddling the boundary carries the words spoken inside it.
+    ///
+    /// `false` also covers "there is no audio here at all", which is what makes
+    /// this safe to ask per slot without first asking whether the slot has any
+    /// audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the vault cannot be queried.
+    pub fn has_untranscribed_audio_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let connection = self.readers.get();
+        let found: Option<i64> = connection
+            .query_row(
+                &format!(
+                    "SELECT 1 FROM audio_segments a
+                      WHERE a.started_at_ms <= ?2 AND a.ended_at_ms >= ?1
+                        AND {AUDIO_UNTRANSCRIBED_PREDICATE}
+                      LIMIT 1"
+                ),
+                params![from_ms, to_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Whether transcription is getting anywhere, vault-wide.
+    ///
+    /// Global on purpose: ASR is one worker with one model behind it, so its
+    /// health is not a property of any slot, and a caller sweeping a backlog
+    /// should pay for this once rather than per slot.
+    ///
+    /// "Success" is `transcription_state = 'done'` rather than the presence of
+    /// transcript evidence: `done` is written only by
+    /// [`Vault::complete_audio_transcription`] (and, at schema 21, to rows that
+    /// already had evidence), so it means exactly "the worker returned" —
+    /// including the healthy case where what it returned was silence. Keying on
+    /// evidence alone would report a perfectly working ASR as never having
+    /// succeeded on a quiet machine.
+    ///
+    /// Both instants are clamped to `now_ms`. A row stamped in the future — a
+    /// clock that moved backwards, a vault carried between machines — would
+    /// otherwise look eternally fresh to any staleness test downstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the vault cannot be queried.
+    pub fn asr_health(&self, now_ms: i64) -> Result<AsrHealth, StoreError> {
+        let connection = self.readers.get();
+        let last_success_ms: Option<i64> = connection.query_row(
+            "SELECT max(transcription_updated_at_ms) FROM audio_segments
+              WHERE transcription_state = 'done'",
+            [],
+            |row| row.get(0),
+        )?;
+        let last_failure_ms: Option<i64> = connection.query_row(
+            "SELECT max(transcription_updated_at_ms) FROM audio_segments
+              WHERE transcription_error IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        // A migrated row (schema 21) carries the column default, 0. Reading
+        // that as "succeeded at the epoch" is right: it says nothing about
+        // whether ASR works *now*, and every staleness test treats it as stale.
+        let (waiting_segments, exhausted_segments) = connection.query_row(
+            &format!(
+                "SELECT count(*), sum(a.transcription_attempts >= ?1)
+                   FROM audio_segments a WHERE {AUDIO_UNTRANSCRIBED_PREDICATE}"
+            ),
+            [AUDIO_BACKOFF_SATURATION_ATTEMPTS],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )?;
+        Ok(AsrHealth {
+            last_success_ms: last_success_ms.map(|at| at.min(now_ms)),
+            last_failure_ms: last_failure_ms.map(|at| at.min(now_ms)),
+            waiting_segments: usize::try_from(waiting_segments).unwrap_or_default(),
+            exhausted_segments: usize::try_from(exhausted_segments).unwrap_or_default(),
+        })
+    }
+
     /// Commits transcript evidence and marks the audio item done atomically.
     /// Replaying a recovered claim is idempotent.
     ///
@@ -7224,6 +7375,135 @@ mod tests {
         let transcripts = vault.transcripts_in_range(0, 1_000, 10).unwrap();
         assert_eq!(transcripts.len(), 1);
         assert_eq!(transcripts[0].2, "hello world");
+    }
+
+    /// The question a summariser asks before sealing a card it can never
+    /// revise. Every state the queue can be in has to answer it correctly —
+    /// including the one that has no evidence row and never will.
+    #[test]
+    fn untranscribed_audio_is_only_reported_while_a_transcript_is_still_coming() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let spoken = vault
+            .insert_audio_segment(&session.id, AudioTrack::Microphone, 1_000, 2_000, "audio/mp4", b"a")
+            .unwrap();
+
+        assert!(vault.has_untranscribed_audio_between(1_500, 1_600).unwrap());
+        assert!(
+            vault.has_untranscribed_audio_between(500, 1_000).unwrap(),
+            "overlap is inclusive: a segment straddling the boundary holds words spoken inside it"
+        );
+        assert!(
+            !vault.has_untranscribed_audio_between(3_000, 4_000).unwrap(),
+            "a window with no audio in it is never waiting on one"
+        );
+
+        // In flight right now: the strongest reason there is to wait.
+        vault.claim_audio_transcription(1_000).unwrap().unwrap();
+        assert!(vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
+
+        // Sitting out a retry backoff. `claim_audio_transcription` says "not
+        // now"; the summariser must still hear "a transcript is coming".
+        vault
+            .fail_audio_transcription(&spoken.id, "model unavailable", 900_000, 2_000)
+            .unwrap();
+        assert!(vault.claim_audio_transcription(3_000).unwrap().is_none());
+        assert!(vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
+
+        vault
+            .complete_audio_transcription(&spoken, "hello world", "test-asr", 4_000)
+            .unwrap();
+        assert!(!vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
+    }
+
+    /// Silence completes with no evidence row at all. Read through the
+    /// `NOT EXISTS` half alone it would look untranscribed forever, and a
+    /// summary waiting on one would wait out its whole cap on every quiet slot.
+    #[test]
+    fn a_silent_segment_is_not_waiting_for_anything() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let quiet = vault
+            .insert_audio_segment(&session.id, AudioTrack::System, 1_000, 2_000, "audio/mp4", b"a")
+            .unwrap();
+        assert_eq!(
+            vault
+                .complete_audio_transcription(&quiet, "   ", "test-asr", 3_000)
+                .unwrap(),
+            None,
+            "an empty transcript writes no evidence"
+        );
+        assert!(!vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
+        assert_eq!(vault.asr_health(9_000).unwrap().waiting_segments, 0);
+        assert_eq!(
+            vault.asr_health(9_000).unwrap().last_success_ms,
+            Some(3_000),
+            "the worker ran and returned; that is a success even with nothing to index"
+        );
+    }
+
+    #[test]
+    fn asr_health_reports_the_last_success_the_last_failure_and_the_pile() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+
+        let empty = vault.asr_health(10_000).unwrap();
+        assert_eq!(empty, AsrHealth::default());
+        assert_eq!(empty.last_success_ms, None, "never transcribed anything");
+
+        let done = vault
+            .insert_audio_segment(&session.id, AudioTrack::Microphone, 100, 200, "audio/mp4", b"a")
+            .unwrap();
+        let broken = vault
+            .insert_audio_segment(&session.id, AudioTrack::Microphone, 300, 400, "audio/mp4", b"b")
+            .unwrap();
+        vault
+            .complete_audio_transcription(&done, "spoken", "test-asr", 5_000)
+            .unwrap();
+        vault
+            .fail_audio_transcription(&broken.id, "worker died", 9_000, 6_000)
+            .unwrap();
+
+        let health = vault.asr_health(10_000).unwrap();
+        assert_eq!(health.last_success_ms, Some(5_000));
+        assert_eq!(health.last_failure_ms, Some(6_000));
+        assert_eq!(health.waiting_segments, 1);
+        assert_eq!(health.exhausted_segments, 0);
+
+        // Re-claiming clears the error, so the last failure recedes with it.
+        vault.claim_audio_transcription(9_000).unwrap().unwrap();
+        assert_eq!(vault.asr_health(10_000).unwrap().last_failure_ms, None);
+
+        // A clock that moved backwards must not leave ASR looking eternally
+        // fresh: both instants are clamped to the caller's now.
+        assert_eq!(vault.asr_health(1_000).unwrap().last_success_ms, Some(1_000));
+    }
+
+    /// There is no retry cap in this codebase — segments retry forever — so
+    /// "exhausted" is pinned to the one place retrying stops escalating: the
+    /// point where `1 << min(attempts, N)` stops growing.
+    #[test]
+    fn a_segment_is_exhausted_once_its_backoff_stops_growing() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let segment = vault
+            .insert_audio_segment(&session.id, AudioTrack::Microphone, 100, 200, "audio/mp4", b"a")
+            .unwrap();
+
+        for attempt in 1..=AUDIO_BACKOFF_SATURATION_ATTEMPTS {
+            let claimed = vault.claim_audio_transcription(1_000).unwrap().unwrap();
+            assert_eq!(claimed.attempts, attempt);
+            vault
+                .fail_audio_transcription(&segment.id, "worker died", 1_000, 1_000)
+                .unwrap();
+            let health = vault.asr_health(2_000).unwrap();
+            assert_eq!(health.waiting_segments, 1);
+            assert_eq!(
+                health.exhausted_segments,
+                usize::from(attempt >= AUDIO_BACKOFF_SATURATION_ATTEMPTS),
+                "attempt {attempt} of {AUDIO_BACKOFF_SATURATION_ATTEMPTS}"
+            );
+        }
     }
 
     #[test]
