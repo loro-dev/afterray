@@ -7,6 +7,7 @@ Implements AfterRayRecall's model protocols with deterministic fixture data so t
 - `Sources/RecallScenarios.swift:5` `RecallScenario` — named fixture sets including `empty`, `short`, `long`, `stress`, `processing`, `favorites`, and `search`. Entry point for labs and snapshots.
 - `Sources/SettingsPreviewModel.swift:6` `SettingsPreviewModel` — `AfterRaySettingsModeling` over in-memory state.
 - `Sources/ChatPreviewModel.swift:25` `ChatPreviewModel` — `AfterRayChatModeling` with scripted replies.
+- `Sources/RecallScenarios.swift` `MockScreenText` — the strings a mock frame draws **and** the OCR boxes describing them, measured from the same table and font. `MockArtifactFactory.renderFrame` and `MockSearchData.ocrLoader` both read it; hand-written box coordinates drift the first time either side is edited.
 
 ## Invariants
 

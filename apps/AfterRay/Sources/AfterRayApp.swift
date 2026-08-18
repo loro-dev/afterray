@@ -1154,6 +1154,7 @@ private struct AfterRayRootView: View {
             isChatPresented = false
             clearRecallDecodedImageCache()
             RecallThumbnailCache.shared.clearSensitiveData()
+            OcrRegionCache.shared.clearSensitiveData()
             Task { await images.clearSensitiveData() }
             Task { try? await SummaryExportFileStore.shared.cleanupAll() }
         }

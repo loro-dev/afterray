@@ -13,6 +13,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - `Sources/ChatAutoScrollState.swift` + `Sources/ChatScrollObserver.swift` — macOS 14 chat bottom-follow state machine and the narrow AppKit live-scroll/geometry bridge; content growth follows only until the user scrolls away.
 - `Sources/AfterRaySettingsChrome.swift:5` `AfterRaySettingsModeling` + `AfterRaySettingsView` (:327) — settings UI generic over the protocol, so mock and real models share it; `downloadQueueSection` draws the models page's downloads; `downloadSourceSection` picks the Hugging Face mirror (official / hf-mirror / custom).
 - `Sources/ModelDownloadQueue.swift:116` `ModelLibrary.downloadQueue` — the daemon's active-pack + waiting-ids report flattened into queue rows; `isQueued` (:160) gates per-pack buttons.
+- `Sources/OcrTextLayout.swift` + `Sources/OcrTextSelectionLayer.swift` + `Sources/OcrRegionCache.swift` — selectable OCR text over the settled frame (I-beam, drag-select, ⌘C). Every non-obvious decision is in [context/ocr-text-selection.md](../../context/ocr-text-selection.md); read it before touching the mount gate or the gesture veto.
 - `Sources/AppIconLookup.swift:8` — cached bundle-id → icon; `AppIconView` (:54) for rows naming an app.
 - `Sources/HangWatchdog.swift:36` `HangJudge` + `OverlayVisibility` (:6) — terminates the process if the main thread stalls ~12s while the overlay is visible.
 - `Tests/` (XCTest, `@testable import AfterRayRecall`) — `DaemonWireTests.swift` and `ChatWireTests.swift` pin the wire shape against the Rust daemon.
@@ -24,7 +25,8 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - Concurrency: stores are `@MainActor` `ObservableObject`s; socket client and image repository are actors; daemon I/O runs in `Task.detached(priority: .userInitiated)` (`DaemonClient.swift:394,416`). Never block the main thread — the HangWatchdog kills the app.
 - Unary socket reads have a 30s receive deadline (`DaemonClient.swift:587`, postmortem in the comment above); streaming reads deliberately stay deadline-free. Do not remove.
 - Every async load guards completion with a generation counter (`sensitiveGeneration`, `RecallStore.swift:16`); new load paths must follow the same capture-and-compare pattern.
-- On lock/sleep the app calls `clearSensitiveState()`/`clearSensitiveData()` (zeroes cached bytes) — hook any new decrypted-content cache in (`apps/AfterRay/Sources/AfterRayApp.swift:1097`).
+- On lock/sleep the app calls `clearSensitiveState()`/`clearSensitiveData()` (zeroes cached bytes) — hook any new decrypted-content cache in (`apps/AfterRay/Sources/AfterRayApp.swift:1097`). `OcrRegionCache` holds decrypted screen text and is already in that list.
+- The selectable text layer mounts only after the frame has been still for `OcrTextSelectionLayer.quietDuration`; the gate is the `.task(id: textLayerKey)` key, and anything that means "the picture moved" must be folded into that key rather than handled with a new timer.
 - Decode artifact bytes by `contentType`, never by assumption (`DaemonClient.swift:34-35`): moments packed before thumbnails answer with raw IVF/AV1 frames.
 - Chat Markdown never loads general image URLs. Only `afterray://moment` image references may call `ReadThumbnail`; http/file/data images stay selectable text, and missing captures stay clickable citations.
 - Every surface must stay drivable by `AfterRayMockData`; `RecallView` hides daemon-only chrome when callbacks are nil.
