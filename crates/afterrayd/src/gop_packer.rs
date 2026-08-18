@@ -15,7 +15,6 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub struct GopPackerConfig {
     pub archive: bool,
-    pub require_ac: bool,
     pub policy: PackPolicy,
 }
 
@@ -38,7 +37,6 @@ impl GopPackerConfig {
             .clamp(3_600, 7_200);
         Self {
             archive: env_flag("AFTERRAY_GOP_ARCHIVE", true),
-            require_ac: env_flag("AFTERRAY_GOP_REQUIRE_AC", false),
             policy: PackPolicy {
                 hot_window_ms: i64::try_from(hot_window_seconds.saturating_mul(1000))
                     .unwrap_or(7_200_000),
@@ -111,11 +109,15 @@ impl GopPacker {
         self.encode_busy.load(Ordering::SeqCst)
     }
 
+    /// Packs one run of cold stills, or `Ok(None)` when there is nothing to pack.
+    ///
+    /// Deliberately holds **no power policy of its own**. It used to re-check AC
+    /// as a "backstop", which meant a user pressing "run now" on Archive while
+    /// on battery got `Ok(None)` — indistinguishable from an empty backlog, so
+    /// the caller cancelled its own override and logged "nothing left to pack".
+    /// One gate, in `compute::ComputeGovernor`, which can see the override.
     pub fn pack_one(&self, vault: &Vault, now_ms: i64) -> Result<Option<String>, anyhow::Error> {
         if !self.config.archive {
-            return Ok(None);
-        }
-        if self.config.require_ac && !afterray_platform_macos::on_ac_power() {
             return Ok(None);
         }
         if self

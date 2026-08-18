@@ -55,6 +55,211 @@ final class ChatTranscriptTests: XCTestCase {
         XCTAssertEqual(bubbles[1].reasoning.first?.text, "checking history")
     }
 
+    func testStreamingPartsStayInArrivalOrder() {
+        let user = ChatMessage(
+            id: "u1",
+            conversationId: "c1",
+            role: .user,
+            content: "hi",
+            createdAtMs: 1
+        )
+        let tool = ChatToolCall(id: "t1", name: "get_slot_card", argsJSON: "{}", resultChars: 12)
+        let parts: [ChatMessagePart] = [
+            .reasoning(id: "r1", round: 1, text: "look it up"),
+            .tool(tool),
+            .reasoning(id: "r2", round: 2, text: "that is the one"),
+        ]
+        let bubbles = ChatTranscript.bubbles(
+            messages: [user],
+            streamingText: "You did",
+            streamingParts: parts,
+            isSending: true,
+            nowMs: 9
+        )
+        XCTAssertEqual(bubbles[1].parts.count, 3)
+        XCTAssertEqual(bubbles[1].parts.map(\.id), ["r1", "t1", "r2"])
+        XCTAssertEqual(bubbles[1].reasoning.map(\.text), ["look it up", "that is the one"])
+        XCTAssertEqual(bubbles[1].tools.map(\.name), ["get_slot_card"])
+    }
+
+    func testStoredHistoryReconstructsTypicalReactOrder() {
+        let message = ChatMessage(
+            id: "a1",
+            conversationId: "c1",
+            role: .assistant,
+            content: "the compiler",
+            toolLog: #"[{"name":"get_slot_card","args":{"at_ms":1},"chars":12}]"#,
+            createdAtMs: 2,
+            reasoning: #"[{"round":1,"text":"check the card"},{"round":2,"text":"that is the error"}]"#
+        )
+        let bubbles = ChatTranscript.bubbles(messages: [message])
+        XCTAssertEqual(bubbles[0].parts.count, 3, "two thoughts and one tool should interleave")
+        guard case .reasoning(_, 1, "check the card") = bubbles[0].parts[0],
+              case .tool(let tool) = bubbles[0].parts[1],
+              case .reasoning(_, 2, "that is the error") = bubbles[0].parts[2]
+        else {
+            return XCTFail("expected think → tool → think, got \(bubbles[0].parts)")
+        }
+        XCTAssertEqual(tool.name, "get_slot_card")
+    }
+
+    func testStoredHistoryLeavesLeftoverToolsAfterTheLastThought() {
+        let message = ChatMessage(
+            id: "a1",
+            conversationId: "c1",
+            role: .assistant,
+            content: "done",
+            toolLog: #"[{"name":"get_slot_card","args":{}},{"name":"get_transcript","args":{}}]"#,
+            createdAtMs: 2,
+            reasoning: #"[{"round":1,"text":"one look"}]"#
+        )
+        let parts = ChatTranscript.bubbles(messages: [message])[0].parts
+        XCTAssertEqual(parts.count, 3)
+        guard case .reasoning = parts[0],
+              case .tool(let first) = parts[1],
+              case .tool(let second) = parts[2]
+        else {
+            return XCTFail("one thought plus two tools reconstructs as thought then both tools: \(parts)")
+        }
+        XCTAssertEqual(first.name, "get_slot_card")
+        XCTAssertEqual(second.name, "get_transcript")
+    }
+
+    func testFinishedAssistantGetsWorkElapsedFromUserGap() {
+        let messages = [
+            ChatMessage(
+                id: "u1",
+                conversationId: "c1",
+                role: .user,
+                content: "what",
+                createdAtMs: 1_000
+            ),
+            ChatMessage(
+                id: "a1",
+                conversationId: "c1",
+                role: .assistant,
+                content: "that",
+                toolLog: #"[{"name":"get_slot_card","args":{}}]"#,
+                createdAtMs: 13_500,
+                reasoning: #"[{"round":1,"text":"look"}]"#
+            ),
+        ]
+        let bubble = ChatTranscript.bubbles(messages: messages)[1]
+        XCTAssertEqual(bubble.workElapsedMs, 12_500)
+        XCTAssertEqual(
+            ChatWorkSummary.label(thoughts: 1, lookups: 1, elapsedMs: bubble.workElapsedMs),
+            "Worked for 13s · 1 thought · 1 lookup"
+        )
+    }
+
+    func testLiveElapsedOverridesCreatedAtGap() {
+        let messages = [
+            ChatMessage(
+                id: "u1",
+                conversationId: "c1",
+                role: .user,
+                content: "what",
+                createdAtMs: 1_000
+            ),
+            ChatMessage(
+                id: "a1",
+                conversationId: "c1",
+                role: .assistant,
+                content: "that",
+                toolLog: #"[{"name":"list_moments","args":{}}]"#,
+                createdAtMs: 1_100
+            ),
+        ]
+        let bubble = ChatTranscript.bubbles(
+            messages: messages,
+            lastWorkElapsedMs: 8_400
+        )[1]
+        XCTAssertEqual(bubble.workElapsedMs, 8_400)
+        XCTAssertEqual(
+            ChatWorkSummary.label(thoughts: 0, lookups: 1, elapsedMs: 8_400),
+            "Worked for 8.4s · 1 lookup"
+        )
+    }
+
+    func testTinyCreatedAtGapIsNotADuration() {
+        let messages = [
+            ChatMessage(id: "u1", conversationId: "c1", role: .user, content: "q", createdAtMs: 10),
+            ChatMessage(id: "a1", conversationId: "c1", role: .assistant, content: "a", createdAtMs: 20),
+        ]
+        XCTAssertNil(ChatTranscript.bubbles(messages: messages)[1].workElapsedMs)
+    }
+
+    func testConversationsGroupByLocalDayNewestFirst() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let today = Int64(calendar.startOfDay(for: now).timeIntervalSince1970 * 1_000)
+        let yesterday = today - 86_400_000
+        let older = today - 10 * 86_400_000
+        let conversations = [
+            ChatConversation(id: "old", title: "Older", createdAtMs: older + 3_600_000, updatedAtMs: older, messageCount: 1),
+            ChatConversation(id: "t2", title: "Later today", createdAtMs: today + 8_000_000, updatedAtMs: today, messageCount: 1),
+            ChatConversation(id: "y", title: "Yesterday", createdAtMs: yesterday + 1_000, updatedAtMs: yesterday, messageCount: 1),
+            ChatConversation(id: "t1", title: "Earlier today", createdAtMs: today + 1_000, updatedAtMs: today, messageCount: 1),
+        ]
+        let groups = ChatConversationGrouping.days(conversations, now: now, calendar: calendar)
+        XCTAssertEqual(groups.map(\.label).prefix(2), ["Today", "Yesterday"])
+        XCTAssertEqual(groups.count, 3)
+        XCTAssertEqual(groups[0].conversations.map(\.id), ["t2", "t1"])
+        XCTAssertEqual(groups[1].conversations.map(\.id), ["y"])
+        XCTAssertEqual(groups[2].conversations.map(\.id), ["old"])
+    }
+
+    func testChatModelCatalogListsEveryLlmPackAndOllamaRow() {
+        let packs = [
+            ModelPack(
+                id: "llm_qwen35_4b_mlx4",
+                name: "Qwen 3.5 4B",
+                capability: "llm_vlm",
+                path: "/tmp/q",
+                present: true,
+                bytes: 1,
+                required: true
+            ),
+            ModelPack(
+                id: "embed",
+                name: "Embed",
+                capability: "embed",
+                path: "/tmp/e",
+                present: true,
+                bytes: 1,
+                required: false
+            ),
+        ]
+        let ollama = (0..<30).map { LlmRemoteModel(id: "m\($0)", name: "model-\($0)") }
+        let settings = AppSettings(
+            dataDir: "/tmp",
+            modelDir: "/tmp",
+            recordAudio: false,
+            captureIntervalSeconds: 10,
+            llmProvider: .ollama,
+            llmModel: "m7"
+        )
+        let catalog = ChatModelChoice.catalog(packs: packs, ollamaModels: ollama, settings: settings)
+        XCTAssertEqual(catalog.models.filter { $0.group == "Built-in" }.count, 1)
+        XCTAssertEqual(catalog.models.filter { $0.group == "Ollama" }.count, 30)
+        XCTAssertEqual(catalog.selectedID, "ollama:m7")
+    }
+
+    func testConversationSearchFiltersByTitleAndKeepsDayGroups() {
+        let conversations = [
+            ChatConversation(id: "a", title: "Flock release bugs", createdAtMs: 2_000, updatedAtMs: 2_000, messageCount: 1),
+            ChatConversation(id: "b", title: "Yesterday's meeting", createdAtMs: 1_000, updatedAtMs: 1_000, messageCount: 1),
+            ChatConversation(id: "c", title: "flock follow-up", createdAtMs: 3_000, updatedAtMs: 3_000, messageCount: 1),
+        ]
+        XCTAssertEqual(
+            ChatConversationGrouping.matching(conversations, query: "  FLOCK ").map(\.id),
+            ["a", "c"]
+        )
+        XCTAssertEqual(ChatConversationGrouping.matching(conversations, query: "   ").map(\.id), ["a", "b", "c"])
+        XCTAssertTrue(ChatConversationGrouping.matching(conversations, query: "zzz").isEmpty)
+    }
+
     func testUnknownRoleDecodesAsAssistant() throws {
         let json = #"{"id":"m1","conversation_id":"c1","role":"system","content":"x","created_at_ms":1}"#
         let message = try JSONDecoder().decode(ChatMessage.self, from: Data(json.utf8))
@@ -112,6 +317,89 @@ final class ChatTranscriptTests: XCTestCase {
             "Yesterday"
         )
     }
+
+    func testToolLogReadsStoredResultAndDroppedTokens() {
+        let tools = ChatToolLog.parse(
+            #"[{"name":"get_ocr","args":{"moment_id":"m1"},"chars":12,"result":"hello screen","truncated":true,"dropped_tokens":40}]"#
+        )
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools[0].name, "get_ocr")
+        XCTAssertEqual(tools[0].result, "hello screen")
+        XCTAssertEqual(tools[0].resultChars, 12)
+        XCTAssertTrue(tools[0].truncated)
+        XCTAssertEqual(tools[0].droppedTokens, 40)
+    }
+
+    func testConversationExportIncludesThinkingAndToolResults() {
+        let tool = ChatToolCall(
+            id: "t1",
+            name: "get_ocr",
+            argsJSON: #"{"moment_id":"m1"}"#,
+            resultChars: 12,
+            result: "the dock said Safari",
+            truncated: false
+        )
+        let bubbles = [
+            ChatBubble(id: "u1", role: .user, text: "what was on screen?", createdAtMs: 1),
+            ChatBubble(
+                id: "a1",
+                role: .assistant,
+                text: "Safari was frontmost.",
+                createdAtMs: 2,
+                parts: [
+                    .reasoning(id: "r1", round: 1, text: "need the frame"),
+                    .tool(tool),
+                ]
+            ),
+        ]
+        let markdown = ChatConversationExport.markdown(title: "Screen check", bubbles: bubbles)
+        XCTAssertTrue(markdown.contains("# Screen check"))
+        XCTAssertTrue(markdown.contains("## User"))
+        XCTAssertTrue(markdown.contains("what was on screen?"))
+        XCTAssertTrue(markdown.contains("## Agent"))
+        XCTAssertTrue(markdown.contains("### Thinking"))
+        XCTAssertTrue(markdown.contains("need the frame"))
+        XCTAssertTrue(markdown.contains("### Tool call: `get_ocr`"))
+        XCTAssertTrue(markdown.contains("the dock said Safari"))
+        XCTAssertTrue(markdown.contains("### Answer"))
+        XCTAssertTrue(markdown.contains("Safari was frontmost."))
+    }
+
+    func testTokenEstimateAndTurnRate() {
+        XCTAssertEqual(ChatTokenEstimate.count(in: "abcd"), 1)
+        XCTAssertEqual(ChatTokenEstimate.count(in: "截图"), 2)
+        let rate = ChatTokenEstimate.tokensPerSecond(
+            text: String(repeating: "abcd", count: 25),
+            reasoning: [ChatReasoningRound(round: 1, text: String(repeating: "abcd", count: 25))],
+            elapsedMs: 1_000
+        )
+        XCTAssertEqual(rate ?? 0, 50, accuracy: 0.01)
+        XCTAssertEqual(ChatTokenEstimate.rateLabel(12.4), "12.4 tok/s")
+        let bubble = ChatBubble(
+            id: "a",
+            role: .assistant,
+            text: "hello",
+            createdAtMs: 2,
+            workElapsedMs: 2_000,
+            usage: ChatContextUsage(
+                promptTokens: 1_000,
+                windowTokens: 16_384,
+                round: 1,
+                completionTokens: 40,
+                generationMs: 2_000
+            )
+        )
+        XCTAssertEqual(bubble.tokensPerSecond ?? 0, 20, accuracy: 0.01)
+        XCTAssertNil(
+            ChatBubble(id: "b", role: .assistant, text: "hello", createdAtMs: 2).tokensPerSecond
+        )
+    }
+
+    func testContextUsagePercentLabel() {
+        let usage = ChatContextUsage(promptTokens: 5_120, windowTokens: 16_384, round: 2)
+        XCTAssertEqual(usage.percentLabel, "31%")
+        XCTAssertEqual(usage.shortLabel, "5.1k / 16k")
+    }
 }
 
 final class ChatStreamReducerTests: XCTestCase {
@@ -137,5 +425,49 @@ final class ChatStreamReducerTests: XCTestCase {
         var state = ChatStreamState()
         ChatStreamReducer.apply(.error(message: "unknown request"), to: &state)
         XCTAssertTrue(state.shouldFallbackToSend)
+    }
+
+    func testReducerKeepsThinkToolThinkAsSeparateParts() {
+        var state = ChatStreamState()
+        ChatStreamReducer.apply(.reasoning(text: "plan ", round: 1), to: &state)
+        ChatStreamReducer.apply(.reasoning(text: "lookup", round: 1), to: &state)
+        ChatStreamReducer.apply(.toolCall(name: "get_slot_card", argsJSON: #"{"at_ms":1}"#), to: &state)
+        ChatStreamReducer.apply(.toolResult(name: "get_slot_card", chars: 20), to: &state)
+        ChatStreamReducer.apply(.reasoning(text: "found it", round: 2), to: &state)
+        ChatStreamReducer.apply(.token(text: "You "), to: &state)
+        ChatStreamReducer.apply(.token(text: "did"), to: &state)
+
+        XCTAssertEqual(state.parts.count, 3, "think → tool → think must stay three stretches")
+        XCTAssertEqual(state.text, "You did")
+        guard case .reasoning(_, 1, let first) = state.parts[0] else {
+            return XCTFail("first part should be round-1 reasoning, got \(state.parts[0])")
+        }
+        XCTAssertEqual(first, "plan lookup")
+        guard case .tool(let tool) = state.parts[1] else {
+            return XCTFail("second part should be the tool, got \(state.parts[1])")
+        }
+        XCTAssertEqual(tool.name, "get_slot_card")
+        XCTAssertEqual(tool.resultChars, 20)
+        guard case .reasoning(_, 2, let second) = state.parts[2] else {
+            return XCTFail("third part should be round-2 reasoning, got \(state.parts[2])")
+        }
+        XCTAssertEqual(second, "found it")
+        XCTAssertEqual(state.reasoning.map(\.round), [1, 2])
+        XCTAssertEqual(state.tools.map(\.name), ["get_slot_card"])
+    }
+
+    func testSameRoundReasoningAfterAToolStartsANewPart() {
+        var state = ChatStreamState()
+        ChatStreamReducer.apply(.reasoning(text: "before", round: 1), to: &state)
+        ChatStreamReducer.apply(.toolCall(name: "list_moments", argsJSON: "{}"), to: &state)
+        ChatStreamReducer.apply(.reasoning(text: "after", round: 1), to: &state)
+
+        XCTAssertEqual(state.parts.count, 3)
+        guard case .reasoning(_, 1, "before") = state.parts[0],
+              case .tool = state.parts[1],
+              case .reasoning(_, 1, "after") = state.parts[2]
+        else {
+            return XCTFail("same-round thought after a tool is a new segment: \(state.parts)")
+        }
     }
 }

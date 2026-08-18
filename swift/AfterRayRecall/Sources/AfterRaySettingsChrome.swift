@@ -5,6 +5,7 @@ import SwiftUI
 private let settingsMirrorEndpoint = "https://hf-mirror.com"
 private let settingsCustomEndpointTag = "custom"
 
+@MainActor
 public protocol AfterRaySettingsModeling: ObservableObject {
     var settings: AppSettings? { get }
     var library: ModelLibrary? { get }
@@ -46,6 +47,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var updateStatus: String { get }
     var developerOptionsUnlocked: Bool { get }
     var developerOptionsEnabled: Bool { get }
+    /// Whether the local-computation dashboard is offered. Off by default.
+    var computeDashboardEnabled: Bool { get }
 
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
@@ -81,6 +84,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func checkForUpdates()
     func unlockDeveloperOptions()
     func setDeveloperOptionsEnabled(_ enabled: Bool)
+    func setComputeDashboardEnabled(_ enabled: Bool)
     func replayOnboarding()
 }
 
@@ -324,6 +328,13 @@ private enum SettingsTone {
 
 // MARK: - Panel
 
+/// How settings is being hosted. Mirrors `DaySummaryPanelStyle`: a standalone
+/// window owns its own chrome, so the panel must not draw a card inside it.
+public enum AfterRaySettingsStyle: Sendable {
+    case card
+    case window
+}
+
 public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @ObservedObject var model: Model
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
@@ -336,13 +347,17 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @State private var isEditingCustomEndpoint = false
     @FocusState private var domainFieldFocused: Bool
 
+    var style: AfterRaySettingsStyle = .card
+
     public init(
         model: Model,
         onClose: @escaping () -> Void,
-        initialPage: AfterRaySettingsPage = .general
+        initialPage: AfterRaySettingsPage = .general,
+        style: AfterRaySettingsStyle = .card
     ) {
         self.model = model
         self.onClose = onClose
+        self.style = style
         _page = State(initialValue: initialPage)
     }
 
@@ -354,20 +369,40 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 .frame(width: 1)
             pageColumn
         }
-        .frame(width: SettingsMetrics.panelWidth, height: SettingsMetrics.panelHeight)
+        .frame(
+            width: style == .card ? SettingsMetrics.panelWidth : nil,
+            height: style == .card ? SettingsMetrics.panelHeight : nil
+        )
+        .frame(
+            minWidth: style == .window ? SettingsMetrics.panelWidth : nil,
+            minHeight: style == .window ? 520 : nil
+        )
         .background(SettingsPalette.panel)
-        // Settings sits inside the recall overlay, where a global scroll-wheel
-        // monitor claims events for the timeline. Fencing the whole panel hands
-        // every phase of the gesture — including the zero-delta `began`/`ended`
-        // events AppKit needs to run momentum — straight to the page's own
-        // scroll view. Without it the page tracks the finger and then stops
-        // dead on release.
-        .background(ScrollFenceView())
+        // A card floating in the recall overlay sits under a global scroll-wheel
+        // monitor that claims events for the timeline. Fencing the whole panel
+        // hands every phase of the gesture — including the zero-delta
+        // `began`/`ended` events AppKit needs for momentum — to the page's own
+        // scroll view. Without it the page tracks the finger then stops dead on
+        // release. A window has no such monitor above it.
+        .background(style == .card ? ScrollFenceView() : nil)
         .preferredColorScheme(.dark)
-        .clipShape(RoundedRectangle(cornerRadius: SettingsMetrics.panelRadius, style: .continuous))
+        // Only the card clips and strokes itself: in a window those belong to
+        // the window, and drawing them inside leaves the panel's own corners
+        // sitting inside the window's.
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: style == .card ? SettingsMetrics.panelRadius : 0,
+                style: .continuous
+            )
+        )
         .overlay {
-            RoundedRectangle(cornerRadius: SettingsMetrics.panelRadius, style: .continuous)
+            if style == .card {
+                RoundedRectangle(
+                    cornerRadius: SettingsMetrics.panelRadius,
+                    style: .continuous
+                )
                 .strokeBorder(.white.opacity(0.09), lineWidth: 1)
+            }
         }
         .task { await model.refresh() }
         .onChange(of: model.developerOptionsEnabled) { _, enabled in
@@ -470,7 +505,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         Task { await model.refresh() }
                     }
                 }
-                SettingsIconButton(symbol: "xmark", help: "Close settings", action: onClose)
+                // A window already has a close button in its titlebar; a second
+                // one inside the content is the kind of duplicate chrome that
+                // makes a hosted panel read as a dialog stuck in a window.
+                if style == .card {
+                    SettingsIconButton(symbol: "xmark", help: "Close settings", action: onClose)
+                }
             }
         }
         .padding(.horizontal, SettingsMetrics.gutter)
@@ -1613,6 +1653,24 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     @ViewBuilder
     private var advancedPage: some View {
+        SettingsSection(
+            title: "Local computation",
+            footnote: "AfterRay already backs off on battery, when the machine is busy, and while you are working. The panel is for the times you want to see why — or override it."
+        ) {
+            SettingsRow(
+                title: "Show the local computation panel",
+                subtitle: "Adds a menu bar item and an overlay button showing what is running, what is waiting, and controls to pause or start it.",
+                subtitleLineLimit: 3
+            ) {
+                Toggle("", isOn: Binding(
+                    get: { model.computeDashboardEnabled },
+                    set: { model.setComputeDashboardEnabled($0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+            }
+        }
+
         if model.developerOptionsUnlocked {
             SettingsSection(title: "Developer Options") {
                 SettingsRow(title: "Show developer settings") {

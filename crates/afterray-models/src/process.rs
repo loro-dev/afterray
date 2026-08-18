@@ -63,12 +63,49 @@ impl ProcessAdapterConfig {
 #[derive(Debug)]
 pub struct ProcessAdapter {
     config: ProcessAdapterConfig,
+    /// pid of the worker serving each in-flight job. A `Vec` rather than a map
+    /// because concurrency here is one or two, and `Vec::new` keeps
+    /// [`ProcessAdapter::new`] usable in const position.
+    running: std::sync::Mutex<Vec<(String, u32)>>,
 }
 
 impl ProcessAdapter {
     #[must_use]
     pub const fn new(config: ProcessAdapterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            running: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register(&self, job_id: &str, pid: u32) {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        running.push((job_id.to_owned(), pid));
+    }
+
+    fn forget(&self, job_id: &str) {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        running.retain(|(id, _)| id != job_id);
+    }
+}
+
+/// Removes the pid registration however `execute` returns — including the
+/// cancellation and timeout paths, where the child is killed on drop and its pid
+/// would otherwise be reported as a live worker forever.
+struct PidRegistration<'adapter> {
+    adapter: &'adapter ProcessAdapter,
+    job_id: String,
+}
+
+impl Drop for PidRegistration<'_> {
+    fn drop(&mut self) {
+        self.adapter.forget(&self.job_id);
     }
 }
 
@@ -80,6 +117,17 @@ impl ModelAdapter for ProcessAdapter {
 
     fn name(&self) -> &str {
         &self.config.name
+    }
+
+    fn worker_pid(&self, job_id: &str) -> Option<u32> {
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        running
+            .iter()
+            .find(|(id, _)| id == job_id)
+            .map(|(_, pid)| *pid)
     }
 
     async fn execute(
@@ -129,6 +177,14 @@ impl ModelAdapter for ProcessAdapter {
             }
         })?;
 
+        let _registration = child.id().map(|pid| {
+            self.register(job_id, pid);
+            PidRegistration {
+                adapter: self,
+                job_id: job_id.to_owned(),
+            }
+        });
+
         let mut stdin = child
             .stdin
             .take()
@@ -150,52 +206,62 @@ impl ModelAdapter for ProcessAdapter {
             result = &mut wait => result?,
         };
 
-        if !output.stderr.is_empty() {
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        }
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AdapterError::Process(truncate(&stderr, 4_096)));
-        }
-        if output.stdout.len() > self.config.max_output_bytes {
-            return Err(AdapterError::InvalidOutput(format!(
-                "worker output was {} bytes, exceeding the {} byte limit",
-                output.stdout.len(),
-                self.config.max_output_bytes
-            )));
-        }
-
-        let response: WorkerResponse = serde_json::from_slice(&output.stdout).map_err(|error| {
-            AdapterError::InvalidOutput(format!(
-                "{error}; stdout was: {}",
-                truncate(&String::from_utf8_lossy(&output.stdout), 4_096)
-            ))
-        })?;
-        if response.protocol_version != WORKER_PROTOCOL_VERSION {
-            return Err(AdapterError::InvalidOutput(format!(
-                "worker protocol version {} is unsupported",
-                response.protocol_version
-            )));
-        }
-        if let Some(error) = response.error {
-            return if response.retryable {
-                Err(AdapterError::Process(error))
-            } else {
-                Err(AdapterError::MissingModel(error))
-            };
-        }
-        let model_output = response.output.ok_or_else(|| {
-            AdapterError::InvalidOutput("worker returned neither output nor error".to_owned())
-        })?;
-        if model_output.capability() != self.config.capability {
-            return Err(AdapterError::InvalidOutput(format!(
-                "worker returned {:?} output for {:?} request",
-                model_output.capability(),
-                self.config.capability
-            )));
-        }
-        Ok(model_output)
+        decode_worker_output(&output, self.config.capability, self.config.max_output_bytes)
     }
+}
+
+/// Turns one finished worker process into a typed output or a typed failure.
+///
+/// Split out of `execute` so the spawn/cancel/timeout path and the
+/// what-did-it-say path can be read separately.
+fn decode_worker_output(
+    output: &std::process::Output,
+    capability: ModelCapability,
+    max_output_bytes: usize,
+) -> Result<ModelOutput, AdapterError> {
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AdapterError::Process(truncate(&stderr, 4_096)));
+    }
+    if output.stdout.len() > max_output_bytes {
+        return Err(AdapterError::InvalidOutput(format!(
+            "worker output was {} bytes, exceeding the {max_output_bytes} byte limit",
+            output.stdout.len(),
+        )));
+    }
+
+    let response: WorkerResponse = serde_json::from_slice(&output.stdout).map_err(|error| {
+        AdapterError::InvalidOutput(format!(
+            "{error}; stdout was: {}",
+            truncate(&String::from_utf8_lossy(&output.stdout), 4_096)
+        ))
+    })?;
+    if response.protocol_version != WORKER_PROTOCOL_VERSION {
+        return Err(AdapterError::InvalidOutput(format!(
+            "worker protocol version {} is unsupported",
+            response.protocol_version
+        )));
+    }
+    if let Some(error) = response.error {
+        return if response.retryable {
+            Err(AdapterError::Process(error))
+        } else {
+            Err(AdapterError::MissingModel(error))
+        };
+    }
+    let model_output = response.output.ok_or_else(|| {
+        AdapterError::InvalidOutput("worker returned neither output nor error".to_owned())
+    })?;
+    if model_output.capability() != capability {
+        return Err(AdapterError::InvalidOutput(format!(
+            "worker returned {:?} output for {capability:?} request",
+            model_output.capability(),
+        )));
+    }
+    Ok(model_output)
 }
 
 async fn validate_local_input(input: &ModelInput) -> Result<(), AdapterError> {

@@ -211,7 +211,6 @@ stateDiagram-v2
 | `AFTERRAY_GOP_KEYINT` | `30` | closed GOP 最大帧数；允许 6 / 12 / 20 / 24 / 30。按墙钟连续切，不按 App 分桶 |
 | `AFTERRAY_GOP_ARCHIVE` | `1` | 冷区默认归档。设 `0` 才停 packer |
 | `AFTERRAY_GOP_OCR_GRACE_SECONDS` | `600` | OCR 未完成也可 pack 的宽限 |
-| `AFTERRAY_GOP_REQUIRE_AC` | `0` | 设 `1` 时仅 AC 编码 |
 
 Moment **同时**满足以下条件才可进入候选：
 

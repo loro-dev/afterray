@@ -484,16 +484,22 @@ impl<W: AsyncWrite + Unpin + Send> EventSink for StreamSink<'_, '_, W> {
                 prompt_tokens,
                 window_tokens,
                 round,
+                completion_tokens,
+                generation_ms,
             } => {
                 self.row.set_usage(afterray_harness::TurnUsage {
                     prompt_tokens,
                     window_tokens,
                     rounds: round,
+                    completion_tokens,
+                    generation_ms,
                 });
                 ChatStreamEvent::Usage {
                     prompt_tokens,
                     window_tokens,
                     round,
+                    completion_tokens,
+                    generation_ms,
                 }
             }
             HarnessEvent::Progress(report) => ChatStreamEvent::Progress {
@@ -939,6 +945,7 @@ print(json.dumps({
                     round,
                     prompt_tokens,
                     window_tokens,
+                    ..
                 } => {
                     assert!(prompt_tokens > &0 && window_tokens > prompt_tokens);
                     Some(*round)
@@ -946,7 +953,13 @@ print(json.dumps({
                 _ => None,
             })
             .collect();
-        assert_eq!(usage, [1, 2], "{events:?}");
+        let unique: Vec<usize> = usage.iter().copied().fold(Vec::new(), |mut acc, round| {
+            if acc.last() != Some(&round) {
+                acc.push(round);
+            }
+            acc
+        });
+        assert_eq!(unique, [1, 2], "{events:?}");
         let tokens: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -1138,6 +1151,7 @@ print(json.dumps({
                     round,
                     prompt_tokens,
                     window_tokens,
+                    ..
                 } => {
                     assert_eq!(*window_tokens, budget.window_tokens, "{events:?}");
                     Some((*round, *prompt_tokens))
@@ -1796,8 +1810,8 @@ print(json.dumps({
 
         let questions = [
             format!(
-                "Call the get_ocr tool with moment_id {}. Then answer FINAL with the single \
-                 word: done.",
+                "Call the get_moment_context tool with moment_id {}. Then answer FINAL with the \
+                 single word: done.",
                 moment.id
             ),
             "What was the build passphrase in that screen text? Answer FINAL with just the \
