@@ -1810,8 +1810,8 @@ print(json.dumps({
 
         let questions = [
             format!(
-                "Call the get_ocr tool with moment_id {}. Then answer FINAL with the single \
-                 word: done.",
+                "Call the get_moment_context tool with moment_id {}. Then answer FINAL with the \
+                 single word: done.",
                 moment.id
             ),
             "What was the build passphrase in that screen text? Answer FINAL with just the \

@@ -4992,7 +4992,7 @@ mod tests {
 
     #[test]
     fn packing_thumbnails_every_still_before_dropping_it() {
-        let jpegs = load_e2e_jpegs();
+        let (jpegs, _) = load_e2e_jpegs();
         if jpegs.len() < 2 {
             eprintln!("skip: no JPEG fixtures and ffmpeg unavailable");
             return;
@@ -5207,7 +5207,18 @@ mod tests {
         assert!(rest.is_empty());
     }
 
-    fn load_e2e_jpegs() -> Vec<Vec<u8>> {
+    /// Frames for the packer e2e, and whether they are real screen captures.
+    ///
+    /// The two sources are not interchangeable. Sampled captures are what the
+    /// archive actually holds — a near-static screen with a small change per
+    /// frame, which is the whole reason a closed GOP pays. The ffmpeg fallback
+    /// is four 64×64 solid-colour frames so the test can run at all on a
+    /// machine without the sample directory, and it cannot carry a compression
+    /// claim: measured here, 32 bytes of IVF file header plus 12 per frame are
+    /// 37% of the 218-byte output, against JPEGs that are themselves mostly
+    /// JFIF and quantisation tables. What the ratio reports there is container
+    /// overhead, not the codec.
+    fn load_e2e_jpegs() -> (Vec<Vec<u8>>, bool) {
         let dir = std::path::Path::new("/tmp/afterray-gop-sim/frames/Lody");
         if dir.is_dir() {
             let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -5222,11 +5233,14 @@ mod tests {
             } else {
                 4
             };
-            return files
-                .into_iter()
-                .take(take)
-                .map(|path| std::fs::read(path).unwrap())
-                .collect();
+            return (
+                files
+                    .into_iter()
+                    .take(take)
+                    .map(|path| std::fs::read(path).unwrap())
+                    .collect(),
+                true,
+            );
         }
         let scratch = tempfile::tempdir().unwrap();
         let mut frames = Vec::new();
@@ -5249,16 +5263,16 @@ mod tests {
                 .arg(&path)
                 .status();
             if !status.map(|code| code.success()).unwrap_or(false) {
-                return Vec::new();
+                return (Vec::new(), false);
             }
             frames.push(std::fs::read(path).unwrap());
         }
-        frames
+        (frames, false)
     }
 
     #[test]
     fn packer_encodes_closed_gop_and_serves_poster() {
-        let jpegs = load_e2e_jpegs();
+        let (jpegs, from_real_captures) = load_e2e_jpegs();
         if jpegs.len() < 2 {
             eprintln!("skip packer e2e: no JPEG fixtures and ffmpeg unavailable");
             return;
@@ -5318,11 +5332,25 @@ mod tests {
             ratio,
             1.0 / ratio
         );
-        assert!(
-            ratio < 0.20,
-            "GOP should beat 5x vs JPEG, got {:.1}%",
-            ratio * 100.0
-        );
+        // The 5x claim belongs to real captures, and is asserted only against
+        // them. On screen-like frames it is not a close call — 2560x1440 with
+        // a small change per frame measures 48x — so a real sample landing
+        // near this line means something changed, which is what a threshold is
+        // for. Holding the synthetic fallback to it only ever reported that
+        // 64x64 solid colour has nothing to compress.
+        if from_real_captures {
+            assert!(
+                ratio < 0.20,
+                "GOP should beat 5x vs JPEG, got {:.1}%",
+                ratio * 100.0
+            );
+        } else {
+            assert!(
+                ratio < 1.0,
+                "even four toy frames must not grow when packed, got {:.1}%",
+                ratio * 100.0
+            );
+        }
         let packed = vault.moments_sync(&session.id).unwrap();
         for moment in &packed {
             if ids.contains(&moment.id) {
