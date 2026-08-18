@@ -140,6 +140,12 @@ swift build \
   --configuration release \
   --product afterray-mlx-vlm-worker
 
+# swift build cannot compile Metal shaders; without mlx.metallib colocated
+# with the worker its first MLX call dies with "Failed to load the default
+# metallib".
+printf '%s\n' '==> Building mlx.metallib for the MLX worker'
+"$script_dir/build-mlx-metallib.sh"
+
 printf '%s\n' '==> Assembling AfterRay.app'
 stop_development_processes
 case "$app_bundle" in
@@ -161,6 +167,11 @@ cp "$cli_bin" "$app_bundle/Contents/Helpers/afterray"
 cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
 cp "$mlx_model_worker" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
+# mlx loads mlx.metallib from the worker binary's directory at runtime. A data
+# file in Contents/Helpers fails codesign --verify --deep --strict as unsigned
+# nested code, so the library lives in Resources behind a symlink.
+cp "$repo_root/.build/release/mlx.metallib" "$app_bundle/Contents/Resources/mlx.metallib"
+ln -sf ../Resources/mlx.metallib "$app_bundle/Contents/Helpers/mlx.metallib"
 cp "$model_worker" "$app_bundle/Contents/Helpers/afterray-model-worker"
 chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
 

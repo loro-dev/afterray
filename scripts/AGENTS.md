@@ -6,6 +6,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 - `dev.sh` — watch-mode rebuild loop; change fingerprint via `stat` + `shasum` (dev.sh:57). `--ui` watches only Swift UI + mock data and runs the Visual Lab instead of the app. An explicit `AFTERRAY_DATA_DIR` is forwarded through LaunchServices on every relaunch.
 - `run-v0.sh` — builds shim + Rust workspace (release) and the app (debug — mixed configs are deliberate), assembles and signs `.afterray-dev/AfterRay.app`. Dev vault data lives in `.afterray/`, dev bundle/socket in `.afterray-dev/` (both gitignored); `--ephemeral` uses a throwaway vault.
+- `build-mlx-metallib.sh` — compiles the mlx-swift checkout's Metal shaders into `mlx.metallib` (command-line `swift build` cannot) next to the worker binaries; called by `run-v0.sh` / `build-release.sh`. Bundle layout: `Contents/Resources/mlx.metallib` behind a `Contents/Helpers` symlink (a data file in Helpers fails codesign). Needs `xcodebuild -downloadComponent MetalToolchain` on Xcode 26+.
 - `open-dev.sh` / `stop-dev.sh` — reopen/quit the dev bundle (bundle id `dev.afterray.app`).
 
 ## Release

@@ -1,5 +1,6 @@
 import Foundation
 import HuggingFace
+import MLX
 import MLXHuggingFace
 import MLXLMCommon
 import MLXVLM
@@ -88,6 +89,40 @@ public enum WorkerLog {
         let line = "afterray-mlx-vlm-worker: \(message)\n"
         try? FileHandle.standardError.write(contentsOf: Data(line.utf8))
     }
+}
+
+// mlx-c's default error handler prints `MLX error: ...` to stdout and then
+// calls exit(-1) (mlx/c/error.cpp). stdout belongs to the line-delimited JSON
+// protocol, so an MLX error escaping every mlx-swift `withError` scope both
+// corrupts the stream and kills the worker without a protocol error. Routing
+// the process-wide handler to stderr keeps the channel clean; exiting still
+// applies because an MLX call that reaches this handler returned no error to
+// its caller, leaving MLX state undefined.
+private var mlxErrorSink: @Sendable (String) -> Void = { message in
+    WorkerLog.write("fatal MLX error outside a scoped handler: \(message)")
+    exit(EXIT_FAILURE)
+}
+
+// @convention(c) closures cannot capture context, so the Swift sink lives in
+// the global above and is swapped only before MLX is first touched (worker
+// startup, test setUp).
+private let mlxErrorCallback: @convention(c) (
+    UnsafePointer<CChar>?, UnsafeMutableRawPointer?
+) -> Void = { message, _ in
+    mlxErrorSink(message.map { String(cString: $0) } ?? "unknown MLX error")
+}
+
+/// Installs the process-wide MLX error sink. The worker executable calls this
+/// once at startup; tests pass a non-exiting sink to observe errors.
+///
+/// Uses the deprecated `setErrorHandler` on purpose: it is mlx-swift's only
+/// process-wide hook. `withErrorHandler`/`withError` are task-scoped and cannot
+/// catch errors raised by mlx-swift-lm internals outside those scopes.
+public func installMlxErrorHandler(sink: (@Sendable (String) -> Void)? = nil) {
+    if let sink {
+        mlxErrorSink = sink
+    }
+    MLX.setErrorHandler(mlxErrorCallback)
 }
 
 actor MlxModelRuntime {
