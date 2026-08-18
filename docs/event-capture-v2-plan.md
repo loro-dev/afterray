@@ -171,6 +171,17 @@
    解析后按小节展开，行内语法与引用渲染成它们说的话（`[label](afterray://moment/id)` → `label`）。
    加载帧本身与 `#el<N>` 元素高亮仍是聊天面板的能力，日面板留待后续。
 
+## 运行时验证（2026-08-18 晚，真实生产 vault）
+
+- schema 21→26 迁移无损，protocol 15 握手正常，录制持续。
+- OCR 窗口裁剪：天气组件文本最后进库 21:02:13，新 daemon 21:05:30 启动后零命中——精确到重启时刻。
+- tree_text 链：三种模式齐全，链按窗口分、seq 递增、LRU 驱逐回归付 keyframe；**安静帧 diff ~1KB vs 整树 260–380KB（250–350×）**，与逆向预测吻合。`root` 仍每帧照发（过渡契约），减重收益待消费切换后兑现。
+- 输入事件端到端（tap→daemon→vault→join→卡片）：submit value 逐字捕获用户消息（含时刻）；IME 行为与设计一致（typed=拼音/中间态，submitted=组合整句）；点击带元素身份；run 正确切分；`no_input_ratio` 合理。
+- **原始 bug 修复实证**：用户只读未碰的 226 行聊天输出被正确标为 `not_engaged`，而非冒充用户活动。
+- listen-only tap **不在输入监控面板留痕**（§7.3 PoC 落定；意义随 CAP-005 取消反转——透明义务在应用自身，见 input-events 计划的 PoC 节）。
+- 待验：首张真实 v3 T2 卡（degraded 队列等空闲闸门）；WS7 语料回归。
+- 小毛刺（不阻塞）：无标签元素点击 label 退化为角色名；边界 ⌘C 归属到相邻 run；地址栏 URL 进 typed。
+
 ## 开放 PoC
 
 - diff 树对齐在 Electron 大树上的稳定性与性能（20k 节点上限内）。
