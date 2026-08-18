@@ -139,6 +139,8 @@ impl<'a> TurnRow<'a> {
                 "prompt_tokens": usage.prompt_tokens,
                 "window_tokens": usage.window_tokens,
                 "round": usage.rounds,
+                "completion_tokens": usage.completion_tokens,
+                "generation_ms": usage.generation_ms,
             })
             .to_string()
         });
@@ -238,6 +240,8 @@ mod tests {
             prompt_tokens: 4_000,
             window_tokens: 16_384,
             rounds: 2,
+            completion_tokens: 120,
+            generation_ms: 800,
         });
         row.close(false).unwrap();
 

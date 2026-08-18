@@ -1,6 +1,7 @@
 mod agent;
 mod ask;
 mod chat;
+mod compute;
 mod gop_packer;
 mod memory;
 mod stream;
@@ -221,6 +222,27 @@ async fn async_main() -> anyhow::Result<()> {
     let packer = Arc::new(gop_packer::GopPacker::new(
         gop_packer::GopPackerConfig::from_env(),
     ));
+    let compute = Arc::new(compute::ComputeGovernor::new(
+        persisted.compute_mode,
+        persisted.compute_paused_until_ms,
+        compute::ComputeLimits {
+            summaries_disabled_by_env: t2_sweep_period().is_zero(),
+            archive_disabled_by_env: !packer.config.archive,
+        },
+    ));
+    // Persisted durations, so "summaries usually take about this long" is
+    // answerable immediately after a restart — which is exactly when someone
+    // who just updated the app may be wondering why their fans are up. Read
+    // once here, never on the dashboard's polling path.
+    if let Some(until) = compute.paused_until_ms(now_ms()) {
+        eprintln!(
+            "compute: background work suspended for another {} min (restored from settings)",
+            (until - now_ms()) / 60_000
+        );
+    }
+    if compute.mode() != afterray_protocol::ComputeMode::Full {
+        eprintln!("compute: mode is {}", compute.mode().as_label());
+    }
     let capture_busy = Arc::new(AtomicBool::new(false));
     let capture_paused = Arc::new(AtomicBool::new(false));
     let last_capture_ms = Arc::new(AtomicI64::new(0));
@@ -271,8 +293,20 @@ async fn async_main() -> anyhow::Result<()> {
         llm_config,
         llm_token_sink,
         mlx_adapters,
+        compute,
+        backlog: tokio::sync::Mutex::new(None),
+        t2_changed: tokio::sync::Notify::new(),
         running_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
+
+    // Off the boot path: `recent_summary_runs` sorts an unindexed column, and
+    // nothing in the daemon's first seconds needs the answer — the panel is not
+    // open yet, and `seed_summaries` no-ops once a live pass has been recorded.
+    {
+        let seed_store = Arc::clone(&state.store);
+        let seed_compute = Arc::clone(&state.compute);
+        tokio::task::spawn_blocking(move || seed_summary_history(&seed_store, &seed_compute));
+    }
 
     settle_orphaned_turns(&state);
     println!("afterrayd listening on {}", socket.display());
@@ -493,6 +527,16 @@ struct AppState {
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     llm_token_sink: LlmTokenSink,
     mlx_adapters: Vec<(String, Arc<PersistentMlxAdapter>)>,
+    /// Decides whether background computation may run, and describes that
+    /// decision to the dashboard. Interactive work never consults it.
+    compute: Arc<compute::ComputeGovernor>,
+    /// Last durable backlog count and when it was taken. Cached because the
+    /// dashboard polls every couple of seconds and the count walks `moments`
+    /// against `text_evidence` — cheap once, wasteful sixty times a minute.
+    backlog: tokio::sync::Mutex<Option<(std::time::Instant, BacklogCounts)>>,
+    /// Wakes the summary sweeper without waiting out its five-minute tick, so
+    /// "run now" starts within a second rather than eventually.
+    t2_changed: tokio::sync::Notify,
     /// Cancel tokens for turns currently running, by conversation.
     ///
     /// A `ChatAbort` arrives on a *different* connection from the stream it
@@ -527,8 +571,29 @@ struct PersistedSettings {
     summary_language: String,
     #[serde(default)]
     model_download_endpoint: String,
+    /// How much background computation is allowed. Persisted so the choice
+    /// survives the restart that an app update performs.
+    #[serde(default)]
+    compute_mode: afterray_protocol::ComputeMode,
+    /// Deadline of a user-requested suspension, epoch-ms; `0` means none.
+    ///
+    /// A deadline rather than a remaining duration: a daemon that restarts
+    /// twice during the hour must not extend the hour twice.
+    #[serde(default)]
+    compute_paused_until_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cli_evidence_until_ms: Option<i64>,
+}
+
+/// How often the T2 sweeper wakes. `0` disables it, which the dashboard reports
+/// as "disabled at launch" rather than pretending the switch works.
+fn t2_sweep_period() -> Duration {
+    Duration::from_secs(
+        std::env::var("AFTERRAY_T2_SWEEP_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+    )
 }
 
 fn default_language() -> String {
@@ -586,6 +651,8 @@ impl Default for PersistedSettings {
             ui_language: default_language(),
             summary_language: default_language(),
             model_download_endpoint: String::new(),
+            compute_mode: afterray_protocol::ComputeMode::Full,
+            compute_paused_until_ms: 0,
             cli_evidence_until_ms: None,
         }
     }
@@ -995,6 +1062,61 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             .await
         }
         Request::ModelsStatus => Response::success(model_library(state)),
+        Request::ComputeStatus => Response::success(compute_status(state).await),
+        Request::ComputeSetMode { mode } => {
+            state.compute.set_mode(mode);
+            if let Err(error) = persist_current_settings(state) {
+                return Response::failure(format!("could not save the compute mode: {error}"));
+            }
+            eprintln!("compute: mode set to {}", mode.as_label());
+            Response::success(compute_status(state).await)
+        }
+        Request::ComputeRunNow { workload } => {
+            if let Some(refusal) = state.compute.force_refusal(workload, now_ms()) {
+                return Response::failure(refusal.reason);
+            }
+            state.compute.force_now(workload, now_ms());
+            // The counts this is about to change are cached; drop it so the next
+            // poll shows the pile actually moving.
+            state.backlog.lock().await.take();
+            // Persisted because `force_now` lifts an active suspension, and that
+            // must not come back on the next restart.
+            if let Err(error) = persist_current_settings(state) {
+                eprintln!("compute: could not save the lifted suspension: {error}");
+            }
+            // Wake the loop instead of letting it find out on its next tick: a
+            // button that takes five minutes to visibly do anything reads as
+            // broken.
+            match workload {
+                afterray_protocol::ComputeWorkload::Summary => state.t2_changed.notify_one(),
+                afterray_protocol::ComputeWorkload::Asr => state.asr_changed.notify_one(),
+                // The packer polls on a one-second sleep and the model queue
+                // starts work as it arrives, so neither needs a nudge.
+                afterray_protocol::ComputeWorkload::Archive
+                | afterray_protocol::ComputeWorkload::Ocr
+                | afterray_protocol::ComputeWorkload::Embedding => {}
+            }
+            eprintln!(
+                "compute: running {} now, overriding machine conditions for {}",
+                workload.as_label(),
+                human_duration(compute::FORCE_WINDOW)
+            );
+            Response::success(compute_status(state).await)
+        }
+        Request::ComputePause { seconds } => {
+            let until = state.compute.pause_for(now_ms(), seconds);
+            if let Err(error) = persist_current_settings(state) {
+                return Response::failure(format!("could not save the suspension: {error}"));
+            }
+            match until {
+                Some(until) => eprintln!(
+                    "compute: background work suspended for {} min",
+                    (until - now_ms()) / 60_000
+                ),
+                None => eprintln!("compute: background work resumed"),
+            }
+            Response::success(compute_status(state).await)
+        }
         Request::JobsList => Response::success(state.models.list().await),
         Request::JobRetry { job_id } => match state.models.retry(&job_id).await {
             Ok(snapshot) => Response::success(snapshot),
@@ -1478,6 +1600,8 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
             .lock()
             .map(|endpoint| endpoint.clone())
             .unwrap_or_default(),
+        compute_mode: state.compute.mode(),
+        compute_paused_until_ms: state.compute.persisted_pause_ms(),
         cli_evidence_until_ms: cli_evidence_until_ms(state),
     }
 }
@@ -2233,6 +2357,31 @@ async fn import_artifact(
                     recording.captured_frame = true;
                 }
             }
+            // The one gate that only "off" can close. Nothing in the vault
+            // remembers that a frame went un-OCR'd, so a skipped frame is never
+            // indexed by anything later — which is why an hour-long suspension
+            // deliberately leaves screen text running (see compute.rs) and only
+            // the explicit switch, whose copy says what it costs, stops it.
+            if let Err(refusal) = state.compute.decide(
+                afterray_protocol::ComputeWorkload::Ocr,
+                compute::MachineConditions::probe(),
+                now_ms(),
+            ) {
+                eprintln!(
+                    "screen text skipped for moment {}: {}",
+                    moment.id, refusal.reason
+                );
+                // The staging copy is normally deleted by the OCR task that
+                // never runs here. Leaving it would fill the staging directory
+                // with plaintext JPEGs for as long as the switch stays off.
+                if let Err(error) = tokio::fs::remove_file(path).await {
+                    eprintln!(
+                        "could not remove capture staging file {}: {error}",
+                        path.display()
+                    );
+                }
+                return Ok(());
+            }
             let job = state
                 .models
                 .submit(ModelInput::Ocr {
@@ -2489,6 +2638,7 @@ async fn delete_excluded_moment(state: &Arc<AppState>, moment_id: &str) {
     };
     eprintln!("excluded moment {moment_id} could not be deleted, retrying once: {error}");
     tokio::time::sleep(RETRY_DELAY).await;
+
     let moment_id_owned = moment_id.to_owned();
     if let Err(error) = run_store(state, move |s| {
         s.store.delete_moment_and_artifacts(&moment_id_owned)
@@ -2497,6 +2647,233 @@ async fn delete_excluded_moment(state: &Arc<AppState>, moment_id: &str) {
     {
         eprintln!("excluded moment {moment_id} survived a retry and is still recorded: {error}");
     }
+}
+
+/// The capture interval in milliseconds, which several slot readers need.
+fn capture_interval_ms(state: &AppState) -> i64 {
+    i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000)
+}
+
+/// The durable backlog per workload, as the dashboard shows it.
+#[derive(Debug, Clone, Copy, Default)]
+struct BacklogCounts {
+    summaries: usize,
+    archive: usize,
+    transcripts: usize,
+    /// Moments that still have a JPEG but no screen text. Only frames whose
+    /// pixels survive are counted: once a moment is packed into a GOP its JPEG
+    /// is gone, so counting those would show a pile nothing can ever drain.
+    unindexed: usize,
+}
+
+/// How long a backlog count is trusted before it is taken again.
+///
+/// The panel polls every two seconds, so without a cache the counts would be the
+/// dashboard's own dominant cost — and it walks slot cards and `moments` against
+/// `text_evidence`. Thirty seconds is chosen against how fast the numbers can
+/// actually move: a slot becomes eligible for summarising every ten minutes, and
+/// audio arrives in five-minute segments. Pressing "run now" drops the cache, so
+/// the effect of the one action that is meant to move these numbers is visible on
+/// the next poll rather than up to half a minute later.
+const BACKLOG_TTL: Duration = Duration::from_secs(30);
+
+async fn backlog_counts(state: &Arc<AppState>) -> BacklogCounts {
+    {
+        let cached = state.backlog.lock().await;
+        if let Some((taken_at, counts)) = cached.as_ref()
+            && taken_at.elapsed() < BACKLOG_TTL
+        {
+            return *counts;
+        }
+    }
+    let policy = state.packer.config.policy;
+    let interval_ms = capture_interval_ms(state);
+    let now = now_ms();
+    // Both counts are `Vault` reads, so they go through `run_store` together:
+    // one `spawn_blocking` hop, and — the part that matters — never a synchronous
+    // vault call from a tokio worker. `slots_awaiting_t2` walks up to three days
+    // of slot cards, which is exactly the kind of blocking that used to freeze
+    // socket accepts.
+    let counts = run_store(state, move |s| {
+        let summaries = slots_awaiting_t2(&s.store, interval_ms, now, T2_LOOKBACK_DAYS).len();
+        s.store
+            .compute_backlog(now, &policy)
+            .map(|vault| BacklogCounts {
+                summaries,
+                archive: vault.archive_stills,
+                transcripts: vault.transcripts,
+                unindexed: vault.unindexed_moments,
+            })
+    })
+    .await;
+    let counts = counts.unwrap_or_else(|error| {
+        eprintln!("compute: could not count the backlog: {error}");
+        BacklogCounts::default()
+    });
+    *state.backlog.lock().await = Some((std::time::Instant::now(), counts));
+    counts
+}
+
+/// Everything the dashboard shows, gathered against one instant.
+///
+/// One RPC rather than a client that aggregates `JobsList`: the panel polls
+/// while it is open, and the old surface handed back every job the daemon had
+/// ever run, including their model outputs.
+async fn compute_status(state: &Arc<AppState>) -> afterray_protocol::ComputeStatusReport {
+    use afterray_protocol::{ComputeResidentModel, ComputeTask, ComputeWorkload};
+
+    let conditions = compute::MachineConditions::probe();
+    let now = now_ms();
+    let activity = state.models.activity().await;
+
+    // Sampled pids, so readings for exited one-shot workers are dropped rather
+    // than accumulating for the life of the daemon.
+    let mut live_pids = vec![std::process::id()];
+    let mut running = Vec::with_capacity(activity.running.len() + 1);
+    for job in &activity.running {
+        let workload = compute::workload_for_capability(job.capability);
+        let pid = state
+            .models
+            .adapter_for(job.capability)
+            .and_then(|adapter| adapter.worker_pid(&job.id));
+        let (cpu_percent, footprint_bytes) = match pid {
+            Some(pid) => {
+                live_pids.push(pid);
+                state.compute.sample(pid)
+            }
+            None => (None, None),
+        };
+        running.push(ComputeTask {
+            id: job.id.clone(),
+            workload,
+            lane: workload.lane(),
+            detail: job.adapter.clone(),
+            started_at_ms: job.started_at_ms,
+            cpu_percent,
+            footprint_bytes,
+        });
+    }
+
+    // AV1 packing runs on a thread inside this process, so it has no worker pid
+    // and would be invisible next to the model jobs — the one workload most
+    // likely to be the answer to "why is my Mac slow".
+    if state.packer.encode_busy() {
+        running.push(ComputeTask {
+            id: "gop-packer".to_owned(),
+            workload: ComputeWorkload::Archive,
+            lane: ComputeWorkload::Archive.lane(),
+            detail: "rav1e (in the daemon)".to_owned(),
+            started_at_ms: now,
+            cpu_percent: None,
+            footprint_bytes: None,
+        });
+    }
+
+    let mut resident_models = Vec::new();
+    for (pack_id, adapter) in &state.mlx_adapters {
+        let health = adapter.health();
+        let Some(pid) = health.pid else {
+            continue;
+        };
+        live_pids.push(pid);
+        let (cpu_percent, footprint_bytes) = state.compute.sample(pid);
+        resident_models.push(ComputeResidentModel {
+            pack_id: pack_id.clone(),
+            name: health
+                .runtime
+                .clone()
+                .unwrap_or_else(|| pack_id.clone()),
+            pid: Some(pid),
+            footprint_bytes,
+            cpu_percent,
+        });
+    }
+
+    let recent_summaries = state.compute.recent_summaries();
+    let machine = state.compute.machine_report(conditions);
+    let backlog = backlog_counts(state).await;
+    let mut counts = compute::WorkloadCounts::default();
+    counts.set(
+        ComputeWorkload::Ocr,
+        activity.pending_for(ModelCapability::Ocr),
+        backlog.unindexed,
+    );
+    counts.set(
+        ComputeWorkload::Asr,
+        activity.pending_for(ModelCapability::Asr),
+        backlog.transcripts,
+    );
+    // Embeddings follow whatever OCR and ASR produce; no pile of their own.
+    counts.set(
+        ComputeWorkload::Embedding,
+        activity.pending_for(ModelCapability::Embedding),
+        0,
+    );
+    counts.set(
+        ComputeWorkload::Summary,
+        activity.pending_for(ModelCapability::Llm),
+        backlog.summaries,
+    );
+    // The packer's backlog lives in the vault, not in the queue.
+    counts.set(ComputeWorkload::Archive, 0, backlog.archive);
+    let gates = state.compute.gates(conditions, now, &counts);
+    state.compute.forget_dead_samples(&live_pids);
+
+    afterray_protocol::ComputeStatusReport {
+        mode: state.compute.mode(),
+        paused_until_ms: state.compute.paused_until_ms(now),
+        running,
+        gates,
+        machine,
+        thresholds: compute::ComputeGovernor::thresholds(),
+        resident_models,
+        summary_typical_ms: afterray_protocol::typical_run_ms(&recent_summaries),
+        recent_summaries,
+        capture_paused: state.capture_paused.load(Ordering::SeqCst),
+    }
+}
+
+/// Fills the governor's duration window from persisted history.
+///
+/// Read once, at startup: it answers "how long do summaries usually take"
+/// immediately after a restart — the moment a user who just updated the app may
+/// be wondering why their fans are up — and there is no index behind the query,
+/// so it must never reach the dashboard's polling path.
+fn seed_summary_history(store: &Vault, compute: &compute::ComputeGovernor) {
+    match store.recent_summary_runs(compute::SUMMARY_HISTORY) {
+        Ok(runs) => {
+            let count = runs.len();
+            compute.seed_summaries(runs.into_iter().map(|run| afterray_protocol::ComputeRun {
+                slot_start_ms: run.slot_start_ms,
+                finished_at_ms: run.produced_at_ms,
+                duration_ms: run.latency_ms,
+                ok: true,
+            }));
+            if let Some(typical) = afterray_protocol::typical_run_ms(&compute.recent_summaries()) {
+                eprintln!(
+                    "compute: {count} past summary duration(s), typically {}",
+                    human_duration(Duration::from_millis(
+                        u64::try_from(typical).unwrap_or_default()
+                    ))
+                );
+            }
+        }
+        Err(error) => eprintln!("compute: could not read past summary durations: {error}"),
+    }
+}
+
+/// A duration a person can read out loud, for log lines. `2m 41s`, not
+/// `161337ms`: the log is where someone goes to answer "how long did that
+/// take", and milliseconds make them do arithmetic.
+fn human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    if seconds < 3_600 {
+        return format!("{}m {:02}s", seconds / 60, seconds % 60);
+    }
+    format!("{}h {:02}m", seconds / 3_600, (seconds % 3_600) / 60)
 }
 
 /// What the recall UI searches with: exact text, and nothing else.
@@ -2544,10 +2921,39 @@ pub(crate) fn search_hits(
 /// `slot_start_ms` as the `slot.t1` line, so a card's full history is
 /// recoverable from the log.
 async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
-    match run_slot_t2(state, at_ms).await {
+    match run_slot_t2_recording(state, at_ms).await.0 {
         Ok(value) => Response::success(value),
         Err(error) => Response::failure(error),
     }
+}
+
+/// Runs one T2 pass, timing it and filing the duration with the compute
+/// governor, and hands the caller both the outcome and how long it took.
+///
+/// Every caller goes through here — the sweeper, `slot backfill`, and the
+/// manual RPC — because they all cost the user the same thing, and the
+/// dashboard's "about N left" estimate is only as good as the number of real
+/// passes behind it. Timing wraps the whole call so a pass that fails halfway
+/// still reports the time it burned.
+async fn run_slot_t2_recording(
+    state: &Arc<AppState>,
+    at_ms: i64,
+) -> (Result<serde_json::Value, String>, Duration) {
+    let began = std::time::Instant::now();
+    let outcome = run_slot_t2(state, at_ms).await;
+    let took = began.elapsed();
+    // A pass that failed before it resolved a card has no slot of its own;
+    // `at_ms` is the closest true thing to say about it. Failures are excluded
+    // from the median anyway.
+    let slot_start_ms = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("slot_start_ms").and_then(serde_json::Value::as_i64))
+        .unwrap_or(at_ms);
+    state
+        .compute
+        .record_summary(slot_start_ms, now_ms(), took, outcome.is_ok());
+    (outcome, took)
 }
 
 /// One T2 pass over the slot containing `at_ms`: render the prompt, run it
@@ -2689,89 +3095,19 @@ const T2_MAX_ATTEMPTS: u32 = 3;
 /// Slots summarised per tick. The queue is shared with OCR, so a backlog drains
 /// gradually instead of monopolising the model for minutes at a time.
 const T2_PER_TICK: usize = 2;
-/// Charge below which T2 waits even on AC — a laptop plugged in at 8% is still
-/// recovering, and a local model is the last thing it needs.
-const T2_MIN_BATTERY: f64 = 0.30;
-/// How long the machine must have been untouched. Long enough not to fire
-/// between two keystrokes, short enough to find a gap in a working morning.
-///
-/// Two minutes never opened. On a day of continuous work the idle time hovered
-/// under a minute for hours and four slots went unsummarised — the sweeper
-/// logged the same refusal every five minutes from 08:00 on. The load check
-/// below is the one that actually predicts whether the user will feel a model
-/// start; this one only needs to rule out a pause mid-sentence.
-const T2_MIN_IDLE_SECONDS: f64 = 30.0;
-/// One-minute load average per core. Above this something else already wants
-/// the machine, and the user will feel a local model piling on.
-const T2_MAX_LOAD_PER_CORE: f64 = 0.7;
-
-/// What the machine looked like when the sweeper woke up.
-#[derive(Debug, Clone, Copy)]
-struct MachineConditions {
-    on_ac: bool,
-    /// `None` on a desktop, which has no battery to conserve.
-    battery: Option<f64>,
-    idle_seconds: f64,
-    /// `None` when the load average could not be read.
-    load_per_core: Option<f64>,
-}
-
-impl MachineConditions {
-    fn probe() -> Self {
-        Self {
-            on_ac: afterray_platform_macos::on_ac_power(),
-            battery: afterray_platform_macos::battery_fraction(),
-            idle_seconds: afterray_platform_macos::seconds_since_user_input(),
-            load_per_core: afterray_platform_macos::load_per_core(),
-        }
-    }
-}
-
-/// Whether a T2 pass may run now, or the reason it may not.
-///
-/// T2 is the most expensive thing this daemon does — a local model over a
-/// 16k-character prompt — and it is never urgent. Every check here fails
-/// closed: an unreadable probe means wait, because the cost of waiting is a
-/// summary arriving late and the cost of guessing wrong is the user's machine
-/// stuttering while they work.
-fn t2_may_run(conditions: MachineConditions) -> Result<(), String> {
-    if !conditions.on_ac {
-        return Err("on battery".to_owned());
-    }
-    // A desktop reports no battery; nothing to conserve, so nothing to check.
-    if let Some(battery) = conditions.battery
-        && battery < T2_MIN_BATTERY
-    {
-        return Err(format!(
-            "battery at {:.0}% is below {:.0}%",
-            battery * 100.0,
-            T2_MIN_BATTERY * 100.0
-        ));
-    }
-    if conditions.idle_seconds < T2_MIN_IDLE_SECONDS {
-        return Err(format!(
-            "in use {:.0}s ago, needs {T2_MIN_IDLE_SECONDS:.0}s",
-            conditions.idle_seconds
-        ));
-    }
-    match conditions.load_per_core {
-        Some(load) if load > T2_MAX_LOAD_PER_CORE => Err(format!(
-            "load {load:.2}/core is above {T2_MAX_LOAD_PER_CORE:.2}"
-        )),
-        // An unreadable load average is not permission to add to it.
-        None => Err("load average unavailable".to_owned()),
-        Some(_) => Ok(()),
-    }
-}
 
 /// Every occupied slot that T1 marked ready, has closed and settled, and has no
 /// T2 card yet — oldest first, so a backlog fills in the order it happened.
-fn slots_awaiting_t2(state: &Arc<AppState>, now: i64, lookback_days: i64) -> Vec<i64> {
-    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
+fn slots_awaiting_t2(
+    store: &Vault,
+    interval_ms: i64,
+    now: i64,
+    lookback_days: i64,
+) -> Vec<i64> {
     let mut due = Vec::new();
     let mut day_ms = now;
     for _ in 0..=lookback_days.max(0) {
-        let Ok(summary) = state.store.day_summary(day_ms, interval_ms) else {
+        let Ok(summary) = store.day_summary(day_ms, interval_ms) else {
             continue;
         };
         due.extend(due_slot_starts(&summary.slots, now));
@@ -2800,12 +3136,12 @@ fn due_slot_starts(slots: &[afterray_store::DaySlot], now: i64) -> Vec<i64> {
 const T2_BACKFILL_CAP: usize = 40;
 
 async fn slot_backfill(state: &Arc<AppState>, days: i64) -> Response {
-    let due = slots_awaiting_t2(state, now_ms(), days);
+    let due = slots_awaiting_t2(&state.store, capture_interval_ms(state), now_ms(), days);
     let total = due.len();
     let mut summarised = 0_usize;
     let mut failures: Vec<serde_json::Value> = Vec::new();
     for slot_start_ms in due.into_iter().take(T2_BACKFILL_CAP) {
-        match run_slot_t2(state, slot_start_ms).await {
+        match run_slot_t2_recording(state, slot_start_ms).await.0 {
             Ok(_) => summarised += 1,
             Err(error) => failures.push(serde_json::json!({
                 "slot_start_ms": slot_start_ms,
@@ -2875,7 +3211,10 @@ fn spawn_asr_sweeper(state: Arc<AppState>) {
     let mut shutdown = state.shutdown.subscribe();
     state.asr_changed.notify_one();
     tokio::spawn(async move {
+        // Logged on change only, like the T2 sweeper's.
+        let mut blocked_reason: Option<String> = None;
         loop {
+            let conditions = compute::MachineConditions::probe();
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -2884,11 +3223,35 @@ fn spawn_asr_sweeper(state: Arc<AppState>) {
                     continue;
                 }
                 () = state.asr_changed.notified() => {}
-                () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                // On battery this stretches to five minutes instead of
+                // stopping: the audio rows are a durable backlog, so the work
+                // still drains, just slower.
+                () = tokio::time::sleep(state.compute.asr_sweep_interval(conditions, now_ms())) => {}
+            }
+            if let Err(refusal) = state.compute.decide(
+                afterray_protocol::ComputeWorkload::Asr,
+                conditions,
+                now_ms(),
+            ) {
+                if blocked_reason.as_deref() != Some(refusal.reason.as_str()) {
+                    eprintln!("asr backlog: holding off — {}", refusal.reason);
+                    blocked_reason = Some(refusal.reason);
+                }
+                continue;
+            }
+            if blocked_reason.take().is_some() {
+                eprintln!("asr backlog: resuming");
             }
             match run_one_audio_transcription(&state).await {
                 Ok(true) => state.asr_changed.notify_one(),
-                Ok(false) => {}
+                Ok(false) => {
+                    if state
+                        .compute
+                        .clear_force(afterray_protocol::ComputeWorkload::Asr)
+                    {
+                        eprintln!("asr backlog: drained, override ended");
+                    }
+                }
                 Err(error) => eprintln!("asr backlog: {error}"),
             }
         }
@@ -3067,12 +3430,7 @@ async fn freeze_slot_acts(state: &Arc<AppState>, now: i64) {
 }
 
 fn spawn_slot_summarizer(state: Arc<AppState>) {
-    let period = Duration::from_secs(
-        std::env::var("AFTERRAY_T2_SWEEP_SECONDS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(300),
-    );
+    let period = t2_sweep_period();
     if period.is_zero() {
         eprintln!("slot.t2 sweeper: disabled by AFTERRAY_T2_SWEEP_SECONDS=0");
         return;
@@ -3096,6 +3454,9 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                     }
                     continue;
                 }
+                // "Run now" nudges this, so the button acts within a second
+                // instead of somewhere in the next five minutes.
+                () = state.t2_changed.notified() => {}
                 _ = timer.tick() => {}
             }
 
@@ -3127,11 +3488,17 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 continue;
             }
 
-            // Cheap to check, so check before touching the vault at all.
-            if let Err(reason) = t2_may_run(MachineConditions::probe()) {
-                if blocked_reason.as_deref() != Some(reason.as_str()) {
-                    eprintln!("slot.t2 sweeper: holding off — {reason}");
-                    blocked_reason = Some(reason);
+            // Cheap to check, so check before touching the vault at all. The
+            // governor folds the machine gate together with the user's own
+            // mode and suspension, so one refusal string explains all three.
+            if let Err(refusal) = state.compute.decide(
+                afterray_protocol::ComputeWorkload::Summary,
+                compute::MachineConditions::probe(),
+                now_ms(),
+            ) {
+                if blocked_reason.as_deref() != Some(refusal.reason.as_str()) {
+                    eprintln!("slot.t2 sweeper: holding off — {}", refusal.reason);
+                    blocked_reason = Some(refusal.reason);
                 }
                 continue;
             }
@@ -3139,10 +3506,33 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 eprintln!("slot.t2 sweeper: conditions met, resuming");
             }
 
-            let due = slots_awaiting_t2(&state, now_ms(), T2_LOOKBACK_DAYS);
+            let due = slots_awaiting_t2(
+                &state.store,
+                capture_interval_ms(&state),
+                now_ms(),
+                T2_LOOKBACK_DAYS,
+            );
+            if due.is_empty()
+                && state
+                    .compute
+                    .clear_force(afterray_protocol::ComputeWorkload::Summary)
+            {
+                // Nothing left to force. Ending the override here rather than
+                // letting it time out means the machine goes back under its
+                // usual gates the moment the pile the user pointed at is gone.
+                eprintln!("slot.t2 sweeper: backlog drained, override ended");
+            }
             let mut ran = 0;
             for slot_start_ms in due {
-                if ran >= T2_PER_TICK {
+                // A forced run is draining a backlog the user is watching, so it
+                // works through the lot instead of two slots every five minutes —
+                // and it stops the moment the override expires or is withdrawn,
+                // rather than running on past the point they stopped watching.
+                let forced = state
+                    .compute
+                    .forced_until_ms(afterray_protocol::ComputeWorkload::Summary, now_ms())
+                    .is_some();
+                if !forced && ran >= T2_PER_TICK {
                     break;
                 }
                 let attempt = attempts.entry(slot_start_ms).or_default();
@@ -3152,14 +3542,19 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 *attempt += 1;
                 let attempt = *attempt;
                 ran += 1;
-                match run_slot_t2(&state, slot_start_ms).await {
+                let (outcome, took) = run_slot_t2_recording(&state, slot_start_ms).await;
+                match outcome {
                     Ok(_) => {
                         attempts.remove(&slot_start_ms);
-                        eprintln!("slot.t2 sweeper: summarised slot={slot_start_ms}");
+                        eprintln!(
+                            "slot.t2 sweeper: summarised slot={slot_start_ms} in {}",
+                            human_duration(took)
+                        );
                     }
                     Err(error) => {
                         eprintln!(
-                            "slot.t2 sweeper: slot={slot_start_ms} attempt={attempt}/{T2_MAX_ATTEMPTS} failed: {error}"
+                            "slot.t2 sweeper: slot={slot_start_ms} attempt={attempt}/{T2_MAX_ATTEMPTS} failed after {}: {error}",
+                            human_duration(took)
                         );
                     }
                 }
@@ -4116,8 +4511,8 @@ fn spawn_gop_packer(state: Arc<AppState>) {
         return;
     }
     eprintln!(
-        "gop packer: enabled keyint={} cold_gop_only require_ac={}",
-        state.packer.config.policy.keyint, state.packer.config.require_ac
+        "gop packer: enabled keyint={} cold_gop_only",
+        state.packer.config.policy.keyint
     );
     let shutdown = state.shutdown.subscribe();
     if let Err(error) = std::thread::Builder::new()
@@ -4126,9 +4521,31 @@ fn spawn_gop_packer(state: Arc<AppState>) {
             apply_background_qos();
             eprintln!("gop packer: background thread started");
             std::thread::sleep(Duration::from_secs(15));
+            let mut blocked_reason: Option<String> = None;
             loop {
                 if *shutdown.borrow() {
                     break;
+                }
+                // rav1e is the only all-core workload here, so it is the one a
+                // user most wants to stand down. Checked before the vault is
+                // touched; `pack_one` keeps its own AC check as a backstop.
+                if let Err(refusal) = state.compute.decide(
+                    afterray_protocol::ComputeWorkload::Archive,
+                    compute::MachineConditions::probe(),
+                    now_ms(),
+                ) {
+                    if blocked_reason.as_deref() != Some(refusal.reason.as_str()) {
+                        eprintln!("gop packer: holding off — {}", refusal.reason);
+                        blocked_reason = Some(refusal.reason);
+                    }
+                    // Ten seconds, not a minute: this is also how long "run now"
+                    // takes to visibly start, and the probes it re-reads are
+                    // cheap.
+                    std::thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+                if blocked_reason.take().is_some() {
+                    eprintln!("gop packer: resuming");
                 }
                 if state.capture_busy.load(Ordering::SeqCst)
                     || state.packer.encode_busy()
@@ -4148,7 +4565,16 @@ fn spawn_gop_packer(state: Arc<AppState>) {
                     Ok(Some(segment_id)) => {
                         eprintln!("gop packer: committed {segment_id}");
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // Nothing left to pack, so a "run now" override has done
+                        // its job and the usual power gates should apply again.
+                        if state
+                            .compute
+                            .clear_force(afterray_protocol::ComputeWorkload::Archive)
+                        {
+                            eprintln!("gop packer: nothing left to pack, override ended");
+                        }
+                    }
                     Err(error) => eprintln!("gop packer: {error:#}"),
                 }
                 std::thread::sleep(Duration::from_secs(5));
@@ -4283,6 +4709,20 @@ mod tests {
             )),
             "the URL must reach the domain exclusion check"
         );
+    }
+
+    /// The sweeper log is where somebody goes to answer "how long did that
+    /// take", so it must not make them convert milliseconds in their head — and
+    /// it must render a duration exactly as the panel does (`ComputeFormat`
+    /// `duration(ms:)`), or the same pass reads as two different numbers.
+    #[test]
+    fn logged_durations_are_readable_at_every_scale() {
+        assert_eq!(human_duration(Duration::from_millis(940)), "0s");
+        assert_eq!(human_duration(Duration::from_millis(9_500)), "9s");
+        assert_eq!(human_duration(Duration::from_secs(61)), "1m 01s");
+        assert_eq!(human_duration(Duration::from_secs(161)), "2m 41s");
+        assert_eq!(human_duration(Duration::from_secs(3_600)), "1h 00m");
+        assert_eq!(human_duration(Duration::from_secs(4_500)), "1h 15m");
     }
 
     /// The picker's list and the vault's accepted lengths are declared in two
@@ -4642,137 +5082,6 @@ mod tests {
         );
     }
 
-    /// A machine that should be summarising: plugged in, charged, untouched,
-    /// quiet. Each test spoils exactly one of those.
-    const IDEAL: MachineConditions = MachineConditions {
-        on_ac: true,
-        battery: Some(0.9),
-        idle_seconds: 600.0,
-        load_per_core: Some(0.1),
-    };
-
-    #[test]
-    fn ideal_conditions_allow_t2() {
-        assert!(t2_may_run(IDEAL).is_ok());
-    }
-
-    #[test]
-    fn each_condition_alone_blocks_t2() {
-        let cases = [
-            (
-                "battery",
-                MachineConditions {
-                    on_ac: false,
-                    ..IDEAL
-                },
-            ),
-            (
-                "low charge",
-                MachineConditions {
-                    battery: Some(0.1),
-                    ..IDEAL
-                },
-            ),
-            (
-                "in use",
-                MachineConditions {
-                    idle_seconds: 5.0,
-                    ..IDEAL
-                },
-            ),
-            (
-                "busy",
-                MachineConditions {
-                    load_per_core: Some(3.0),
-                    ..IDEAL
-                },
-            ),
-        ];
-        for (label, conditions) in cases {
-            assert!(
-                t2_may_run(conditions).is_err(),
-                "{label} should have blocked the sweep"
-            );
-        }
-    }
-
-    /// A desktop has no battery to conserve, so a missing reading is not a
-    /// reason to never summarise on one.
-    #[test]
-    fn a_machine_without_a_battery_is_not_blocked_by_charge() {
-        assert!(
-            t2_may_run(MachineConditions {
-                battery: None,
-                ..IDEAL
-            })
-            .is_ok()
-        );
-    }
-
-    /// An unreadable load average is not permission to add to it. Every other
-    /// probe fails closed and this one must too, or a machine that cannot
-    /// report load would run T2 while pinned.
-    #[test]
-    fn an_unreadable_load_average_blocks_t2() {
-        assert!(
-            t2_may_run(MachineConditions {
-                load_per_core: None,
-                ..IDEAL
-            })
-            .is_err()
-        );
-    }
-
-    /// The thresholds are boundaries, not approximations: exactly at the limit
-    /// counts as acceptable, one step past does not.
-    #[test]
-    fn thresholds_are_exact() {
-        assert!(
-            t2_may_run(MachineConditions {
-                battery: Some(T2_MIN_BATTERY),
-                ..IDEAL
-            })
-            .is_ok()
-        );
-        assert!(
-            t2_may_run(MachineConditions {
-                idle_seconds: T2_MIN_IDLE_SECONDS,
-                ..IDEAL
-            })
-            .is_ok()
-        );
-        assert!(
-            t2_may_run(MachineConditions {
-                idle_seconds: T2_MIN_IDLE_SECONDS - 0.1,
-                ..IDEAL
-            })
-            .is_err()
-        );
-        assert!(
-            t2_may_run(MachineConditions {
-                load_per_core: Some(T2_MAX_LOAD_PER_CORE),
-                ..IDEAL
-            })
-            .is_ok()
-        );
-    }
-
-    /// The reason reaches the log, so it has to name the thing that is wrong.
-    #[test]
-    fn the_block_reason_names_the_condition() {
-        let reason = t2_may_run(MachineConditions {
-            on_ac: false,
-            ..IDEAL
-        })
-        .unwrap_err();
-        assert!(reason.contains("battery"), "{reason}");
-        let reason = t2_may_run(MachineConditions {
-            idle_seconds: 3.0,
-            ..IDEAL
-        })
-        .unwrap_err();
-        assert!(reason.contains("in use"), "{reason}");
-    }
 
     fn day_slot(start_ms: i64, state: SlotSummaryState) -> afterray_store::DaySlot {
         afterray_store::DaySlot {
@@ -4927,7 +5236,7 @@ mod tests {
 
     #[test]
     fn packing_thumbnails_every_still_before_dropping_it() {
-        let jpegs = load_e2e_jpegs();
+        let (jpegs, _) = load_e2e_jpegs();
         if jpegs.len() < 2 {
             eprintln!("skip: no JPEG fixtures and ffmpeg unavailable");
             return;
@@ -4944,7 +5253,6 @@ mod tests {
         }
         let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
             archive: true,
-            require_ac: false,
             policy: afterray_store::PackPolicy {
                 hot_window_ms: 0,
                 hot_min_stills: 0,
@@ -5143,7 +5451,18 @@ mod tests {
         assert!(rest.is_empty());
     }
 
-    fn load_e2e_jpegs() -> Vec<Vec<u8>> {
+    /// Frames for the packer e2e, and whether they are real screen captures.
+    ///
+    /// The two sources are not interchangeable. Sampled captures are what the
+    /// archive actually holds — a near-static screen with a small change per
+    /// frame, which is the whole reason a closed GOP pays. The ffmpeg fallback
+    /// is four 64×64 solid-colour frames so the test can run at all on a
+    /// machine without the sample directory, and it cannot carry a compression
+    /// claim: measured here, 32 bytes of IVF file header plus 12 per frame are
+    /// 37% of the 218-byte output, against JPEGs that are themselves mostly
+    /// JFIF and quantisation tables. What the ratio reports there is container
+    /// overhead, not the codec.
+    fn load_e2e_jpegs() -> (Vec<Vec<u8>>, bool) {
         let dir = std::path::Path::new("/tmp/afterray-gop-sim/frames/Lody");
         if dir.is_dir() {
             let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -5158,11 +5477,14 @@ mod tests {
             } else {
                 4
             };
-            return files
-                .into_iter()
-                .take(take)
-                .map(|path| std::fs::read(path).unwrap())
-                .collect();
+            return (
+                files
+                    .into_iter()
+                    .take(take)
+                    .map(|path| std::fs::read(path).unwrap())
+                    .collect(),
+                true,
+            );
         }
         let scratch = tempfile::tempdir().unwrap();
         let mut frames = Vec::new();
@@ -5185,16 +5507,16 @@ mod tests {
                 .arg(&path)
                 .status();
             if !status.map(|code| code.success()).unwrap_or(false) {
-                return Vec::new();
+                return (Vec::new(), false);
             }
             frames.push(std::fs::read(path).unwrap());
         }
-        frames
+        (frames, false)
     }
 
     #[test]
     fn packer_encodes_closed_gop_and_serves_poster() {
-        let jpegs = load_e2e_jpegs();
+        let (jpegs, from_real_captures) = load_e2e_jpegs();
         if jpegs.len() < 2 {
             eprintln!("skip packer e2e: no JPEG fixtures and ffmpeg unavailable");
             return;
@@ -5225,7 +5547,6 @@ mod tests {
         let jpeg_bytes: usize = jpegs.iter().map(Vec::len).sum();
         let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
             archive: true,
-            require_ac: false,
             policy: afterray_store::PackPolicy {
                 hot_window_ms: 0,
                 hot_min_stills: 0,
@@ -5255,11 +5576,25 @@ mod tests {
             ratio,
             1.0 / ratio
         );
-        assert!(
-            ratio < 0.20,
-            "GOP should beat 5x vs JPEG, got {:.1}%",
-            ratio * 100.0
-        );
+        // The 5x claim belongs to real captures, and is asserted only against
+        // them. On screen-like frames it is not a close call — 2560x1440 with
+        // a small change per frame measures 48x — so a real sample landing
+        // near this line means something changed, which is what a threshold is
+        // for. Holding the synthetic fallback to it only ever reported that
+        // 64x64 solid colour has nothing to compress.
+        if from_real_captures {
+            assert!(
+                ratio < 0.20,
+                "GOP should beat 5x vs JPEG, got {:.1}%",
+                ratio * 100.0
+            );
+        } else {
+            assert!(
+                ratio < 1.0,
+                "even four toy frames must not grow when packed, got {:.1}%",
+                ratio * 100.0
+            );
+        }
         let packed = vault.moments_sync(&session.id).unwrap();
         for moment in &packed {
             if ids.contains(&moment.id) {
@@ -5327,7 +5662,6 @@ mod tests {
             .unwrap();
         let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
             archive: true,
-            require_ac: false,
             policy: afterray_store::PackPolicy {
                 hot_window_ms: 0,
                 hot_min_stills: 0,
@@ -5578,7 +5912,6 @@ mod tests {
         };
         let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
             archive: true,
-            require_ac: false,
             policy: policy.clone(),
         });
         let mut packed = 0_usize;

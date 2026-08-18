@@ -32,9 +32,50 @@ pub struct JobSnapshot {
     pub max_attempts: u32,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// When the job last entered [`JobState::Running`]. `updated_at_ms` cannot
+    /// answer "how long has this been going", because every retry and every
+    /// completion moves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
     pub output: Option<ModelOutput>,
     pub last_error: Option<String>,
 }
+
+/// A job executing right now.
+#[derive(Debug, Clone)]
+pub struct RunningJob {
+    pub id: JobId,
+    pub capability: ModelCapability,
+    pub adapter: String,
+    pub started_at_ms: i64,
+}
+
+/// What the queue is doing, without the history.
+///
+/// [`ModelQueue::list`] answers "every job this daemon has seen", which is the
+/// wrong question for a live dashboard polling every two seconds.
+#[derive(Debug, Clone, Default)]
+pub struct QueueActivity {
+    pub running: Vec<RunningJob>,
+    pub pending: HashMap<ModelCapability, usize>,
+}
+
+impl QueueActivity {
+    #[must_use]
+    pub fn pending_for(&self, capability: ModelCapability) -> usize {
+        self.pending.get(&capability).copied().unwrap_or(0)
+    }
+}
+
+/// Terminal jobs kept for inspection. Enough to explain a recent failure,
+/// bounded because nothing else ever removed them: a day of ten-second
+/// captures alone leaves ~8600 finished OCR jobs in memory, and every
+/// `JobsList` copied all of them.
+const TERMINAL_JOB_HISTORY: usize = 200;
+
+/// How long a finished job is kept regardless of the cap, so a `wait` that has
+/// been notified but not yet polled always finds its own job.
+const TERMINAL_JOB_GRACE_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CapabilityConcurrency {
@@ -356,6 +397,14 @@ impl ModelQueue {
         }
     }
 
+    /// The adapter serving a capability, for callers that need to ask it
+    /// something the queue does not model — currently only the worker pid
+    /// behind a running job.
+    #[must_use]
+    pub fn adapter_for(&self, capability: ModelCapability) -> Option<Arc<dyn ModelAdapter>> {
+        self.inner.adapters.get(&capability).map(Arc::clone)
+    }
+
     #[must_use]
     pub fn ocr_in_flight(&self) -> bool {
         self.inner
@@ -424,6 +473,7 @@ impl ModelQueue {
                 max_attempts: self.inner.config.max_attempts.max(1),
                 created_at_ms: now,
                 updated_at_ms: now,
+                started_at_ms: None,
                 output: None,
                 last_error: None,
             },
@@ -454,6 +504,40 @@ impl ModelQueue {
             .get(id)
             .map(|record| record.snapshot.clone())
             .ok_or_else(|| QueueError::MissingJob(id.to_owned()))
+    }
+
+    /// What is running and what is waiting, per capability.
+    ///
+    /// Cheap by design: the dashboard polls this every couple of seconds, and
+    /// it neither clones model outputs nor walks finished history.
+    pub async fn activity(&self) -> QueueActivity {
+        let jobs = self.inner.jobs.lock().await;
+        let mut activity = QueueActivity::default();
+        for record in jobs.values() {
+            match record.snapshot.state {
+                JobState::Running => activity.running.push(RunningJob {
+                    id: record.snapshot.id.clone(),
+                    capability: record.snapshot.capability,
+                    adapter: record.snapshot.adapter.clone(),
+                    started_at_ms: record
+                        .snapshot
+                        .started_at_ms
+                        .unwrap_or(record.snapshot.updated_at_ms),
+                }),
+                JobState::Pending => {
+                    *activity
+                        .pending
+                        .entry(record.snapshot.capability)
+                        .or_default() += 1;
+                }
+                JobState::Done | JobState::Failed | JobState::Cancelled => {}
+            }
+        }
+        drop(jobs);
+        activity
+            .running
+            .sort_unstable_by_key(|job| job.started_at_ms);
+        activity
     }
 
     pub async fn list(&self) -> Vec<JobSnapshot> {
@@ -666,6 +750,7 @@ async fn prepare_attempt(
 async fn set_running(inner: &QueueInner, id: &str, generation: u64) -> bool {
     update_job(inner, id, generation, |snapshot| {
         snapshot.state = JobState::Running;
+        snapshot.started_at_ms = Some(unix_time_ms());
     })
     .await
 }
@@ -718,7 +803,7 @@ fn output_summary(output: &ModelOutput) -> String {
             _ => format!("asr, {} chars", text.chars().count()),
         },
         ModelOutput::Embedding { vector } => format!("embedding, {} dims", vector.len()),
-        ModelOutput::Llm { text } => format!("llm, {} chars", text.chars().count()),
+        ModelOutput::Llm { text, .. } => format!("llm, {} chars", text.chars().count()),
     }
 }
 
@@ -737,9 +822,37 @@ async fn update_job(
     }
     update(&mut record.snapshot);
     record.snapshot.updated_at_ms = unix_time_ms();
+    if record.snapshot.state.terminal() {
+        prune_terminal(&mut jobs);
+    }
     drop(jobs);
     inner.changed.notify_waiters();
     true
+}
+
+/// Drops the oldest finished jobs once there are more than the cap, leaving
+/// anything that finished within the grace window alone.
+///
+/// The grace window is what keeps this safe next to [`ModelQueue::wait`]: a
+/// waiter is woken by `changed` and then re-reads its job by id, so a job
+/// pruned in that gap would surface as `MissingJob` — a completed inference
+/// reported as a lost one.
+fn prune_terminal(jobs: &mut HashMap<JobId, JobRecord>) {
+    let now = unix_time_ms();
+    let mut finished: Vec<(i64, JobId)> = jobs
+        .values()
+        .filter(|record| record.snapshot.state.terminal())
+        .filter(|record| now.saturating_sub(record.snapshot.updated_at_ms) > TERMINAL_JOB_GRACE_MS)
+        .map(|record| (record.snapshot.updated_at_ms, record.snapshot.id.clone()))
+        .collect();
+    if finished.len() <= TERMINAL_JOB_HISTORY {
+        return;
+    }
+    // Newest first, then drop everything past the cap.
+    finished.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    for (_, id) in finished.into_iter().skip(TERMINAL_JOB_HISTORY) {
+        jobs.remove(&id);
+    }
 }
 
 fn unix_time_ms() -> i64 {
@@ -783,9 +896,7 @@ mod tests {
                 return Err(AdapterError::Process("wrong input".into()));
             };
             self.order.lock().unwrap().push(prompt.clone());
-            Ok(ModelOutput::Llm {
-                text: prompt.clone(),
-            })
+            Ok(ModelOutput::llm(prompt.clone()))
         }
     }
 
@@ -1047,6 +1158,116 @@ mod tests {
             Some(id.as_str()),
             "prepare must see the job id it will run under"
         );
+    }
+
+    #[tokio::test]
+    async fn activity_separates_running_from_queued_work() {
+        let adapter = Arc::new(TestAdapter {
+            failures_left: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            delay: Duration::from_millis(80),
+        });
+        let queue = queue(adapter, 1, 1);
+        let first = queue.submit(embedding_input()).await.unwrap();
+        let second = queue.submit(embedding_input()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let activity = queue.activity().await;
+        assert_eq!(activity.running.len(), 1, "one slot, one running job");
+        assert_eq!(activity.running[0].adapter, "test");
+        assert!(
+            activity.running[0].started_at_ms > 0,
+            "a running job knows when it started"
+        );
+        assert_eq!(activity.pending_for(ModelCapability::Embedding), 1);
+
+        for id in [&first, &second] {
+            queue.wait(id).await.unwrap();
+        }
+        let drained = queue.activity().await;
+        assert!(drained.running.is_empty());
+        assert_eq!(drained.pending_for(ModelCapability::Embedding), 0);
+    }
+
+    /// Nothing used to remove finished jobs, so a day of captures left
+    /// thousands of them in memory and every `JobsList` copied the lot.
+    #[tokio::test]
+    async fn finished_jobs_beyond_the_cap_are_dropped() {
+        let queue = queue(
+            Arc::new(TestAdapter {
+                failures_left: AtomicUsize::new(0),
+                running: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                delay: Duration::from_millis(0),
+            }),
+            4,
+            1,
+        );
+        let mut jobs = queue.inner.jobs.lock().await;
+        let stale = unix_time_ms() - TERMINAL_JOB_GRACE_MS - 1_000;
+        for index in 0..(TERMINAL_JOB_HISTORY + 50) {
+            let id = format!("job-{index}");
+            jobs.insert(
+                id.clone(),
+                JobRecord {
+                    snapshot: JobSnapshot {
+                        id,
+                        capability: ModelCapability::Embedding,
+                        adapter: "test".to_owned(),
+                        state: JobState::Done,
+                        attempts: 1,
+                        max_attempts: 1,
+                        created_at_ms: stale,
+                        updated_at_ms: stale + i64::try_from(index).unwrap_or(0),
+                        started_at_ms: Some(stale),
+                        output: None,
+                        last_error: None,
+                    },
+                    input: embedding_input(),
+                    cancellation: Cancellation::default(),
+                    generation: 0,
+                    priority: JobPriority::Interactive,
+                },
+            );
+        }
+        prune_terminal(&mut jobs);
+        assert_eq!(jobs.len(), TERMINAL_JOB_HISTORY);
+        assert!(
+            jobs.contains_key(&format!("job-{}", TERMINAL_JOB_HISTORY + 49)),
+            "the newest finished jobs are the ones worth keeping"
+        );
+        assert!(
+            !jobs.contains_key("job-0"),
+            "the oldest finished job should have been dropped"
+        );
+    }
+
+    /// The grace window is load-bearing: `wait` re-reads its job by id after
+    /// being woken, and a job pruned in that gap reads as a lost inference.
+    #[tokio::test]
+    async fn a_just_finished_job_survives_pruning_so_wait_can_read_it() {
+        let queue = queue(
+            Arc::new(TestAdapter {
+                failures_left: AtomicUsize::new(0),
+                running: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                delay: Duration::from_millis(0),
+            }),
+            4,
+            1,
+        );
+        let mut ids = Vec::new();
+        for _ in 0..(TERMINAL_JOB_HISTORY + 20) {
+            ids.push(queue.submit(embedding_input()).await.unwrap());
+        }
+        for id in &ids {
+            assert_eq!(
+                queue.wait(id).await.unwrap().state,
+                JobState::Done,
+                "every job that finished must still be readable"
+            );
+        }
     }
 
     #[tokio::test]

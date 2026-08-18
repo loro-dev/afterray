@@ -194,6 +194,52 @@ pub struct ClaimedAudioTranscription {
     pub attempts: u32,
 }
 
+/// Which audio segments the transcription sweeper may claim, as one predicate
+/// over `audio_segments a`. `?1` is now, in epoch-ms.
+///
+/// Shared with the dashboard's backlog count: a hand-copy that omitted the
+/// retry-backoff clause counted segments the sweeper would not touch, so
+/// "start now" promised more than it could drain.
+/// How far back the "no screen text" count looks. A day: long enough to show
+/// what an overnight `off` cost, short enough that the query stays a bounded
+/// range scan instead of walking the whole vault every refresh.
+const UNINDEXED_LOOKBACK_MS: i64 = 24 * 60 * 60 * 1_000;
+
+const AUDIO_CLAIMABLE_PREDICATE: &str = "a.transcription_state IN ('pending', 'failed')
+                    AND a.transcription_next_attempt_ms <= ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM text_evidence te
+                         WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
+                    )";
+
+/// Outstanding background work that survives a restart.
+///
+/// Counted from the vault, not from the in-memory job queue: the queue only
+/// knows about work already submitted, which is a few seconds of it. What the
+/// user wants to see is the pile — "42 slots still need summarising" — and
+/// whether pressing start will make it shrink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComputeBacklog {
+    /// Stills eligible for AV1 packing right now.
+    pub archive_stills: usize,
+    /// Audio segments waiting for, or retrying, transcription.
+    pub transcripts: usize,
+    /// Moments that still have their JPEG but no screen text.
+    ///
+    /// Bounded to what is still recoverable on purpose: once a moment is packed
+    /// into a GOP its JPEG is gone and Rust cannot decode AV1 back, so counting
+    /// those would be reporting a backlog nothing can ever drain.
+    pub unindexed_moments: usize,
+}
+
+/// One completed summary pass and what it cost in wall-clock time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryRun {
+    pub slot_start_ms: i64,
+    pub produced_at_ms: i64,
+    pub latency_ms: i64,
+}
+
 /// What conversations may occupy, separate from the capture budget.
 ///
 /// Deliberately its own pool rather than a share of `storage_limit_bytes`.
@@ -1970,6 +2016,100 @@ impl Vault {
         Ok(cards)
     }
 
+    /// Counts the durable background backlog.
+    ///
+    /// Three counts in one call because the dashboard shows them together, and
+    /// each is a scan the panel must not repeat per row. Callers should cache
+    /// the result for a few seconds rather than issuing it per poll —
+    /// `unindexed_moments` walks `moments` against `text_evidence`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the vault cannot be queried.
+    pub fn compute_backlog(
+        &self,
+        now_ms: i64,
+        policy: &PackPolicy,
+    ) -> Result<ComputeBacklog, StoreError> {
+        let connection = self.readers.get();
+        let archive_stills: i64 = connection.query_row(
+            &format!(
+                "SELECT count(*) FROM moments m WHERE {}",
+                gop::PACK_CANDIDATE_PREDICATE
+            ),
+            params![
+                now_ms.saturating_sub(policy.hot_window_ms),
+                i64::try_from(policy.hot_min_stills).unwrap_or(i64::MAX),
+                now_ms.saturating_sub(policy.ocr_grace_ms),
+            ],
+            |row| row.get(0),
+        )?;
+        let transcripts: i64 = connection.query_row(
+            &format!(
+                "SELECT count(*) FROM audio_segments a WHERE {AUDIO_CLAIMABLE_PREDICATE}"
+            ),
+            [now_ms],
+            |row| row.get(0),
+        )?;
+        // Two bounds, both deliberate. A minute of grace so a frame whose OCR is
+        // in flight is not counted as neglected — at a ten-second capture
+        // interval that would otherwise report a permanent backlog of one or
+        // two. And a lookback window, because nothing drains old un-OCR'd frames
+        // (there is no OCR backlog) and an unbounded `NOT EXISTS` probe per row
+        // would scan the whole of `moments` on every dashboard refresh — three
+        // million rows on a year-old vault.
+        let unindexed_moments: i64 = connection.query_row(
+            "SELECT count(*) FROM moments m
+              WHERE m.image_artifact_id IS NOT NULL
+                AND m.gop_segment_id IS NULL
+                AND m.captured_at_ms <= ?1
+                AND m.captured_at_ms >= ?2
+                AND NOT EXISTS (
+                    SELECT 1 FROM text_evidence te
+                     WHERE te.moment_id = m.id AND te.source = 'ocr'
+                )",
+            [
+                now_ms.saturating_sub(60_000),
+                now_ms.saturating_sub(UNINDEXED_LOOKBACK_MS),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(ComputeBacklog {
+            archive_stills: usize::try_from(archive_stills).unwrap_or(0),
+            transcripts: usize::try_from(transcripts).unwrap_or(0),
+            unindexed_moments: usize::try_from(unindexed_moments).unwrap_or(0),
+        })
+    }
+
+    /// How long the most recent summary passes took, newest first.
+    ///
+    /// Feeds the compute dashboard's answer to "I am slow now — how much
+    /// longer?". Read once at daemon start to seed an in-memory window: the
+    /// panel polls every couple of seconds, and there is no index on
+    /// `produced_at_ms`, so this must not be on the polling path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the vault cannot be queried.
+    pub fn recent_summary_runs(&self, limit: usize) -> Result<Vec<SummaryRun>, StoreError> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT slot_start_ms, produced_at_ms, latency_ms
+               FROM slot_summaries
+              WHERE latency_ms IS NOT NULL AND produced_at_ms IS NOT NULL
+              ORDER BY produced_at_ms DESC
+              LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(20)], |row| {
+            Ok(SummaryRun {
+                slot_start_ms: row.get(0)?,
+                produced_at_ms: row.get(1)?,
+                latency_ms: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// The stored summary covering `at_ms`, if a model has titled it.
     ///
     /// Keyed off the row's own `slot_end_ms` rather than recomputed bounds, so
@@ -3427,16 +3567,12 @@ impl Vault {
         )?;
         let candidate = transaction
             .query_row(
-                "SELECT a.id, a.session_id, a.track, a.started_at_ms, a.ended_at_ms,
-                        a.audio_artifact_id, a.transcription_attempts
-                   FROM audio_segments a
-                  WHERE a.transcription_state IN ('pending', 'failed')
-                    AND a.transcription_next_attempt_ms <= ?1
-                    AND NOT EXISTS (
-                        SELECT 1 FROM text_evidence te
-                         WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
-                    )
-                  ORDER BY a.started_at_ms, a.id LIMIT 1",
+                &format!(
+                    "SELECT a.id, a.session_id, a.track, a.started_at_ms, a.ended_at_ms,
+                            a.audio_artifact_id, a.transcription_attempts
+                       FROM audio_segments a
+                      WHERE {AUDIO_CLAIMABLE_PREDICATE}
+                  ORDER BY a.started_at_ms, a.id LIMIT 1"),
                 [now_ms],
                 |row| {
                     let track: String = row.get(2)?;
@@ -6073,6 +6209,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, None, None));
+    }
+
+    /// The backlog is what the dashboard's "start now" button promises to
+    /// drain, so a count that disagrees with what the packer and the OCR path
+    /// actually pick up would make that button lie.
+    #[test]
+    fn compute_backlog_counts_only_work_that_can_still_be_done() {
+        let (_directory, vault) = test_vault(10);
+        let policy = PackPolicy {
+            hot_window_ms: 0,
+            hot_min_stills: 0,
+            ocr_grace_ms: 0,
+            keyint: 6,
+        };
+        let now = 1_600_000_000_000;
+        let session = vault.create_session_sync(now - 600_000).unwrap();
+
+        // Two stills, one of them already indexed.
+        let indexed = vault
+            .insert_moment(&session.id, now - 500_000, "image/jpeg", b"pixels")
+            .unwrap();
+        vault
+            .insert_moment(&session.id, now - 400_000, "image/jpeg", b"pixels")
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&indexed.id),
+                None,
+                "ocr",
+                "hello",
+                indexed.captured_at_ms,
+                None,
+                "test",
+                None,
+            )
+            .unwrap();
+
+        let backlog = vault.compute_backlog(now, &policy).unwrap();
+        assert_eq!(
+            backlog.unindexed_moments, 1,
+            "only the moment without screen text is outstanding"
+        );
+        // Pinned against the packer's own selection rather than a literal: the
+        // number on the button has to be the number the packer will pick up, or
+        // pressing start leaves a count that never reaches zero.
+        assert_eq!(
+            backlog.archive_stills,
+            vault.list_pack_candidates(now, &policy).unwrap().len(),
+            "the archive count must match what the packer would actually pack"
+        );
+        assert_eq!(backlog.transcripts, 0);
+
+        // A frame captured seconds ago is not neglected, it is in flight.
+        vault
+            .insert_moment(&session.id, now - 5_000, "image/jpeg", b"pixels")
+            .unwrap();
+        assert_eq!(
+            vault.compute_backlog(now, &policy).unwrap().unindexed_moments,
+            1,
+            "the grace window keeps in-flight OCR out of the backlog"
+        );
+    }
+
+    /// The dashboard's "summaries usually take about this long" comes from
+    /// here, so the ordering and the `latency_ms IS NOT NULL` filter matter:
+    /// a slot with facts but no model pass has no duration to report.
+    #[test]
+    fn recent_summary_runs_are_newest_first_and_skip_unsummarised_slots() {
+        let (_directory, vault) = test_vault(10);
+        let mut expected = Vec::new();
+        for (index, latency) in [12_000_i64, 205_000, 61_500].into_iter().enumerate() {
+            let at = 1_600_000_000_000 + i64::try_from(index).unwrap() * 600_000;
+            let bounds = vault.summary_slot_bounds(at);
+            let session = vault.create_session_sync(bounds.start_ms).unwrap();
+            vault
+                .insert_moment(&session.id, bounds.start_ms + 1_000, "image/jpeg", b"pixels")
+                .unwrap();
+            let card = vault.slot_card(bounds.start_ms, 10_000).unwrap();
+            let summary = slot::T2CardV2 {
+                title: format!("Pass {index}"),
+                description: "Visible description".into(),
+                ..slot::T2CardV2::default()
+            };
+            vault
+                .put_t2_summary_v2(&card, &summary, "test", bounds.end_ms, Some(latency))
+                .unwrap();
+            expected.push((bounds.start_ms, latency));
+        }
+        // A fourth slot with capture but no summary pass: it must not appear as
+        // a zero-duration run and drag the typical figure down.
+        let bare = vault.summary_slot_bounds(1_600_000_000_000 + 4 * 600_000);
+        let session = vault.create_session_sync(bare.start_ms).unwrap();
+        vault
+            .insert_moment(&session.id, bare.start_ms + 1_000, "image/jpeg", b"pixels")
+            .unwrap();
+
+        let runs = vault.recent_summary_runs(10).unwrap();
+        assert_eq!(runs.len(), 3, "only summarised slots have a duration");
+        let newest = runs.first().expect("at least one run");
+        assert_eq!(newest.slot_start_ms, expected[2].0);
+        assert_eq!(newest.latency_ms, expected[2].1);
+        assert!(
+            runs.windows(2)
+                .all(|pair| pair[0].produced_at_ms >= pair[1].produced_at_ms),
+            "newest first: {runs:?}"
+        );
+
+        assert_eq!(vault.recent_summary_runs(2).unwrap().len(), 2, "limit holds");
     }
 
     #[test]

@@ -8,6 +8,8 @@ macOS platform glue for the daemon: owns the `AfterRayCaptureShim` child process
 - `set_excluded_bundle_ids` — remembers the list and pushes it to a running shim; `start_capture` writes it into the child's stdin *before* returning, so the helper has it before the first audio sample buffer. Screen exclusions are not sent here — they stay in the daemon.
 - `lib.rs:108 ArtifactKind` — `screen | system_audio | microphone | accessibility | accessibility_edge` (the last is R3: AX-only, unpaired with any screenshot).
 - `power.rs` — `on_ac_power`, `battery_fraction`, `seconds_since_user_input`, `load_per_core`, `apply_background_qos` (used by the T2 gate and the GOP packer thread).
+- `process.rs` — `process_usage(pid)` (CPU time + memory footprint via `proc_pid_rusage`) and `thermal_pressure()`, for the compute dashboard. **`ri_user_time` is mach absolute time, not nanoseconds** — the timebase conversion is load-bearing and pinned by `measured_cpu_time_is_in_nanoseconds`; without it every figure is ~42× low on Apple Silicon. Deliberately no GPU: macOS has no public per-process GPU accounting.
+- `sysctl.rs` — the crate's single `sysctlbyname` declaration (`scalar::<T>`), with the SAFETY note written once; `total_memory_bytes` and `thermal_pressure` both go through it. This is the workspace's only `unsafe_code` exception, so keep one documented FFI declaration per symbol.
 - `locale.rs` — `preferred_languages`.
 - `peer.rs` — `peer_is_afterray_app(fd, parent_app_anchor())`. Audit token + valid `dev.afterray.app` signature, then matching Team ID **or** the spawn-time parent cdhash. Identifier-only / ad-hoc copies are rejected. Path is not a trust signal.
 

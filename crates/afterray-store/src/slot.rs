@@ -126,8 +126,18 @@ pub fn next_legacy_slot_boundary(after_ms: i64) -> i64 {
 const GATE_MIN_MOMENTS: usize = 3;
 /// Activity gate: minimum distinct screen fingerprints.
 const GATE_MIN_DISTINCT: usize = 2;
-/// Activity gate: maximum share of the slot that may be idle.
-const GATE_MAX_IDLE_RATIO: f32 = 0.8;
+/// Activity gate: non-idle wall-clock a slot must hold to be worth a card.
+///
+/// This was a *share* of the slot (idle under 80%), which is the same rule as
+/// this one only while every slot is ten minutes long. Read as a share, the
+/// slot length silently decides whether work gets summarised at all: twelve
+/// real minutes inside an hour away from the desk fails the gate, while the
+/// same twelve minutes cut into ten-minute slots passes it several times
+/// over — so lengthening slots would quietly delete the sparse days rather
+/// than group them. A slot must hold *more* than this, which is what the old
+/// ratio came to at the default length (10 min × 20%), so a vault on the
+/// default geometry gates exactly as it did — without the float comparison.
+const GATE_MIN_ACTIVE_MS: i64 = 2 * 60 * 1000;
 /// Space between consecutive moments beyond which the timeline shows a hole.
 const GAP_MS: i64 = 45_000;
 /// Below this length a line's digits fold to `#` for dedup: clocks, battery
@@ -136,10 +146,48 @@ const DIGIT_FOLD_MAX_CHARS: usize = 20;
 /// Prefix-bucket width for merging OCR jitter and typing mid-states.
 const BUCKET_CHARS: usize = 12;
 /// Total characters of deduplicated lines inlined into one prompt (~10k
-/// tokens for the whole JSON once structure overhead is added).
+/// tokens for the whole JSON once structure overhead is added), for a slot of
+/// the default length. Longer slots scale up — see [`prompt_budget_for`].
 const PROMPT_LINES_BUDGET_CHARS: usize = 12_000;
-/// Per-run inline cap so one chatty run cannot starve the rest.
+/// Ceiling on the scaled budget.
+///
+/// The reader is a local model whose window is routinely 4 096 tokens
+/// (Ollama's default under 24 GiB of RAM) and 32 768 at a remote endpoint, and
+/// a prompt longer than the real window is cut before the model reads it, with
+/// no error and no event (`afterray_models::context`). Past roughly twice the
+/// baseline the extra characters stop being read rather than start being
+/// summarised, so an hour-long slot buys depth up to here and then relies on
+/// the OCR tool and `more_chars` for the rest — which is what those are for.
+const PROMPT_LINES_BUDGET_CEILING_CHARS: usize = 24_000;
+/// Per-run inline cap at the default length, so one chatty run cannot starve
+/// the rest. Scales with the budget, keeping its share of it.
 const RUN_LINES_CAP_CHARS: usize = 2_000;
+
+/// Inlined-text budget and per-run cap for a slot of `slot_duration_ms`.
+///
+/// The budget is spent per slot, so a fixed one was really a per-minute budget
+/// that shrank as the user lengthened their slots: at sixty minutes the same
+/// 12 000 characters had to cover six times the evidence, and the surplus was
+/// dropped silently rather than reported. It scales with the slot instead,
+/// bounded by [`PROMPT_LINES_BUDGET_CEILING_CHARS`], and never falls below the
+/// baseline — a stretch clipped short by a geometry change keeps the budget it
+/// would have had, because it is one card either way.
+fn prompt_budget_for(slot_duration_ms: i64) -> (usize, usize) {
+    let minutes = usize::try_from(slot_duration_ms.max(0)).unwrap_or(usize::MAX);
+    let baseline = usize::try_from(CURRENT_SLOT_DURATION_MS).unwrap_or(1).max(1);
+    let budget = PROMPT_LINES_BUDGET_CHARS
+        .saturating_mul(minutes)
+        .checked_div(baseline)
+        .unwrap_or(PROMPT_LINES_BUDGET_CHARS)
+        .clamp(PROMPT_LINES_BUDGET_CHARS, PROMPT_LINES_BUDGET_CEILING_CHARS);
+    // Derived rather than scaled independently, so the cap keeps exactly the
+    // share of the budget it has at the default length however either moves.
+    let per_run = budget
+        .saturating_mul(RUN_LINES_CAP_CHARS)
+        .checked_div(PROMPT_LINES_BUDGET_CHARS)
+        .unwrap_or(RUN_LINES_CAP_CHARS);
+    (budget, per_run)
+}
 /// Cap for selected-text / typing excerpts.
 const SEL_TYPING_CAP_CHARS: usize = 240;
 /// Characters of peripheral text — visible, never operated — inlined per run.
@@ -1586,7 +1634,10 @@ pub fn build_slot_card_with_edges(
     };
     let not_engaged = untouched_regions(rows, events, slot_end_ms);
     let revisits = build_revisits(&pieces);
-    let state = gate(rows, &facts);
+    let state = gate(
+        rows,
+        (slot_end_ms - slot_start_ms).saturating_sub(idle_ms).max(0),
+    );
     let theme_key = pieces
         .iter()
         .max_by_key(|piece| piece.end_ms - piece.start_ms)
@@ -1989,7 +2040,7 @@ fn build_revisits(pieces: &[Piece]) -> Vec<Revisit> {
     revisits
 }
 
-fn gate(rows: &[SlotMomentRow], facts: &SlotFacts) -> SlotState {
+fn gate(rows: &[SlotMomentRow], active_ms: i64) -> SlotState {
     if rows.is_empty() {
         return SlotState::NoData;
     }
@@ -2001,7 +2052,7 @@ fn gate(rows: &[SlotMomentRow], facts: &SlotFacts) -> SlotState {
     };
     let active = rows.len() >= GATE_MIN_MOMENTS
         && distinct >= GATE_MIN_DISTINCT
-        && facts.idle_ratio < GATE_MAX_IDLE_RATIO;
+        && active_ms > GATE_MIN_ACTIVE_MS;
     if active {
         SlotState::Ready
     } else {
@@ -2236,12 +2287,10 @@ pub fn render_t2_prompt(
             frames: &run.line_frames,
         })
         .collect();
-    let picked = crate::infoscore::select_lines(
-        &candidates,
-        background,
-        PROMPT_LINES_BUDGET_CHARS,
-        RUN_LINES_CAP_CHARS,
-    );
+    let (budget_chars, per_run_cap_chars) =
+        prompt_budget_for(card.slot_end_ms - card.slot_start_ms);
+    let picked =
+        crate::infoscore::select_lines(&candidates, background, budget_chars, per_run_cap_chars);
 
     let mut run_cursor = 0_usize;
     let runs_view: Vec<serde_json::Value> = card
@@ -2678,7 +2727,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_ratio_gates_a_locked_screen() {
+    fn a_locked_screen_has_no_active_time_to_summarise() {
         let rows = vec![
             row("a", 0, "Xcode", "gop.rs", Some("one")),
             row("b", 10_000, "Xcode", "gop.rs", Some("two")),
@@ -2686,6 +2735,56 @@ mod tests {
         ];
         let card = build_slot_card(0, &rows, SLOT_DURATION_MS, 10_000);
         assert_eq!(card.state, SlotState::SkippedIdle);
+    }
+
+    /// The gate must mean the same thing at every offered slot length. Read as
+    /// a share of the slot it did not: the same work passed at ten minutes and
+    /// failed at sixty, so the summary-length setting silently decided whether
+    /// a sparse afternoon was summarised at all.
+    #[test]
+    fn the_activity_floor_does_not_move_with_the_slot_length() {
+        let rows = vec![
+            row("a", 0, "Xcode", "gop.rs", Some("one")),
+            row("b", 10_000, "Xcode", "gop.rs", Some("two")),
+            row("c", 20_000, "Xcode", "gop.rs", Some("three")),
+        ];
+        let three_minutes = 3 * 60_000;
+        for minutes in SLOT_DURATION_CHOICES_MINUTES {
+            let slot = minutes * 60_000;
+            let card =
+                build_slot_card_with_end(0, slot, &rows, slot - three_minutes, 10_000);
+            assert_eq!(
+                card.state,
+                SlotState::Ready,
+                "{minutes}min: three minutes of work earns a card at every length"
+            );
+
+            let card = build_slot_card_with_end(0, slot, &rows, slot - 60_000, 10_000);
+            assert_eq!(
+                card.state,
+                SlotState::SkippedIdle,
+                "{minutes}min: one minute is below the floor at every length"
+            );
+        }
+    }
+
+    /// Pinned because the default geometry is what almost every vault runs:
+    /// swapping the idle *ratio* for an absolute floor must not move where the
+    /// ten-minute slot gates, only where the others do.
+    #[test]
+    fn the_default_length_gates_exactly_where_it_used_to() {
+        let rows = vec![
+            row("a", 0, "Xcode", "gop.rs", Some("one")),
+            row("b", 10_000, "Xcode", "gop.rs", Some("two")),
+            row("c", 20_000, "Xcode", "gop.rs", Some("three")),
+        ];
+        let slot = CURRENT_SLOT_DURATION_MS;
+        // Idle exactly 80% — the old `idle_ratio < 0.8` rejected this.
+        let card = build_slot_card_with_end(0, slot, &rows, slot * 4 / 5, 10_000);
+        assert_eq!(card.state, SlotState::SkippedIdle);
+        // One millisecond less idle passed it, and still does.
+        let card = build_slot_card_with_end(0, slot, &rows, slot * 4 / 5 - 1, 10_000);
+        assert_eq!(card.state, SlotState::Ready);
     }
 
     #[test]
@@ -3537,6 +3636,73 @@ mod tests {
         // The full card itself keeps everything — the budget is a view concern.
         let full = runs(&card)[0];
         assert_eq!(full.lines.len(), 200);
+    }
+
+    /// A fixed budget is a *per-minute* budget once the slot length is a
+    /// setting: an hour-long slot carries six times the evidence, so holding
+    /// the number still means dropping five sixths of it without saying so.
+    #[test]
+    fn the_text_budget_follows_the_slot_length_up_to_the_window() {
+        let ten = CURRENT_SLOT_DURATION_MS;
+        assert_eq!(
+            prompt_budget_for(ten),
+            (PROMPT_LINES_BUDGET_CHARS, RUN_LINES_CAP_CHARS),
+            "the default length is the baseline, unchanged"
+        );
+        assert_eq!(
+            prompt_budget_for(2 * ten),
+            (2 * PROMPT_LINES_BUDGET_CHARS, 2 * RUN_LINES_CAP_CHARS),
+            "twice the slot, twice the evidence, twice the budget"
+        );
+        for minutes in [30_i64, 60] {
+            assert_eq!(
+                prompt_budget_for(minutes * 60_000).0,
+                PROMPT_LINES_BUDGET_CEILING_CHARS,
+                "{minutes}min: stops at the window rather than being cut unread"
+            );
+        }
+        // A stretch clipped by a geometry change is still one card, and gets
+        // the budget one card has always had.
+        for clipped in [0_i64, 90_000, ten - 1] {
+            assert_eq!(
+                prompt_budget_for(clipped),
+                (PROMPT_LINES_BUDGET_CHARS, RUN_LINES_CAP_CHARS),
+                "clipped to {clipped}ms"
+            );
+        }
+    }
+
+    /// The budget reaching `select_lines`, not just the arithmetic: the same
+    /// evidence in a longer slot must actually reach the model.
+    ///
+    /// Every line is built from its own vocabulary, so nothing is dropped as a
+    /// near-duplicate and the budget is the only thing doing the cutting —
+    /// which is what this test is about.
+    #[test]
+    fn a_long_slot_inlines_more_of_the_same_evidence() {
+        let huge = (0..400).fold(String::new(), |mut out, index: usize| {
+            use std::fmt::Write as _;
+            for word in 0..6 {
+                let _ = write!(out, "w{:04} ", index * 6 + word);
+            }
+            let _ = writeln!(out);
+            out
+        });
+        let rows = vec![row("a", 0, "Lody", "chat", Some(&huge))];
+        let inlined = |slot_ms: i64| {
+            let card = build_slot_card_with_end(0, slot_ms, &rows, 0, 10_000);
+            let prompt = render_t2_prompt(
+                &card,
+                &[],
+                "English",
+                &crate::infoscore::BackgroundStats::empty(),
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&prompt).unwrap();
+            parsed["runs"][0]["text"].as_array().unwrap().len()
+        };
+        let short = inlined(CURRENT_SLOT_DURATION_MS);
+        let long = inlined(60 * 60_000);
+        assert!(long > short, "short {short}, long {long}");
     }
 
     #[test]

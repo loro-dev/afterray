@@ -8,7 +8,7 @@ public enum ChatScenario: String, CaseIterable, Identifiable, Sendable {
     case markdown
     case tools
     case pressure
-    /// A thinking model mid-turn with live reasoning visible.
+    /// A thinking model mid-turn: thought, a lookup, then another thought.
     case thinking
     /// A finished answer with its reasoning kept beside it, and a turn that
     /// was stopped part-way but kept what it had.
@@ -46,11 +46,14 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var streamText = ""
     @Published public private(set) var streamTools: [ChatToolCall] = []
     @Published public private(set) var streamReasoning: [ChatReasoningRound] = []
+    @Published public private(set) var streamParts: [ChatMessagePart] = []
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var contextUsage: ChatContextUsage?
     @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
     @Published public private(set) var streamProgress: ChatProgress?
+    @Published public private(set) var chatModels: [ChatModelChoice] = ChatModelChoice.previewCatalog
+    @Published public private(set) var selectedChatModelID: String? = ChatModelChoice.previewCatalog.first?.id
 
     public private(set) var scenario: ChatScenario = .markdown
     private var store: [String: [ChatMessage]] = [:]
@@ -69,9 +72,10 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         isSending = false
         streamText = ""
         streamTools = []
-        streamReasoning = scenario == .thinking
-            ? [ChatReasoningRound(round: 1, text: "Checking the recent timeline and weighing the strongest evidence…")]
-            : []
+        streamReasoning = []
+        streamParts = ChatFixtures.liveParts(scenario)
+        streamTools = ChatMessagePart.tools(in: streamParts)
+        streamReasoning = ChatMessagePart.reasoning(in: streamParts)
         errorMessage = nil
         statusMessage = nil
         let fixture = ChatFixtures.load(scenario)
@@ -97,12 +101,18 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         selectedID = id
         messages = store[id] ?? []
         // Same rule as the real model: occupancy belongs to a turn, so it does
         // not survive a conversation switch.
         contextUsage = nil
         compactionNotices = ChatTranscript.compactions(in: messages)
+    }
+
+    public func selectChatModel(_ id: String) {
+        guard chatModels.contains(where: { $0.id == id }) else { return }
+        selectedChatModelID = id
     }
 
     public func startNew() {
@@ -113,6 +123,7 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         errorMessage = nil
         contextUsage = nil
         compactionNotices = []
@@ -166,14 +177,16 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         var state = ChatStreamState()
-        let events = script ?? ChatFixtures.replyScript
+        let events = script ?? ChatFixtures.replyScript(for: scenario)
         for event in events {
             if Task.isCancelled { break }
             ChatStreamReducer.apply(event, to: &state)
             streamText = state.text
             streamTools = state.tools
             streamReasoning = state.reasoning
+            streamParts = state.parts
             if let usage = state.usage { contextUsage = usage }
             if !state.compactions.isEmpty { compactionNotices = state.compactions }
             streamProgress = state.progress
@@ -188,11 +201,17 @@ public final class ChatPreviewModel: ObservableObject, AfterRayChatModeling {
         streamText = ""
         streamTools = []
         streamReasoning = []
+        streamParts = []
         streamTask = nil
     }
 
     private func persistPartial(_ state: ChatStreamState? = nil) {
-        let snapshot = state ?? ChatStreamState(text: streamText, tools: streamTools)
+        let snapshot = state ?? ChatStreamState(
+            text: streamText,
+            tools: streamTools,
+            reasoning: streamReasoning,
+            parts: streamParts
+        )
         guard let conversationId = selectedID else { return }
         guard !snapshot.text.isEmpty || !snapshot.tools.isEmpty else { return }
         let message = ChatMessage.localAssistant(
@@ -254,8 +273,66 @@ public enum ChatFixtures {
         ]
     }
 
+    /// think → tool → think → answer. The case a single reasoning chip
+    /// above the tools used to flatten.
+    public static var thinkToolThinkScript: [ChatStreamEvent] {
+        [
+            .progress(ChatProgress(phase: .thinking, reasoningDeltas: 4, elapsedMs: 400, round: 1)),
+            .reasoning(
+                text: "The question is about yesterday afternoon. A slot card is the cheapest first look.\n",
+                round: 1
+            ),
+            .reasoning(text: "If that is thin I can open the transcript.", round: 1),
+            .toolCall(name: "get_slot_card", argsJSON: #"{"at_ms":50400000}"#),
+            .toolResult(name: "get_slot_card", chars: 2480),
+            .progress(ChatProgress(phase: .thinking, reasoningDeltas: 8, elapsedMs: 900, round: 2)),
+            .reasoning(
+                text: "The card shows Safari on a PDF, not Xcode. That is the reading.",
+                round: 2
+            ),
+            .token(text: "Yesterday afternoon you were reading a PDF in Safari, not editing."),
+            .done(messageId: "preview-think", conversationId: "c-think"),
+        ]
+    }
+
     public static var replyScript: [ChatStreamEvent] {
         tokenEvents(from: markdownAnswer)
+    }
+
+    public static func replyScript(for scenario: ChatScenario) -> [ChatStreamEvent] {
+        switch scenario {
+        case .thinking: thinkToolThinkScript
+        default: replyScript
+        }
+    }
+
+    /// Frozen mid-turn parts for the thinking lab / snapshot.
+    public static func liveParts(_ scenario: ChatScenario) -> [ChatMessagePart] {
+        switch scenario {
+        case .thinking:
+            [
+                .reasoning(
+                    id: "think-r1",
+                    round: 1,
+                    text: "Checking the recent timeline and weighing the strongest evidence…"
+                ),
+                .tool(
+                    ChatToolCall(
+                        id: "think-t1",
+                        name: "list_activity",
+                        argsJSON: #"{"from_ms":50400000,"to_ms":52200000}"#,
+                        resultChars: 640
+                    )
+                ),
+                .reasoning(
+                    id: "think-r2",
+                    round: 2,
+                    text: "The afternoon tab was a long PDF in Safari, not the editor."
+                ),
+            ]
+        default:
+            []
+        }
     }
 
     public static func tokenEvents(from text: String) -> [ChatStreamEvent] {
@@ -314,7 +391,9 @@ public enum ChatFixtures {
             return (
                 [
                     conversation("c-markdown", "Afternoon in two stretches", count: 2, updated: nowMs - 120_000),
+                    conversation("c-flock", "Bugs that did not ship on Flock", count: 2, updated: nowMs - 400_000),
                     conversation("c-old", "Yesterday's meeting", count: 6, updated: nowMs - 86_400_000),
+                    conversation("c-week", "What did I ship?", count: 4, updated: nowMs - 200_000_000),
                 ],
                 [
                     "c-markdown": [
@@ -330,7 +409,8 @@ public enum ChatFixtures {
                             conversationId: "c-markdown",
                             role: .assistant,
                             content: markdownAnswer,
-                            createdAtMs: nowMs - 120_000
+                            createdAtMs: nowMs - 120_000,
+                            usageJSON: #"{"prompt_tokens":3180,"window_tokens":16384,"round":2,"completion_tokens":180,"generation_ms":1500}"#
                         ),
                     ],
                     "c-old": shortMessages,
@@ -354,13 +434,16 @@ public enum ChatFixtures {
     public static func usage(_ scenario: ChatScenario) -> ChatContextUsage? {
         switch scenario {
         case .empty, .short: nil
-        case .markdown: ChatContextUsage(promptTokens: 3_180, windowTokens: 16_384, round: 2)
-        case .streaming, .tools: ChatContextUsage(promptTokens: 6_420, windowTokens: 16_384, round: 3)
-        case .pressure: ChatContextUsage(promptTokens: 13_910, windowTokens: 16_384, round: 5)
+        case .markdown:
+            ChatContextUsage(promptTokens: 3_180, windowTokens: 16_384, round: 2, completionTokens: 180, generationMs: 1_500)
+        case .streaming, .tools:
+            ChatContextUsage(promptTokens: 6_420, windowTokens: 16_384, round: 3, completionTokens: 260, generationMs: 2_000)
+        case .pressure:
+            ChatContextUsage(promptTokens: 13_910, windowTokens: 16_384, round: 5, completionTokens: 90, generationMs: 1_200)
         case .thinking, .waiting:
             ChatContextUsage(promptTokens: 2_240, windowTokens: 16_384, round: 1)
         case .reasoning:
-            ChatContextUsage(promptTokens: 5_050, windowTokens: 16_384, round: 2)
+            ChatContextUsage(promptTokens: 5_050, windowTokens: 16_384, round: 2, completionTokens: 140, generationMs: 1_800)
         }
     }
 
@@ -399,7 +482,7 @@ public enum ChatFixtures {
                 createdAtMs: nowMs - 190_000,
                 reasoning: #"[{"round":1,"text":"The user is asking about a build failure yesterday. I should look at the half hour around the last commit rather than search blindly — a slot card will show which files were open and what the terminal said."},{"round":2,"text":"The card shows an IVF header assertion. That points at the length field, not the encoder itself."}]"#,
                 status: "complete",
-                usageJSON: #"{"prompt_tokens":5050,"window_tokens":16384,"round":2}"#
+                usageJSON: #"{"prompt_tokens":5050,"window_tokens":16384,"round":2,"completion_tokens":140,"generation_ms":1800}"#
             ),
             ChatMessage(
                 id: "u-reason-2",
@@ -473,7 +556,8 @@ public enum ChatFixtures {
                         resultChars: 2_040
                     ),
                 ]),
-                createdAtMs: nowMs - 20_000
+                createdAtMs: nowMs - 20_000,
+                usageJSON: #"{"prompt_tokens":13910,"window_tokens":16384,"round":5,"completion_tokens":90,"generation_ms":1200}"#
             ),
         ]
     }

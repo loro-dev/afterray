@@ -177,7 +177,36 @@ pub enum ModelOutput {
     },
     Llm {
         text: String,
+        /// Tokenizer-accurate counts when the runtime reported them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<LlmUsage>,
     },
+}
+
+/// Prompt / completion tokens and decode time from the model runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub generation_ms: u64,
+}
+
+impl ModelOutput {
+    #[must_use]
+    pub fn llm(text: impl Into<String>) -> Self {
+        Self::Llm {
+            text: text.into(),
+            usage: None,
+        }
+    }
+
+    #[must_use]
+    pub fn llm_with_usage(text: impl Into<String>, usage: LlmUsage) -> Self {
+        Self::Llm {
+            text: text.into(),
+            usage: Some(usage),
+        }
+    }
 }
 
 impl ModelOutput {
@@ -267,6 +296,17 @@ pub trait ModelAdapter: Send + Sync {
         input: &ModelInput,
         cancellation: Cancellation,
     ) -> Result<ModelOutput, AdapterError>;
+
+    /// pid of the process currently serving `job_id`, when the adapter runs
+    /// inference in a child process.
+    ///
+    /// The compute dashboard uses this to report what a running job actually
+    /// costs. `None` is the honest answer for an adapter that runs in-process
+    /// or over the network — better an empty column than the daemon's own
+    /// figure relabelled as this job's.
+    fn worker_pid(&self, _job_id: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// Builds adapters for all V0 capabilities from one compatible worker binary.
