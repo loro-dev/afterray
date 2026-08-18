@@ -178,8 +178,13 @@ unobservable rather than idle. Inside such a stretch,
   events counted as 1s. `None` when the slot holds no input event: unmeasured is
   not zero. `idle_ratio` keeps its name and meaning (it is really "recording was
   paused") for UI compatibility.
-- `T2_SYSTEM_PROMPT_V2`: *acts are what the user did; text is what was on
-  screen; peripheral was visible but not operated.*
+- `RunRow.content` — what was written, `None` under the same gate as `acts`.
+- `RunRow.unframed_lines` — lines an R3 edge tree introduced. Evidence with no
+  frame behind it, so the prompt can say per run: write from it, cite nothing
+  for it.
+- `T2_SYSTEM_PROMPT_V3`: *acts are what the user did; text is what was on
+  screen; peripheral was visible but not operated;* `wrote` *is the user's own
+  words.*
 
 **Known v1 blind spot:** a user who genuinely sat still and a tap that was never
 running both read as a high `no_input_ratio`. Only an explicit `signal_gap`
@@ -226,10 +231,17 @@ by hit-testing rects that no longer exist.
    typing that happened in both slots; enqueueing only the one it started in
    leaves the other unfrozen, and once the events expire it fails open forever
    — silently dropping work the user did.
-6. **Acts carry no content.** The `Acts` shape is counts, labels and instants —
-   a burst is a count, a click is a label. This is now a property of the *join*
-   alone: since event-capture v2 the `input_events` table does hold the typed
-   run and the field's value (`docs/event-capture-v2-plan.md` §信任模型变更
-   retired CAP-005 under the local trust model), and the one guard is the
-   shim's secure guard, at the source. What WS5 does with that content is a
-   contract change; reading it into `Acts` by accident is not.
+6. **`Acts` carries no content — `ActContent` does, beside it.** The `Acts`
+   shape is still counts, labels and instants, and that is what
+   `materialize_slot_acts` freezes into `acts_json`: unversioned, unchanged,
+   readable by everything that ever read it. WS5 added the content channel as a
+   *sibling* (`acts::ActContent` → `RunRow.content` → the prompt's `wrote`
+   block): the typed run and the field's value the shim now stores
+   (`docs/event-capture-v2-plan.md` §信任模型变更 retired CAP-005 under the local
+   trust model), the value preferred over the keystream, a sentence composed and
+   then sent counted once, and a field the shim called secure contributing
+   nothing even if a value rode along with the row. Content is **never
+   materialised**: it lives exactly as long as the events do, and an expired
+   slot says nothing about what was written rather than saying "nothing was".
+   Reading content into `Acts` itself is still the thing not to do — it would
+   version the frozen copy and put words where a reader expects a count.

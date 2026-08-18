@@ -102,7 +102,7 @@
 | 2 | 事件词汇表 v2：text_input(text+value) / drag 两端 / secure 护栏 / 停顿合并 | shim `InputEventMonitor` | ✅ 2026-08-18 `11c401e`（+ 解析 `cf5e01d`） |
 | 3 | submit value + 截图节流 + `screenshot_id`/citable 标记 + 心跳降兜底 | shim 主循环 + daemon | 🟡 submit value + 附树分级（`11c401e`）、`tree_text` 落盘（`21246e3`）、**截图节流 + 心跳降兜底**（daemon 侧，见下）已落；**`screenshot_id` / citable 标记推迟到 WS5** —— 标记的唯一消费者是 T2 prompt（"无截图的 AX 时刻不可出图级引用"），在写 prompt 的同一个工作流里落地才能被验证，否则只是没人读的字段 |
 | 4 | 链存储（keyframe+diff artifact 类型）、保留期统一、`INPUT_EVENT_RETENTION_MS` 废除 | afterray-store | ✅ 2026-08-18 schema 25（`text` + `extra_json` 列）+ 保留期统一（`prune_input_events_before` / `prune_edge_snapshots_before`，48h 只剩 `signal_gap`）。链的 keyframe/diff **不另立 artifact 类型**：`tree_text` 是 AX 快照信封里的字段，另存一份会让同一棵树有两个真相 |
-| 5 | T1/T2 契约 v3：frontmatter+MD 解析、五段指导、`#el` 引用、预算窗口化、工具目录裁剪、prev-card 注入 | store slot.rs + afterrayd | ⬜ |
+| 5 | T1/T2 契约 v3：frontmatter+MD 解析、五段指导、`#el` 引用、预算窗口化、工具目录裁剪、prev-card 注入 | store slot.rs + afterrayd | ✅ 2026-08-18（schema 26 / 卡片 v3；见下方「WS5 实现偏差」） |
 | 6 | OCR 窗口裁剪 + 碎片过滤 | afterrayd 导入路径 `ocr_crop.rs` | ✅ 2026-08-18 `1a7ed62` |
 | 7 | 语料回归（复用 phase 5 计划：≥20 slot 盲评） | scripts/t2-eval.py | ⬜ |
 
@@ -137,6 +137,39 @@
 4. **不新增 keyframe/diff artifact 类型**：`tree_text` 是 AX 快照信封内的字段，另存一份会让同一棵树有两个真相。
 5. **事件驱动截图的节流取 `max(10s, 用户配置的间隔)`**。配 60s 心跳的用户想要的是更少的帧，不是"一打字就 10s 一张"。
 6. **心跳改为"从 `last_capture_ms` 起睡"**而不是固定 interval：这才是"降为兜底" —— 任何一次采集（心跳的或事件拉起的）都重置相位，两个任务之间不需要通道。
+
+### WS5 实现偏差（2026-08-18）
+
+1. **卡片版本常量一分为二**：`SLOT_SUMMARY_SCHEMA_VERSION` 变 3，新增
+   `V2_SLOT_SUMMARY_SCHEMA_VERSION = 2`。vault 里有三处 `>= 常量` 的判断表达的是
+   「至少 v2」而非「是 v2」，其中 `find_slot_mentions` 是 `WHERE` 闸门 —— 只改一个
+   常量会在 v3 上线当天悄悄把库里所有 v2 卡片踢出检索。行的形状一律由
+   `schema_version` 判定，绝不由「哪些列为 NULL」推断（三种形状的写入路径互相清空对方的列）。
+2. **v3 正文进检索靠 `details_sections`**：Markdown 正文按 `#` 小节切成 v2 的
+   `T2Thread` 形状喂给既有匹配器，命中返回的是那一节（并裁到 300 字符），不是整篇。
+   不这么做，v3 之后的卡片只剩标题可搜。
+3. **`applications` 未落库也未进 prompt**：按设计由 facts 在渲染期派生，模型不写。
+   `derived_bullets()` 由正文小标题派生，v1 读者（旧 CLI、旧客户端）照旧能用。
+4. **acts 的内容通道做成 `Acts` 的兄弟而非扩展**（`acts::ActContent`）。
+   `acts_json` 是事件过期后唯一剩下的东西，保持 counts/labels 原形状就无需版本化，
+   老读者一行不改；内容只在事件还在时存在，**从不冻结** —— 过期的 slot 说的是
+   「不知道写了什么」，不是「什么都没写」。value 优先于键流；写完又发出去的同一句只出现一次；
+   shim 标了 secure 的字段即使带着 value 也一律不读（源头之外的第二道锁）。
+5. **citable 标记落成 `unframed_lines` 计数**：`screenshot_id` 共享仍未实现，所以库里
+   不存在「没有截图的 moment」，一个恒为 true 的布尔字段没有消费者。真正无帧可引的证据是
+   R3 边沿树贡献的行，按 run 计数写进 prompt（「可以据此写，但不要为它出引用」）。
+   等 `screenshot_id` 落地，这个计数只是变大，不需要新字段。
+6. **fail-open pin 未重生成**。v3 新增的字段（`wrote`、`unframed`、邻卡 description）
+   在无事件、无边沿树的 slot 上一律**省略而非空值输出**，因此零事件卡片与 prompt 逐字节不变；
+   变的是**模型侧**的输出契约，而 pin 钉的是输入侧。保持原样比重生成是更强的陈述。
+7. **预算取 `opening_allowance()` 而非整个 transcript**：T2 的 prompt 就是 opening，
+   这样每一轮仍放得下一个完整的工具结果。上限 48k 是「已评测范围」的边界，不是模型能力边界 ——
+   放开它的是 WS7 的语料回归。
+8. **`get_transcript` 仍留在 ToolHost 上（只是无音频时不写进 prompt）**：模型若凭空调用它，
+   得到的是「本时段没有录到语音」，比「未知工具」更接近事实。
+9. **Swift 侧是最小渲染**：日面板是一个 AppKit 文本视图，v3 正文用 `StreamingMarkdown`
+   解析后按小节展开，行内语法与引用渲染成它们说的话（`[label](afterray://moment/id)` → `label`）。
+   加载帧本身与 `#el<N>` 元素高亮仍是聊天面板的能力，日面板留待后续。
 
 ## 开放 PoC
 

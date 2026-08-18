@@ -51,6 +51,10 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
     public let bullets: [String]?
     public let category: String?
     public let description: String?
+    /// The v3 card body: one Markdown document. Present only on cards written
+    /// by the v3 contract; v1 and v2 rows keep answering with bullets and
+    /// threads, and both must keep rendering.
+    public let details: String?
     public let threads: [SummaryThread]?
     public let entities: [SummaryEntity]?
     public let decisions: [String]?
@@ -66,6 +70,7 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         bullets: [String]? = nil,
         category: String? = nil,
         description: String? = nil,
+        details: String? = nil,
         threads: [SummaryThread]? = nil,
         entities: [SummaryEntity]? = nil,
         decisions: [String]? = nil,
@@ -80,6 +85,7 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         self.bullets = bullets
         self.category = category
         self.description = description
+        self.details = details
         self.threads = threads
         self.entities = entities
         self.decisions = decisions
@@ -95,7 +101,7 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         case title
         case bullets
         case category
-        case description, threads, entities, decisions
+        case description, details, threads, entities, decisions
         case notCaptured = "not_captured"
     }
 
@@ -111,6 +117,7 @@ public struct DaySlotSummary: Codable, Equatable, Identifiable, Sendable {
         bullets = try container.decodeIfPresent([String].self, forKey: .bullets)
         category = try container.decodeIfPresent(String.self, forKey: .category)
         description = try container.decodeIfPresent(String.self, forKey: .description)
+        details = try container.decodeIfPresent(String.self, forKey: .details)
         threads = try container.decodeIfPresent([SummaryThread].self, forKey: .threads)
         entities = try container.decodeIfPresent([SummaryEntity].self, forKey: .entities)
         decisions = try container.decodeIfPresent([String].self, forKey: .decisions)
@@ -405,6 +412,12 @@ public enum DaySummaryLayout {
     }
 
     public static func expandedSections(slot: DaySlotSummary) -> [DaySummaryExpandedSection] {
+        // v3 first: a card that has a body is a card whose body is the details.
+        // v1 and v2 rows fall through to the two branches below unchanged —
+        // three card shapes are on disk and the panel renders all three.
+        if let details = slot.details, !details.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return markdownSections(details)
+        }
         if let threads = slot.threads, !threads.isEmpty {
             var sections = threads.compactMap { thread -> DaySummaryExpandedSection? in
                 let body = normalizedParagraph(thread.prose)
@@ -430,6 +443,72 @@ public enum DaySummaryLayout {
             let body = normalizedParagraph(bullet)
             return body.isEmpty ? nil : DaySummaryExpandedSection(heading: nil, body: body)
         }
+    }
+
+    /// A v3 body, split into the panel's sections.
+    ///
+    /// Parsed by `StreamingMarkdown` — the same parser the chat uses, so the
+    /// two surfaces agree on what a heading and a citation are, and a change to
+    /// one cannot leave the other reading a different document. What the panel
+    /// draws is plain text (it is one AppKit text view, not a stack of SwiftUI
+    /// blocks), so inline markup and citation syntax are resolved to what they
+    /// say: `[label](afterray://moment/id)` renders as `label`, and a
+    /// standalone citation becomes its own line. Loading the frame itself, and
+    /// highlighting an `#el<N>` element inside it, is the chat's job today and
+    /// this panel's later.
+    static func markdownSections(_ details: String) -> [DaySummaryExpandedSection] {
+        var sections: [DaySummaryExpandedSection] = []
+        var heading: String?
+        var body: [String] = []
+
+        func flush() {
+            let text = body.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            body.removeAll()
+            guard heading != nil || !text.isEmpty else { return }
+            sections.append(DaySummaryExpandedSection(heading: heading, body: text))
+        }
+
+        for block in StreamingMarkdown.blocks(from: details) {
+            switch block {
+            case let .heading(_, text):
+                flush()
+                // The streaming parser folds the lines under a heading into the
+                // heading block, so a card's whole first paragraph can arrive
+                // attached to its title. The heading is the first line; the
+                // rest is already this section's body.
+                var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                heading = plainText(lines.removeFirst())
+                let rest = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !rest.isEmpty {
+                    body.append(plainText(rest))
+                }
+            case let .paragraph(text):
+                body.append(plainText(text))
+            case let .momentImage(label, momentID):
+                // No media in the panel: the label is what the citation says,
+                // and an unlabelled one still marks that a frame was cited.
+                let text = plainText(label)
+                body.append(text.isEmpty ? "Frame \(momentID)" : text)
+            case let .bulletedList(items):
+                body.append(contentsOf: items.map { "• " + plainText($0) })
+            case let .numberedList(items):
+                body.append(contentsOf: items.enumerated().map { "\($0.offset + 1). " + plainText($0.element) })
+            case let .code(_, text, _):
+                body.append(text)
+            case let .quote(text):
+                body.append(plainText(text))
+            case .rule:
+                continue
+            }
+        }
+        flush()
+        return sections.filter { $0.heading != nil || !$0.body.isEmpty }
+    }
+
+    /// Markdown inline syntax resolved to the words it wraps.
+    private static func plainText(_ text: String) -> String {
+        String(StreamingMarkdown.attributedInline(text).characters)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func normalizedParagraph(_ text: String) -> String {

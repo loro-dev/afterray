@@ -4231,11 +4231,14 @@ mod tests {
         for index in 0..40 {
             // Every line carries tokens nothing else does, so what runs out
             // first is the budget rather than the information.
-            let text: String = (0..20)
-                .map(|line| {
-                    format!("let payload_{index}_{line} = decode_{index}_{line}(frame_{index}_{line});\n")
-                })
-                .collect();
+            let mut text = String::new();
+            for line in 0..20 {
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    text,
+                    "let payload_{index}_{line} = decode_{index}_{line}(frame_{index}_{line});"
+                );
+            }
             // A distinct place per row, so the timeline is many runs and the
             // per-run cap is not what binds.
             rows.push(row(

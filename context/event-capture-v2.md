@@ -1,8 +1,8 @@
 # Event capture v2 — tree text, diff chains, and the input vocabulary
 
-Verified against code 2026-08-18 (WS1–WS3 shim half, WS4).
+Verified against code 2026-08-18 (WS1–WS3 shim half, WS4, WS5, WS6).
 
-What the shim emits after [docs/event-capture-v2-plan.md](../docs/event-capture-v2-plan.md), and what the daemon and vault now do with it. Owners: `apps/AfterRayCaptureShim` (`Sources/AfterRayCapturePolicy` for everything pure, `Sources/AfterRayCaptureShim/main.swift` for the live-AX wiring), `crates/afterray-platform-macos` (parsing), `crates/afterrayd` (mapping + scheduling), `crates/afterray-store` (storage + retention). Every field the shim sends is now stored (§3b); nothing *reads* the new ones yet — that is WS5.
+What the shim emits after [docs/event-capture-v2-plan.md](../docs/event-capture-v2-plan.md), and what the daemon and vault now do with it. Owners: `apps/AfterRayCaptureShim` (`Sources/AfterRayCapturePolicy` for everything pure, `Sources/AfterRayCaptureShim/main.swift` for the live-AX wiring), `crates/afterray-platform-macos` (parsing), `crates/afterrayd` (mapping + scheduling), `crates/afterray-store` (storage + retention). Every field the shim sends is stored (§3b) and, since WS5, read: the typed run and the field's value reach the T2 prompt through `acts::ActContent` ([acts-join](acts-join.md)).
 
 ## 1. `tree_text` — the AX tree as readable text
 
@@ -114,9 +114,15 @@ not a line of it changed for this. What changed is when the daemon pulls.
   between the two tasks. Cadence unchanged, phase follows the user.
 
 The pairing invariant is untouched: a screenshot still always carries AX, and
-an AX moment may still have no screenshot. `screenshot_id` and the citable
-marking are **not** implemented — their only consumer is the T2 prompt, so they
-land in WS5 where something reads them.
+an AX moment may still have no screenshot. `screenshot_id` sharing is still
+**not** implemented — capture stays one AX tree per frame, so no moment in the
+vault lacks an image and there is nothing for a shared id to point at.
+
+What WS5 did land is the half that had a consumer: the **citability** rule. The
+text that genuinely has no frame behind it is what an R3 edge tree contributed,
+and `RunRow.unframed_lines` counts it per run so the prompt can say, of that
+stretch, "write from it, cite nothing for it". When `screenshot_id` sharing
+arrives it makes the same count larger; it does not need a new field.
 
 ## 4. Attachment tiers
 
@@ -131,4 +137,5 @@ The R3 invariants are unchanged: one window, `accessibility_edge`, **never a scr
 ## Watch out
 
 - The shim's `main.swift` needs live AX and TCC, so nothing in it is covered by `swift test`. Anything that can be a pure decision belongs in `AfterRayCapturePolicy` — that is why the chain, the guard, the chunking and the tiers all live there.
-- Every field the shim sends now lands in the vault (WS4, schema 25) — but nothing *reads* the new ones yet. `acts.rs parse_event` still matches on `kind` alone and the acts it builds are still counts and labels; consuming `text` / `value` is WS5's contract change.
+- Event kinds are still `burst` / `command` (not the plan's `text_input` / `submit`): `acts.rs parse_event` matches these strings, and WS5 kept adding rather than renaming. The rename has no consumer waiting on it.
+- `parse_event` now reads `text` and `target.value` into `ActEvent`, and `fold_act_content` folds them into `ActContent` — beside `Acts`, never inside it, so the frozen `acts_json` keeps its shape ([acts-join](acts-join.md) invariant 6).

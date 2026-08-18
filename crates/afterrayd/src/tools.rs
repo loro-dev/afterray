@@ -54,6 +54,10 @@ const CLOCK_DAYS: i64 = 7;
 const MAX_ENTITIES: usize = 4;
 const MAX_DECISIONS: usize = 2;
 const MAX_DAY_THREAD_MOMENTS: usize = 1;
+/// Characters of one v3 section shown on a day line. A v3 body is a document —
+/// a day of them would be the whole day's writing, and the day view exists to
+/// choose which stretch to open, not to be read instead of it.
+const MAX_DAY_SECTION_CHARS: usize = 200;
 /// What a narrowed-down view may cite, where there is one stretch to pay for
 /// rather than a day of them.
 const MAX_THREAD_MOMENTS: usize = 3;
@@ -825,7 +829,26 @@ fn render_day(summary: &afterray_store::DaySummary, detail: bool) -> String {
             continue;
         };
 
-        let threads = slot.threads.as_deref().filter(|threads| !threads.is_empty());
+        // A v3 card's body enters here as its own sections, so one day line
+        // still reads as "what this stretch was about" rather than a list of
+        // headings with the writing left in the vault.
+        let v3_sections = slot
+            .details
+            .as_deref()
+            .filter(|details| !details.trim().is_empty())
+            .map(|details| {
+                afterray_store::details_sections(details)
+                    .into_iter()
+                    .map(|mut section| {
+                        section.prose = clip_chars(&section.prose, MAX_DAY_SECTION_CHARS);
+                        section
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sections| !sections.is_empty());
+        let threads = v3_sections
+            .as_deref()
+            .or_else(|| slot.threads.as_deref().filter(|threads| !threads.is_empty()));
         // The anchor is the stretch's first frame, and the threads below
         // usually cite it too. Only offer it when they cite nothing, so a
         // stretch always has one id to point at and never the same id twice.
@@ -878,6 +901,14 @@ fn render_day(summary: &afterray_store::DaySummary, detail: bool) -> String {
         ));
     }
     lines.join("\n")
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
 }
 
 /// One thread of a stretch, with the frames it cites.
@@ -2018,6 +2049,45 @@ mod tests {
         // `not_captured` is not rendered here; the day-scale budget cannot
         // afford a caveat per stretch.
         assert!(!text.contains("not captured"), "{text}");
+    }
+
+    /// A v3 card's body reaches the day view as its own sections, bounded.
+    /// Rendering only the headings — which is what the derived bullet list
+    /// holds — would answer "what happened today" with a table of contents.
+    #[tokio::test]
+    async fn the_day_summary_reads_a_v3_body_as_bounded_sections() {
+        let (_dir, vault) = host_fixture();
+        let noon = local_calendar_day_bounds_ms(NOW).0 + 3_600_000;
+        seed_moments(&vault, &[noon, noon + 60_000]);
+        let card = vault.slot_card(noon, 10_000).unwrap();
+        vault
+            .put_t2_summary_v3(
+                &card,
+                &afterray_store::T2CardV3 {
+                    title: "Cut the 0.0.4 release".into(),
+                    description: "Notarised and published.".into(),
+                    details: format!(
+                        "### Notarising\nRan `make release`; notarytool took 4m. {}\n\n\
+                         ### Appcast\nPublished to R2.",
+                        "and then some more prose ".repeat(20)
+                    ),
+                    low_trust: false,
+                },
+                "t2-agent",
+                noon,
+                None,
+            )
+            .unwrap();
+        let host = host_for(&vault);
+
+        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
+        assert!(text.contains("Cut the 0.0.4 release"), "{text}");
+        assert!(text.contains("Notarising: Ran `make release`"), "{text}");
+        assert!(text.contains("Appcast: Published to R2."), "{text}");
+        assert!(
+            text.contains('…'),
+            "a long section must be clipped, not pasted whole: {text}"
+        );
     }
 
     /// A worked day must arrive whole.
