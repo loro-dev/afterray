@@ -210,6 +210,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
                 llmModel: modelName,
                 llmApiKey: nil,
                 storageLimitBytes: nil,
+                summarySlotMinutes: nil,
                 uiLanguage: nil,
                 summaryLanguage: nil,
                 cliEvidenceAccess: nil

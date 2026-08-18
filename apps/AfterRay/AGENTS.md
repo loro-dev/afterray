@@ -13,7 +13,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 ## Invariants
 
-- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 13, which must match `afterray-protocol`.
+- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 14, which must match `afterray-protocol`.
 - On lock/sleep, `.afterRaySystemSessionWillSuspend` clears store/control/chat, closes chat, and clears image/thumbnail/preview caches. Hook every decrypted-content cache into this.
 - The overlay, history window, and chat window must share `AfterRayServices.shared` stores — never construct a private `RecallStore` or `AfterRayChatModel`.
 - `RecallView` alone owns the opaque history backdrop; `AfterRayRootView` stays transparent. An outer backdrop lags a fast flick to NOW and can leave a black screen.

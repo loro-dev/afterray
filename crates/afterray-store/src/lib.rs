@@ -74,21 +74,22 @@ pub type MomentAt = (String, i64);
 
 pub use slot::{
     AppFact, CURRENT_SLOT_DURATION_MS, DaySlot, DaySummary, GapEntry, MentionKind, PrevCard,
-    Revisit, RunRow, LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, SLOT_DURATION_MS,
-    SLOT_SUMMARY_SCHEMA_VERSION, SlotCard, SlotEvidence, SlotExportFacts, SlotFacts, SlotMention,
-    SlotMomentRow, SlotState, SlotSummaryExport, SlotSummaryState, StoredSlotOverlay,
-    T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2, T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport,
-    TimelineEntry, assemble_day_summary, attach_entity_candidates, build_slot_card,
-    build_slot_card_with_end, dedup_key_of, extract_json_object, local_day_bounds, local_day_for,
-    match_slot_mention, next_legacy_slot_boundary, parse_t2_card, parse_t2_card_v2,
-    render_t2_prompt, shorten_place, slot_bounds_for, slot_clock_label, slot_start_for,
-    verify_t2_card,
+    Revisit, RunRow, LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, SLOT_DURATION_CHOICES_MINUTES,
+    SLOT_DURATION_MS, SLOT_SUMMARY_SCHEMA_VERSION, SlotBounds, SlotCard, SlotEvidence,
+    SlotExportFacts, SlotFacts, SlotMention, SlotMomentRow, SlotSegment, SlotState,
+    SlotSummaryExport, SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2,
+    T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport, TimelineEntry, assemble_day_summary,
+    attach_entity_candidates, build_slot_card, build_slot_card_with_end, dedup_key_of,
+    extract_json_object, legacy_segments, local_day_bounds, local_day_for, match_slot_mention,
+    next_legacy_slot_boundary, parse_t2_card, parse_t2_card_v2, render_t2_prompt, shorten_place,
+    slot_bounds_for, slot_bounds_in, slot_clock_label, slot_duration_ms_for_minutes,
+    slot_start_for, verify_t2_card,
 };
 
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// How a search is narrowed before anything is ranked.
 ///
@@ -243,6 +244,8 @@ pub enum StoreError {
     GopStale,
     #[error("moment not found: {0}")]
     MomentNotFound(String),
+    #[error("{0} ms is not an offered summary slot length")]
+    InvalidSlotDuration(i64),
 }
 
 pub trait KeyProvider: Send + Sync {
@@ -620,9 +623,10 @@ pub struct Vault {
     /// so filmstrip scrubbing can decrypt many JPEGs in parallel.
     artifact_io: RwLock<()>,
     max_storage_bytes: AtomicU64,
-    /// Absent for a new/empty vault. Existing vaults persist the first
-    /// 10-minute boundary so reopening never reinterprets old half-hours.
-    summary_slot_cutover_ms: Option<i64>,
+    /// How long a summary slot has been at each point in this vault's life,
+    /// oldest first. Persisted, because a card already written must keep the
+    /// shape it was summarised at however often the user changes the setting.
+    summary_slot_segments: RwLock<Vec<slot::SlotSegment>>,
 }
 
 /// A handful of `PRAGMA query_only` connections, handed out round-robin.
@@ -705,14 +709,135 @@ type SlotSummaryExportRow = (
 
 
 impl Vault {
+    /// The whole geometry history, oldest first. Callers that bound many
+    /// moments at once should take this once and use [`slot::slot_bounds_in`]
+    /// rather than re-locking per row.
     #[must_use]
-    pub const fn summary_slot_cutover_ms(&self) -> Option<i64> {
-        self.summary_slot_cutover_ms
+    pub fn summary_slot_segments(&self) -> Vec<slot::SlotSegment> {
+        self.summary_slot_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The length new slots are being cut at right now.
+    #[must_use]
+    pub fn summary_slot_duration_ms(&self) -> i64 {
+        self.summary_slot_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .map_or(slot::CURRENT_SLOT_DURATION_MS, |segment| {
+                segment.duration_ms
+            })
     }
 
     #[must_use]
     pub fn summary_slot_bounds(&self, at_ms: i64) -> slot::SlotBounds {
-        slot::slot_bounds_for(at_ms, self.summary_slot_cutover_ms)
+        slot::slot_bounds_in(
+            at_ms,
+            &self
+                .summary_slot_segments
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Changes the length of slots cut from `now_ms` onwards, leaving every
+    /// slot already summarised exactly as it was.
+    ///
+    /// The change takes effect immediately rather than at the next boundary:
+    /// waiting for one would mean up to an hour of a setting the user can see
+    /// but not feel. The stretch in progress is clipped at `now_ms`, so the
+    /// two geometries still tile the timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidSlotDuration`] for a length that is not
+    /// offered, or an error if the vault cannot be written.
+    pub fn set_summary_slot_duration_ms(
+        &self,
+        duration_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        if !slot::SLOT_DURATION_CHOICES_MINUTES.contains(&(duration_ms / 60_000))
+            || duration_ms % 60_000 != 0
+        {
+            return Err(StoreError::InvalidSlotDuration(duration_ms));
+        }
+        let mut segments = self
+            .summary_slot_segments
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if segments
+            .last()
+            .is_some_and(|segment| segment.duration_ms == duration_ms)
+        {
+            return Ok(());
+        }
+        let mut next = segments.clone();
+        // A segment that never held a moment described no slot anyone read, so
+        // flipping the control twice on an idle Mac leaves one boundary, not a
+        // trail of empty geometries.
+        while next.len() > 1
+            && next
+                .last()
+                .is_some_and(|segment| !self.has_moment_at_or_after(segment.from_ms).unwrap_or(true))
+        {
+            next.pop();
+        }
+        if next
+            .last()
+            .is_some_and(|segment| segment.duration_ms == duration_ms)
+        {
+            // Unwinding the empty segments already restored this length.
+            self.write_summary_slot_segments(&next)?;
+            *segments = next;
+            drop(segments);
+            self.flush_card_cache();
+            return Ok(());
+        }
+        let from_ms = next
+            .last()
+            .map_or(now_ms, |segment| now_ms.max(segment.from_ms + 1));
+        next.push(slot::SlotSegment::new(from_ms, duration_ms));
+        self.write_summary_slot_segments(&next)?;
+        *segments = next;
+        drop(segments);
+        // Cached cards are keyed by slot start; the boundaries just moved.
+        self.flush_card_cache();
+        Ok(())
+    }
+
+    fn has_moment_at_or_after(&self, from_ms: i64) -> Result<bool, StoreError> {
+        let connection = self.readers.get();
+        let found: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM moments WHERE captured_at_ms >= ?1 LIMIT 1",
+                [from_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    fn write_summary_slot_segments(
+        &self,
+        segments: &[slot::SlotSegment],
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().unwrap();
+        let tx = connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM summary_slot_geometry", [])?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO summary_slot_geometry (from_ms, duration_ms) VALUES (?1, ?2)",
+            )?;
+            for segment in segments {
+                insert.execute(params![segment.from_ms, segment.duration_ms])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn open(config: VaultConfig, provider: &dyn KeyProvider) -> Result<Self, StoreError> {
@@ -738,7 +863,7 @@ impl Vault {
         let connection =
             open_database_with_legacy_migration(&database_path, &database_key, &master_key)?;
         migrate(&connection)?;
-        let summary_slot_cutover_ms = read_summary_slot_cutover(&connection)?;
+        let summary_slot_segments = read_summary_slot_segments(&connection)?;
         connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
         set_database_file_permissions(&database_path)?;
         // Readers open only after migration has settled the schema.
@@ -755,7 +880,7 @@ impl Vault {
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: RwLock::new(()),
             max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
-            summary_slot_cutover_ms,
+            summary_slot_segments: RwLock::new(summary_slot_segments),
         };
         let _ = vault.rollback_orphan_gops();
         let _ = vault.reconcile_packed_stills();
@@ -2090,9 +2215,13 @@ impl Vault {
         let day = slot::local_day_for(day_ms);
         let (day_start_ms, day_end_ms) = slot::local_day_bounds(day_ms);
         let rows = self.slot_moment_rows(day_start_ms, day_end_ms)?;
+        // One snapshot for the whole day: a geometry change landing mid-build
+        // would otherwise group some rows by the old boundaries and some by
+        // the new, and the day would show two overlapping slots.
+        let segments = self.summary_slot_segments();
         let mut grouped: HashMap<i64, Vec<slot::SlotMomentRow>> = HashMap::new();
         for row in rows {
-            let bounds = self.summary_slot_bounds(row.captured_at_ms);
+            let bounds = slot::slot_bounds_in(row.captured_at_ms, &segments);
             grouped
                 .entry(bounds.start_ms)
                 .or_default()
@@ -2110,6 +2239,7 @@ impl Vault {
             .iter()
             .map(|start| (*start, grouped.remove(start).unwrap_or_default()))
             .collect();
+        let segments = segments.as_slice();
         let mut cards: Vec<(i64, slot::SlotCard)> = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(lanes);
             for chunk in work.chunks(work.len().div_ceil(lanes).max(1)) {
@@ -2117,7 +2247,7 @@ impl Vault {
                     chunk
                         .iter()
                         .map(|(start, slot_rows)| {
-                            let bounds = self.summary_slot_bounds(*start);
+                            let bounds = slot::slot_bounds_in(*start, segments);
                             let idle_ms = self.idle_overlap_ms(bounds.start_ms, bounds.end_ms)?;
                             Ok((
                                 *start,
@@ -4135,6 +4265,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_19(connection)?;
     migrate_schema_20(connection, from_version)?;
     migrate_schema_21(connection)?;
+    migrate_schema_22(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -4160,6 +4291,30 @@ fn read_summary_slot_cutover(connection: &Connection) -> Result<Option<i64>, Sto
         )
         .optional()
         .map_err(StoreError::from)
+}
+
+/// The persisted geometry history, normalised so the first segment reaches
+/// back to `i64::MIN` — every instant in the vault has to land in exactly one
+/// segment, including moments captured before the row that describes them.
+fn read_summary_slot_segments(
+    connection: &Connection,
+) -> Result<Vec<slot::SlotSegment>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT from_ms, duration_ms FROM summary_slot_geometry ORDER BY from_ms")?;
+    let mut segments: Vec<slot::SlotSegment> = statement
+        .query_map([], |row| {
+            Ok(slot::SlotSegment::new(row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    segments.retain(|segment| segment.duration_ms > 0);
+    match segments.first_mut() {
+        Some(first) => first.from_ms = i64::MIN,
+        None => segments.push(slot::SlotSegment::new(
+            i64::MIN,
+            slot::CURRENT_SLOT_DURATION_MS,
+        )),
+    }
+    Ok(segments)
 }
 
 fn moment_column_names(connection: &Connection) -> Result<Vec<String>, StoreError> {
@@ -4651,6 +4806,31 @@ fn migrate_schema_20(connection: &Connection, from_version: u32) -> Result<(), S
     Ok(())
 }
 
+/// Turns the one-off 30→10-minute cutover into a geometry history the user can
+/// extend. Seeded from the marker schema 20 froze, so an upgraded vault reads
+/// its old half-hours exactly as it did before slot length was a setting.
+fn migrate_schema_22(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS summary_slot_geometry (
+           from_ms INTEGER PRIMARY KEY,
+           duration_ms INTEGER NOT NULL
+         );",
+    )?;
+    let seeded: i64 =
+        connection.query_row("SELECT COUNT(*) FROM summary_slot_geometry", [], |row| {
+            row.get(0)
+        })?;
+    if seeded > 0 {
+        return Ok(());
+    }
+    let mut insert = connection
+        .prepare("INSERT INTO summary_slot_geometry (from_ms, duration_ms) VALUES (?1, ?2)")?;
+    for segment in slot::legacy_segments(read_summary_slot_cutover(connection)?) {
+        insert.execute(params![segment.from_ms, segment.duration_ms])?;
+    }
+    Ok(())
+}
+
 fn migrate_schema_21(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection.prepare("PRAGMA table_info(audio_segments)")?;
     let existing: Vec<String> = statement
@@ -5093,9 +5273,83 @@ mod tests {
     #[test]
     fn new_vault_starts_with_ten_minute_summary_slots() {
         let (_directory, vault) = test_vault(10);
-        assert_eq!(vault.summary_slot_cutover_ms(), None);
+        assert_eq!(
+            vault.summary_slot_segments(),
+            vec![SlotSegment::new(i64::MIN, CURRENT_SLOT_DURATION_MS)]
+        );
+        assert_eq!(vault.summary_slot_duration_ms(), CURRENT_SLOT_DURATION_MS);
         let bounds = vault.summary_slot_bounds(1_786_699_244_105);
         assert_eq!(bounds.end_ms - bounds.start_ms, CURRENT_SLOT_DURATION_MS);
+    }
+
+    #[test]
+    fn chosen_slot_length_survives_reopening_and_leaves_older_slots_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let key = [37_u8; 32];
+        let changed_at = 1_786_699_244_105;
+        {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(changed_at - 60_000).unwrap();
+            vault
+                .insert_moment(&session.id, changed_at - 60_000, "image/jpeg", b"frame")
+                .unwrap();
+            vault
+                .set_summary_slot_duration_ms(30 * 60_000, changed_at)
+                .unwrap();
+        }
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        assert_eq!(vault.summary_slot_duration_ms(), 30 * 60_000);
+        let before = vault.summary_slot_bounds(changed_at - 1);
+        assert_eq!(before.end_ms, changed_at, "the open slot is clipped");
+        assert!(before.end_ms - before.start_ms < CURRENT_SLOT_DURATION_MS);
+        let after = vault.summary_slot_bounds(changed_at);
+        assert_eq!(after.start_ms, changed_at);
+        assert_eq!(
+            vault.summary_slot_bounds(after.end_ms).end_ms - after.end_ms,
+            30 * 60_000
+        );
+    }
+
+    #[test]
+    fn unoffered_slot_lengths_are_rejected_and_repeats_are_no_ops() {
+        let (_directory, vault) = test_vault(10);
+        assert!(matches!(
+            vault.set_summary_slot_duration_ms(7 * 60_000, 1_786_699_244_105),
+            Err(StoreError::InvalidSlotDuration(_))
+        ));
+        vault
+            .set_summary_slot_duration_ms(CURRENT_SLOT_DURATION_MS, 1_786_699_244_105)
+            .unwrap();
+        assert_eq!(
+            vault.summary_slot_segments(),
+            vec![SlotSegment::new(i64::MIN, CURRENT_SLOT_DURATION_MS)],
+            "asking for the length already in force writes no boundary"
+        );
+    }
+
+    /// Flipping the control back and forth while nothing is being captured
+    /// must not leave a trail of geometries no slot ever used.
+    #[test]
+    fn empty_geometry_segments_are_unwound_instead_of_stacked() {
+        let (_directory, vault) = test_vault(10);
+        let at = 1_786_699_244_105;
+        vault.set_summary_slot_duration_ms(20 * 60_000, at).unwrap();
+        vault
+            .set_summary_slot_duration_ms(60 * 60_000, at + 1_000)
+            .unwrap();
+        assert_eq!(vault.summary_slot_segments().len(), 2);
+        vault
+            .set_summary_slot_duration_ms(CURRENT_SLOT_DURATION_MS, at + 2_000)
+            .unwrap();
+        assert_eq!(
+            vault.summary_slot_segments(),
+            vec![SlotSegment::new(i64::MIN, CURRENT_SLOT_DURATION_MS)]
+        );
     }
 
     #[test]
@@ -5114,15 +5368,24 @@ mod tests {
                 .insert_moment(&session.id, captured_at_ms, "image/jpeg", b"frame")
                 .unwrap();
             let connection = vault.connection.lock().unwrap();
-            connection.execute("DELETE FROM vault_meta", []).unwrap();
             connection
-                .execute("UPDATE schema_meta SET version = 19", [])
+                .execute_batch(
+                    "DELETE FROM vault_meta;
+                     DROP TABLE summary_slot_geometry;
+                     UPDATE schema_meta SET version = 19;",
+                )
                 .unwrap();
         }
 
         let vault = Vault::open_with_key(config, key).unwrap();
         let cutover = next_legacy_slot_boundary(captured_at_ms);
-        assert_eq!(vault.summary_slot_cutover_ms(), Some(cutover));
+        assert_eq!(
+            vault.summary_slot_segments(),
+            vec![
+                SlotSegment::new(i64::MIN, SLOT_DURATION_MS),
+                SlotSegment::new(cutover, CURRENT_SLOT_DURATION_MS),
+            ]
+        );
         let before = vault.summary_slot_bounds(cutover - 1);
         let after = vault.summary_slot_bounds(cutover);
         assert_eq!(before.end_ms, after.start_ms);
@@ -5178,6 +5441,7 @@ mod tests {
                      ALTER TABLE slot_summaries DROP COLUMN decisions_json;
                      ALTER TABLE slot_summaries DROP COLUMN not_captured_json;
                      DELETE FROM vault_meta;
+                     DROP TABLE summary_slot_geometry;
                      UPDATE schema_meta SET version = 15;",
                 )
                 .unwrap();
@@ -5185,8 +5449,11 @@ mod tests {
 
         let vault = Vault::open_with_key(config, key).unwrap();
         assert_eq!(
-            vault.summary_slot_cutover_ms(),
-            Some(legacy_start + SLOT_DURATION_MS)
+            vault.summary_slot_segments(),
+            vec![
+                SlotSegment::new(i64::MIN, SLOT_DURATION_MS),
+                SlotSegment::new(legacy_start + SLOT_DURATION_MS, CURRENT_SLOT_DURATION_MS),
+            ]
         );
         let day = vault.day_summary(captured_at_ms, 10_000).unwrap();
         let legacy = day

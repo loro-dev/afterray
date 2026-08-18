@@ -8,7 +8,9 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         dataDir: "/Users/demo/.afterray/v0-data",
         modelDir: "/Users/demo/.afterray/models",
         recordAudio: true,
-        captureIntervalSeconds: 10
+        captureIntervalSeconds: 10,
+        summarySlotMinutes: 10,
+        summarySlotMinutesOptions: [10, 20, 30, 60]
     )
     @Published public var library: ModelLibrary?
     @Published public var storage = AfterRayStorageSnapshot(
@@ -24,6 +26,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var isControllingDownload = false
     @Published public var isUpdatingAudio = false
     @Published public var isUpdatingStorageLimit = false
+    @Published public var isUpdatingSummarySlot = false
     @Published public var isUpdatingLanguage = false
     @Published public var isUpdatingExclusions = false
     @Published public var isClearingHistory = false
@@ -150,6 +153,14 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         settings = replacing(current, storageLimitBytes: bytes)
         isUpdatingStorageLimit = false
         message = "Preview memory limit updated."
+    }
+
+    public func setSummarySlotMinutes(_ minutes: UInt32) async {
+        guard let current = settings else { return }
+        isUpdatingSummarySlot = true
+        settings = replacing(current, summarySlotMinutes: minutes)
+        isUpdatingSummarySlot = false
+        message = "Preview summary length updated."
     }
 
     public func setUiLanguage(_ code: String) async {
@@ -494,6 +505,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     private func replacing(
         _ current: AppSettings,
         storageLimitBytes: UInt64? = nil,
+        summarySlotMinutes: UInt32? = nil,
         uiLanguage: String? = nil,
         summaryLanguage: String? = nil
     ) -> AppSettings {
@@ -503,6 +515,8 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             recordAudio: current.recordAudio,
             captureIntervalSeconds: current.captureIntervalSeconds,
             storageLimitBytes: storageLimitBytes ?? current.storageLimitBytes,
+            summarySlotMinutes: summarySlotMinutes ?? current.summarySlotMinutes,
+            summarySlotMinutesOptions: current.summarySlotMinutesOptions,
             excludedBundleIds: current.excludedBundleIds,
             protectedBundleIds: current.protectedBundleIds,
             llmProvider: current.llmProvider,

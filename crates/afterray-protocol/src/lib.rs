@@ -25,8 +25,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// model's reasoning so the chat UI can show thinking as it happens. 12 adds
 /// the privacy-bounded parsed summary export. 13 adds the compute dashboard,
 /// the CLI evidence window (`cli_evidence_until_ms` / `cli_evidence_access`),
-/// and gated access for unprivileged socket clients.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// and treats unprivileged socket clients as a gated query surface. 14 makes
+/// the summary slot length a setting (`summary_slot_minutes`).
+pub const PROTOCOL_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +246,11 @@ pub enum Request {
         summary_language: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_limit_bytes: Option<u64>,
+        /// Wall-clock minutes one summary covers, from now on. Must be one of
+        /// `AppSettings::summary_slot_minutes_options`; slots already
+        /// summarised keep the length they were written at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_slot_minutes: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         excluded_bundle_ids: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -806,6 +812,13 @@ pub struct AppSettings {
     pub capture_interval_seconds: u64,
     #[serde(default = "default_storage_limit_bytes")]
     pub storage_limit_bytes: u64,
+    /// Wall-clock minutes one summary card covers. Changing it governs future
+    /// slots only — a day already summarised keeps the shape it was read at.
+    #[serde(default = "default_summary_slot_minutes")]
+    pub summary_slot_minutes: u32,
+    /// The lengths the settings UI offers, so one list serves every client.
+    #[serde(default = "summary_slot_minutes_options")]
+    pub summary_slot_minutes_options: Vec<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_bundle_ids: Vec<String>,
     /// Credential-bearing and system surfaces the daemon always excludes.
@@ -907,6 +920,22 @@ fn default_language() -> String {
 
 const fn default_storage_limit_bytes() -> u64 {
     DEFAULT_STORAGE_LIMIT_BYTES
+}
+
+/// How many wall-clock minutes one summary covers unless the user says
+/// otherwise. Mirrors `afterray_store::CURRENT_SLOT_DURATION_MS`; the protocol
+/// crate must not depend on the vault, so the two are pinned by a test there.
+pub const DEFAULT_SUMMARY_SLOT_MINUTES: u32 = 10;
+
+const fn default_summary_slot_minutes() -> u32 {
+    DEFAULT_SUMMARY_SLOT_MINUTES
+}
+
+/// Summary lengths a client may offer. Each divides an hour, so whichever the
+/// user picks, cards start on clock times they recognise.
+#[must_use]
+pub fn summary_slot_minutes_options() -> Vec<u32> {
+    vec![10, 20, 30, 60]
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1615,6 +1644,7 @@ mod tests {
                 ui_language: None,
                 summary_language: None,
                 storage_limit_bytes: None,
+                summary_slot_minutes: None,
                 excluded_bundle_ids: None,
                 excluded_domains: None,
                 llm_provider: None,
@@ -1633,6 +1663,7 @@ mod tests {
                 ui_language: None,
                 summary_language: None,
                 storage_limit_bytes: None,
+                summary_slot_minutes: None,
                 excluded_bundle_ids: None,
                 excluded_domains: None,
                 llm_provider: None,
@@ -1691,6 +1722,7 @@ mod tests {
             ui_language: None,
             summary_language: None,
             storage_limit_bytes: Some(250_000_000_000),
+            summary_slot_minutes: None,
             excluded_bundle_ids: None,
             excluded_domains: None,
             llm_provider: None,
@@ -1708,12 +1740,53 @@ mod tests {
     }
 
     #[test]
+    fn summary_slot_minutes_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::UpdateSettings {
+            record_audio: None,
+            ui_language: None,
+            summary_language: None,
+            storage_limit_bytes: None,
+            summary_slot_minutes: Some(30),
+            excluded_bundle_ids: None,
+            excluded_domains: None,
+            llm_provider: None,
+            llm_base_url: None,
+            llm_model: None,
+            llm_api_key: None,
+            model_download_endpoint: None,
+            cli_evidence_access: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"update_settings","summary_slot_minutes":30}"#
+        );
+    }
+
+    #[test]
+    fn app_settings_from_an_older_daemon_default_to_ten_minute_summaries() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.summary_slot_minutes,
+            DEFAULT_SUMMARY_SLOT_MINUTES
+        );
+        assert_eq!(
+            settings.summary_slot_minutes_options,
+            summary_slot_minutes_options()
+        );
+    }
+
+    #[test]
     fn cli_evidence_access_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::UpdateSettings {
             record_audio: None,
             ui_language: None,
             summary_language: None,
             storage_limit_bytes: None,
+            summary_slot_minutes: None,
             excluded_bundle_ids: None,
             excluded_domains: None,
             llm_provider: None,
