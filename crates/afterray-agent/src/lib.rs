@@ -7,7 +7,10 @@
 //!
 //! Tools stay in the daemon, where the vault is.
 
-use afterray_harness::{GenerateRequest, Message, ModelError, ModelSurface, StreamDelta};
+use afterray_harness::{
+    GenerateOutcome, GenerateRequest, GenerationUsage, Message, ModelError, ModelSurface,
+    StreamDelta,
+};
 use afterray_models::{
     ChatMessage, JobPriority, JobState, LlmDelta, LlmDeltaKind, LlmTokenSink, ModelInput,
     ModelOutput, ModelQueue, QueueError,
@@ -41,7 +44,7 @@ impl ModelSurface for QueueModel<'_> {
         &self,
         request: GenerateRequest<'_>,
         tokens: mpsc::Sender<StreamDelta>,
-    ) -> Result<String, ModelError> {
+    ) -> Result<GenerateOutcome, ModelError> {
         self.run_round(request, tokens).await
     }
 }
@@ -75,7 +78,7 @@ impl QueueModel<'_> {
         &self,
         request: GenerateRequest<'_>,
         tokens: mpsc::Sender<StreamDelta>,
-    ) -> Result<String, ModelError> {
+    ) -> Result<GenerateOutcome, ModelError> {
         // The outlet is armed inside the submit, while the job is still
         // pending. Arming afterwards left a gap in which an idle lane could
         // start the adapter first, so whether a round streamed at all came down
@@ -145,7 +148,16 @@ impl QueueModel<'_> {
             return Err(classify(&error));
         }
         match snapshot.output {
-            Some(ModelOutput::Llm { text }) if !text.trim().is_empty() => Ok(text),
+            Some(ModelOutput::Llm { text, usage }) if !text.trim().is_empty() => {
+                Ok(GenerateOutcome {
+                    text,
+                    usage: usage.map(|usage| GenerationUsage {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        generation_ms: usage.generation_ms,
+                    }),
+                })
+            }
             Some(ModelOutput::Llm { .. }) => Err(ModelError::Failed("empty llm text".into())),
             _ => Err(ModelError::Failed("wrong llm output type".into())),
         }

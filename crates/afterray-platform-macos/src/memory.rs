@@ -63,32 +63,8 @@ pub fn local_context_tokens() -> usize {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    unsafe extern "C" {
-        fn sysctlbyname(
-            name: *const core::ffi::c_char,
-            oldp: *mut core::ffi::c_void,
-            oldlenp: *mut usize,
-            newp: *mut core::ffi::c_void,
-            newlen: usize,
-        ) -> i32;
-    }
-
     pub fn total_memory_bytes() -> Option<u64> {
-        let name = c"hw.memsize";
-        let mut value: u64 = 0;
-        let mut length = size_of::<u64>();
-        // SAFETY: `name` is a NUL-terminated literal, and the out-pointer and
-        // its length describe the same `u64` that outlives the call.
-        let rc = unsafe {
-            sysctlbyname(
-                name.as_ptr(),
-                std::ptr::from_mut(&mut value).cast(),
-                &raw mut length,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (rc == 0 && value > 0).then_some(value)
+        crate::sysctl::scalar::<u64>(c"hw.memsize").filter(|bytes| *bytes > 0)
     }
 }
 

@@ -12,8 +12,22 @@ final class OverlayOpenRouteTests: XCTestCase {
             facts: DaySlotFacts(apps: [])
         )
         XCTAssertEqual(
-            OverlayOpenRoute.resolve(summarySlot: slot, hasSelectedSearch: true),
+            OverlayOpenRoute.resolve(intent: .summary(slot), hasSelectedSearch: true),
             .summary(slot)
+        )
+    }
+
+    func testMomentCitationWinsOverExistingSearch() {
+        XCTAssertEqual(
+            OverlayOpenRoute.resolve(intent: .moment("m1"), hasSelectedSearch: true),
+            .moment("m1")
+        )
+    }
+
+    func testEmptyIntentFallsBackToSelectedSearch() {
+        XCTAssertEqual(
+            OverlayOpenRoute.resolve(intent: nil, hasSelectedSearch: true),
+            .selectedSearch
         )
     }
 }

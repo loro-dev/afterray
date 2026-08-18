@@ -42,6 +42,11 @@ public struct RecallView: View {
     /// overlay. Nil falls back to opening in place, which is right for the
     /// labs and snapshots — they have no overlay in the way.
     public var onOpenWebLink: ((URL) -> Void)?
+    /// Opens the local-computation dashboard. Nil hides the button, which is
+    /// how the Visual Lab renders scenes without a daemon to ask.
+    public var onOpenCompute: (() -> Void)?
+    /// What that button shows at a glance, without being opened.
+    public var computeIndicator: ComputeIndicator
     /// Capture state shown as a word next to the gear. Nil `onToggleRecording`
     /// hides the control entirely — the Visual Lab drives scenes without a daemon.
     public var recordingState: DaemonRecordingState?
@@ -111,6 +116,8 @@ public struct RecallView: View {
         onReload: (() -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil,
         onOpenWebLink: ((URL) -> Void)? = nil,
+        onOpenCompute: (() -> Void)? = nil,
+        computeIndicator: ComputeIndicator = .idle,
         recordingState: DaemonRecordingState? = nil,
         isChangingRecording: Bool = false,
         onToggleRecording: (() -> Void)? = nil,
@@ -144,6 +151,8 @@ public struct RecallView: View {
         self.onReload = onReload
         self.onOpenSettings = onOpenSettings
         self.onOpenWebLink = onOpenWebLink
+        self.onOpenCompute = onOpenCompute
+        self.computeIndicator = computeIndicator
         self.recordingState = recordingState
         self.isChangingRecording = isChangingRecording
         self.onToggleRecording = onToggleRecording
@@ -532,6 +541,19 @@ public struct RecallView: View {
                                     showsDetails = true
                                 }
                             }
+                        )
+                    }
+
+                    // Left of the gear: a whole-app control, like Settings, but
+                    // one the user reaches for mid-task ("give me my GPU back")
+                    // rather than to configure something. It carries its own
+                    // state so the overlay answers "is AfterRay busy right now"
+                    // without being opened — the menu-bar copy of this button
+                    // can be hidden by a crowded menu bar, this one cannot.
+                    if let onOpenCompute {
+                        ComputeActivityButton(
+                            indicator: computeIndicator,
+                            action: onOpenCompute
                         )
                     }
 

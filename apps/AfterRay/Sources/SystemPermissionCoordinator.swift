@@ -11,15 +11,24 @@ final class SystemPermissionCoordinator: ObservableObject {
 
     @Published private(set) var screenRecording = false
     @Published private(set) var microphone = false
+    @Published private(set) var hasMicrophoneInput = false
     @Published private(set) var accessibility = false
     @Published private(set) var isRequesting = false
     @Published private(set) var recordsAudio = AfterRayPreferences.recordAudio
 
     private let defaults: UserDefaults
+    private let microphoneInputAvailable: () -> Bool
     private var preferenceObserver: NSObjectProtocol?
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        microphoneInputAvailable: @escaping () -> Bool = {
+            AVCaptureDevice.default(for: .audio) != nil
+        }
+    ) {
         self.defaults = defaults
+        self.microphoneInputAvailable = microphoneInputAvailable
+        hasMicrophoneInput = microphoneInputAvailable()
         preferenceObserver = NotificationCenter.default.addObserver(
             forName: .afterRayPreferencesDidChange,
             object: nil,
@@ -38,7 +47,20 @@ final class SystemPermissionCoordinator: ObservableObject {
     }
 
     var allGranted: Bool {
-        screenRecording && accessibility && (microphone || !recordsAudio)
+        SystemPermissionPolicy.allGranted(
+            screenRecording: screenRecording,
+            microphone: microphone,
+            hasMicrophoneInput: hasMicrophoneInput,
+            accessibility: accessibility,
+            recordsAudio: recordsAudio
+        )
+    }
+
+    var microphoneRequired: Bool {
+        SystemPermissionPolicy.microphoneRequired(
+            recordsAudio: recordsAudio,
+            hasMicrophoneInput: hasMicrophoneInput
+        )
     }
 
     func requestInitialPermissionsOnce() async {
@@ -53,15 +75,17 @@ final class SystemPermissionCoordinator: ObservableObject {
             screenRecording = CGRequestScreenCaptureAccess()
         }
 
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            microphone = true
-        case .notDetermined where reserveAutomaticRequest(for: .microphone):
-            microphone = await AVCaptureDevice.requestAccess(for: .audio)
-        case .notDetermined, .denied, .restricted:
-            microphone = false
-        @unknown default:
-            microphone = false
+        if microphoneRequired {
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized:
+                microphone = true
+            case .notDetermined where reserveAutomaticRequest(for: .microphone):
+                microphone = await AVCaptureDevice.requestAccess(for: .audio)
+            case .notDetermined, .denied, .restricted:
+                microphone = false
+            @unknown default:
+                microphone = false
+            }
         }
 
         if !accessibility, reserveAutomaticRequest(for: .accessibility) {
@@ -73,6 +97,7 @@ final class SystemPermissionCoordinator: ObservableObject {
     func refresh() {
         screenRecording = CGPreflightScreenCaptureAccess()
         microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        hasMicrophoneInput = microphoneInputAvailable()
         accessibility = AXIsProcessTrusted()
     }
 
@@ -80,10 +105,12 @@ final class SystemPermissionCoordinator: ObservableObject {
     /// prompts stay guarded by the ledger above, while a permission removed in
     /// System Settings can still be requested again without reinstalling.
     func requestAgain(_ permission: RequiredPermission) async {
+        refresh()
         switch permission {
         case .screenRecording:
             screenRecording = CGRequestScreenCaptureAccess()
         case .microphone:
+            guard hasMicrophoneInput else { return }
             if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
                 microphone = await AVCaptureDevice.requestAccess(for: .audio)
             }
@@ -117,6 +144,27 @@ final class SystemPermissionCoordinator: ObservableObject {
         guard requested.insert(permission.rawValue).inserted else { return false }
         defaults.set(requested.sorted(), forKey: Self.automaticRequestLedgerKey)
         return true
+    }
+}
+
+enum SystemPermissionPolicy {
+    static func microphoneRequired(recordsAudio: Bool, hasMicrophoneInput: Bool) -> Bool {
+        recordsAudio && hasMicrophoneInput
+    }
+
+    static func allGranted(
+        screenRecording: Bool,
+        microphone: Bool,
+        hasMicrophoneInput: Bool,
+        accessibility: Bool,
+        recordsAudio: Bool
+    ) -> Bool {
+        screenRecording
+            && accessibility
+            && (!microphoneRequired(
+                recordsAudio: recordsAudio,
+                hasMicrophoneInput: hasMicrophoneInput
+            ) || microphone)
     }
 }
 

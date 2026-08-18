@@ -218,11 +218,26 @@ private final class AfterRayMenuBar: NSObject {
 
     private var statusItem: NSStatusItem?
     private var pauseItem: NSMenuItem?
+    private var computeItem: NSMenuItem?
     private var isRecording = false
     private var shortcut = RecallHotKeyStore.shared.hotKey
+    private var preferenceObserver: NSObjectProtocol?
 
     private override init() {
         super.init()
+        // The compute dashboard is off by default and toggled in Advanced
+        // settings; the menu has to follow without being rebuilt.
+        preferenceObserver = NotificationCenter.default.addObserver(
+            forName: .afterRayPreferencesDidChange,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in AfterRayMenuBar.shared.refreshComputeItem() }
+        }
+    }
+
+    func refreshComputeItem() {
+        computeItem?.isHidden = !AfterRayPreferences.computeDashboardEnabled
     }
 
     func install() {
@@ -262,6 +277,16 @@ private final class AfterRayMenuBar: NSObject {
         pauseItem.target = self
         menu.addItem(pauseItem)
         self.pauseItem = pauseItem
+        let computeItem = NSMenuItem(
+            title: "Local Computation…",
+            action: #selector(openComputeActivity),
+            keyEquivalent: ""
+        )
+        computeItem.target = self
+        // Hidden unless the user asked for the dashboard in Advanced settings.
+        computeItem.isHidden = !AfterRayPreferences.computeDashboardEnabled
+        menu.addItem(computeItem)
+        self.computeItem = computeItem
         let clearHour = NSMenuItem(
             title: "Delete Last Hour",
             action: #selector(deleteLastHour),
@@ -313,6 +338,10 @@ private final class AfterRayMenuBar: NSObject {
 
     @objc private func openSettings() {
         AfterRaySettingsController.shared.show()
+    }
+
+    @objc private func openComputeActivity() {
+        ComputeActivityWindowController.shared.show()
     }
 
     @objc private func toggleCapture() {
@@ -442,7 +471,11 @@ final class RecallOverlayController: RecallHotKeyBinding {
             queue: .main
         ) { _ in
             Task { @MainActor in
-                if AfterRaySettingsController.shared.isPresented { return }
+                // Settings, the compute dashboard and chat are their own windows
+                // now. Losing key to one of them is not a reason to tear the
+                // overlay down behind it.
+                if AfterRaySettingsController.shared.isVisible { return }
+                if ComputeActivityWindowController.shared.isVisible { return }
                 RecallOverlayController.shared.hide(returnFocus: false)
             }
         }
@@ -502,6 +535,14 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 
     func show(navigatingTo summarySlot: DaySlotSummary? = nil) {
+        present(intent: summarySlot.map { .summary($0) })
+    }
+
+    func show(navigatingToMoment momentID: String) {
+        present(intent: .moment(momentID))
+    }
+
+    private func present(intent: OverlayOpenIntent? = nil) {
         guard let panel else { return }
         PermissionGuideController.shared.hide()
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
@@ -518,7 +559,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         // Publish only after the panel is key. The query bar handles this on
         // the next main-actor turn, so its text field becomes first responder
         // instead of losing a race to the panel itself.
-        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: summarySlot)
+        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: intent)
         AfterRayMenuBar.shared.setOverlayVisible(true)
         OverlayVisibility.shared.set(true)
         setCapturePaused(true)
@@ -595,10 +636,6 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 
     fileprivate func closeFromKeyboard() {
-        if AfterRaySettingsController.shared.isPresented {
-            AfterRaySettingsController.shared.hide()
-            return
-        }
         if PermissionGuideController.shared.isVisible {
             PermissionGuideController.shared.hide()
             return
@@ -942,12 +979,16 @@ private struct AfterRayRootView: View {
     @ObservedObject private var audioPlayer = AfterRayServices.shared.audioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
     @ObservedObject private var overlayLayout = RecallOverlayLayout.shared
-    @ObservedObject private var settings = AfterRaySettingsController.shared
-    // The overlay observes chat directly. Keeping it non-observed here stops a
-    // token from rebuilding the entire recall surface underneath the panel.
+    @ObservedObject private var computeModel = AfterRayServices.shared.compute
+    /// Mirrors the Advanced-settings switch. Off by default, so the overlay's
+    /// chrome cluster carries one fewer button for everyone who never asked
+    /// what their machine is doing.
+    @State private var showsComputeButton = AfterRayPreferences.computeDashboardEnabled
+    // Chat lives in its own window (`ChatWindowController`) so a token
+    // never rebuilds the recall surface. The model is shared so lock/sleep
+    // can still wipe it here.
     private let chat = AfterRayServices.shared.chat
     @State private var isLive = true
-    @State private var isChatPresented = false
     @State private var queryMode = ImmersiveQueryMode.search
     @State private var queryFocusRequest: UInt64 = 0
     private let images = AfterRayServices.shared.images
@@ -986,6 +1027,10 @@ private struct AfterRayRootView: View {
                 RecallOverlayController.shared.hide(returnFocus: false)
                 NSWorkspace.shared.open(url)
             },
+            onOpenCompute: showsComputeButton
+                ? { ComputeActivityWindowController.shared.toggle() }
+                : nil,
+            computeIndicator: computeModel.indicator,
             recordingState: control.status?.recordingState,
             isChangingRecording: control.isChangingRecording,
             onToggleRecording: toggleRecording,
@@ -1044,35 +1089,30 @@ private struct AfterRayRootView: View {
                     .transition(.opacity)
             }
         }
-        .overlay {
-            if settings.isPresented {
-                AfterRaySettingsOverlay(
-                    model: settings.model,
-                    onClose: { settings.hide() }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+        // Tied to the overlay being *visible*, not to this view's lifetime: the
+        // panel is `orderOut`-ed rather than torn down, so `onDisappear` never
+        // fires and an `onAppear` watcher would poll for the life of the process
+        // — the exact background load this dashboard exists to report on.
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { _ in
+            if showsComputeButton { computeModel.startWatching() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
+            if showsComputeButton { computeModel.stopWatching() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayPreferencesDidChange)) { _ in
+            let enabled = AfterRayPreferences.computeDashboardEnabled
+            guard enabled != showsComputeButton else { return }
+            showsComputeButton = enabled
+            // Start or stop the button's own poll with the switch, not just its
+            // visibility: an invisible watcher is the whole failure mode this
+            // panel exists to warn about.
+            if enabled {
+                if RecallOverlayController.shared.isVisible { computeModel.startWatching() }
+            } else {
+                computeModel.stopWatching()
             }
         }
-        .overlay {
-            if isChatPresented {
-                AfterRayChatOverlay(
-                    model: chat,
-                    onClose: { isChatPresented = false },
-                    onOpenMoment: openChatMoment,
-                    thumbnailLoader: { momentID in
-                        try await images.thumbnail(momentID: momentID).bytes
-                    }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-            }
-        }
-        .animation(.easeOut(duration: 0.16), value: settings.isPresented)
-        .animation(.easeOut(duration: 0.16), value: isChatPresented)
         .onExitCommand {
-            if isChatPresented {
-                isChatPresented = false
-                return
-            }
             audioPlayer.stop()
             RecallOverlayController.shared.hide(returnFocus: true)
         }
@@ -1117,7 +1157,7 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { notification in
             audioPlayer.stop()
-            if permissions.allGranted, !settings.isPresented, !isChatPresented {
+            if permissions.allGranted, !AfterRaySettingsController.shared.isVisible {
                 queryFocusRequest &+= 1
             }
             // A search outlives the overlay being dismissed, and its filmstrip
@@ -1126,11 +1166,13 @@ private struct AfterRayRootView: View {
             // into a live search lands back on the selected result instead.
             let selectedSearch = control.searchSession?.selectedFrame != nil
             switch OverlayOpenRoute.resolve(
-                summarySlot: notification.object as? DaySlotSummary,
+                intent: notification.object as? OverlayOpenIntent,
                 hasSelectedSearch: selectedSearch
             ) {
             case .summary(let slot):
                 openSummarySlot(slot)
+            case .moment(let momentID):
+                openCitedMoment(momentID)
             case .selectedSearch:
                 guard let session = control.searchSession else { return }
                 selectSearchFrame(session.selectedIndex)
@@ -1160,9 +1202,10 @@ private struct AfterRayRootView: View {
             store.clearSensitiveState()
             control.clearSensitiveState()
             chat.clearSensitiveState()
-            isChatPresented = false
+            ChatWindowController.shared.close()
             clearRecallDecodedImageCache()
             RecallThumbnailCache.shared.clearSensitiveData()
+            RecallChatPreviewCache.shared.clearSensitiveData()
             Task { await images.clearSensitiveData() }
             Task { try? await SummaryExportFileStore.shared.cleanupAll() }
         }
@@ -1266,12 +1309,6 @@ private struct AfterRayRootView: View {
         }
     }
 
-    private func openSearchHit(_ hit: RecallSearchHit) {
-        control.dismissSearch()
-        enterHistory()
-        Task { await store.openSearchHit(hit) }
-    }
-
     /// Runs the query and lands on the newest match without a second click.
     /// Recall almost always means "the thing I just had open".
     private func submitSearch() {
@@ -1323,34 +1360,31 @@ private struct AfterRayRootView: View {
             let question = control.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !question.isEmpty else { return }
             control.searchQuery = ""
-            openChat(draft: question, send: true)
+            openChat(draft: question, send: true, startsNewConversation: true)
         }
     }
 
-    private func openChat(draft: String = "", send: Bool = false) {
+    private func openChat(
+        draft: String = "",
+        send: Bool = false,
+        startsNewConversation: Bool = false
+    ) {
         control.dismissSearch()
-        isChatPresented = true
-        if !draft.isEmpty {
-            chat.draft = draft
-        }
-        Task {
-            await chat.refresh()
-            if send { chat.send() }
-        }
+        ChatWindowController.shared.show(
+            draft: draft,
+            send: send,
+            startsNewConversation: startsNewConversation
+        )
     }
 
-    private func openChatMoment(_ momentID: String) {
-        isChatPresented = false
-        openSearchHit(
-            RecallSearchHit(
-                momentId: momentID,
-                sessionId: "",
-                capturedAtMs: 0,
-                source: "chat",
-                text: "",
-                score: 1
-            )
-        )
+    /// A citation from the standalone chat window. The overlay comes up on
+    /// this moment; the chat window stays put so the stream can keep going.
+    private func openCitedMoment(_ momentID: String) {
+        control.dismissSearch()
+        enterHistory()
+        if !store.selectLoaded(momentID: momentID) {
+            Task { await store.openMoment(id: momentID) }
+        }
     }
 }
 
@@ -1371,13 +1405,11 @@ private struct PermissionPanel: View {
                             .tracking(1.1)
                     }
                     .foregroundStyle(RecallPalette.ray)
-                    Text(coordinator.recordsAudio
+                    Text(coordinator.microphoneRequired
                          ? "Three local permissions are required"
                          : "Two local permissions are required")
                         .font(.title2.weight(.semibold))
-                    Text(coordinator.recordsAudio
-                         ? "AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded."
-                         : "Audio recording is off, so the microphone is optional. Screen and Accessibility are still required.")
+                    Text(permissionSummary)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1422,16 +1454,31 @@ private struct PermissionPanel: View {
         }
     }
 
+    private var permissionSummary: String {
+        if !coordinator.recordsAudio {
+            return "Audio recording is off, so the microphone is optional. Screen and Accessibility are still required."
+        }
+        if !coordinator.hasMicrophoneInput {
+            return "No microphone input is connected. AfterRay can still record screen and system audio, so microphone access is not required."
+        }
+        return "AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded."
+    }
+
     private func permissionRow(_ permission: RequiredPermission) -> some View {
         let granted = isGranted(permission)
+        let unavailable = permission == .microphone && !coordinator.hasMicrophoneInput
         return HStack(spacing: 12) {
             Image(systemName: permission.icon)
                 .frame(width: 22)
-                .foregroundStyle(granted ? Color.green : Color.red)
+                .foregroundStyle(unavailable ? Color.secondary : (granted ? Color.green : Color.red))
             Text(permission.title)
                 .font(.callout.weight(.medium))
             Spacer()
-            if granted {
+            if unavailable {
+                Label("No input device", systemImage: "minus.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if granted {
                 Label("Allowed", systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
@@ -1467,25 +1514,6 @@ private struct PermissionPanel: View {
     }
 }
 
-private struct AfterRaySettingsOverlay: View {
-    @ObservedObject var model: AfterRaySettingsModel
-    let onClose: () -> Void
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.42)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onClose)
-            AfterRaySettingsView(model: model, onClose: onClose)
-                .recallGlass(in: .rounded(14))
-                .shadow(color: .black.opacity(0.35), radius: 28, y: 12)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-
 /// One line for both ways of asking the vault a question. It stays one line in
 /// either mode — the chat panel is where an answer goes, and it opens on send
 /// or on the chat button, never merely because you pressed Tab.
@@ -1502,15 +1530,19 @@ private struct ImmersiveQueryBar: View {
     var body: some View {
         HStack(spacing: 10) {
             Button(action: toggleMode) {
-                Label(mode.title, systemImage: mode.symbol)
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(mode == .ask ? RecallPalette.ray : .white.opacity(0.76))
-                    .padding(.horizontal, 9)
-                    .frame(height: 26)
-                    .background(.white.opacity(0.08), in: Capsule())
-                    .contentShape(Capsule())
+                HStack(spacing: 5) {
+                    queryModeIcon
+                    Text(mode.title)
+                }
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(mode == .ask ? RecallPalette.ray : .white.opacity(0.86))
+                .padding(.horizontal, 9)
+                .frame(height: 26)
+                .background(.white.opacity(0.08), in: Capsule())
+                .contentShape(Capsule())
+                .recallHoverFill(in: Capsule())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RecallGlassPressStyle())
             .help("\(mode.toggleHelp) (Tab)")
             .accessibilityLabel("Input mode")
             .accessibilityValue(mode.title)
@@ -1553,10 +1585,14 @@ private struct ImmersiveQueryBar: View {
             Button(action: onOpenChat) {
                 Image(systemName: "bubble.left.and.bubble.right")
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.78))
+                    .foregroundStyle(.white.opacity(0.86))
                     .frame(width: 26, height: 26)
+                    .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .recallHoverFill(
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RecallGlassPressStyle())
             .help("Open chat")
             .accessibilityLabel("Open chat")
 
@@ -1585,8 +1621,29 @@ private struct ImmersiveQueryBar: View {
         }
     }
 
+    /// Search and Ask share one slot. Both glyphs stay mounted so the swap
+    /// can cross-fade instead of popping — hover/click is frequent, so the
+    /// motion stays short and the label still names the state.
+    private var queryModeIcon: some View {
+        ZStack {
+            Image(systemName: ImmersiveQueryMode.search.symbol)
+                .opacity(mode == .search ? 1 : 0)
+                .scaleEffect(mode == .search ? 1 : 0.25)
+                .blur(radius: mode == .search ? 0 : 4)
+            Image(systemName: ImmersiveQueryMode.ask.symbol)
+                .opacity(mode == .ask ? 1 : 0)
+                .scaleEffect(mode == .ask ? 1 : 0.25)
+                .blur(radius: mode == .ask ? 0 : 4)
+        }
+        .frame(width: 11, height: 11)
+        .animation(.easeOut(duration: 0.18), value: mode)
+        .accessibilityHidden(true)
+    }
+
     private func toggleMode() {
-        mode.toggle()
+        withAnimation(.easeOut(duration: 0.18)) {
+            mode.toggle()
+        }
         isInputFocused = true
     }
 

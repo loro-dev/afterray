@@ -94,8 +94,10 @@ final class ChatWireTests: XCTestCase {
 
         ChatStreamReducer.apply(.progress(progress), to: &state)
         XCTAssertNotNil(state.progress)
+        XCTAssertEqual(state.lastElapsedMs, 800)
         ChatStreamReducer.apply(.token(text: "OK"), to: &state)
         XCTAssertNil(state.progress)
+        XCTAssertEqual(state.lastElapsedMs, 800, "token must not wipe the turn clock")
 
         ChatStreamReducer.apply(.progress(progress), to: &state)
         ChatStreamReducer.apply(.toolCall(name: "get_now", argsJSON: "{}"), to: &state)
@@ -122,6 +124,26 @@ final class ChatWireTests: XCTestCase {
         XCTAssertTrue(state.receivedWork)
     }
 
+    /// A tool between thoughts is its own part. Merging every round into
+    /// `state.reasoning` and rendering that above the tools is what hid
+    /// think → tool → think as one chip.
+    func testReducerDoesNotMergeThoughtsAcrossATool() {
+        var state = ChatStreamState()
+        ChatStreamReducer.apply(.reasoning(text: "check", round: 1), to: &state)
+        ChatStreamReducer.apply(.toolCall(name: "get_slot_card", argsJSON: "{}"), to: &state)
+        ChatStreamReducer.apply(.reasoning(text: "use it", round: 2), to: &state)
+        XCTAssertEqual(state.parts.count, 3)
+        XCTAssertEqual(
+            state.parts.map { part -> String in
+                switch part {
+                case .reasoning(_, let round, _): "r\(round)"
+                case .tool(let call): call.name
+                }
+            },
+            ["r1", "get_slot_card", "r2"]
+        )
+    }
+
     func testUsageAndCompactionDecodeFromTheWire() throws {
         let usage = try ChatStreamEventDecoder.decode(
             line: Data(#"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2}"#.utf8)
@@ -135,6 +157,21 @@ final class ChatWireTests: XCTestCase {
         XCTAssertEqual(value.fraction, 5_120.0 / 16_384.0, accuracy: 0.0001)
         XCTAssertFalse(value.isTight)
         XCTAssertEqual(value.shortLabel, "5.1k / 16k")
+        XCTAssertEqual(value.percentLabel, "31%")
+        XCTAssertEqual(value.completionTokens, 0)
+        XCTAssertNil(value.tokensPerSecond)
+
+        let withRate = try ChatStreamEventDecoder.decode(
+            line: Data(
+                #"{"kind":"usage","prompt_tokens":5120,"window_tokens":16384,"round":2,"completion_tokens":240,"generation_ms":2000}"#.utf8
+            )
+        )
+        guard case .usage(let rated)? = withRate else {
+            return XCTFail("expected a usage event with completion counts")
+        }
+        XCTAssertEqual(rated.completionTokens, 240)
+        XCTAssertEqual(rated.generationMs, 2_000)
+        XCTAssertEqual(rated.tokensPerSecond ?? 0, 120, accuracy: 0.01)
 
         let compaction = try ChatStreamEventDecoder.decode(
             line: Data(

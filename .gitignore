@@ -23,3 +23,6 @@ __pycache__/
 # Local state written by `wrangler pages dev` (simulated R2, build cache).
 /.wrangler/
 /site/.wrangler/
+
+# Local clones of open-source reference UIs (not shipped)
+.ref-libs/

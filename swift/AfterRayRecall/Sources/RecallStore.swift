@@ -445,6 +445,26 @@ public actor RecallImageRepository {
         try await daemon.thumbnail(momentID: momentID, maxEdge: nil)
     }
 
+    public func moment(id: String) async throws -> RecallMoment {
+        try await daemon.moment(id: id)
+    }
+
+    /// Chat-card pixels: the hot still when it is still on disk, otherwise the
+    /// exact GOP frame. Never the 360px filmstrip JPEG.
+    public func chatPreviewBytes(for moment: RecallMoment) async throws -> Data {
+        if let stillID = moment.imageArtifactId {
+            do {
+                return try await data(artifactID: stillID)
+            } catch {
+                if moment.gop == nil { throw error }
+            }
+        }
+        if moment.gop != nil {
+            return try await data(artifactID: moment.displayCacheKey)
+        }
+        throw DaemonClientError.missingData
+    }
+
     public func ocrEvidence(momentID: String) async throws -> OcrEvidence {
         try await daemon.evidenceOcr(momentID: momentID)
     }
