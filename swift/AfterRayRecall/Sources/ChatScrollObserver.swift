@@ -3,6 +3,10 @@ import SwiftUI
 
 /// macOS 14 compatibility bridge for the scroll geometry and live-scroll
 /// signals that SwiftUI exposes natively only on macOS 15.
+///
+/// Read-only: the callback must not request `scrollTo`. `updateNSView`
+/// must not re-emit when already attached — that plus a state write is a
+/// layout loop.
 struct ChatScrollObserver: NSViewRepresentable {
     let onChange: @MainActor (ChatScrollMetrics) -> Void
 
@@ -40,6 +44,7 @@ struct ChatScrollObserver: NSViewRepresentable {
         private weak var documentView: NSView?
         private var observers: [NSObjectProtocol] = []
         private var isLiveScrolling = false
+        private var lastMetrics: ChatScrollMetrics?
 
         init(onChange: @escaping @MainActor (ChatScrollMetrics) -> Void) {
             self.onChange = onChange
@@ -48,7 +53,6 @@ struct ChatScrollObserver: NSViewRepresentable {
         func attach(to candidate: NSScrollView?) {
             guard let candidate else { return }
             guard scrollView !== candidate || documentView !== candidate.documentView else {
-                emitMetrics()
                 return
             }
 
@@ -105,6 +109,7 @@ struct ChatScrollObserver: NSViewRepresentable {
             scrollView = nil
             documentView = nil
             isLiveScrolling = false
+            lastMetrics = nil
         }
 
         private func emitMetrics() {
@@ -116,13 +121,14 @@ struct ChatScrollObserver: NSViewRepresentable {
             } else {
                 distance = visible.minY - documentView.bounds.minY
             }
-            onChange(
-                ChatScrollMetrics(
-                    distanceFromBottom: max(0, distance),
-                    isUserScrolling: isLiveScrolling,
-                    contentHeight: documentView.bounds.height
-                )
+            let metrics = ChatScrollMetrics(
+                distanceFromBottom: max(0, distance),
+                isUserScrolling: isLiveScrolling,
+                contentHeight: documentView.bounds.height
             )
+            guard lastMetrics != metrics else { return }
+            lastMetrics = metrics
+            onChange(metrics)
         }
     }
 }

@@ -68,7 +68,7 @@ final class ChatAutoScrollStateTests: XCTestCase {
         XCTAssertFalse(state.shouldShowLatestButton)
     }
 
-    func testStreamingFrameDriftWhileFollowingSticks() {
+    func testStreamingFrameDriftWhileFollowingDoesNotScrollTo() {
         var state = ChatAutoScrollState()
         _ = state.noteSendingChanged(true)
 
@@ -77,7 +77,7 @@ final class ChatAutoScrollStateTests: XCTestCase {
             isSending: true
         )
 
-        XCTAssertEqual(action, .scrollToLatest)
+        XCTAssertEqual(action, .none)
         XCTAssertTrue(state.isFollowingLatest)
     }
 
@@ -131,7 +131,7 @@ final class ChatAutoScrollStateTests: XCTestCase {
             isSending: true
         )
 
-        XCTAssertEqual(action, .scrollToLatest)
+        XCTAssertEqual(action, .none)
         XCTAssertTrue(state.isFollowingLatest)
         XCTAssertFalse(state.shouldShowLatestButton)
     }
@@ -194,7 +194,7 @@ final class ChatAutoScrollStateTests: XCTestCase {
         XCTAssertTrue(state.isFollowingLatest)
     }
 
-    func testSmallShrinkWhileStreamingStillSticks() {
+    func testSmallShrinkWhileStreamingDoesNotScrollTo() {
         var state = ChatAutoScrollState()
         _ = state.noteSendingChanged(true)
         _ = state.decide(metrics: .stub(distance: 0, height: 800), isSending: true)
@@ -204,7 +204,25 @@ final class ChatAutoScrollStateTests: XCTestCase {
             isSending: true
         )
 
-        XCTAssertEqual(action, .scrollToLatest)
+        XCTAssertEqual(action, .none)
+    }
+
+    func testStreamingGeometryNeverRequestsScrollTo() {
+        var state = ChatAutoScrollState()
+        _ = state.noteSendingChanged(true)
+
+        let far = state.decide(
+            metrics: .stub(distance: 240, height: 1_200),
+            isSending: true
+        )
+        let again = state.decide(
+            metrics: .stub(distance: 8, height: 1_280),
+            isSending: true
+        )
+
+        XCTAssertEqual(far, .none)
+        XCTAssertEqual(again, .none)
+        XCTAssertTrue(state.isFollowingLatest)
     }
 
     func testLiveScrollCancelsPendingEndSnap() {

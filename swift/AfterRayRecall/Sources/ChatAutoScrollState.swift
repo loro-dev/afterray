@@ -2,18 +2,19 @@ import CoreGraphics
 
 /// User intent for a growing chat transcript.
 ///
-/// Content growth never disables following by itself. Only a live user scroll
-/// can do that, which prevents a streaming token from being mistaken for the
-/// user moving away from the answer.
+/// Streaming follow is `defaultScrollAnchor(.bottom)` in the view — this
+/// machine never asks for `scrollTo` on a geometry tick. Only a live user
+/// scroll can disable following, so a growing last bubble is not mistaken
+/// for the user moving away.
 ///
-/// Continuous stick-to-bottom runs only while a turn is streaming. When the
-/// turn ends, at most one snap is issued — and never across a large content
-/// collapse, which used to dump the viewport into empty space.
+/// `scrollTo` stays discrete: open / switch, Latest, a new send, and at
+/// most one snap when the turn ends. A large content collapse never pairs
+/// with that snap (it used to dump the viewport into empty space).
 struct ChatAutoScrollState: Equatable, Sendable {
     static let nearBottomThreshold: CGFloat = 40
-    /// Reasoning fold / streaming-row swap at end of turn. Scrolling across a
-    /// drop this large unloads lazy cells and flashes white.
+    /// Reasoning fold / streaming-row swap at end of turn.
     static let collapseSkipThreshold: CGFloat = 24
+    /// One-shot end-of-stream residual. Not used for continuous stick.
     static let stickDistanceThreshold: CGFloat = 1
 
     private(set) var isFollowingLatest = true
@@ -72,6 +73,9 @@ struct ChatAutoScrollState: Equatable, Sendable {
         return .scrollToLatest
     }
 
+    /// Read-only against the scroll view: update follow intent, never stick
+    /// while a turn is streaming. `scrollTo` from bounds-change is the
+    /// main-thread 100% loop.
     mutating func decide(metrics: ChatScrollMetrics, isSending: Bool) -> ChatScrollAction {
         let previousHeight = lastContentHeight
         let heightDelta = metrics.contentHeight - previousHeight
@@ -92,6 +96,12 @@ struct ChatAutoScrollState: Equatable, Sendable {
 
         guard isFollowingLatest else { return .none }
 
+        if isSending {
+            return .none
+        }
+
+        guard pendingEndOfStreamSnap else { return .none }
+
         let collapsed = previousHeight > 0
             && metrics.contentHeight > 0
             && heightDelta <= -Self.collapseSkipThreshold
@@ -100,13 +110,6 @@ struct ChatAutoScrollState: Equatable, Sendable {
             return .none
         }
 
-        if isSending {
-            return metrics.distanceFromBottom > Self.stickDistanceThreshold
-                ? .scrollToLatest
-                : .none
-        }
-
-        guard pendingEndOfStreamSnap else { return .none }
         pendingEndOfStreamSnap = false
         return metrics.distanceFromBottom > Self.stickDistanceThreshold
             ? .scrollToLatest

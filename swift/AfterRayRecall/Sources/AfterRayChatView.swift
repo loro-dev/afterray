@@ -49,6 +49,8 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     @StateObject private var sidebarState: ChatSidebarState
     @State private var autoScrollState = ChatAutoScrollState()
     @State private var scrollToLatestRequest: UInt64 = 0
+    @State private var latestScrollInFlight = false
+    @State private var latestScrollQueued = false
     @State private var conversationQuery = ""
     @State private var modelPickerOpen = false
     @State private var moreMenuOpen = false
@@ -370,16 +372,24 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .padding(.vertical, 16)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                // macOS 14: pin growing content only while a turn is streaming
-                // and the user still wants latest. Idle size changes must not
-                // consult a bottom anchor — that is the old re-stick trap.
+                // Pin growth while a turn is streaming and the user still
+                // wants latest. Do not also scrollTo from geometry ticks —
+                // that relayouts the eager transcript on the main thread.
                 .defaultScrollAnchor(pinsToBottom ? .bottom : nil)
                 .background(ScrollFenceView())
                 .task(id: scrollToLatestRequest) {
                     guard scrollToLatestRequest > 0 else { return }
                     await Task.yield()
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled else {
+                        latestScrollInFlight = false
+                        return
+                    }
                     proxy.scrollTo(ChatMetrics.bottomAnchorID, anchor: .bottom)
+                    latestScrollInFlight = false
+                    if latestScrollQueued {
+                        latestScrollQueued = false
+                        requestLatestScroll()
+                    }
                 }
 
                 if autoScrollState.shouldShowLatestButton {
@@ -392,9 +402,6 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 if !model.isLoadingHistory, !model.bubbles.isEmpty {
                     applyScrollAction(autoScrollState.noteConversationContentReady())
                 }
-            }
-            .onChange(of: model.bubbles.last?.text) { _, _ in
-                requestLatestScrollIfFollowing()
             }
             .onChange(of: model.bubbles.count) { _, count in
                 if count > 0, !model.isSending {
@@ -443,11 +450,6 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         applyScrollAction(autoScrollState.decide(metrics: metrics, isSending: model.isSending))
     }
 
-    private func requestLatestScrollIfFollowing() {
-        guard autoScrollState.isFollowingLatest, model.isSending else { return }
-        requestLatestScroll()
-    }
-
     private func followLatest() {
         autoScrollState.followLatest()
         requestLatestScroll()
@@ -460,6 +462,11 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private func requestLatestScroll() {
+        if latestScrollInFlight {
+            latestScrollQueued = true
+            return
+        }
+        latestScrollInFlight = true
         scrollToLatestRequest &+= 1
     }
 
