@@ -265,6 +265,10 @@ private struct AccessibilitySnapshot: Encodable {
     let truncated: Bool
     let digest: AccessibilityDigest
     let root: AccessibilityNode
+    /// The same tree as numbered indented text, or the diff from this window's
+    /// previous one (docs/event-capture-v2-plan.md §4). Purely additive: `root`
+    /// and `digest` are unchanged and every existing consumer keeps working.
+    let treeText: AccessibilityTreeText?
 
     enum CodingKeys: String, CodingKey {
         case capturedAtMs = "captured_at_ms"
@@ -274,8 +278,85 @@ private struct AccessibilitySnapshot: Encodable {
         case windowTitle = "window_title"
         case url, document, truncated, digest, root
         case privateBrowsing = "private_browsing"
+        case treeText = "tree_text"
     }
 }
+
+/// The wire shape of `CaptureTreeTextEnvelope`.
+private struct AccessibilityTreeText: Encodable {
+    let mode: String
+    let text: String?
+    let chain: String
+    let sequence: Int
+
+    enum CodingKeys: String, CodingKey {
+        case mode, text, chain
+        case sequence = "seq"
+    }
+
+    init(_ envelope: CaptureTreeTextEnvelope) {
+        mode = envelope.mode.rawValue
+        text = envelope.text
+        chain = envelope.chain
+        sequence = envelope.sequence
+    }
+}
+
+/// The shim's `AccessibilityNode` as the pure value type the text encoding and
+/// the diff work on. Frames round to whole points — the precision a citation's
+/// crop needs, and all the text encoding would ever carry.
+private func captureTreeNode(from node: AccessibilityNode) -> CaptureTreeNode {
+    CaptureTreeNode(
+        role: node.role,
+        subrole: node.subrole,
+        title: node.title,
+        nodeDescription: node.nodeDescription,
+        value: node.value,
+        url: node.url,
+        document: node.document,
+        frame: node.frame.map {
+            CaptureTreeFrame(
+                x: Int($0.x.rounded()),
+                y: Int($0.y.rounded()),
+                width: Int($0.width.rounded()),
+                height: Int($0.height.rounded())
+            )
+        },
+        children: node.children.map(captureTreeNode(from:))
+    )
+}
+
+/// The process-wide diff chains, shared by the heartbeat walk (main thread) and
+/// the attached walks (the input monitor's worker queue).
+///
+/// A lock rather than an actor: both callers are synchronous at the point they
+/// stage and commit, and the critical section is one dictionary lookup plus a
+/// tree render the caller has to pay for anyway.
+private final class CaptureTreeChainStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var chains: CaptureTreeChains
+
+    init() {
+        chains = CaptureTreeChains(processTag: String(UUID().uuidString.prefix(8)))
+    }
+
+    func stage(scope: CaptureTreeScope, tree: CaptureTreeNode) -> StagedCaptureTreeText {
+        lock.lock()
+        defer { lock.unlock() }
+        return chains.stage(scope: scope, tree: tree)
+    }
+
+    /// Advances the chain, once the artifact carrying the staged text is on its
+    /// way out. Never call it for an artifact that was dropped or deleted: the
+    /// next diff would be taken against a tree the consumer never received.
+    func commit(_ staged: StagedCaptureTreeText) {
+        lock.lock()
+        defer { lock.unlock() }
+        chains.commit(staged)
+    }
+}
+
+private let captureTreeChains = CaptureTreeChainStore()
 
 private struct AccessibilityDigest: Encodable {
     let applicationName: String?
@@ -596,7 +677,10 @@ private func appendUnique(_ items: inout [String], _ value: String, limit: Int) 
 }
 
 private enum AccessibilityCapture {
-    case artifact(URL, context: ForegroundCaptureContext)
+    /// The written snapshot, plus the tree-text decision that snapshot carries.
+    /// The decision travels with it because the caller can still drop the
+    /// artifact — only a caller that emits it may advance the chain.
+    case artifact(URL, context: ForegroundCaptureContext, treeText: StagedCaptureTreeText)
     case privateBrowsing(BrowserPrivacyEvidence)
     case foregroundChanged
 }
@@ -790,6 +874,16 @@ private func captureAccessibilityTree(
     let encoder = AccessibilityTreeEncoder()
     let encodedRoot = encoder.encode(captureRoot)
     let privateBrowsing = false
+    let staged = captureTreeChains.stage(
+        scope: CaptureTreeScope(
+            processId: application.processIdentifier,
+            windowTitle: windowTitle ?? encoder.windowTitle,
+            // A browser capture is rooted at the window, everything else at the
+            // application element; the chain has to know which.
+            walk: preflightDetector.isKnownBrowser ? .window : .application
+        ),
+        tree: captureTreeNode(from: encodedRoot)
+    )
     let snapshot = AccessibilitySnapshot(
         capturedAtMs: capturedAtMs,
         processId: application.processIdentifier,
@@ -806,7 +900,8 @@ private func captureAccessibilityTree(
             windowTitle: windowTitle ?? encoder.windowTitle,
             privateBrowsing: privateBrowsing
         ),
-        root: encodedRoot
+        root: encodedRoot,
+        treeText: AccessibilityTreeText(staged.envelope)
     )
     guard foregroundCaptureContextIsCurrent(context) else {
         return .foregroundChanged
@@ -816,7 +911,7 @@ private func captureAccessibilityTree(
         .appendingPathExtension("json")
     try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
     try hardenPrivateFile(url)
-    return .artifact(url, context: context)
+    return .artifact(url, context: context, treeText: staged)
 }
 
 private func capturedForegroundApplication() -> NSRunningApplication? {
@@ -852,6 +947,16 @@ private func frontWindowTitle(appElement: AXUIElement, processId: pid_t, treeTit
     }
     if let treeTitle { return treeTitle }
     return cgWindowName(for: processId)
+}
+
+/// The front window title of a process, for the `window_changed` record. Same
+/// resolution order as a capture's title, with no walked tree to fall back on.
+private func frontWindowTitleOfProcess(_ processId: pid_t) -> String? {
+    frontWindowTitle(
+        appElement: AXUIElementCreateApplication(processId),
+        processId: processId,
+        treeTitle: nil
+    )
 }
 
 private func frontWindowElement(_ appElement: AXUIElement) -> AXUIElement? {
@@ -1333,7 +1438,7 @@ private func captureScreen(
     if case .foregroundChanged = accessibility {
         return
     }
-    guard case let .artifact(accessibilityURL, context) = accessibility else { return }
+    guard case let .artifact(accessibilityURL, context, treeText) = accessibility else { return }
     guard foregroundCaptureContextIsCurrent(context) else {
         try? FileManager.default.removeItem(at: accessibilityURL)
         return
@@ -1391,6 +1496,10 @@ private func captureScreen(
             endedAtMs: now,
             requestId: requestId
         ))
+        // The snapshot is out; only now may the chain move past it. Every
+        // `return` above this line leaves the artifact deleted and the chain
+        // exactly where the consumer's last received tree left it.
+        captureTreeChains.commit(treeText)
     } catch {
         try? FileManager.default.removeItem(at: screenURL)
         try? FileManager.default.removeItem(at: accessibilityURL)
@@ -1400,13 +1509,21 @@ private func captureScreen(
 
 // MARK: - Input events (listen-only)
 //
-// CAP-005 discipline is enforced here, at the source (see
-// docs/input-events-and-t1-acts-plan.md): plain keystrokes exist only as
-// burst counts — key codes are read solely to classify command keys and never
-// leave the tap callback; pointer coordinates live exactly as long as the
-// element resolution they feed. Return/Tab/Esc count as command keys
-// (2026-08-17 decision): they carry no character content and their
-// "submit/execute" semantics is the strongest read-vs-write signal T1 has.
+// The trust model changed on 2026-08-18 (docs/event-capture-v2-plan.md
+// §信任模型变更): CAP-005's ban on keystroke content is retired, because
+// everything is processed locally, the vault is encrypted, and nothing leaves
+// the machine without the user's explicit say-so. Typed characters and the
+// value of the field they landed in may now be recorded.
+//
+// One guard survives, and it is absolute: inside a secure text field neither
+// the keystream nor the value is captured — only the burst count that says
+// something was typed. `SecureInputGuard` owns the question; every path that
+// could keep text asks it first.
+//
+// What has not changed: pointer coordinates live exactly as long as the element
+// resolution they feed, and Return/Tab/Esc stay command keys — their
+// "submit/execute" semantics is the strongest read-vs-write signal T1 has, and
+// `return`/`cmd-return` are what the plan calls `submit`.
 
 private struct InputTargetFrame: Encodable {
     let x: Int
@@ -1417,14 +1534,25 @@ private struct InputTargetFrame: Encodable {
 
 private struct InputAncestorRef: Encodable {
     let role: String?
+    let subrole: String?
     let label: String?
 }
 
-/// The resolved identity of the element an input landed on. `label` is
-/// title/description only — never `AXValue`, which is the element's content.
+/// The resolved identity of the element an input landed on, and — for typing
+/// and submit events only — what it held at that instant.
+///
+/// `label` remains title/description. `value` is the element's content and is
+/// the plan's primary content channel (§2: 451 values carried Chinese against
+/// zero in the keystream); it is filled only where the plan asks for it, and
+/// never when `SecureInputGuard` says the element is secret.
 private struct InputTargetRef: Encodable {
     let role: String?
+    let subrole: String?
     let label: String?
+    var value: String?
+    /// Present (and `true`) only when the secure guard suppressed content, so a
+    /// reader can tell "nothing typed here" from "not ours to keep".
+    var secure: Bool?
     let frame: InputTargetFrame?
     let ancestors: [InputAncestorRef]
 }
@@ -1438,19 +1566,38 @@ private struct InputEventRecord: Encodable {
     var command: String?
     var bundleIdentifier: String?
     var target: InputTargetRef?
+    /// The typed run of a `burst`, pause-coalesced (§2 `text_input`).
+    var text: String?
+    /// `window_changed` only.
+    var applicationName: String?
+    var windowTitle: String?
+    /// `drag` only: the two ends of the gesture, resolved like any other target.
+    var source: InputTargetRef?
+    var destination: InputTargetRef?
 
     enum CodingKeys: String, CodingKey {
-        case kind, count, command, target
+        case kind, count, command, target, text, source, destination
         case atMs = "at_ms"
         case endMs = "end_ms"
         case endedWith = "ended_with"
         case bundleIdentifier = "bundle_identifier"
+        case applicationName = "application_name"
+        case windowTitle = "window_title"
     }
 
     init(atMs: Int64, kind: String) {
         self.atMs = atMs
         self.kind = kind
     }
+}
+
+/// An element the shim resolved, kept together with the live reference so a
+/// later moment can re-read it (a typing run's value is only worth reading when
+/// the run ends).
+private struct ResolvedInputTarget {
+    let element: AXUIElement
+    var ref: InputTargetRef
+    let secure: Bool
 }
 
 /// Listen-only observation of user input, coalesced at the source.
@@ -1486,16 +1633,45 @@ private final class InputEventMonitor: @unchecked Sendable {
     private var tap: CFMachPort?
     private var runLoop: CFRunLoop?
 
+    // Tap-thread state — touched only inside `handle`, never off that thread.
+    /// Where the button went down, so the up can ask whether the pointer
+    /// travelled. Both coordinates die in `DragGesturePolicy.isDrag`; only its
+    /// `Bool` is ever forwarded.
+    private var tapDownLocation: CGPoint?
+    private var tapDragged = false
+
     // Worker-queue state — touched only on `worker`.
     private var records: [InputEventRecord] = []
     private var dropped = 0
     private var lastFlushMs: Int64 = 0
-    private var burst: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
+    private var burst: TypingBurst?
     private var scroll: (startMs: Int64, endMs: Int64, count: Int, bundle: String?, target: InputTargetRef?)?
     private var lastRawMs: Int64 = 0
     /// Where the user last put the caret with the mouse, and when. Feeds
     /// `TypingTarget`, which owns the rule and the reasons for it.
-    private var lastClick: (atMs: Int64, target: InputTargetRef)?
+    private var lastClick: (atMs: Int64, target: ResolvedInputTarget)?
+    /// The button-down a drag would have started from: its resolved source and
+    /// the instant it happened. Cleared by every up, dragged or not.
+    private var pendingDrag: (atMs: Int64, source: ResolvedInputTarget?)?
+    /// Shortcuts seen, for the throttled attachment tier.
+    private var shortcutCount = 0
+
+    /// One typing run in progress.
+    private struct TypingBurst {
+        var startMs: Int64
+        var endMs: Int64
+        var count: Int
+        var bundle: String?
+        var target: InputTargetRef?
+        /// The field the run is going into, kept live so its composed value can
+        /// be read when the run ends rather than before it began.
+        var element: AXUIElement?
+        /// False whenever the guard fired **or** the target could not be
+        /// resolved at all. An unresolvable focus is not evidence that the field
+        /// is safe, so the run is dropped: fail closed, keep the count.
+        var textAllowed: Bool
+        var run: TypedTextRun
+    }
     private var timer: DispatchSourceTimer?
     private var livenessTick = 0
     /// R3 pacing (see `EdgeSnapshotPacing`).
@@ -1550,10 +1726,19 @@ private final class InputEventMonitor: @unchecked Sendable {
     }
 
     private func runTapLoop() {
+        // Ups and dragged events join the mask for `drag` (§2). Dragged events
+        // arrive at pointer rate; the callback answers them with one comparison
+        // and forwards nothing, so the worker queue never sees them.
         let mask = Self.maskBit(.keyDown)
             | Self.maskBit(.leftMouseDown)
             | Self.maskBit(.rightMouseDown)
             | Self.maskBit(.otherMouseDown)
+            | Self.maskBit(.leftMouseUp)
+            | Self.maskBit(.rightMouseUp)
+            | Self.maskBit(.otherMouseUp)
+            | Self.maskBit(.leftMouseDragged)
+            | Self.maskBit(.rightMouseDragged)
+            | Self.maskBit(.otherMouseDragged)
             | Self.maskBit(.scrollWheel)
         let callback: CGEventTapCallBack = { _, type, event, userInfo in
             if let userInfo {
@@ -1603,10 +1788,35 @@ private final class InputEventMonitor: @unchecked Sendable {
             let classified: KeyClass =
                 autorepeat ? .autorepeat : Self.classify(keyCode: keyCode, flags: event.flags)
             // The key code goes no further than the classification above.
-            worker.async { self.onKey(atMs: now, classified: classified) }
+            // Characters are read for typing only — a ⌘-combo's letter is a
+            // command name, not content, and never materializes. Whether the
+            // characters may be *kept* is decided on the worker, where the
+            // focused element is known; the callback must not do AX work.
+            let characters: String?
+            switch classified {
+            case .command: characters = nil
+            case .plain, .autorepeat: characters = Self.typedCharacters(event)
+            }
+            worker.async { self.onKey(atMs: now, classified: classified, characters: characters) }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             let location = event.location
+            tapDownLocation = location
+            tapDragged = false
             worker.async { self.onClick(atMs: now, x: location.x, y: location.y) }
+        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            guard !tapDragged, let down = tapDownLocation else { break }
+            tapDragged = DragGesturePolicy.isDrag(
+                dx: event.location.x - down.x,
+                dy: event.location.y - down.y
+            )
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            let dragged = tapDragged
+            tapDragged = false
+            tapDownLocation = nil
+            let location = event.location
+            worker.async {
+                self.onMouseUp(atMs: now, x: location.x, y: location.y, dragged: dragged)
+            }
         case .scrollWheel:
             let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase) != 0
             let location = event.location
@@ -1622,28 +1832,62 @@ private final class InputEventMonitor: @unchecked Sendable {
         }
     }
 
-    private func onKey(atMs: Int64, classified: KeyClass) {
+    private func onKey(atMs: Int64, classified: KeyClass, characters: String?) {
         lastRawMs = atMs
         edgePacing.observeInput(atMs: atMs)
         switch classified {
         case .autorepeat:
-            if burst != nil { burst?.endMs = atMs }
+            // A held key types too — a held delete unwrites a word — so the run
+            // follows it even though the count deliberately does not.
+            if burst != nil {
+                burst?.endMs = atMs
+                appendTypedCharacters(characters)
+            }
         case .plain:
             if burst != nil, atMs - (burst?.endMs ?? 0) <= Self.burstGapMs {
                 burst?.endMs = atMs
                 burst?.count += 1
             } else {
                 closeBurst(endedWith: nil)
-                burst = (atMs, atMs, 1, frontmostBundle(), resolveTypingTarget(atMs: atMs))
+                burst = openBurst(atMs: atMs)
             }
+            appendTypedCharacters(characters)
         case .command(let name):
             closeBurst(endedWith: name)
+            // A submit reads the field at the instant it is handed over — the
+            // one moment the whole composed message exists in one place,
+            // whether it was typed, pasted, dictated or completed by an AI.
+            let submit = TreeAttachment.submitCommands.contains(name)
+            let resolved = resolveTypingTarget(atMs: atMs, includeValue: submit)
             var record = InputEventRecord(atMs: atMs, kind: "command")
             record.command = name
             record.bundleIdentifier = frontmostBundle()
-            record.target = resolveTypingTarget(atMs: atMs)
+            record.target = resolved?.ref
             append(record)
+            requestTreeWalk(kind: "command", command: name, atMs: atMs, element: resolved?.element)
         }
+    }
+
+    /// Adds a keystroke's characters to the run in progress, if one is allowed
+    /// to keep them.
+    private func appendTypedCharacters(_ characters: String?) {
+        guard let characters, var current = burst, current.textAllowed else { return }
+        current.run.append(characters)
+        burst = current
+    }
+
+    private func openBurst(atMs: Int64) -> TypingBurst {
+        let resolved = resolveTypingTarget(atMs: atMs)
+        return TypingBurst(
+            startMs: atMs,
+            endMs: atMs,
+            count: 1,
+            bundle: frontmostBundle(),
+            target: resolved?.ref,
+            element: resolved?.element,
+            textAllowed: resolved.map { !$0.secure } ?? false,
+            run: TypedTextRun()
+        )
     }
 
     private func onClick(atMs: Int64, x: Double, y: Double) {
@@ -1653,20 +1897,36 @@ private final class InputEventMonitor: @unchecked Sendable {
         closeBurst(endedWith: nil)
         var record = InputEventRecord(atMs: atMs, kind: "click")
         record.bundleIdentifier = frontmostBundle()
-        let element = elementAt(x: x, y: y)
-        record.target = element.map(targetRef(for:))
-        if let target = record.target {
-            lastClick = (atMs, target)
+        let resolved = elementAt(x: x, y: y).map { resolveTarget(element: $0) }
+        record.target = resolved?.ref
+        if let resolved {
+            lastClick = (atMs, resolved)
         }
-        // R3: a click is a candidate scope change, and the window it landed in
-        // is the walk root. The coordinates are already gone by here.
-        if isRecordable(record.bundleIdentifier) {
-            pendingEdgeWindow = element
-                .flatMap(enclosingWindow(of:))
-                .flatMap { window in elementPid(window).map { (window, $0) } }
-            edgePacing.arm(atMs: atMs)
-        }
+        // The window the click landed in is the walk root for the tree this
+        // event asks for. The coordinates are already gone by here.
+        pendingDrag = (atMs, resolved)
+        requestTreeWalk(kind: "click", atMs: atMs, element: resolved?.element)
         append(record)
+    }
+
+    /// Closes a drag session. A button that went down and came up in the same
+    /// place was a click and is already recorded as one.
+    private func onMouseUp(atMs: Int64, x: Double, y: Double, dragged: Bool) {
+        lastRawMs = atMs
+        edgePacing.observeInput(atMs: atMs)
+        let down = pendingDrag
+        pendingDrag = nil
+        guard dragged, let down else { return }
+        // Both ends, because a drag is a causal edge between two elements —
+        // the same shape as ⌘C → ⌘V, and useless with only one of them.
+        let destination = elementAt(x: x, y: y).map { resolveTarget(element: $0) }
+        var record = InputEventRecord(atMs: down.atMs, kind: "drag")
+        record.endMs = atMs
+        record.bundleIdentifier = frontmostBundle()
+        record.source = down.source?.ref
+        record.destination = destination?.ref
+        append(record)
+        requestTreeWalk(kind: "drag", atMs: atMs, element: destination?.element)
     }
 
     private func onScroll(atMs: Int64, x: Double, y: Double, momentum: Bool) {
@@ -1683,6 +1943,12 @@ private final class InputEventMonitor: @unchecked Sendable {
         scroll = (atMs, atMs, 1, frontmostBundle(), resolveTarget(x: x, y: y))
     }
 
+    /// Closes a typing run and records it.
+    ///
+    /// This is the plan's `text_input`: runs are cut by a `burstGapMs` pause,
+    /// which is the measured word-level chunk (median 3.0s between chunks, 5
+    /// characters inside one). The kind stays `burst` because consumers already
+    /// read it; what is new is `text` and the target's `value`.
     private func closeBurst(endedWith: String?) {
         guard let current = burst else { return }
         burst = nil
@@ -1692,6 +1958,18 @@ private final class InputEventMonitor: @unchecked Sendable {
         record.endedWith = endedWith
         record.bundleIdentifier = current.bundle
         record.target = current.target
+        if current.textAllowed {
+            record.text = current.run.recorded
+            // The field is read at the *end* of the run: at its start the value
+            // is the field before the user typed into it, and for a CJK user the
+            // composed sentence only exists once the IME has committed it.
+            if let element = current.element, frontmostBundle() == current.bundle {
+                let reread = resolveTarget(element: element, includeValue: true)
+                record.target?.value = reread.ref.value
+                record.target?.secure = reread.ref.secure
+                if reread.secure { record.text = nil }
+            }
+        }
         append(record)
     }
 
@@ -1781,19 +2059,59 @@ private final class InputEventMonitor: @unchecked Sendable {
     /// `NSWorkspace` notifications would not arrive — the same reason the audio
     /// gate polls. One call a second on a queue that is already awake.
     private func considerEdgeSnapshot(nowMs: Int64) {
-        let bundle = frontmostBundle()
+        let application = NSWorkspace.shared.frontmostApplication
+        let bundle = application?.bundleIdentifier
         if bundle != lastFrontmostBundle {
             lastFrontmostBundle = bundle
             if isRecordable(bundle) {
+                // The switch is an event in its own right now (§2
+                // `window.changed`), not just something that arms a walk: it is
+                // what the chronicle reads as "the user moved to X", and 130 of
+                // 140 measured full trees hung on one.
+                var record = InputEventRecord(atMs: nowMs, kind: "window_changed")
+                record.bundleIdentifier = bundle
+                record.applicationName = application?.localizedName
+                record.windowTitle = application
+                    .flatMap { frontWindowTitleOfProcess($0.processIdentifier) }
+                    .map { clip($0, 120) }
+                append(record)
                 // A switch invalidates the click's window; the new app's
                 // focused window is the honest root.
-                pendingEdgeWindow = nil
-                edgePacing.arm(atMs: nowMs)
+                requestTreeWalk(kind: "window_changed", atMs: nowMs, element: nil)
             }
         }
         // The walk's own guards can still decline (browser, excluded app, no
         // resolvable window); `fire` spends the allowance only if one happened.
         edgePacing.fire(nowMs: nowMs) { captureEdgeSnapshot(nowMs: nowMs) }
+    }
+
+    /// Asks for the tree this event is entitled to (§3 attachment tiers).
+    ///
+    /// "Asks" is the whole contract: `EdgeSnapshotPacing` still decides whether
+    /// a walk happens, and the walk's own guards (browser, excluded app, no
+    /// resolvable window) can still decline. Nothing here spends the minute's
+    /// allowance — only a walk that actually ran does, through `fire`.
+    private func requestTreeWalk(
+        kind: String,
+        command: String? = nil,
+        atMs: Int64,
+        element: AXUIElement?
+    ) {
+        switch TreeAttachment.tier(kind: kind, command: command) {
+        case .never:
+            return
+        case .throttled:
+            let index = shortcutCount
+            shortcutCount += 1
+            guard TreeAttachment.shortcutAttaches(shortcutIndex: index) else { return }
+        case .always:
+            break
+        }
+        guard isRecordable(frontmostBundle()) else { return }
+        pendingEdgeWindow = element
+            .flatMap(enclosingWindow(of:))
+            .flatMap { window in elementPid(window).map { (window, $0) } }
+        edgePacing.arm(atMs: atMs)
     }
 
     /// Walks the window the trigger landed in and emits it as an
@@ -1824,6 +2142,16 @@ private final class InputEventMonitor: @unchecked Sendable {
         guard let root = edgeWalkRoot(pid: pid) else { return false }
         let encoder = AccessibilityTreeEncoder()
         let encodedRoot = encoder.encode(root)
+        // Attached walks start at one window, so they chain with each other and
+        // not with the heartbeat's whole-application walk of the same app.
+        let staged = captureTreeChains.stage(
+            scope: CaptureTreeScope(
+                processId: pid,
+                windowTitle: encoder.windowTitle,
+                walk: .window
+            ),
+            tree: captureTreeNode(from: encodedRoot)
+        )
         let snapshot = AccessibilitySnapshot(
             capturedAtMs: nowMs,
             processId: pid,
@@ -1840,7 +2168,8 @@ private final class InputEventMonitor: @unchecked Sendable {
                 windowTitle: encoder.windowTitle,
                 privateBrowsing: false
             ),
-            root: encodedRoot
+            root: encodedRoot,
+            treeText: AccessibilityTreeText(staged.envelope)
         )
         let url = outputDirectory
             .appendingPathComponent("accessibility-edge-\(UUID().uuidString)")
@@ -1856,6 +2185,7 @@ private final class InputEventMonitor: @unchecked Sendable {
         events.send(
             .artifact(kind: .accessibilityEdge, url: url, startedAtMs: nowMs, endedAtMs: nowMs)
         )
+        captureTreeChains.commit(staged)
         return true
     }
 
@@ -1879,7 +2209,7 @@ private final class InputEventMonitor: @unchecked Sendable {
     }
 
     private func resolveTarget(x: Double, y: Double) -> InputTargetRef? {
-        elementAt(x: x, y: y).map(targetRef(for:))
+        elementAt(x: x, y: y).map { resolveTarget(element: $0).ref }
     }
 
     /// The element under a pointer position. The coordinates die with this
@@ -1916,29 +2246,48 @@ private final class InputEventMonitor: @unchecked Sendable {
     /// Where a keystroke landed: system focus when the app named something
     /// typeable, otherwise the last click. The rule itself lives in
     /// `TypingTarget` so it can be tested without live Accessibility.
-    private func resolveTypingTarget(atMs: Int64) -> InputTargetRef? {
+    ///
+    /// `includeValue` is asked for only at the moments the plan names — a run
+    /// closing, a submit — so an ordinary keystroke never reads a field's
+    /// content.
+    private func resolveTypingTarget(atMs: Int64, includeValue: Bool = false) -> ResolvedInputTarget? {
         let focused = axElement(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute)
-            .map(targetRef(for:))
+            .map { resolveTarget(element: $0, includeValue: includeValue) }
         let age = lastClick.map { atMs - $0.atMs }
-        switch TypingTarget.choose(focusedRole: focused?.role, lastClickAgeMs: age) {
+        switch TypingTarget.choose(focusedRole: focused?.ref.role, lastClickAgeMs: age) {
         case .focus:
             return focused
         case .lastClick:
-            return lastClick?.target ?? focused
+            guard let click = lastClick else { return focused }
+            guard includeValue else { return click.target }
+            // The stored click was resolved without a value; re-read the same
+            // element now that one is wanted.
+            return resolveTarget(element: click.target.element, includeValue: true)
         }
     }
 
-    private func targetRef(for element: AXUIElement) -> InputTargetRef {
+    /// Resolves an element to its recorded identity, and answers the secure
+    /// question about it once, where both the subrole and the ancestors are in
+    /// hand.
+    private func resolveTarget(
+        element: AXUIElement,
+        includeValue: Bool = false
+    ) -> ResolvedInputTarget {
         var ancestors: [InputAncestorRef] = []
+        var ancestorSubroles: [String?] = []
         var cursor = axElement(element, kAXParentAttribute)
         var hops = 0
         while let parent = cursor, hops < 6 {
             let role = axString(parent, kAXRoleAttribute)
             if role == "AXApplication" { break }
+            let subrole = axString(parent, kAXSubroleAttribute)
             let label = nonempty(axString(parent, kAXTitleAttribute))
                 ?? nonempty(axString(parent, kAXDescriptionAttribute))
-            if role != nil || label != nil {
-                ancestors.append(InputAncestorRef(role: role, label: label.map { clip($0, 80) }))
+            ancestorSubroles.append(subrole)
+            if role != nil || subrole != nil || label != nil {
+                ancestors.append(
+                    InputAncestorRef(role: role, subrole: subrole, label: label.map { clip($0, 80) })
+                )
             }
             cursor = axElement(parent, kAXParentAttribute)
             hops += 1
@@ -1951,14 +2300,62 @@ private final class InputEventMonitor: @unchecked Sendable {
                 height: Int($0.height.rounded())
             )
         }
+        let subrole = axString(element, kAXSubroleAttribute)
         let label = nonempty(axString(element, kAXTitleAttribute))
             ?? nonempty(axString(element, kAXDescriptionAttribute))
-        return InputTargetRef(
+        let secure = SecureInputGuard.isSecure(
+            subrole: subrole,
+            label: label,
+            ancestorSubroles: ancestorSubroles
+        )
+        var ref = InputTargetRef(
             role: axString(element, kAXRoleAttribute),
+            subrole: subrole,
             label: label.map { clip($0, 120) },
+            value: nil,
+            secure: secure ? true : nil,
             frame: frame,
             ancestors: ancestors
         )
+        // The one place a field's content is read. A secure field is never
+        // asked for its value at all — not read and then dropped.
+        if includeValue, !secure {
+            ref.value = ComposedFieldValue.windowed(
+                nonempty(axString(element, kAXValueAttribute)),
+                caret: caretOffset(element)
+            )
+        }
+        return ResolvedInputTarget(element: element, ref: ref, secure: secure)
+    }
+
+    /// The caret's character offset, so a long field is clipped around where the
+    /// user is working rather than at its beginning.
+    ///
+    /// AX reports UTF-16 offsets while the clip counts characters; for CJK and
+    /// emoji the window can therefore sit a little off. It is a window, not an
+    /// index — being a few characters out costs nothing a reader would notice.
+    private func caretOffset(_ element: AXUIElement) -> Int? {
+        guard
+            let value = axAttribute(element, kAXSelectedTextRangeAttribute as String),
+            CFGetTypeID(value) == AXValueGetTypeID()
+        else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
+        return range.location >= 0 ? range.location : nil
+    }
+
+    /// The characters a key event would type, as the system resolves them for
+    /// the current layout and dead-key state.
+    private static func typedCharacters(_ event: CGEvent) -> String? {
+        var length = 0
+        var buffer = [UniChar](repeating: 0, count: 8)
+        event.keyboardGetUnicodeString(
+            maxStringLength: buffer.count,
+            actualStringLength: &length,
+            unicodeString: &buffer
+        )
+        guard length > 0 else { return nil }
+        return String(utf16CodeUnits: buffer, count: min(length, buffer.count))
     }
 
     private static func classify(keyCode: Int64, flags: CGEventFlags) -> KeyClass {

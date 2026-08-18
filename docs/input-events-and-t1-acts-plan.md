@@ -1,6 +1,6 @@
 # 输入事件与 T1 acts 重组计划
 
-> 状态：已批准（2026-08-17 拍板），实施中。
+> 状态：已批准（2026-08-17 拍板）；阶段 0–4 已落地（PR #41）。**部分被 [`event-capture-v2-plan.md`](./event-capture-v2-plan.md) 取代（2026-08-18）**：R3 边沿快照被 keyframe 策略吸收；acts 的 typing 布尔方案被 `text_input.value` 取代；CAP-005 击键禁令在本地信任模型下取消。
 > 关系：修订 [`slot-summaries-and-ax-pipeline.md`](./slot-summaries-and-ax-pipeline.md) §7 的若干"已决定"条目（本文为准，修订处已回改）；实现落点见文末阶段表。
 > 起因：IM 类应用（飞书等）的 T1 卡片把侧边栏噪音当成用户行为 —— 实测 2026-08-17 15:20 slot 的 prompt 预算 67% 花在用户从未触碰的会话列表上，T2 卡片写成 "multi-group scan"，真实的 1:1 对话一字未提。
 
@@ -162,7 +162,7 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 
 ## 开放 PoC
 
-- listen-only tap 是否在"系统设置 → 输入监控"留痕（§7.3 遗留；决定能否宣称"可验证未监听输入"）。
+- ~~listen-only tap 是否在"系统设置 → 输入监控"留痕~~ **已解决（2026-08-18 实测）：不留痕** —— tap 在真实捕获击键时，输入监控面板无 AfterRay 条目。注意意义已随 CAP-005 取消而反转：原本这是"可验证未监听"的卖点，现在它意味着**系统不会替用户指出 AfterRay 在观察输入**，透明披露的义务完全在应用自身（onboarding/权限页明示）。原 §7.3 "移除 Permission Center 输入监控项"的建议应重新评估。
 - Electron 上事件时刻现场元素解析质量（fallback：对已存树做几何命中，已验证 depth 21–39）。
 - LCA 10% 旋钮跨 app 表现；engaged 子树从点击元素哪级祖先起走。
 - 500ms 走树预算在大型 Chrome 页面（20k 节点上限）上的命中率。

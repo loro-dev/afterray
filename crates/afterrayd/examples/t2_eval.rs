@@ -17,7 +17,7 @@ use afterray_models::{
 };
 use afterray_protocol::LlmProvider;
 use afterray_store::{
-    MacOsKeychainProvider, SLOT_DURATION_MS, T2_SYSTEM_PROMPT, Vault, VaultConfig,
+    MacOsKeychainProvider, SLOT_DURATION_MS, Vault, VaultConfig,
     render_t2_prompt, slot_start_for,
 };
 use std::{path::PathBuf, sync::Arc};
@@ -94,7 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let background = vault.background_stats(&card).unwrap_or_default();
         afterray_store::attach_entity_candidates(&mut card, &background);
-        let user = render_t2_prompt(&card, &[], &language, &background);
+        // The eval harness has no live model to probe, so it renders at the
+        // floor the daemon derives — the smallest prompt production can send.
+        let user = render_t2_prompt(&card, &[], &language, &background, 12_000);
         println!("════════════════════════════════════════════════════");
         println!(
             "slot {} {} · {} moments · prompt {} chars · provider {:?} · model {model} · lang {language}",
@@ -110,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .submit(ModelInput::Llm {
                 messages: Vec::new(),
                 prompt: user.clone(),
-                system: Some(T2_SYSTEM_PROMPT.to_owned()),
+                system: Some(afterray_store::render_t2_system_prompt(card.facts.has_audio)),
             })
             .await?;
         let snapshot = queue.wait(&job).await?;

@@ -8,7 +8,7 @@
 //! `--json` emits one machine-readable record per slot: `{card, system, user}`.
 
 use afterray_store::{
-    MacOsKeychainProvider, SLOT_DURATION_MS, T2_SYSTEM_PROMPT, Vault, VaultConfig,
+    MacOsKeychainProvider, SLOT_DURATION_MS, Vault, VaultConfig,
     render_t2_prompt, slot_start_for,
 };
 use std::path::PathBuf;
@@ -70,11 +70,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let background = vault.background_stats(&card).unwrap_or_default();
         afterray_store::attach_entity_candidates(&mut card, &background);
-        let user = render_t2_prompt(&card, &[], &language, &background);
+        // No model to probe from an example: render at the floor the daemon
+        // derives, which is the smallest prompt production ever sends.
+        let user = render_t2_prompt(&card, &[], &language, &background, 12_000);
         if as_json {
             let record = serde_json::json!({
                 "card": card,
-                "system": T2_SYSTEM_PROMPT,
+                "system": afterray_store::render_t2_system_prompt(card.facts.has_audio),
                 "user": user,
             });
             println!("{}", serde_json::to_string(&record)?);

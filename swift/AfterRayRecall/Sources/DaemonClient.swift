@@ -219,7 +219,7 @@ public extension AfterRayDaemonServing {
 }
 
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 14
+    public static let protocolVersion = 15
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {

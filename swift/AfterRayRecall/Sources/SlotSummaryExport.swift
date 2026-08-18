@@ -44,9 +44,14 @@ public struct SummaryEntity: Codable, Equatable, Sendable {
     }
 }
 
+/// The union of the three card shapes the vault can export. Which one a
+/// payload is comes from `SlotSummaryExport.schemaVersion`, not from which
+/// fields are nil: 1 is `bullets`, 2 is `threads`, 3 is `details`.
 public struct SlotSummaryPayload: Codable, Equatable, Sendable {
     public let title: String
     public let description: String?
+    /// The v3 card body, Markdown.
+    public let details: String?
     public let threads: [SummaryThread]?
     public let entities: [SummaryEntity]?
     public let decisions: [String]?
@@ -59,6 +64,7 @@ public struct SlotSummaryPayload: Codable, Equatable, Sendable {
     public init(
         title: String,
         description: String? = nil,
+        details: String? = nil,
         threads: [SummaryThread]? = nil,
         entities: [SummaryEntity]? = nil,
         decisions: [String]? = nil,
@@ -70,6 +76,7 @@ public struct SlotSummaryPayload: Codable, Equatable, Sendable {
     ) {
         self.title = title
         self.description = description
+        self.details = details
         self.threads = threads
         self.entities = entities
         self.decisions = decisions
@@ -81,7 +88,8 @@ public struct SlotSummaryPayload: Codable, Equatable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case title, description, threads, entities, decisions, artifacts, bullets, category, confidence
+        case title, description, details, threads, entities, decisions, artifacts, bullets
+        case category, confidence
         case notCaptured = "not_captured"
     }
 }

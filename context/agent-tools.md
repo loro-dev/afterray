@@ -147,3 +147,22 @@ asked, and answers it with silence: ask for last month's work on a term you
 also used this week, and the global ranking fills with recent hits, the
 post-filter drops all of them, and the tool reports nothing while the evidence
 sits in the vault.
+
+## The T2 slot surface
+
+The summariser has its own, much smaller tool host (`afterrayd::SlotT2Tools`),
+scoped to one slot: **`get_ocr`**, and **`get_transcript` only when that slot
+recorded audio**. It is not the chat catalog above and shares no code with it.
+
+Two tools were removed with card v3, for the same reason: measured across
+Haiku / qwen3.5:4b / qwen3.5:9b / qwen3.6:35b on a dense real hour, `get_run_text`
+was called zero times by the three smaller tiers and `get_prev_cards` by none of
+the four, while the 35b spent rounds discovering a transcript tool on a silent
+slot. What they served is now handed over instead of offered: neighbouring cards
+are injected with their descriptions, and what the budget left out is disclosed
+as `more_chars` and left there. A prompt that invites a fetch it will not get is
+a prompt that teaches procedure instead of writing.
+
+The prompt itself is `afterray_store::render_t2_system_prompt(has_audio)`, and
+the evidence view is `render_t2_prompt(…, budget_chars)` — the budget comes from
+the real context window, never a constant.

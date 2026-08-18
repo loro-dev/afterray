@@ -26,8 +26,12 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// the privacy-bounded parsed summary export. 13 adds the compute dashboard,
 /// the CLI evidence window (`cli_evidence_until_ms` / `cli_evidence_access`),
 /// and treats unprivileged socket clients as a gated query surface. 14 makes
-/// the summary slot length a setting (`summary_slot_minutes`).
-pub const PROTOCOL_VERSION: u32 = 14;
+/// the summary slot length a setting (`summary_slot_minutes`). 15 adds the v3
+/// summary body (`details`) to the day summary and the export — additive on
+/// the wire, but a client that does not read it renders a v3 card as a title
+/// with nothing under it, and a silent empty panel is exactly the failure the
+/// strict handshake exists to turn into a loud one.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

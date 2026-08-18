@@ -86,6 +86,18 @@ seal_at = slot_end_ms + max(90s, 队列积压估计)
 
 理由：OCR / ASR / embedding 都走异步队列，transcript 可能晚到几十秒。宁可晚两分钟出结果，也不要产出漏掉会议转录的摘要。
 
+**已实现（2026-08-18）**：上面这句话的 OCR 那一半早就实现了（`T2_SETTLE_MS` = 3 分钟 + `ocr_in_flight()` 让路），ASR 那一半一直没有。实测：ASR 积压 10 个任务（约 50 分钟音频）时，18:10 那张卡在 transcript 落库之前就被写了出去，`not_captured` 里永远写着"无法获取语音转录"；22:10 那张卡碰巧在 transcript 之后才扫到，整场会议讨论都在里面。拿到哪一张全凭运气。
+
+现在 T2 sweeper 有第四道闸门（`crates/afterrayd/src/main.rs`：`slots_ready_for_t2` / `asr_wait_verdict`）：
+
+- **"值得等"的定义**：这个 slot 的音频确实还欠着 transcript（`Vault::has_untranscribed_audio_between`），**并且** ASR 明显还活着，**并且** 还没等满上限。三者缺一就直接出卡。
+- **"还活着"的判据是上次成功比上次失败新**（`Vault::asr_health`），不是"上次成功离现在够近"——睡了八小时的机器上次成功就是八小时前，而 ASR 完全正常。墙钟只作绝对上限（一周），用来兜住那种"不再成功、也不再报错"的死 worker（没人认领就没人失败）。
+- **上限 `ASR_WAIT_CAP_MS` = 30 分钟**。既然 50 分钟的积压是能实测到的，这个上限就必须会到期：等过半小时之后，宁可出一张诚实地写着"转录缺失"的卡，也不能让这张卡永远不出现——用户读不到一张还在等的摘要。
+- 等待期间 slot **保持 `Degraded`**，不引入新状态：sweeper 只捡 `Degraded`，"等"是跳过这一轮而不是状态迁移。
+- `slot backfill` 不等：那是用户明确要求补历史，那些音频要么早就转录完了，要么永远不会有。
+
+**已知缺口**：卡片写出去之后不会因为 transcript 晚到而重跑。18:10 那张卡会永远缺着转录；只有 `slot backfill` 能重做，而它会覆盖用户可能已经读过的卡。这个不对称——等一下只花几分钟，赛输了却是永久的——就是这道闸门存在的全部理由。
+
 ### 2.4 catch-up
 
 **建议**：
@@ -649,6 +661,8 @@ FTS5 用 `content='elements'`（external content），索引不复制文本。
 > 修订（2026-08-17）：本节多项"已决定"被 [`input-events-and-t1-acts-plan.md`](./input-events-and-t1-acts-plan.md) 修订与扩展（Return/Tab/Esc 归命令键、burst 粒度、指针事件的元素解析、R1/R2/R3 采集节奏、T1 acts 重组）。冲突处以该计划为准；下文表格已就地标注修订项。
 
 ### 7.1 CAP-005 的修订
+
+> 再修订（2026-08-18）：**击键内容禁令整体取消**——全部处理在本地模型完成、vault 端到端加密、数据出境需用户显式批准，原禁令针对的信任边界不存在。`text_input` 可存键流原文与输入框 value；事件触发的截图记录真实时间戳。唯一保留的护栏：`AXSecureTextField` 焦点期间不采任何输入内容。详见 [event-capture-v2-plan.md](./event-capture-v2-plan.md)。下表按 2026-08-17 状态保留作历史记录。
 
 **已决定（2026-08-14）**：放开 CAP-005 对操作事件的限制。约束改为落在**内容**上，而非事件上。
 

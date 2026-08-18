@@ -159,7 +159,12 @@ public extension DaySummary {
                     duration = thirty
                 }
                 let index = slots.count
-                let isV2 = index.isMultiple(of: 3)
+                // Three card shapes live in the vault at once, so the lab
+                // draws all three: v3 writes a Markdown body, v2 writes
+                // threads, v1 writes bullets.
+                let shape = index % 3
+                let isV3 = shape == 0
+                let isV2 = shape == 1
                 slots.append(DaySlotSummary(
                     slotStartMs: cursor,
                     slotEndMs: min(cursor + duration, bounds.end),
@@ -170,9 +175,14 @@ public extension DaySummary {
                         momentCount: 8
                     ),
                     title: "Summary \(dayOffset + 1).\(index + 1)",
-                    bullets: isV2 ? nil : ["Legacy detail one", "Legacy detail two"],
+                    bullets: isV2 || isV3 ? nil : ["Legacy detail one", "Legacy detail two"],
                     category: "coding",
-                    description: isV2 ? "Implemented and validated one focused part of the summary sidebar." : nil,
+                    description: isV2 || isV3
+                        ? "Implemented and validated one focused part of the summary sidebar."
+                        : nil,
+                    details: isV3
+                        ? "### Implementation\nChanged the component and kept the unfinished state visible.\n\n![10:23 the failing check](afterray://moment/summary-stress-\(dayOffset)-\(index))\n\n### Left open\nRelease validation was not run."
+                        : nil,
                     threads: isV2 ? [SummaryThread(name: "Implementation", prose: "Changed the component and kept the unfinished state visible.")] : nil,
                     decisions: isV2 ? ["Keep details collapsed by default."] : nil,
                     notCaptured: isV2 && index.isMultiple(of: 9) ? ["Release validation was not run."] : nil

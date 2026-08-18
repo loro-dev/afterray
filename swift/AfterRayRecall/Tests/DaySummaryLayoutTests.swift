@@ -23,6 +23,79 @@ final class DaySummaryLayoutTests: XCTestCase {
         XCTAssertEqual(DaySummaryLayout.expandedSections(slot: slot).map(\.heading), ["UI", "Decisions", "Not captured"])
     }
 
+    /// The v3 card: one Markdown body, split into panel sections by the same
+    /// parser the chat uses. The description still bounds the collapsed row.
+    func testV3DetailsDecodeAndBecomeSections() throws {
+        let json = #"""
+        {
+          "slot_start_ms": 0,
+          "slot_end_ms": 600000,
+          "state": "done",
+          "facts": {"apps": [], "moment_count": 4},
+          "title": "Cut the 0.0.4 release",
+          "description": "Notarised the DMG and published the appcast.",
+          "details": "### Notarising\nRan `make release`; **notarytool** took 4m.\n\n### Appcast\nPublished to R2.\n\n- checked the feed\n- bumped the build"
+        }
+        """#
+
+        let slot = try JSONDecoder().decode(DaySlotSummary.self, from: Data(json.utf8))
+        XCTAssertEqual(
+            DaySummaryLayout.shortDescription(slot: slot),
+            "Notarised the DMG and published the appcast."
+        )
+        let sections = DaySummaryLayout.expandedSections(slot: slot)
+        XCTAssertEqual(sections.map(\.heading), ["Notarising", "Appcast"])
+        // Inline markup resolves to the words it wraps: the panel is text.
+        XCTAssertEqual(sections[0].body, "Ran make release; notarytool took 4m.")
+        XCTAssertTrue(sections[1].body.contains("• checked the feed"))
+        XCTAssertNil(slot.threads, "a v3 card has no threads")
+    }
+
+    /// A citation renders as what it says. Loading the frame, and highlighting
+    /// an `#el<N>` element inside it, is later work — but neither may leave
+    /// raw link syntax on screen.
+    func testV3CitationsRenderAsTheirLabels() {
+        let details = """
+        ### Merge
+        The diff was ready ![10:23 the diff](afterray://moment/m-1)
+
+        ![10:31 element](afterray://moment/m-2#el33)
+
+        Inline [as a link](afterray://moment/m-1) too.
+        """
+        let sections = DaySummaryLayout.markdownSections(details)
+        XCTAssertEqual(sections.count, 1)
+        let body = sections[0].body
+        XCTAssertFalse(body.contains("afterray://moment/"), body)
+        XCTAssertTrue(body.contains("10:23 the diff"), body)
+        XCTAssertTrue(body.contains("10:31 element"), body)
+        XCTAssertTrue(body.contains("as a link"), body)
+    }
+
+    /// Three shapes are on disk. A v3 reader must not stop rendering the two
+    /// that came before it.
+    func testV1AndV2CardsStillRenderWhenV3Exists() {
+        let v2 = DaySlotSummary(
+            slotStartMs: 0,
+            slotEndMs: 600_000,
+            state: "done",
+            facts: DaySlotFacts(apps: []),
+            title: "v2 card",
+            threads: [SummaryThread(name: "UI", prose: "Shipped it.", momentIds: [])]
+        )
+        XCTAssertEqual(DaySummaryLayout.expandedSections(slot: v2).map(\.heading), ["UI"])
+
+        let v1 = DaySlotSummary(
+            slotStartMs: 0,
+            slotEndMs: 600_000,
+            state: "done",
+            facts: DaySlotFacts(apps: []),
+            title: "v1 card",
+            bullets: ["One old bullet"]
+        )
+        XCTAssertEqual(DaySummaryLayout.expandedSections(slot: v1).first?.body, "One old bullet")
+    }
+
     func testV2ThreadWithoutMomentIdsDecodesAsNoCitations() throws {
         let json = #"""
         {

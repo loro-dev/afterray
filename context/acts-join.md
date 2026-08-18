@@ -14,8 +14,12 @@ Two independent fact streams, joined by time and tree position:
 
 | stream | what it answers | where it lives |
 |---|---|---|
-| accessibility tree / OCR | what could be **seen** | `moments` + AX artifacts, long-lived |
-| input events | what the user **did** | `input_events`, 48h |
+| accessibility tree / OCR | what could be **seen** | `moments` + AX artifacts |
+| input events | what the user **did** | `input_events` |
+
+Both expire together, oldest-first, under the vault's general retention
+(event-capture v2 retired the events' separate 48h channel; only `signal_gap`
+markers still run on a clock).
 
 **T1 only joins. It never infers.** Every attempt to derive agency from screen
 content failed on some app: geometry heuristics (wrong on app switch),
@@ -116,9 +120,10 @@ stepping into a conversation for eight seconds and leaving. R3 fills that hole:
 the shim walks the window a trigger landed in (frontmost-app change or a click,
 after a 500ms settle any further input re-arms, bucketed to ≥5s apart and ≤6 a
 minute) and emits it as an unpaired `accessibility_edge` artifact. **Never a
-screenshot** — an event-driven frame outliving its events would keep exposing
-interaction instants after the record of the interaction was erased, which is
-also why `edge_snapshots` share `INPUT_EVENT_RETENTION_MS`.
+screenshot** — the pairing invariant (a screenshot always has AX; AX may have
+no screenshot) runs one way only. An edge tree still cannot outlive its events:
+both are swept at the same retention horizon, the oldest frame the vault still
+holds.
 
 In the join (`Vault::edge_frames_between` → `slot::EdgeFrame`) an edge tree is
 **text and only text**: its lines go to the run whose span contains it,
@@ -173,8 +178,13 @@ unobservable rather than idle. Inside such a stretch,
   events counted as 1s. `None` when the slot holds no input event: unmeasured is
   not zero. `idle_ratio` keeps its name and meaning (it is really "recording was
   paused") for UI compatibility.
-- `T2_SYSTEM_PROMPT_V2`: *acts are what the user did; text is what was on
-  screen; peripheral was visible but not operated.*
+- `RunRow.content` — what was written, `None` under the same gate as `acts`.
+- `RunRow.unframed_lines` — lines an R3 edge tree introduced. Evidence with no
+  frame behind it, so the prompt can say per run: write from it, cite nothing
+  for it.
+- `T2_SYSTEM_PROMPT_V3`: *acts are what the user did; text is what was on
+  screen; peripheral was visible but not operated;* `wrote` *is the user's own
+  words.*
 
 **Known v1 blind spot:** a user who genuinely sat still and a tap that was never
 running both read as a high `no_input_ratio`. Only an explicit `signal_gap`
@@ -183,9 +193,10 @@ j/k) is undetectable by design — the heartbeat covers it; no heuristic is adde
 
 ## Materialisation
 
-Events are deleted after 48h and T1 is computed lazily, so **unfrozen acts
-vanish from history**: two days on, a card keeps the half about the screen and
-silently loses the half about the user.
+Events are swept when retention reaches their era and T1 is computed lazily, so
+**unfrozen acts vanish from history**: past that edge a card keeps the half
+about the screen and silently loses the half about the user. The deadline moved
+out with the retention unification; it did not go away.
 
 `materialize_slot_acts` freezes per-run acts (keyed by the run's `moment_id`, not
 its position — a deleted frame would renumber positions) plus `no_input_ratio`
@@ -194,9 +205,9 @@ into `slot_summaries.acts_json`; `slot_card` reads it when
 so the five-minute sweeper can revisit forever.
 
 The freeze runs **before and independently of the T2 gate**: it is a short read
-and one small write with no model in it, and the deadline it races is physical.
-Gating it behind T2's AC-power and battery conditions would lose acts on exactly
-the laptops that stay unplugged.
+and one small write with no model in it, and the deadline it races belongs to
+the vault, not to the power supply. Gating it behind T2's AC-power and battery
+conditions would lose acts on exactly the laptops that stay unplugged.
 
 A row created by the freeze carries `degraded` with no title, which is what the
 day panel already renders for an unsummarised slot — it cannot conjure a phantom
@@ -220,5 +231,17 @@ by hit-testing rects that no longer exist.
    typing that happened in both slots; enqueueing only the one it started in
    leaves the other unfrozen, and once the events expire it fails open forever
    — silently dropping work the user did.
-6. **Never holds typed characters.** Bursts are counts; targets carry labels,
-   never values.
+6. **`Acts` carries no content — `ActContent` does, beside it.** The `Acts`
+   shape is still counts, labels and instants, and that is what
+   `materialize_slot_acts` freezes into `acts_json`: unversioned, unchanged,
+   readable by everything that ever read it. WS5 added the content channel as a
+   *sibling* (`acts::ActContent` → `RunRow.content` → the prompt's `wrote`
+   block): the typed run and the field's value the shim now stores
+   (`docs/event-capture-v2-plan.md` §信任模型变更 retired CAP-005 under the local
+   trust model), the value preferred over the keystream, a sentence composed and
+   then sent counted once, and a field the shim called secure contributing
+   nothing even if a value rode along with the row. Content is **never
+   materialised**: it lives exactly as long as the events do, and an expired
+   slot says nothing about what was written rather than saying "nothing was".
+   Reading content into `Acts` itself is still the thing not to do — it would
+   version the frozen copy and put words where a reader expects a count.

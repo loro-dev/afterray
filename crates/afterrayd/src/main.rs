@@ -4,6 +4,7 @@ mod chat;
 mod compute;
 mod gop_packer;
 mod memory;
+mod ocr_crop;
 mod stream;
 mod tools;
 mod turn_row;
@@ -12,7 +13,8 @@ use afterray_codec::{CONTENT_TYPE_IVF_AV01, DEFAULT_THUMBNAIL_MAX_EDGE, still_th
 use afterray_harness::ContextBudget;
 use afterray_models::{
     Cancellation, DownloadError, JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink,
-    ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, PersistentMlxAdapter,
+    ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, OcrRegion,
+    PersistentMlxAdapter,
     PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID,
     QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig,
     download_packs_with_cancellation, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
@@ -29,8 +31,8 @@ use afterray_protocol::{
     redact_cli_response_data,
 };
 use afterray_store::{
-    InputEventRow, LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState, StoreError, Vault,
-    VaultConfig,
+    AsrHealth, InputEventRow, LLM_API_KEY_SECRET, MacOsKeychainProvider, SlotSummaryState,
+    StoreError, Vault, VaultConfig,
 };
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -278,6 +280,7 @@ async fn async_main() -> anyhow::Result<()> {
         packer,
         capture_busy,
         capture_paused,
+        capture_display: std::sync::Mutex::new(None),
         last_capture_ms,
         recording_active,
         excluded_bundle_ids: std::sync::Mutex::new(persisted.excluded_bundle_ids.clone()),
@@ -507,6 +510,13 @@ struct AppState {
     /// scheduler keeps ticking but skips the screenshot, so the recording
     /// session — and the shim's audio — run on uninterrupted.
     capture_paused: Arc<AtomicBool>,
+    /// Logical size of the display the shim is capturing, from its `Ready`
+    /// event. The only place the daemon learns a screenshot's dimensions, and
+    /// therefore the only way to map Vision's normalized OCR boxes onto the
+    /// accessibility tree's screen points ([`ocr_crop`]). `None` until a
+    /// capture session has started; a stale value from a previous session is
+    /// overwritten before that session's first moment exists.
+    capture_display: std::sync::Mutex<Option<ocr_crop::DisplayPoints>>,
     last_capture_ms: Arc<AtomicI64>,
     recording_active: Arc<AtomicBool>,
     excluded_bundle_ids: std::sync::Mutex<Vec<String>>,
@@ -1011,7 +1021,14 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             .await
         }
         Request::SlotPrompt { at_ms } => {
-            run_store(state, move |s| match slot_prompt_for(s, at_ms) {
+            // The same budget the summariser would use, probed the same way:
+            // an inspection that showed a different prompt than the one the
+            // model gets would be worse than no inspection.
+            let budget_chars = t2_prompt_budget_chars(ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..resolve_context_budget(state).await
+            });
+            run_store(state, move |s| match slot_prompt_for(s, at_ms, budget_chars) {
                 Ok(prompt) => Response::success(prompt),
                 Err(error) => Response::failure(error.to_string()),
             })
@@ -1305,6 +1322,7 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
             height,
         }))) => {
             eprintln!("capture runtime: shim ready display={display_id} {width}x{height}");
+            remember_capture_display(state, width, height);
         }
         Ok(Some(Ok(CaptureEvent::Failed { code, message }))) => {
             state.capture_busy.store(false, Ordering::SeqCst);
@@ -1336,26 +1354,33 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
     }
     state.capture_busy.store(false, Ordering::SeqCst);
 
-    let capture = Arc::clone(&state.capture);
     let interval = state.capture_interval;
-    let capture_busy = Arc::clone(&state.capture_busy);
-    let capture_paused = Arc::clone(&state.capture_paused);
-    let last_capture_ms = Arc::clone(&state.last_capture_ms);
+    let scheduler_state = Arc::clone(state);
     let scheduler = tokio::spawn(async move {
-        let mut timer = tokio::time::interval(interval);
+        // Not `tokio::time::interval`: the heartbeat is the *fallback*, and its
+        // phase has to follow whatever captured last. An input batch can pull a
+        // capture forward (`consume_capture_events`), and sleeping from
+        // `last_capture_ms` is how that resets the timer without a channel
+        // between the two tasks — the atomic every tick already writes is the
+        // whole handshake.
+        let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(10_000);
         loop {
-            timer.tick().await;
-            if capture_paused.load(Ordering::SeqCst) {
+            let wait_ms = scheduler_state
+                .last_capture_ms
+                .load(Ordering::SeqCst)
+                .saturating_add(interval_ms)
+                .saturating_sub(now_ms());
+            if wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(u64::try_from(wait_ms).unwrap_or(0))).await;
                 continue;
             }
-            capture_busy.store(true, Ordering::SeqCst);
-            last_capture_ms.store(now_ms(), Ordering::SeqCst);
-            let request_id = Uuid::now_v7().to_string();
-            let result = capture.capture_screen(&request_id).await;
-            capture_busy.store(false, Ordering::SeqCst);
-            if let Err(error) = result {
-                eprintln!("capture request failed: {error}");
-                break;
+            match fire_capture_tick(&scheduler_state).await {
+                CaptureTick::Fired => {}
+                // Paused or busy leaves `last_capture_ms` where it was, so the
+                // clause above cannot compute a wait: hold off one interval
+                // before asking again, as the old interval timer did.
+                CaptureTick::Held => tokio::time::sleep(interval).await,
+                CaptureTick::Failed => break,
             }
         }
     });
@@ -1374,6 +1399,91 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
     recording.scheduler = Some(scheduler);
     recording.event_consumer = Some(event_consumer);
     Ok(())
+}
+
+/// What one attempt to take a screenshot did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTick {
+    Fired,
+    /// A gate said no. Nothing was captured and nothing was recorded as
+    /// captured — the caller decides when to ask again.
+    Held,
+    /// The shim could not be asked. The scheduler that owns this session stops.
+    Failed,
+}
+
+/// One capture tick, wherever it came from.
+///
+/// Scheduled by the heartbeat or pulled forward by an input batch, a tick is
+/// the same act, so it goes through one door with one set of gates: not while
+/// the app's overlay is up (`capture_paused`), not while a capture is already
+/// in flight (`capture_busy`), and not once the recording that owns the shim is
+/// gone (`recording_active`). Two doors would mean two chances to forget one of
+/// them.
+///
+/// The busy claim is a compare-exchange because the two callers now race: the
+/// heartbeat's own spacing used to be the only thing keeping a second request
+/// off an in-flight one.
+///
+/// `last_capture_ms` moves *before* the request, not after: it is what the
+/// heartbeat sleeps from and what the throttle measures, and both mean "when we
+/// last asked for a frame", not "when one came back".
+async fn fire_capture_tick(state: &Arc<AppState>) -> CaptureTick {
+    if state.capture_paused.load(Ordering::SeqCst) || !state.recording_active.load(Ordering::SeqCst)
+    {
+        return CaptureTick::Held;
+    }
+    if state
+        .capture_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return CaptureTick::Held;
+    }
+    state.last_capture_ms.store(now_ms(), Ordering::SeqCst);
+    let request_id = Uuid::now_v7().to_string();
+    let result = state.capture.capture_screen(&request_id).await;
+    state.capture_busy.store(false, Ordering::SeqCst);
+    if let Err(error) = result {
+        eprintln!("capture request failed: {error}");
+        return CaptureTick::Failed;
+    }
+    CaptureTick::Fired
+}
+
+/// The floor under an event-driven screenshot (`docs/event-capture-v2-plan.md`
+/// §1). Events arrive at interaction rate; without a floor a fast typist would
+/// drive the screenshot path as fast as the shim could answer.
+const EVENT_CAPTURE_MIN_INTERVAL_MS: i64 = 10_000;
+
+/// Whether an input batch should pull a screenshot forward.
+///
+/// The whole decision, as a function of the two facts it depends on, so the
+/// wiring around it stays a wiring problem. `interval_ms` is the configured
+/// heartbeat: the throttle never goes below the plan's 10s, and never goes
+/// below the cadence the user asked for either — a 60s heartbeat means the user
+/// wants fewer frames, not 10s frames whenever they type.
+///
+/// Age is measured from the last capture *request*. `last_capture_ms` of zero
+/// or less means nothing has been captured — a session just started, or one
+/// stopped and reset — and there is no age to measure, so the interaction is
+/// the first thing worth a frame. Said outright rather than left to the epoch
+/// making the subtraction large: a throttle that depends on what year it is is
+/// not a throttle.
+fn event_capture_is_due(
+    events_in_batch: usize,
+    last_capture_ms: i64,
+    now_ms: i64,
+    interval_ms: i64,
+) -> bool {
+    if events_in_batch == 0 {
+        return false;
+    }
+    if last_capture_ms <= 0 {
+        return true;
+    }
+    let throttle_ms = interval_ms.max(EVENT_CAPTURE_MIN_INTERVAL_MS);
+    now_ms.saturating_sub(last_capture_ms) >= throttle_ms
 }
 
 async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
@@ -1437,6 +1547,42 @@ async fn resolve_context_budget(state: &AppState) -> ContextBudget {
         eprintln!("llm.{}", probe.summary());
     }
     ContextBudget::for_window(probe.resolved)
+}
+
+/// Bytes assumed per token when a token budget becomes a character budget.
+///
+/// Conservative on purpose: real tokenizers average well above this on English
+/// prose, and CJK screen text is the case that must not overrun. Written as a
+/// ratio because 2.5 is not an integer and rounding it up would spend the
+/// margin this exists to keep.
+const T2_PROMPT_BYTES_PER_TOKEN_NUMERATOR: usize = 5;
+const T2_PROMPT_BYTES_PER_TOKEN_DENOMINATOR: usize = 2;
+/// Floor. Exactly the fixed constant this replaced (`PROMPT_LINES_BUDGET_CHARS`
+/// in the store), so no machine ever gets a *worse* card than it did before the
+/// window became a variable — a small window means fewer rounds, not a card
+/// written from four lines.
+const T2_PROMPT_FLOOR_CHARS: usize = 12_000;
+/// Ceiling: 4× the old fixed budget. Not a limit of the models — a limit of
+/// what has been evaluated. The corpus run (WS7) is what lifts it; until then a
+/// 256k window buys depth up to here and no further, because an unevaluated
+/// 200k-character prompt is a guess with a large bill attached.
+const T2_PROMPT_CEILING_CHARS: usize = 48_000;
+
+/// How many characters of evidence one T2 prompt may inline, derived from the
+/// window the model actually has.
+///
+/// The same `resolve_context_budget` chat uses — that asymmetry was a bug: T2
+/// planned against a 16k default while chat measured the real window, so the
+/// summariser wrote from a twelfth of a 256k model's context and nothing said
+/// so. The share taken is the opening allowance: the T2 prompt *is* the
+/// opening, and what is left after every round can hold a full tool result.
+fn t2_prompt_budget_chars(budget: ContextBudget) -> usize {
+    budget
+        .opening_allowance()
+        .saturating_mul(T2_PROMPT_BYTES_PER_TOKEN_NUMERATOR)
+        .checked_div(T2_PROMPT_BYTES_PER_TOKEN_DENOMINATOR)
+        .unwrap_or(T2_PROMPT_FLOOR_CHARS)
+        .clamp(T2_PROMPT_FLOOR_CHARS, T2_PROMPT_CEILING_CHARS)
 }
 
 fn current_llm_config(state: &AppState) -> LlmRuntimeConfig {
@@ -2201,6 +2347,8 @@ async fn record_signal_gap(state: &Arc<AppState>, from_ms: i64, to_ms: i64, reas
         command: Some(reason.to_owned()),
         bundle_identifier: None,
         target_json: None,
+        text: None,
+        extra_json: None,
     };
     if let Err(error) = run_store(state, move |s| s.store.insert_input_events(&[marker])).await {
         eprintln!("input signal gap store failed: {error}");
@@ -2210,7 +2358,12 @@ async fn record_signal_gap(state: &Arc<AppState>, from_ms: i64, to_ms: i64, reas
 async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
     while let Some(event) = state.capture.next_event().await {
         match event {
-            Ok(CaptureEvent::Ready { .. }) => {}
+            // The startup handshake already recorded this, but the shim may
+            // re-announce after a display change, and the OCR crop is only as
+            // good as the dimensions it maps against.
+            Ok(CaptureEvent::Ready { width, height, .. }) => {
+                remember_capture_display(&state, width, height);
+            }
             Ok(CaptureEvent::Artifact {
                 kind,
                 path,
@@ -2272,6 +2425,20 @@ async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
                         }
                     }
                 }
+                // The user did something; the heartbeat's next tick may be nine
+                // seconds away. Pull the frame forward so the screenshot lands
+                // near the interaction rather than wherever the timer's phase
+                // happened to fall — the cadence stays the same, its phase
+                // stops being arbitrary. A failed store above does not change
+                // this: the frame is worth having either way.
+                if event_capture_is_due(
+                    events.len(),
+                    state.last_capture_ms.load(Ordering::SeqCst),
+                    now_ms(),
+                    i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
+                ) {
+                    fire_capture_tick(&state).await;
+                }
             }
             Ok(CaptureEvent::Failed { code, message }) => {
                 eprintln!("capture failed [{code}]: {message}");
@@ -2314,6 +2481,12 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
 /// the first reader that will. A target that somehow cannot be encoded is
 /// stored as absent rather than dropping the event — that an input happened is
 /// the load-bearing fact; where it landed is the refinement.
+/// The shim's record as the vault holds it.
+///
+/// Every field the shim sends lands somewhere: the ones readers filter on have
+/// columns, `target` and the rest are serialised verbatim. The store models
+/// none of it — a `kind` or a field this build has never heard of must still
+/// round-trip, because the shim can ship ahead of its reader.
 fn input_event_row(record: &InputEventRecord) -> InputEventRow {
     InputEventRow {
         at_ms: record.at_ms,
@@ -2327,7 +2500,100 @@ fn input_event_row(record: &InputEventRecord) -> InputEventRow {
             .target
             .as_ref()
             .and_then(|target| serde_json::to_string(target).ok()),
+        text: record.text.clone(),
+        extra_json: input_event_extra_json(record),
     }
+}
+
+/// The record fields with no column of their own, as one JSON object holding
+/// only the keys that are present.
+///
+/// Absent stays absent rather than becoming `null`: these fields are per-kind
+/// (`application_name`/`window_title` on `window_changed`, `source`/
+/// `destination` on `drag`), so on any given row most of them are missing by
+/// definition, and a row of nulls would be four times the bytes at interaction
+/// rate. An object with no keys at all is stored as SQL `NULL` for the same
+/// reason — `{}` and "nothing to say" are the same fact.
+fn input_event_extra_json(record: &InputEventRecord) -> Option<String> {
+    let mut extra = serde_json::Map::new();
+    for (key, held) in [
+        ("application_name", record.application_name.as_ref()),
+        ("window_title", record.window_title.as_ref()),
+    ] {
+        if let Some(held) = held {
+            extra.insert(key.to_owned(), serde_json::Value::String(held.clone()));
+        }
+    }
+    for (key, held) in [
+        ("source", record.source.as_ref()),
+        ("destination", record.destination.as_ref()),
+    ] {
+        if let Some(held) = held
+            && let Ok(value) = serde_json::to_value(held)
+        {
+            extra.insert(key.to_owned(), value);
+        }
+    }
+    if extra.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(extra)).ok()
+}
+
+/// Records the captured display's logical size, the only geometry the daemon
+/// ever learns about a screenshot.
+///
+/// A size that cannot be used is stored as `None` rather than as a guess: the
+/// OCR crop reads that as "do not crop" and keeps every region.
+fn remember_capture_display(state: &Arc<AppState>, width: usize, height: usize) {
+    let display = ocr_crop::DisplayPoints::new(width, height);
+    if display.is_none() {
+        eprintln!(
+            "capture runtime: shim reported a {width}x{height} display; OCR window cropping stays off"
+        );
+    }
+    *state.capture_display.lock().unwrap() = display;
+}
+
+/// Narrows a frame's OCR to the frontmost window, dropping the menu bar,
+/// desktop widgets and clipped background windows that share the screenshot.
+///
+/// Returns the text and regions to store. Every uncertainty keeps the worker's
+/// output verbatim (`docs/event-capture-v2-plan.md` §7): the accessibility
+/// snapshot is read back from the moment because it is attached *after* the
+/// screenshot lands, so a snapshot that has not arrived yet — or one that names
+/// no window — simply means no crop, never a partial one.
+async fn crop_ocr_to_window(
+    state: &Arc<AppState>,
+    moment_id: &str,
+    text: String,
+    regions: Vec<OcrRegion>,
+) -> (String, Vec<OcrRegion>) {
+    let display = *state.capture_display.lock().unwrap();
+    if regions.is_empty() || display.is_none() {
+        return (text, regions);
+    }
+    let wanted = moment_id.to_owned();
+    let snapshot = run_store(state, move |s| {
+        s.store
+            .accessibility_bytes_for_moment(&wanted)
+            .ok()
+            .flatten()
+    })
+    .await;
+    let window = snapshot
+        .as_deref()
+        .and_then(ocr_crop::frontmost_window_frame);
+    let cropped = ocr_crop::crop_to_window(regions, window, display);
+    if cropped.dropped == 0 {
+        return (text, cropped.regions);
+    }
+    eprintln!(
+        "ocr window crop: kept {} regions, dropped {}, moment {moment_id}",
+        cropped.regions.len(),
+        cropped.dropped
+    );
+    (ocr_crop::regions_text(&cropped.regions), cropped.regions)
 }
 
 async fn import_artifact(
@@ -2396,6 +2662,8 @@ async fn import_artifact(
                 if let Ok(snapshot) = snapshot
                     && let Some(ModelOutput::Ocr { text, regions }) = snapshot.output
                 {
+                    let (text, regions) =
+                        crop_ocr_to_window(&model_state, &moment.id, text, regions).await;
                     let layout_json = if regions.is_empty() {
                         None
                     } else {
@@ -2960,18 +3228,21 @@ async fn run_slot_t2_recording(
 /// through the configured model, persist the card. Shared by the RPC and the
 /// background sweeper so both agree on what "summarised" means.
 async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
-    /// Rounds are model calls, so this bounds both cost and transcript
-    /// growth. The transcript is append-only — never pruned — so a
-    /// prefix-caching runtime re-prefills only each round's delta.
-    const T2_MAX_ROUNDS: usize = 8;
-
     let started = std::time::Instant::now();
-    let inputs = run_store(state, move |s| slot_t2_inputs(s, at_ms))
+    // Before the budget, not after: the provider only reports its window once
+    // the model is resident, so a budget resolved first would be the default's
+    // guess exactly when it mattered.
+    ensure_remote_llm_model(state).await;
+    let budget = afterray_harness::ContextBudget {
+        max_rounds: T2_MAX_ROUNDS,
+        ..resolve_context_budget(state).await
+    };
+    let budget_chars = t2_prompt_budget_chars(budget);
+    let inputs = run_store(state, move |s| slot_t2_inputs(s, at_ms, budget_chars))
         .await
         .map_err(|error| error.to_string())?;
     let slot_start_ms = inputs.card.slot_start_ms;
 
-    ensure_remote_llm_model(state).await;
     // Reserve the LLM lane for this loop's rounds. Interactive chat still
     // preempts; other background summaries wait until the guard drops.
     let lease_hold = state.models.hold_llm_lease();
@@ -2991,10 +3262,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         &tools,
         &mut afterray_harness::Discard,
         &afterray_harness::LoopConfig {
-            budget: afterray_harness::ContextBudget {
-                max_rounds: T2_MAX_ROUNDS,
-                ..afterray_harness::ContextBudget::DEFAULT
-            },
+            budget,
             // The background sweeper has no user waiting on it to stop.
             cancel: afterray_harness::CancelToken::new(),
             // Append-only. A prefix-caching runtime re-prefills only each
@@ -3003,7 +3271,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
             // card, so it is bounded by construction.
             compaction: None,
         },
-        inputs.system,
+        &inputs.system,
         // The T2 prompt is one slot's card: no history, and the card itself is
         // the task.
         afterray_harness::Opening {
@@ -3017,19 +3285,15 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     drop(lease_hold);
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let mut parsed = afterray_store::parse_t2_card_v2(&turn.answer);
-    // Grounding: a claim may come from the prompt or from anything a tool
-    // returned this turn. Entities that match neither are dropped in code —
-    // the check the prompt alone can never be.
+    let mut parsed = afterray_store::parse_t2_card_v3(&turn.answer);
+    // Grounding: every frame a card points at must be one this slot holds.
+    // What replaced the v2 entity check is not weaker, it is the same check on
+    // what the v3 card actually asserts — a citation is a promise that a frame
+    // can be shown, and only the code knows which frames exist.
     let verification = parsed.as_mut().map(|card| {
-        let mut evidence = inputs.user.clone();
-        for result in &turn.tool_results {
-            evidence.push('\n');
-            evidence.push_str(result);
-        }
         let valid_ids: std::collections::HashSet<String> =
             inputs.card.evidence.moment_ids.iter().cloned().collect();
-        afterray_store::verify_t2_card(card, &evidence, &valid_ids)
+        afterray_store::ground_t2_details(card, &valid_ids)
     });
 
     let tool_names: Vec<&str> = turn
@@ -3039,15 +3303,16 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         .collect();
     eprintln!(
         "slot.t2 slot={slot_start_ms} prompt_tokens={}/{} rounds={} tools={tool_names:?} \
-         out_chars={} latency_ms={latency_ms} parsed={} entities_dropped={}",
+         out_chars={} latency_ms={latency_ms} parsed={} low_trust={} citations_dropped={}",
         turn.usage.prompt_tokens,
         turn.usage.window_tokens,
         turn.tool_calls.len() + 1,
         turn.answer.chars().count(),
         parsed.is_some(),
+        parsed.as_ref().is_some_and(|card| card.low_trust),
         verification
             .as_ref()
-            .map_or(0, |report| report.entities_dropped.len()),
+            .map_or(0, |report| report.citations_dropped),
     );
 
     let Some(t2) = parsed else {
@@ -3061,7 +3326,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     let t2_for_store = t2.clone();
     if let Err(error) = run_store(state, move |s| {
         s.store
-            .put_t2_summary_v2(&card, &t2_for_store, "t2-agent", now_ms(), latency_i64)
+            .put_t2_summary_v3(&card, &t2_for_store, "t2-agent", now_ms(), latency_i64)
     })
     .await
     {
@@ -3080,6 +3345,11 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     }))
 }
 
+/// Rounds are model calls, so this bounds both cost and transcript growth. The
+/// transcript is append-only — never pruned — so a prefix-caching runtime
+/// re-prefills only each round's delta.
+const T2_MAX_ROUNDS: usize = 8;
+
 /// How long after a slot closes before it is eligible. Frames captured near the
 /// boundary land in the vault a beat late; summarising immediately would read a
 /// slot that is still filling in.
@@ -3096,37 +3366,266 @@ const T2_MAX_ATTEMPTS: u32 = 3;
 /// gradually instead of monopolising the model for minutes at a time.
 const T2_PER_TICK: usize = 2;
 
+/// The longest a summary will wait for a transcript that has not arrived.
+///
+/// Measured, not guessed: on a loaded machine the ASR queue reached ten jobs —
+/// about fifty minutes of audio — behind a summariser sweeping every five
+/// minutes. So a backlog *can* outlive any cap worth having, which is the
+/// whole reason there is one. Past half an hour the honest thing is a card
+/// that arrives saying the transcript was unavailable, rather than a card that
+/// never arrives at all; the user cannot read a summary that is still waiting.
+const ASR_WAIT_CAP_MS: i64 = 30 * 60 * 1000;
+
+/// The wall-clock backstop on "ASR is alive", and *only* a backstop.
+///
+/// Liveness is decided by comparing the last success against the last failure,
+/// never against the clock alone: a machine that slept eight hours wakes with
+/// an eight-hour-old success and a perfectly healthy worker, and a laptop shut
+/// on Friday has a three-day-old one on Monday morning. Judging those stale
+/// would drop the wait exactly when the user's first meeting of the week needs
+/// it.
+///
+/// So this catches only the case no other branch can see: a worker that
+/// stopped succeeding without ever recording a failure (nothing claims, so
+/// nothing fails) — a model file deleted, a runtime that no longer starts.
+/// A week is deliberately generous, because the asymmetry is: too generous
+/// costs at most one [`ASR_WAIT_CAP_MS`] delay, too strict costs a card that
+/// is permanently missing its transcript.
+const ASR_ALIVE_STALENESS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Why a slot was summarised without waiting for its transcript.
+///
+/// Each variant is a different way ASR can fail to arrive, and each is named
+/// because the alternative — folding them into one "not waiting" — is what
+/// makes an unconditional wait look reasonable right up until the machine
+/// where the model was never downloaded produces cards that never come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsrProceed {
+    /// Nothing in this window is owed a transcript (including: no audio).
+    NoTranscriptPending,
+    /// Waited long enough. The card goes out honestly incomplete.
+    CapElapsed,
+    /// Transcription never once succeeded on this vault: cold start, model
+    /// absent, worker that cannot run.
+    NeverSucceeded,
+    /// The most recent thing ASR did was fail.
+    FailingNotSucceeding,
+    /// It last succeeded so long ago that "alive" is no longer a claim the
+    /// vault supports.
+    SuccessTooStale,
+    /// Every segment still owed a transcript has run its backoff out to
+    /// saturation; retries continue, but not on a timescale a card can wait for.
+    AllPendingExhausted,
+}
+
+impl AsrProceed {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::NoTranscriptPending => "no transcript pending",
+            Self::CapElapsed => "waited out the ASR cap",
+            Self::NeverSucceeded => "ASR has never succeeded",
+            Self::FailingNotSucceeding => "ASR is failing, not succeeding",
+            Self::SuccessTooStale => "ASR's last success is too old to trust",
+            Self::AllPendingExhausted => "every pending transcript has exhausted its backoff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsrWait {
+    /// Summarise now.
+    Proceed(AsrProceed),
+    /// Skip this slot this round and look again next sweep. Not a state
+    /// change: the slot stays `Degraded`, which is the only state
+    /// [`due_slot_starts`] ever picks back up.
+    Wait,
+}
+
+/// Whether a summary should hold off until this window's audio is transcribed.
+///
+/// The rule the product asked for is "rather two minutes late than a summary
+/// that missed the meeting" — but only while waiting is justified. Waiting
+/// requires all of: something is actually pending, ASR is demonstrably alive
+/// (its last success is more recent than its last failure, one exists at all,
+/// and it is not absurdly old), and the cap has not elapsed. Everything else
+/// proceeds, with a named reason.
+///
+/// Pure: the vault reads happen in the caller so this can be tested against
+/// every shape of a broken ASR without one.
+const fn asr_wait_verdict(
+    health: &AsrHealth,
+    has_untranscribed: bool,
+    slot_end_ms: i64,
+    now_ms: i64,
+) -> AsrWait {
+    if !has_untranscribed {
+        return AsrWait::Proceed(AsrProceed::NoTranscriptPending);
+    }
+    if slot_end_ms.saturating_add(ASR_WAIT_CAP_MS) <= now_ms {
+        return AsrWait::Proceed(AsrProceed::CapElapsed);
+    }
+    // Global counts against a per-slot fact, so `waiting_segments == 0` here
+    // means the two reads raced; that is not evidence of exhaustion.
+    if health.waiting_segments > 0 && health.exhausted_segments >= health.waiting_segments {
+        return AsrWait::Proceed(AsrProceed::AllPendingExhausted);
+    }
+    let Some(last_success_ms) = health.last_success_ms else {
+        return AsrWait::Proceed(AsrProceed::NeverSucceeded);
+    };
+    if let Some(last_failure_ms) = health.last_failure_ms
+        && last_failure_ms > last_success_ms
+    {
+        return AsrWait::Proceed(AsrProceed::FailingNotSucceeding);
+    }
+    if now_ms.saturating_sub(last_success_ms) > ASR_ALIVE_STALENESS_MS {
+        return AsrWait::Proceed(AsrProceed::SuccessTooStale);
+    }
+    AsrWait::Wait
+}
+
 /// Every occupied slot that T1 marked ready, has closed and settled, and has no
 /// T2 card yet — oldest first, so a backlog fills in the order it happened.
+///
+/// No ASR gate: this is the list of slots that *want* summarising, which is
+/// what the backlog count reports and what `slot backfill` works through. The
+/// sweeper takes [`slots_ready_for_t2`] instead.
 fn slots_awaiting_t2(
     store: &Vault,
     interval_ms: i64,
     now: i64,
     lookback_days: i64,
 ) -> Vec<i64> {
+    slot_windows_awaiting_t2(store, interval_ms, now, lookback_days)
+        .into_iter()
+        .map(|(slot_start_ms, _)| slot_start_ms)
+        .collect()
+}
+
+/// The same walk, keeping each slot's end — the ASR gate needs it to know how
+/// long this particular card has already been waiting.
+fn slot_windows_awaiting_t2(
+    store: &Vault,
+    interval_ms: i64,
+    now: i64,
+    lookback_days: i64,
+) -> Vec<(i64, i64)> {
     let mut due = Vec::new();
     let mut day_ms = now;
     for _ in 0..=lookback_days.max(0) {
         let Ok(summary) = store.day_summary(day_ms, interval_ms) else {
             continue;
         };
-        due.extend(due_slot_starts(&summary.slots, now));
+        due.extend(due_slot_windows(&summary.slots, now));
         day_ms = summary.day_start_ms.saturating_sub(1);
     }
     due.sort_unstable();
-    due.dedup();
+    due.dedup_by_key(|(slot_start_ms, _)| *slot_start_ms);
     due
 }
 
-/// The selection rule on its own, so the two things that make it wrong — the
-/// state filter and the settle window — can be tested without a vault.
-fn due_slot_starts(slots: &[afterray_store::DaySlot], now: i64) -> Vec<i64> {
+/// The automatic sweeper's list: due slots, minus the ones whose transcript is
+/// still worth waiting for.
+///
+/// Blocking, and it must stay that way — every call here is a synchronous
+/// `Vault` read, so async callers reach it through `run_store`.
+///
+/// The health snapshot is taken once for the whole sweep (ASR is one worker
+/// with one model; its health is not a property of a slot), and doubles as the
+/// short circuit: with nothing anywhere owed a transcript, no slot needs the
+/// per-slot query at all.
+fn slots_ready_for_t2(
+    store: &Vault,
+    interval_ms: i64,
+    now: i64,
+    lookback_days: i64,
+) -> T2Sweep {
+    let windows = slot_windows_awaiting_t2(store, interval_ms, now, lookback_days);
+    if windows.is_empty() {
+        return T2Sweep::default();
+    }
+    // Fail open. A summary held back by a query that will not run is a card
+    // the user never sees, which is worse than the incomplete card this whole
+    // gate exists to prevent.
+    let health = match store.asr_health(now) {
+        Ok(health) => health,
+        Err(error) => {
+            eprintln!("slot.t2 sweeper: could not read ASR health, not waiting: {error}");
+            return T2Sweep {
+                ready: windows
+                    .into_iter()
+                    .map(|(slot_start_ms, _)| slot_start_ms)
+                    .collect(),
+                waiting_on_asr: 0,
+            };
+        }
+    };
+    let mut waiting_on_asr = 0_usize;
+    let ready = windows
+        .into_iter()
+        .filter(|&(slot_start_ms, slot_end_ms)| {
+            let has_untranscribed = health.waiting_segments > 0
+                && store
+                    .has_untranscribed_audio_between(slot_start_ms, slot_end_ms)
+                    .unwrap_or(false);
+            match asr_wait_verdict(&health, has_untranscribed, slot_end_ms, now) {
+                AsrWait::Wait => {
+                    eprintln!(
+                        "slot.t2 sweeper: slot={slot_start_ms} waiting for a transcript \
+                         ({} segment(s) queued, up to {} more)",
+                        health.waiting_segments,
+                        human_duration(Duration::from_millis(
+                            u64::try_from(
+                                slot_end_ms.saturating_add(ASR_WAIT_CAP_MS).saturating_sub(now)
+                            )
+                            .unwrap_or_default()
+                        ))
+                    );
+                    waiting_on_asr += 1;
+                    false
+                }
+                // The line that would have explained the card written before
+                // its transcript existed: why this one is not waiting.
+                AsrWait::Proceed(AsrProceed::NoTranscriptPending) => true,
+                AsrWait::Proceed(reason) => {
+                    eprintln!(
+                        "slot.t2 sweeper: slot={slot_start_ms} summarising without its \
+                         transcript — {}",
+                        reason.reason()
+                    );
+                    true
+                }
+            }
+        })
+        .map(|(slot_start_ms, _)| slot_start_ms)
+        .collect();
+    T2Sweep {
+        ready,
+        waiting_on_asr,
+    }
+}
+
+/// What one sweep found: the slots to summarise now, and how many were held
+/// back for a transcript.
+///
+/// The second number exists so the sweeper does not report a backlog it is
+/// deliberately holding as "drained" and cancel the user's "run now" override
+/// on the strength of it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct T2Sweep {
+    ready: Vec<i64>,
+    waiting_on_asr: usize,
+}
+
+/// The selection rule on its own, so the three things that make it wrong — the
+/// state filter, the settle window, and the ASR gate that reads the end it
+/// returns — can be tested without a vault.
+fn due_slot_windows(slots: &[afterray_store::DaySlot], now: i64) -> Vec<(i64, i64)> {
     slots
         .iter()
         // Degraded is precisely "T1 said summarise me, nothing has".
         .filter(|slot| slot.state == SlotSummaryState::Degraded)
         .filter(|slot| slot.slot_end_ms + T2_SETTLE_MS <= now)
-        .map(|slot| slot.slot_start_ms)
+        .map(|slot| (slot.slot_start_ms, slot.slot_end_ms))
         .collect()
 }
 
@@ -3355,7 +3854,9 @@ async fn fail_claimed_audio(
     attempts: u32,
     error: &str,
 ) {
-    let delay_minutes = 1_i64 << attempts.min(6);
+    // The saturation point is shared with the store: past it the delay stops
+    // growing, which is what `AsrHealth::exhausted_segments` counts.
+    let delay_minutes = 1_i64 << attempts.min(afterray_store::AUDIO_BACKOFF_SATURATION_ATTEMPTS);
     let now = now_ms();
     let next = now.saturating_add(delay_minutes * 60 * 1_000);
     let segment_id = segment_id.to_owned();
@@ -3468,18 +3969,15 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
             // exactly the laptops that stay unplugged.
             freeze_slot_acts(&state, now_ms()).await;
 
-            // The same argument, for the other half of the 48h promise: expiry
-            // is a deadline in wall-clock time, so it cannot hang off capture
-            // (which stops when the user pauses) or off the T2 gate (which
-            // waits for power). This tick runs while the daemon is up, whether
-            // or not anything is being recorded.
-            if let Err(error) = run_store(&state, |s| {
-                s.store.prune_input_events(now_ms())?;
-                s.store.prune_edge_snapshots(now_ms())
-            })
-            .await
-            {
-                eprintln!("input stream retention failed: {error}");
+            // All that is left of the 48h channel: the runtime markers. The
+            // observations and the R3 trees are content now and expire with the
+            // rest of the vault's content, oldest-first, inside
+            // `enforce_retention`. A marker's deadline is still wall-clock, so
+            // it cannot hang off capture (which stops when the user pauses) or
+            // off the T2 gate (which waits for power) — this tick runs while
+            // the daemon is up, whether or not anything is being recorded.
+            if let Err(error) = run_store(&state, |s| s.store.prune_signal_gaps(now_ms())).await {
+                eprintln!("signal marker retention failed: {error}");
             }
 
             // OCR is on the critical path for the frames still arriving; T2 is
@@ -3506,13 +4004,20 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 eprintln!("slot.t2 sweeper: conditions met, resuming");
             }
 
-            let due = slots_awaiting_t2(
-                &state.store,
-                capture_interval_ms(&state),
-                now_ms(),
-                T2_LOOKBACK_DAYS,
-            );
-            if due.is_empty()
+            // Through `run_store`: this walks up to three days of slot cards
+            // and now also asks the ASR queue where it stands, all of it
+            // synchronous vault work that must not run on a tokio worker.
+            let interval_ms = capture_interval_ms(&state);
+            let now = now_ms();
+            let due = run_store(&state, move |s| {
+                slots_ready_for_t2(&s.store, interval_ms, now, T2_LOOKBACK_DAYS)
+            })
+            .await;
+            // A slot held back for its transcript is not a drained backlog:
+            // ending the override here would put the work the user pointed at
+            // back under the usual gates the moment it becomes runnable.
+            if due.ready.is_empty()
+                && due.waiting_on_asr == 0
                 && state
                     .compute
                     .clear_force(afterray_protocol::ComputeWorkload::Summary)
@@ -3523,7 +4028,7 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
                 eprintln!("slot.t2 sweeper: backlog drained, override ended");
             }
             let mut ran = 0;
-            for slot_start_ms in due {
+            for slot_start_ms in due.ready {
                 // A forced run is draining a backlog the user is watching, so it
                 // works through the lot instead of two slots every five minutes —
                 // and it stops the moment the override expires or is withdrawn,
@@ -3643,13 +4148,19 @@ fn slot_card_for(
 /// persistence) and the rendered prompt pair.
 struct SlotT2Inputs {
     card: afterray_store::SlotCard,
-    system: &'static str,
+    system: String,
     user: String,
 }
+
+/// Neighbouring cards injected as context. Two, not three: they carry their
+/// descriptions now, and the third one only pushed the slot's own evidence out
+/// of the window.
+const T2_PREV_CARDS: usize = 2;
 
 fn slot_t2_inputs(
     state: &AppState,
     at_ms: i64,
+    budget_chars: usize,
 ) -> Result<SlotT2Inputs, afterray_store::StoreError> {
     let mut card = slot_card_for(state, at_ms)?;
     let stored = state
@@ -3659,7 +4170,7 @@ fn slot_t2_inputs(
     let language = resolve_summary_language(&stored);
     let prev_cards = state
         .store
-        .previous_slot_titles(card.slot_start_ms, 3)
+        .previous_slot_titles(card.slot_start_ms, T2_PREV_CARDS)
         .unwrap_or_default();
     // History-aware rendering: the DF corpus decides which lines carry
     // information and which are the user's everyday chrome. An empty corpus
@@ -3669,15 +4180,19 @@ fn slot_t2_inputs(
         afterray_store::infoscore::BackgroundStats::empty()
     });
     afterray_store::attach_entity_candidates(&mut card, &background);
-    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language, &background);
+    let user =
+        afterray_store::render_t2_prompt(&card, &prev_cards, &language, &background, budget_chars);
     eprintln!(
-        "slot.prompt slot={} language={language} user_chars={}",
+        "slot.prompt slot={} language={language} budget_chars={budget_chars} user_chars={}",
         card.slot_start_ms,
         user.chars().count()
     );
+    // The catalog is cut to this slot's evidence: a silent slot is never told
+    // about a transcript tool, which measured as a whole wasted round.
+    let system = afterray_store::render_t2_system_prompt(card.facts.has_audio);
     Ok(SlotT2Inputs {
         card,
-        system: afterray_store::T2_SYSTEM_PROMPT_V2,
+        system,
         user,
     })
 }
@@ -3686,8 +4201,9 @@ fn slot_t2_inputs(
 fn slot_prompt_for(
     state: &AppState,
     at_ms: i64,
+    budget_chars: usize,
 ) -> Result<serde_json::Value, afterray_store::StoreError> {
-    let inputs = slot_t2_inputs(state, at_ms)?;
+    let inputs = slot_t2_inputs(state, at_ms, budget_chars)?;
     Ok(serde_json::json!({
         "slot_start_ms": inputs.card.slot_start_ms,
         "slot_end_ms": inputs.card.slot_end_ms,
@@ -3710,43 +4226,6 @@ struct SlotT2Tools<'a> {
 const T2_TOOL_PAGE_CHARS: usize = 3_000;
 
 impl SlotT2Tools<'_> {
-    fn run_by_id(&self, id: &str) -> Option<&afterray_store::RunRow> {
-        self.card.timeline.iter().find_map(|entry| match entry {
-            afterray_store::TimelineEntry::Run(run) if run.moment_id == id => Some(run),
-            _ => None,
-        })
-    }
-
-    fn get_run_text(&self, args: &serde_json::Value) -> Result<String, String> {
-        let id = args
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "get_run_text requires id (a run id from the input)".to_owned())?;
-        let offset = args
-            .get("offset")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
-        let run = self
-            .run_by_id(id)
-            .ok_or_else(|| format!("no run with id `{id}` in this slot"))?;
-        let full = run.lines.join("\n");
-        let total = full.chars().count();
-        if offset >= total {
-            return Ok(format!(
-                "(no text beyond offset {offset}; total {total} chars)"
-            ));
-        }
-        let page: String = full.chars().skip(offset).take(T2_TOOL_PAGE_CHARS).collect();
-        let next = offset + page.chars().count();
-        if next < total {
-            Ok(format!(
-                "{page}\n…(continues; call again with offset {next}; total {total} chars)"
-            ))
-        } else {
-            Ok(page)
-        }
-    }
-
     fn get_transcript(&self) -> Result<String, String> {
         let rows = self
             .store
@@ -3792,25 +4271,6 @@ impl SlotT2Tools<'_> {
         Ok(clipped)
     }
 
-    fn get_prev_cards(&self, args: &serde_json::Value) -> Result<String, String> {
-        let n = args
-            .get("n")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(3)
-            .clamp(1, 8) as usize;
-        let cards = self
-            .store
-            .previous_slot_titles(self.card.slot_start_ms, n)
-            .map_err(|error| error.to_string())?;
-        if cards.is_empty() {
-            return Ok("(no earlier cards)".to_owned());
-        }
-        Ok(cards
-            .into_iter()
-            .map(|card| format!("{}: {}", card.from_label, card.title))
-            .collect::<Vec<_>>()
-            .join("\n"))
-    }
 }
 
 impl afterray_harness::ToolSurface for SlotT2Tools<'_> {
@@ -3819,13 +4279,16 @@ impl afterray_harness::ToolSurface for SlotT2Tools<'_> {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<afterray_harness::Budgeted, String> {
+        // Two tools, both answering about evidence the card already stands on.
+        // `get_run_text` and `get_prev_cards` are gone: measured, the small
+        // models never called either, the large one spent rounds on them, and
+        // what they served is now inlined (prev cards) or honestly disclosed
+        // and left there (`more_chars`).
         let text = match name {
-            "get_run_text" => self.get_run_text(args),
             "get_transcript" => self.get_transcript(),
             "get_ocr" => self.get_ocr(args),
-            "get_prev_cards" => self.get_prev_cards(args),
             other => Err(format!(
-                "unknown tool `{other}`; available: get_run_text, get_transcript, get_ocr, get_prev_cards"
+                "unknown tool `{other}`; available: get_transcript, get_ocr"
             )),
         }?;
         // These tools already page themselves against `T2_TOOL_PAGE_CHARS`, so
@@ -4681,6 +5144,41 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
+    /// T2 used to plan against `ContextBudget::DEFAULT` while chat measured the
+    /// real window: on a 256k model the summariser wrote from a twelfth of the
+    /// context it had, and nothing in the logs said so. Now both derive from
+    /// the same probe — bounded below by the constant this replaced, and above
+    /// by what has actually been evaluated.
+    #[test]
+    fn the_t2_prompt_budget_follows_the_window_between_a_floor_and_a_ceiling() {
+        let for_window = |tokens: usize| {
+            t2_prompt_budget_chars(ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..ContextBudget::for_window(tokens)
+            })
+        };
+
+        // A small window buys fewer rounds, never a card written from scraps.
+        assert_eq!(for_window(4_096), T2_PROMPT_FLOOR_CHARS);
+        assert_eq!(for_window(16_384), T2_PROMPT_FLOOR_CHARS);
+        let large = for_window(131_072);
+        assert!(
+            large > T2_PROMPT_FLOOR_CHARS && large < T2_PROMPT_CEILING_CHARS,
+            "a real window must move the budget: {large}"
+        );
+        assert_eq!(for_window(262_144), T2_PROMPT_CEILING_CHARS);
+        // Monotone: a bigger window is never a smaller prompt.
+        assert!(for_window(65_536) <= large);
+        // And whatever it derives still fits the turn it was derived from.
+        assert!(
+            ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..ContextBudget::for_window(131_072)
+            }
+            .is_coherent()
+        );
+    }
+
     /// The import path for an R3 edge snapshot is fail-closed: it stores the
     /// tree only when the snapshot names the app it came from, because that name
     /// is the only thing the exclusion list can be checked against.
@@ -4709,6 +5207,94 @@ mod tests {
             )),
             "the URL must reach the domain exclusion check"
         );
+    }
+
+    /// The screenshot throttle, as the decision it is: an input batch may pull
+    /// a frame forward, but never closer than the plan's 10s floor and never
+    /// denser than the heartbeat the user configured.
+    #[test]
+    fn an_input_batch_pulls_a_frame_forward_only_past_the_throttle() {
+        let default_ms = 10_000;
+
+        // Nothing happened: the heartbeat's phase is all there is.
+        assert!(!event_capture_is_due(0, 0, 60_000, default_ms));
+        assert!(!event_capture_is_due(0, 0, i64::MAX, default_ms));
+
+        // The common case, at the interval's own boundary and past it.
+        assert!(event_capture_is_due(1, 50_000, 60_000, default_ms));
+        assert!(event_capture_is_due(7, 50_000, 61_000, default_ms));
+        assert!(!event_capture_is_due(7, 50_000, 59_999, default_ms));
+
+        // A user who asked for fewer frames gets fewer frames: the throttle
+        // never drops below the configured cadence.
+        assert!(!event_capture_is_due(1, 50_000, 65_000, 60_000));
+        assert!(event_capture_is_due(1, 50_000, 110_000, 60_000));
+
+        // And a user who asked for more does not get the event path firing
+        // faster than the plan's floor.
+        assert!(!event_capture_is_due(1, 50_000, 53_000, 2_000));
+        assert!(event_capture_is_due(1, 50_000, 60_000, 2_000));
+
+        // Nothing captured yet — a fresh session, or one just stopped and
+        // restarted — is past any throttle, whatever the clock reads.
+        assert!(event_capture_is_due(1, 0, 1_000, default_ms));
+        assert!(event_capture_is_due(1, 0, 0, 60_000));
+        // ...but "nothing" still needs an event to justify a frame.
+        assert!(!event_capture_is_due(0, 0, 1_000, default_ms));
+    }
+
+    /// Every field of a v2 record has to land somewhere in the row, and the
+    /// target has to keep arriving verbatim: `value`, `secure` and `subrole`
+    /// ride the platform crate's own `Serialize` into `target_json`, so nothing
+    /// here re-models element identity and nothing silently drops when the shim
+    /// adds a key.
+    #[test]
+    fn a_v2_record_maps_content_to_columns_and_the_rest_to_one_object() {
+        let burst: InputEventRecord = serde_json::from_str(
+            r#"{"at_ms":1000,"end_ms":4000,"kind":"burst","count":17,
+                "ended_with":"return","bundle_identifier":"com.electron.lark",
+                "text":"wsm tongyini",
+                "target":{"role":"AXTextField","subrole":"AXSearchField",
+                          "label":"Message","value":"我们什么时候同意的",
+                          "secure":false}}"#,
+        )
+        .unwrap();
+        let row = input_event_row(&burst);
+        assert_eq!(row.text.as_deref(), Some("wsm tongyini"));
+        assert_eq!(row.extra_json, None, "a burst names no extra field");
+        let target: serde_json::Value =
+            serde_json::from_str(row.target_json.as_deref().unwrap()).unwrap();
+        assert_eq!(target["value"], "我们什么时候同意的");
+        assert_eq!(target["secure"], false);
+        assert_eq!(target["subrole"], "AXSearchField");
+
+        let drag: InputEventRecord = serde_json::from_str(
+            r#"{"at_ms":5000,"kind":"drag","bundle_identifier":"com.apple.finder",
+                "source":{"label":"0817.log"},
+                "destination":{"label":"Archive"}}"#,
+        )
+        .unwrap();
+        let extra: serde_json::Value =
+            serde_json::from_str(input_event_extra_json(&drag).unwrap().as_str()).unwrap();
+        assert_eq!(extra["source"]["label"], "0817.log");
+        assert_eq!(extra["destination"]["label"], "Archive");
+        assert_eq!(extra.as_object().unwrap().len(), 2, "no null keys");
+
+        let switched: InputEventRecord = serde_json::from_str(
+            r#"{"at_ms":6000,"kind":"window_changed","bundle_identifier":"dev.zed.Zed",
+                "application_name":"Zed","window_title":"lib.rs"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            input_event_extra_json(&switched).as_deref(),
+            Some(r#"{"application_name":"Zed","window_title":"lib.rs"}"#)
+        );
+
+        // A pre-v2 batch still parses, and adds nothing.
+        let old: InputEventRecord =
+            serde_json::from_str(r#"{"at_ms":7000,"kind":"click"}"#).unwrap();
+        let row = input_event_row(&old);
+        assert_eq!((row.text, row.extra_json, row.target_json), (None, None, None));
     }
 
     /// The sweeper log is where somebody goes to answer "how long did that
@@ -5107,12 +5693,22 @@ mod tests {
             title: None,
             bullets: None,
             category: None,
+            details: None,
             description: None,
             threads: None,
             entities: None,
             decisions: None,
             not_captured: None,
         }
+    }
+
+    /// The selection rule carries each slot's end now (the ASR gate needs it);
+    /// these three tests are about which slots come back, so they read starts.
+    fn due_slot_starts(slots: &[afterray_store::DaySlot], now: i64) -> Vec<i64> {
+        due_slot_windows(slots, now)
+            .into_iter()
+            .map(|(slot_start_ms, _)| slot_start_ms)
+            .collect()
     }
 
     /// Everything except `Degraded` is either already summarised, deliberately
@@ -5158,6 +5754,300 @@ mod tests {
         let slots = [day_slot(start, SlotSummaryState::Degraded)];
         let midway = start + afterray_store::SLOT_DURATION_MS / 2;
         assert!(due_slot_starts(&slots, midway).is_empty());
+    }
+
+    /// ASR that transcribed something a minute ago and has failed nothing.
+    fn healthy_asr(now: i64) -> AsrHealth {
+        AsrHealth {
+            last_success_ms: Some(now - 60_000),
+            last_failure_ms: None,
+            waiting_segments: 1,
+            exhausted_segments: 0,
+        }
+    }
+
+    #[test]
+    fn a_slot_with_nothing_pending_never_waits() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), false, slot_end, now),
+            AsrWait::Proceed(AsrProceed::NoTranscriptPending),
+        );
+    }
+
+    /// The whole point: a card that would otherwise say "the transcript was
+    /// unavailable" — permanently, because a written card is never re-run —
+    /// while the transcript was minutes away.
+    #[test]
+    fn a_slot_holds_back_while_a_live_asr_still_owes_it_a_transcript() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), true, slot_end, now),
+            AsrWait::Wait,
+        );
+    }
+
+    /// Freshness is measured against the last *failure*, not the clock. A
+    /// machine that slept eight hours wakes with an eight-hour-old success and
+    /// a perfectly healthy worker; judging that dead would drop the wait on
+    /// exactly the first meeting after the lid opens.
+    #[test]
+    fn sleeping_does_not_make_a_healthy_asr_look_dead() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let slept = AsrHealth {
+            last_success_ms: Some(now - 8 * 60 * 60 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(asr_wait_verdict(&slept, true, slot_end, now), AsrWait::Wait);
+
+        // A long weekend, too — the wall clock is only ever a backstop.
+        let weekend = AsrHealth {
+            last_success_ms: Some(now - 3 * 24 * 60 * 60 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(asr_wait_verdict(&weekend, true, slot_end, now), AsrWait::Wait);
+    }
+
+    /// The failure an unconditional wait would produce: a machine where the
+    /// model was never downloaded would hold every audio-bearing card forever.
+    #[test]
+    fn asr_that_never_succeeded_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let cold = AsrHealth {
+            last_success_ms: None,
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&cold, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::NeverSucceeded),
+        );
+    }
+
+    #[test]
+    fn asr_failing_more_recently_than_it_succeeds_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let broken = AsrHealth {
+            last_success_ms: Some(now - 60 * 60 * 1000),
+            last_failure_ms: Some(now - 30 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&broken, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::FailingNotSucceeding),
+        );
+        // The other order is the ordinary one: a failure, then a recovery.
+        let recovered = AsrHealth {
+            last_success_ms: Some(now - 30 * 1000),
+            last_failure_ms: Some(now - 60 * 60 * 1000),
+            ..healthy_asr(now)
+        };
+        assert_eq!(asr_wait_verdict(&recovered, true, slot_end, now), AsrWait::Wait);
+    }
+
+    /// The only case wall-clock staleness can see: a worker that stopped
+    /// succeeding without recording a failure, because nothing claims and so
+    /// nothing fails.
+    #[test]
+    fn an_ancient_success_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let abandoned = AsrHealth {
+            last_success_ms: Some(now - ASR_ALIVE_STALENESS_MS - 1),
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&abandoned, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::SuccessTooStale),
+        );
+    }
+
+    #[test]
+    fn a_pile_that_has_run_its_backoff_out_holds_nothing_back() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - 4 * 60 * 1000;
+        let stuck = AsrHealth {
+            waiting_segments: 3,
+            exhausted_segments: 3,
+            ..healthy_asr(now)
+        };
+        assert_eq!(
+            asr_wait_verdict(&stuck, true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::AllPendingExhausted),
+        );
+        let partly = AsrHealth {
+            exhausted_segments: 2,
+            ..stuck
+        };
+        assert_eq!(asr_wait_verdict(&partly, true, slot_end, now), AsrWait::Wait);
+    }
+
+    /// Measured: a ten-job backlog is about fifty minutes of audio, so the cap
+    /// is reachable and must expire. Past it the card arrives honestly
+    /// incomplete rather than never arriving at all.
+    #[test]
+    fn the_wait_expires_at_the_cap() {
+        let now = 1_700_000_000_000;
+        let slot_end = now - ASR_WAIT_CAP_MS;
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), true, slot_end, now),
+            AsrWait::Proceed(AsrProceed::CapElapsed),
+        );
+        assert_eq!(
+            asr_wait_verdict(&healthy_asr(now), true, slot_end + 1, now),
+            AsrWait::Wait,
+            "one millisecond inside the cap is still worth waiting for"
+        );
+    }
+
+    /// A vault with real audio in it, end to end: the sweeper holds the slot
+    /// back while its transcript is coming, `slot backfill` does not, and the
+    /// slot stays `Degraded` throughout — waiting is "skip this round", not a
+    /// state transition, and `Degraded` is the only state the sweeper ever
+    /// picks back up.
+    #[test]
+    fn the_sweeper_waits_for_a_transcript_and_backfill_does_not() {
+        let (_directory, vault) = test_vault();
+        let base = 1_786_698_000_000_i64;
+        let session = vault.create_session_sync(base).unwrap();
+        for (index, offset) in [0_i64, 20_000, 40_000].into_iter().enumerate() {
+            let moment = vault
+                .insert_moment(&session.id, base + offset, "image/jpeg", b"screen")
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    &format!("cargo test -p afterrayd, run {index}"),
+                    base + offset,
+                    None,
+                    "test-ocr",
+                    None,
+                )
+                .unwrap();
+        }
+        let interval_ms = 10_000;
+        let settled = base + afterray_store::SLOT_DURATION_MS + T2_SETTLE_MS + 60_000;
+        let windows = slot_windows_awaiting_t2(&vault, interval_ms, settled, 1);
+        assert_eq!(windows.len(), 1, "one degraded slot to summarise");
+        let (slot_start_ms, slot_end_ms) = windows[0];
+
+        // ASR is alive: something transcribed successfully a minute ago.
+        let elsewhere = vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::System,
+                slot_start_ms - 3_600_000,
+                slot_start_ms - 3_500_000,
+                "audio/mp4",
+                b"earlier",
+            )
+            .unwrap();
+        vault
+            .complete_audio_transcription(&elsewhere, "an earlier meeting", "test-asr", settled - 60_000)
+            .unwrap();
+        // …and this slot's own audio has not been transcribed yet.
+        let pending = vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::Microphone,
+                slot_start_ms + 1_000,
+                slot_end_ms - 1_000,
+                "audio/mp4",
+                b"the meeting",
+            )
+            .unwrap();
+
+        let swept = slots_ready_for_t2(&vault, interval_ms, settled, 1);
+        assert!(swept.ready.is_empty(), "the transcript is still coming");
+        assert_eq!(swept.waiting_on_asr, 1);
+        assert_eq!(
+            slots_awaiting_t2(&vault, interval_ms, settled, 1),
+            vec![slot_start_ms],
+            "backfill is an explicit request to fill history and never waits"
+        );
+        let day = vault.day_summary(settled, interval_ms).unwrap();
+        assert_eq!(
+            day.slots
+                .iter()
+                .find(|slot| slot.slot_start_ms == slot_start_ms)
+                .map(|slot| slot.state),
+            Some(SlotSummaryState::Degraded),
+            "waiting is skipping a round, not a state change"
+        );
+
+        // The transcript lands: the slot is swept on the next round.
+        vault
+            .complete_audio_transcription(&pending, "we agreed to ship on Friday", "test-asr", settled)
+            .unwrap();
+        assert_eq!(
+            slots_ready_for_t2(&vault, interval_ms, settled, 1).ready,
+            vec![slot_start_ms],
+        );
+    }
+
+    /// Past the cap the same vault stops waiting — otherwise a machine whose
+    /// ASR is merely slow would go quiet instead of late.
+    #[test]
+    fn the_sweeper_gives_up_on_a_transcript_after_the_cap() {
+        let (_directory, vault) = test_vault();
+        let base = 1_786_698_000_000_i64;
+        let session = vault.create_session_sync(base).unwrap();
+        for (index, offset) in [0_i64, 20_000, 40_000].into_iter().enumerate() {
+            let moment = vault
+                .insert_moment(&session.id, base + offset, "image/jpeg", b"screen")
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    &format!("cargo test -p afterrayd, run {index}"),
+                    base + offset,
+                    None,
+                    "test-ocr",
+                    None,
+                )
+                .unwrap();
+        }
+        let interval_ms = 10_000;
+        let settled = base + afterray_store::SLOT_DURATION_MS + T2_SETTLE_MS + 60_000;
+        let (slot_start_ms, slot_end_ms) = slot_windows_awaiting_t2(&vault, interval_ms, settled, 1)[0];
+        let alive = vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::System,
+                slot_start_ms - 3_600_000,
+                slot_start_ms - 3_500_000,
+                "audio/mp4",
+                b"earlier",
+            )
+            .unwrap();
+        vault
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::Microphone,
+                slot_start_ms + 1_000,
+                slot_end_ms - 1_000,
+                "audio/mp4",
+                b"the meeting",
+            )
+            .unwrap();
+        let expired = slot_end_ms + ASR_WAIT_CAP_MS;
+        vault
+            .complete_audio_transcription(&alive, "an earlier meeting", "test-asr", expired - 60_000)
+            .unwrap();
+        assert_eq!(
+            slots_ready_for_t2(&vault, interval_ms, expired, 1).ready,
+            vec![slot_start_ms],
+        );
     }
 
     #[test]
