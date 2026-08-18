@@ -53,6 +53,44 @@ CAP-005's ban on keystroke content lapsed with the local trust model (plan §信
 - The guard runs in the shim, at the source. Nothing downstream re-checks and nothing downstream *can*: by the time a record reaches a parser the password is already absent, and a parser judging a field it never saw would be guessing.
 - A false positive costs one field's text and nothing else. That is the direction this is allowed to be wrong in.
 
+## 3b. What the vault stores, and for how long
+
+Schema 25 gives `input_events` two content columns: `text` (the typed run) and
+`extra_json` (the record's remaining fields — `application_name`,
+`window_title`, `source`, `destination` — as one object holding only the keys
+that are present). The target rides into `target_json` through the platform
+crate's own `Serialize`, so `value`, `secure` and `subrole` arrive with no
+mapping code. Two columns rather than five because the vault stores the input
+vocabulary without modelling it: the fields readers filter on have columns, the
+rest travel together, and the next field the shim invents costs a mapping line
+in `afterrayd`'s `input_event_row` instead of a migration.
+
+**Retention is unified.** The 48h channel that used to take the whole table now
+takes only `signal_gap` markers (`prune_signal_gaps`,
+`SIGNAL_MARKER_RETENTION_MS`): a marker is bookkeeping about the recorder, and
+its whole meaning is a deadline. Everything else — observations and the R3 trees
+in `edge_snapshots` — is captured content and expires inside
+`enforce_retention`'s oldest-first sweep, measured against the **retention
+horizon**: the oldest frame the vault still holds
+(`prune_input_events_before` / `prune_edge_snapshots_before`). What the user did
+in a stretch survives exactly as long as what was on screen during it.
+
+Two decisions the plan left open, made here:
+
+- **The horizon is the oldest surviving moment**, mirroring how orphaned audio
+  is swept — content whose surrounding frames are gone has nothing left to
+  attach to. It is not a second clock; under the size limit, which is the normal
+  state, nothing expires at all, exactly like the frames.
+- **No frames left means no sweep.** "Everything is older than nothing" would
+  take live events off a vault that had merely never captured a frame, so the
+  unknown edge is skipped rather than guessed. The cost is that edge-tree
+  artifacts on a frameless vault are not reclaimable by retention; `delete_history`
+  still reaches them.
+
+R3 trees moved off the events' 48h for a reason worth keeping: that rule existed
+while the events were the shortest-lived thing in the vault. Now that they are
+not, following them would have made the trees the *longest*-lived.
+
 ## 4. Attachment tiers
 
 `requestTreeWalk` (main.swift) is the single door to a walk, and it only ever *asks* — `EdgeSnapshotPacing` still decides, and spend still goes through `fire(nowMs:walk:)`, so a declined walk cannot burn the minute's allowance.
@@ -66,4 +104,4 @@ The R3 invariants are unchanged: one window, `accessibility_edge`, **never a scr
 ## Watch out
 
 - The shim's `main.swift` needs live AX and TCC, so nothing in it is covered by `swift test`. Anything that can be a pure decision belongs in `AfterRayCapturePolicy` — that is why the chain, the guard, the chunking and the tiers all live there.
-- The daemon currently stores only `at_ms/kind/end_ms/count/ended_with/command/bundle_identifier/target_json`; `text`, `source`, `destination`, `application_name` and `window_title` are parsed and dropped until WS4.
+- Every field the shim sends now lands in the vault (WS4, schema 25) — but nothing *reads* the new ones yet. `acts.rs parse_event` still matches on `kind` alone and the acts it builds are still counts and labels; consuming `text` / `value` is WS5's contract change.

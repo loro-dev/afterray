@@ -92,16 +92,20 @@ pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
 pub const SCHEMA_VERSION: u32 = 25;
 
-/// How long the raw input-event stream lives.
+/// How long a runtime marker in the event stream lives.
 ///
-/// Events are the sharpest thing the vault holds about what the user *did*, so
-/// they are deliberately the shortest-lived fact stream: two days is long
-/// enough for the sweeper to seal a slot and freeze its acts into
-/// `slot_summaries.acts_json`, and short enough that the keystroke-level
-/// stream never becomes a standing record. Anything derived from events must
-/// be materialised before this expires — see
-/// `docs/input-events-and-t1-acts-plan.md`.
-pub const INPUT_EVENT_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
+/// This is **not** content retention. A `signal_gap` row records that the
+/// daemon lost observations — the tap died, or a batch failed to land — so T1
+/// reads the stretch as unobservable rather than idle. It is bookkeeping about
+/// the recorder, not a record of the user, and it is worth nothing once every
+/// card covering its stretch has been built. Two days is comfortably past the
+/// five-minute sweeper that seals slots and freezes their acts.
+///
+/// Everything else in `input_events`, and the R3 trees in `edge_snapshots`,
+/// lives under the vault's general retention like any other captured content
+/// (`docs/event-capture-v2-plan.md` §信任模型变更 retired the 48h channel for
+/// them). This short channel is for markers only.
+pub const SIGNAL_MARKER_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
 
 /// One coalesced input observation, as the vault holds it.
 ///
@@ -3270,20 +3274,51 @@ impl Vault {
         Ok(due)
     }
 
-    /// Drops observations older than [`INPUT_EVENT_RETENTION_MS`].
+    /// Drops observations whose span ended before `horizon_ms`.
     ///
-    /// A span is judged by its end, so a burst still inside the window survives
-    /// even when it started before the cutoff. The cutoff instant itself is
-    /// kept: retention is "the last 48 hours", inclusive of its own edge.
+    /// The horizon is the vault's retention edge — the oldest frame it still
+    /// holds — not a clock deadline. Since the trust model changed
+    /// (`docs/event-capture-v2-plan.md` §信任模型变更) the events are content
+    /// like any other capture, so they keep the company of the frames they were
+    /// recorded beside: what the user did in a stretch survives exactly as long
+    /// as what was on screen during it. Markers go too — a `signal_gap` over a
+    /// stretch that has no frames left has nothing left to qualify.
+    ///
+    /// A span is judged by its end, so a burst reaching past the horizon
+    /// survives even when it started before it.
     ///
     /// # Errors
     ///
     /// Returns an error when the delete cannot be executed.
-    pub fn prune_input_events(&self, now_ms: i64) -> Result<usize, StoreError> {
-        let cutoff = now_ms.saturating_sub(INPUT_EVENT_RETENTION_MS);
+    pub fn prune_input_events_before(&self, horizon_ms: i64) -> Result<usize, StoreError> {
         let removed = self.connection.lock().unwrap().execute(
             "DELETE FROM input_events WHERE MAX(at_ms, COALESCE(end_ms, at_ms)) < ?1",
-            [cutoff],
+            [horizon_ms],
+        )?;
+        Ok(removed)
+    }
+
+    /// Drops `signal_gap` markers older than [`SIGNAL_MARKER_RETENTION_MS`].
+    ///
+    /// Markers only. The observations themselves are captured content and
+    /// expire with the rest of it, oldest-first, inside
+    /// [`Self::enforce_retention`]: the 48h channel that once took the whole
+    /// table now takes only the recorder's own bookkeeping. This one still
+    /// hangs off the clock because a marker's whole meaning is a deadline — it
+    /// says "between here and there, nothing could be seen", and once the cards
+    /// for that stretch exist it has said it.
+    ///
+    /// A span is judged by its end, and the cutoff instant itself is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delete cannot be executed.
+    pub fn prune_signal_gaps(&self, now_ms: i64) -> Result<usize, StoreError> {
+        let cutoff = now_ms.saturating_sub(SIGNAL_MARKER_RETENTION_MS);
+        let removed = self.connection.lock().unwrap().execute(
+            "DELETE FROM input_events
+              WHERE kind = ?2 AND MAX(at_ms, COALESCE(end_ms, at_ms)) < ?1",
+            params![cutoff, acts::SIGNAL_GAP_KIND],
         )?;
         Ok(removed)
     }
@@ -3358,25 +3393,26 @@ impl Vault {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Drops edge snapshots older than [`INPUT_EVENT_RETENTION_MS`], files and
-    /// all.
+    /// Drops edge snapshots captured before `horizon_ms`, files and all.
     ///
-    /// Same constant and the same call site as [`Self::prune_input_events`], and
-    /// that is the point: an event-triggered tree that outlived its events would
-    /// still say "the user was here at 03:14" after the record of the input was
-    /// erased. The cutoff instant itself is kept, matching event retention.
+    /// The same horizon as [`Self::prune_input_events_before`] and for the same
+    /// reason: an R3 tree is keyframe content now, not ephemera, so it lives as
+    /// long as the frames of its era and goes when they go. It used to share
+    /// the events' 48 hours, which was the right answer while the events were
+    /// the shortest-lived thing in the vault; now that they are not, following
+    /// them would make the trees the *longest*-lived, which is the opposite of
+    /// what that rule was for.
     ///
     /// # Errors
     ///
     /// Returns an error when the vault cannot be read or written.
-    pub fn prune_edge_snapshots(&self, now_ms: i64) -> Result<usize, StoreError> {
-        let cutoff = now_ms.saturating_sub(INPUT_EVENT_RETENTION_MS);
+    pub fn prune_edge_snapshots_before(&self, horizon_ms: i64) -> Result<usize, StoreError> {
         let doomed: Vec<(String, String)> = {
             let connection = self.connection.lock().unwrap();
             let mut statement = connection.prepare(
                 "SELECT id, artifact_id FROM edge_snapshots WHERE captured_at_ms < ?1",
             )?;
-            let rows = statement.query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let rows = statement.query_map([horizon_ms], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         if doomed.is_empty() {
@@ -4288,12 +4324,11 @@ impl Vault {
 
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
-        // Before the size sweep, and outside its early return: the 48h expiry
-        // of the input streams is a promise about time, not about disk. The
-        // size loop below returns immediately whenever the vault is under its
-        // limit, which is the normal state, so anything placed after it would
-        // effectively never run. Failure here must not stop the size sweep —
-        // a vault over its limit still has to shed frames.
+        // Before the size sweep, and outside its early return: a marker's
+        // expiry is a promise about time, not about disk, and the size loop
+        // below returns immediately whenever the vault is under its limit,
+        // which is the normal state. Failure here must not stop the size sweep
+        // — a vault over its limit still has to shed frames.
         let now_ms = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4301,11 +4336,8 @@ impl Vault {
                 .unwrap_or_default(),
         )
         .unwrap_or(i64::MAX);
-        if let Err(error) = self.prune_input_events(now_ms) {
-            eprintln!("input event retention failed: {error}");
-        }
-        if let Err(error) = self.prune_edge_snapshots(now_ms) {
-            eprintln!("edge snapshot retention failed: {error}");
+        if let Err(error) = self.prune_signal_gaps(now_ms) {
+            eprintln!("signal marker retention failed: {error}");
         }
         loop {
             let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
@@ -4459,6 +4491,21 @@ impl Vault {
                 transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
                 transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
             }
+            // The retention edge this pass leaves behind: the oldest frame the
+            // vault still holds. The second fact stream and the R3 trees are
+            // measured against it rather than against a clock, so what the user
+            // did in a stretch survives exactly as long as what was on screen
+            // during it.
+            //
+            // `None` — no frames left at all — means the edge is unknown, and
+            // the sweep is skipped rather than guessed. Deleting on the theory
+            // that "everything is older than nothing" would take live events on
+            // a vault that had merely never captured a frame.
+            let retention_horizon_ms: Option<i64> = transaction.query_row(
+                "SELECT MIN(captured_at_ms) FROM moments",
+                [],
+                |row| row.get(0),
+            )?;
             let removed_anything = !candidates.is_empty()
                 || !gop_artifact_ids.is_empty()
                 || !audio_candidates.is_empty();
@@ -4482,7 +4529,14 @@ impl Vault {
             for (_, artifact_id) in audio_candidates {
                 let _ = fs::remove_file(self.artifact_path(&artifact_id));
             }
-            if !removed_anything {
+            // Outside the transaction because deleting an edge tree deletes an
+            // encrypted file, which is not something a rollback could undo.
+            let mut swept = 0;
+            if let Some(horizon_ms) = retention_horizon_ms {
+                swept += self.prune_input_events_before(horizon_ms)?;
+                swept += self.prune_edge_snapshots_before(horizon_ms)?;
+            }
+            if !removed_anything && swept == 0 {
                 return Ok(());
             }
         }
@@ -9577,8 +9631,9 @@ mod tests {
         slot
     }
 
-    /// The reason materialisation exists: events are deleted after 48 hours and
-    /// T1 is lazy, so acts that are not frozen simply disappear from history.
+    /// The reason materialisation exists: events are eventually swept — with
+    /// the frames of their era, since the trust model changed — and T1 is lazy,
+    /// so acts that are not frozen simply disappear from history.
     #[test]
     fn frozen_acts_outlive_the_events_they_came_from() {
         let (_directory, vault) = test_vault(10);
@@ -9604,9 +9659,9 @@ mod tests {
         );
         vault.flush_card_cache();
 
-        // 48 hours pass.
+        // The retention edge moves past the slot.
         let removed = vault
-            .prune_input_events(slot + SLOT_DURATION_MS + INPUT_EVENT_RETENTION_MS)
+            .prune_input_events_before(slot + SLOT_DURATION_MS)
             .unwrap();
         assert_eq!(removed, 2);
         assert!(
@@ -9853,14 +9908,14 @@ mod tests {
         assert_eq!(vault.insert_input_events(&[]).unwrap(), 0);
     }
 
-    /// Retention is "the last 48 hours", inclusive of its own edge, and a span
-    /// is judged by its end: a burst reaching into the window outlives its
-    /// start.
-    /// Expiry is a promise about time, so it cannot ride the capture path:
-    /// a vault that is merely opened — recording stopped, nothing imported —
-    /// must still shed anything past the window.
+    /// The 48h channel now carries markers and nothing else. A marker's expiry
+    /// is still a promise about time, so it cannot ride the capture path: a
+    /// vault that is merely opened — recording stopped, nothing imported — must
+    /// shed a stale marker. The observations beside it are content and stay
+    /// until the vault's general retention reaches them, which on an
+    /// under-limit vault is never.
     #[test]
-    fn opening_a_vault_expires_the_input_streams_without_any_capture() {
+    fn opening_a_vault_expires_stale_markers_and_keeps_the_observations() {
         let directory = tempfile::tempdir().unwrap();
         let key = [31_u8; 32];
         let config = VaultConfig {
@@ -9874,87 +9929,115 @@ mod tests {
                 .as_millis(),
         )
         .unwrap();
+        let old = now - SIGNAL_MARKER_RETENTION_MS - 60_000;
         {
             let vault = Vault::open_with_key(config.clone(), key).unwrap();
             vault
                 .insert_input_events(&[
-                    InputEventRow {
-                        at_ms: now - INPUT_EVENT_RETENTION_MS - 60_000,
-                        end_ms: None,
-                        kind: "click".to_owned(),
-                        count: None,
-                        ended_with: None,
-                        command: None,
-                        bundle_identifier: Some("com.electron.lark".to_owned()),
-                        target_json: None,
-                        text: None,
-                        extra_json: None,
-                    },
-                    InputEventRow {
-                        at_ms: now - 60_000,
-                        end_ms: None,
-                        kind: "click".to_owned(),
-                        count: None,
-                        ended_with: None,
-                        command: None,
-                        bundle_identifier: Some("com.electron.lark".to_owned()),
-                        target_json: None,
-                        text: None,
-                        extra_json: None,
-                    },
+                    input_event(old, None, "click"),
+                    input_event(old + 1, None, acts::SIGNAL_GAP_KIND),
+                    input_event(now - 60_000, None, acts::SIGNAL_GAP_KIND),
                 ])
                 .unwrap();
-            assert_eq!(vault.input_events_between(0, now + 1).unwrap().len(), 2);
+            assert_eq!(vault.input_events_between(0, now + 1).unwrap().len(), 3);
         }
         // Reopening runs `enforce_retention`, and nothing else.
         let vault = Vault::open_with_key(config, key).unwrap();
         let kept = vault.input_events_between(0, now + 1).unwrap();
-        assert_eq!(kept.len(), 1, "the expired observation outlived its window");
-        assert!(kept[0].at_ms > now - INPUT_EVENT_RETENTION_MS);
+        assert_eq!(
+            kept.iter()
+                .map(|event| (event.at_ms, event.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(old, "click"), (now - 60_000, acts::SIGNAL_GAP_KIND)],
+            "only the stale marker expires on the clock"
+        );
     }
 
+    /// The short channel is for markers, and only for markers: an observation
+    /// of the same age is content and stays. Retention is "the last 48 hours",
+    /// inclusive of its own edge, and a span is judged by its end.
     #[test]
-    fn prune_input_events_keeps_the_retention_edge() {
+    fn prune_signal_gaps_takes_markers_only_and_keeps_the_retention_edge() {
         let (_directory, vault) = test_vault(10);
         let now = 1_786_698_000_000;
-        let cutoff = now - INPUT_EVENT_RETENTION_MS;
+        let cutoff = now - SIGNAL_MARKER_RETENTION_MS;
+        let gap = acts::SIGNAL_GAP_KIND;
         let rows = vec![
-            input_event(cutoff - 1, None, "click"),
-            input_event(cutoff, None, "click"),
-            input_event(cutoff + 1, None, "click"),
+            input_event(cutoff - 1, None, gap),
+            input_event(cutoff, None, gap),
+            input_event(cutoff + 1, None, gap),
+            input_event(cutoff - 5_000, Some(cutoff - 1), gap),
+            input_event(cutoff - 5_000, Some(cutoff), gap),
+            input_event(cutoff - 5_000, None, "click"),
             input_event(cutoff - 5_000, Some(cutoff - 1), "burst"),
-            input_event(cutoff - 5_000, Some(cutoff), "burst"),
         ];
         vault.insert_input_events(&rows).unwrap();
 
-        assert_eq!(vault.prune_input_events(now).unwrap(), 2);
+        assert_eq!(vault.prune_signal_gaps(now).unwrap(), 2);
         let remaining = vault.input_events_between(0, now + 1).unwrap();
         assert_eq!(
             remaining
                 .iter()
-                .map(|event| (event.at_ms, event.end_ms))
+                .map(|event| (event.at_ms, event.end_ms, event.kind.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (cutoff - 5_000, Some(cutoff)),
-                (cutoff, None),
-                (cutoff + 1, None),
-            ]
+                (cutoff - 5_000, Some(cutoff), gap),
+                (cutoff - 5_000, None, "click"),
+                (cutoff - 5_000, Some(cutoff - 1), "burst"),
+                (cutoff, None, gap),
+                (cutoff + 1, None, gap),
+            ],
+            "the observations of the same age are content, not bookkeeping"
         );
         // Idempotent: nothing left to drop on a second pass at the same instant.
-        assert_eq!(vault.prune_input_events(now).unwrap(), 0);
+        assert_eq!(vault.prune_signal_gaps(now).unwrap(), 0);
+    }
+
+    /// The horizon sweep is the opposite: everything whose span ended before
+    /// the vault's oldest surviving frame goes, markers included.
+    #[test]
+    fn prune_input_events_before_judges_a_span_by_its_end() {
+        let (_directory, vault) = test_vault(10);
+        let horizon = 1_786_698_000_000;
+        let rows = vec![
+            input_event(horizon - 1, None, "click"),
+            input_event(horizon, None, "click"),
+            input_event(horizon - 5_000, Some(horizon - 1), "burst"),
+            input_event(horizon - 5_000, Some(horizon), "burst"),
+            input_event(horizon - 5_000, None, acts::SIGNAL_GAP_KIND),
+        ];
+        vault.insert_input_events(&rows).unwrap();
+
+        assert_eq!(vault.prune_input_events_before(horizon).unwrap(), 3);
+        assert_eq!(
+            vault
+                .input_events_between(0, horizon + 1)
+                .unwrap()
+                .iter()
+                .map(|event| (event.at_ms, event.end_ms))
+                .collect::<Vec<_>>(),
+            vec![(horizon - 5_000, Some(horizon)), (horizon, None)]
+        );
+        assert_eq!(vault.prune_input_events_before(horizon).unwrap(), 0);
     }
 
     /// Forgetting a stretch of history must take the events with it: they say
-    /// what the user did in that window in finer detail than any frame does.
+    /// what the user did in that window in finer detail than any frame does —
+    /// and since schema 25 that includes what was typed and what the field
+    /// held, which is the finest detail the vault has about anything.
     #[test]
     fn delete_history_removes_overlapping_input_events() {
         let (_directory, vault) = test_vault(10);
         let at = 1_786_698_000_000;
         let slot = slot_start_for(at);
+        let mut typed = input_event(slot + 5_000, Some(slot + 9_000), "burst");
+        typed.text = Some("the build passphrase is".to_owned());
+        typed.target_json = Some(r#"{"label":"Message","value":"…"}"#.to_owned());
+        typed.extra_json = Some(r#"{"window_title":"Lody Team"}"#.to_owned());
         let rows = vec![
             input_event(slot - 1, None, "click"),
             input_event(slot, None, "click"),
-            input_event(slot + 5_000, Some(slot + 9_000), "burst"),
+            typed,
             input_event(slot - 5_000, Some(slot + 1_000), "burst"),
             input_event(slot + SLOT_DURATION_MS, None, "click"),
             input_event(slot + SLOT_DURATION_MS + 1, None, "click"),
@@ -9975,6 +10058,22 @@ mod tests {
             ],
             "only rows entirely outside the deleted window may survive"
         );
+        assert!(
+            remaining
+                .iter()
+                .all(|event| event.text.is_none() && event.extra_json.is_none()),
+            "no content column may outlive the window it was recorded in"
+        );
+        let leftover: i64 = vault
+            .readers
+            .get()
+            .query_row(
+                "SELECT COUNT(*) FROM input_events WHERE text IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "checked in SQL, not only through the reader");
     }
 
     #[test]
@@ -10266,30 +10365,29 @@ mod tests {
     /// triggered by an event and outliving it would still say when the user
     /// interacted after the record of the interaction was erased.
     #[test]
-    fn prune_edge_snapshots_deletes_rows_and_their_artifact_files() {
+    fn prune_edge_snapshots_before_deletes_rows_and_their_artifact_files() {
         let (_directory, vault) = test_vault(10);
-        let now = 1_786_698_000_000;
-        let cutoff = now - INPUT_EVENT_RETENTION_MS;
+        let horizon = 1_786_698_000_000;
         let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
 
-        let expired = vault.insert_edge_snapshot(cutoff - 1, &tree).unwrap();
-        let edge = vault.insert_edge_snapshot(cutoff, &tree).unwrap();
-        let fresh = vault.insert_edge_snapshot(cutoff + 1, &tree).unwrap();
+        let expired = vault.insert_edge_snapshot(horizon - 1, &tree).unwrap();
+        let edge = vault.insert_edge_snapshot(horizon, &tree).unwrap();
+        let fresh = vault.insert_edge_snapshot(horizon + 1, &tree).unwrap();
         for row in [&expired, &edge, &fresh] {
             assert!(vault.artifact_path(&row.artifact_id).exists());
         }
 
-        assert_eq!(vault.prune_edge_snapshots(now).unwrap(), 1);
+        assert_eq!(vault.prune_edge_snapshots_before(horizon).unwrap(), 1);
 
         assert_eq!(
             vault
-                .edge_snapshots_between(0, now)
+                .edge_snapshots_between(0, horizon + 2)
                 .unwrap()
                 .iter()
                 .map(|row| row.captured_at_ms)
                 .collect::<Vec<_>>(),
-            vec![cutoff, cutoff + 1],
-            "retention keeps its own edge, like the events'"
+            vec![horizon, horizon + 1],
+            "the horizon instant itself survives, like the events'"
         );
         assert!(
             !vault.artifact_path(&expired.artifact_id).exists(),
@@ -10300,8 +10398,112 @@ mod tests {
             Err(StoreError::ArtifactNotFound(_))
         ));
         assert!(vault.artifact_path(&edge.artifact_id).exists());
-        // Idempotent: nothing left to drop at the same instant.
-        assert_eq!(vault.prune_edge_snapshots(now).unwrap(), 0);
+        // Idempotent: nothing left to drop at the same horizon.
+        assert_eq!(vault.prune_edge_snapshots_before(horizon).unwrap(), 0);
+    }
+
+    /// Retention unification (`docs/event-capture-v2-plan.md` §信任模型变更):
+    /// events and R3 trees are captured content, so the vault's own oldest-first
+    /// sweep takes them — and stops exactly at the oldest frame that survived.
+    /// Neither stream has a clock deadline of its own any more.
+    #[test]
+    fn retention_sweeps_events_and_edge_trees_with_the_frames_of_their_era() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let frame = vec![7_u8; 4096];
+        let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
+
+        vault.insert_moment(&session.id, 1_000, "image/jpeg", &frame).unwrap();
+        vault.insert_moment(&session.id, 2_000, "image/jpeg", &frame).unwrap();
+        // What the vault costs while it holds only the two oldest frames is the
+        // limit that will squeeze the two newest ones out.
+        let two_frames = vault.storage_usage_bytes().unwrap();
+        vault.insert_moment(&session.id, 3_000, "image/jpeg", &frame).unwrap();
+        vault.insert_moment(&session.id, 4_000, "image/jpeg", &frame).unwrap();
+
+        let instants = [500_i64, 1_500, 2_500, 3_500, 4_500];
+        vault
+            .insert_input_events(
+                &instants
+                    .iter()
+                    .map(|at| input_event(*at, None, "click"))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let trees: Vec<EdgeSnapshotRow> = instants
+            .iter()
+            .map(|at| vault.insert_edge_snapshot(*at, &tree).unwrap())
+            .collect();
+
+        vault.set_storage_limit_bytes(two_frames).unwrap();
+
+        let survivors = vault.moments_sync(&session.id).unwrap();
+        assert!(!survivors.is_empty(), "the sweep must leave a horizon");
+        assert!(survivors.len() < 4, "the sweep must have evicted something");
+        let horizon = survivors
+            .iter()
+            .map(|moment| moment.captured_at_ms)
+            .min()
+            .unwrap();
+
+        assert_eq!(
+            vault
+                .input_events_between(0, 10_000)
+                .unwrap()
+                .iter()
+                .map(|event| event.at_ms)
+                .collect::<Vec<_>>(),
+            instants
+                .iter()
+                .copied()
+                .filter(|at| *at >= horizon)
+                .collect::<Vec<_>>(),
+            "events older than the oldest surviving frame go with it"
+        );
+        assert_eq!(
+            vault
+                .edge_snapshots_between(0, 10_000)
+                .unwrap()
+                .iter()
+                .map(|row| row.captured_at_ms)
+                .collect::<Vec<_>>(),
+            instants
+                .iter()
+                .copied()
+                .filter(|at| *at >= horizon)
+                .collect::<Vec<_>>(),
+            "and so do the R3 trees of the same era"
+        );
+        for (at, row) in instants.iter().zip(&trees) {
+            assert_eq!(
+                vault.artifact_path(&row.artifact_id).exists(),
+                *at >= horizon,
+                "an expired tree must take its encrypted file with it"
+            );
+        }
+    }
+
+    /// A vault with no frames left has no retention edge to measure against.
+    /// Deleting on the theory that "everything is older than nothing" would
+    /// take live events off a vault that had simply never captured a frame, so
+    /// the sweep skips rather than guesses.
+    #[test]
+    fn a_vault_with_no_frames_left_sweeps_no_events() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", &vec![7_u8; 4096])
+            .unwrap();
+        vault.insert_input_events(&[input_event(500, None, "click")]).unwrap();
+
+        vault.set_storage_limit_bytes(1).unwrap();
+
+        assert!(vault.moments_sync(&session.id).unwrap().is_empty());
+        assert_eq!(
+            vault.input_events_between(0, 10_000).unwrap().len(),
+            1,
+            "no frames means no horizon, and no horizon means no sweep"
+        );
     }
 
     /// One privacy invariant, four layers: forgetting a window takes the frames,

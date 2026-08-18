@@ -3226,18 +3226,15 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
             // exactly the laptops that stay unplugged.
             freeze_slot_acts(&state, now_ms()).await;
 
-            // The same argument, for the other half of the 48h promise: expiry
-            // is a deadline in wall-clock time, so it cannot hang off capture
-            // (which stops when the user pauses) or off the T2 gate (which
-            // waits for power). This tick runs while the daemon is up, whether
-            // or not anything is being recorded.
-            if let Err(error) = run_store(&state, |s| {
-                s.store.prune_input_events(now_ms())?;
-                s.store.prune_edge_snapshots(now_ms())
-            })
-            .await
-            {
-                eprintln!("input stream retention failed: {error}");
+            // All that is left of the 48h channel: the runtime markers. The
+            // observations and the R3 trees are content now and expire with the
+            // rest of the vault's content, oldest-first, inside
+            // `enforce_retention`. A marker's deadline is still wall-clock, so
+            // it cannot hang off capture (which stops when the user pauses) or
+            // off the T2 gate (which waits for power) — this tick runs while
+            // the daemon is up, whether or not anything is being recorded.
+            if let Err(error) = run_store(&state, |s| s.store.prune_signal_gaps(now_ms())).await {
+                eprintln!("signal marker retention failed: {error}");
             }
 
             // OCR is on the critical path for the frames still arriving; T2 is
