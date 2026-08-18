@@ -152,7 +152,20 @@ pub struct LlmRouterAdapter {
     mlx: BTreeMap<String, Arc<PersistentMlxAdapter>>,
     config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
     client: reqwest::Client,
+    /// Same timeouts as `client`, but with proxies disabled: the endpoint is
+    /// chosen at run time, and a loopback one must not leave through a proxy.
+    direct_client: reqwest::Client,
     token_sink: LlmTokenSink,
+}
+
+fn generate_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(GENERATE_TIMEOUT)
+        // The prompt carries retrieved history and the header carries
+        // the API key: neither follows a redirect to a host the user
+        // did not configure.
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 impl LlmRouterAdapter {
@@ -161,16 +174,22 @@ impl LlmRouterAdapter {
         Self {
             mlx: BTreeMap::new(),
             config,
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(GENERATE_TIMEOUT)
-                // The prompt carries retrieved history and the header carries
-                // the API key: neither follows a redirect to a host the user
-                // did not configure.
-                .redirect(reqwest::redirect::Policy::none())
+            client: generate_client_builder()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            direct_client: generate_client_builder()
+                .no_proxy()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             token_sink: LlmTokenSink::default(),
+        }
+    }
+
+    fn client_for(&self, origin: &str) -> &reqwest::Client {
+        if is_loopback_origin(origin) {
+            &self.direct_client
+        } else {
+            &self.client
         }
     }
 
@@ -255,7 +274,7 @@ impl ModelAdapter for LlmRouterAdapter {
                 // `AFTERRAY_LLM_BASE_URL`, before any evidence is on the wire.
                 check_origin(&config.resolved_base_url()).map_err(AdapterError::Process)?;
                 let (text, usage) = generate_remote(
-                    &self.client,
+                    self.client_for(&config.resolved_base_url()),
                     &config,
                     prompt,
                     messages,
@@ -319,13 +338,16 @@ pub async fn probe_llm(
         };
     }
 
-    let client = match reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(PROBE_TIMEOUT)
-        // A redirect would carry the API key and the probe to a host the user
-        // never approved.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+    let client = match without_proxy_for_loopback(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(PROBE_TIMEOUT)
+            // A redirect would carry the API key and the probe to a host the user
+            // never approved.
+            .redirect(reqwest::redirect::Policy::none()),
+        &origin,
+    )
+    .build()
     {
         Ok(client) => client,
         Err(error) => {
@@ -578,6 +600,26 @@ fn is_loopback_host(host: &str) -> bool {
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    split_origin(&normalize_origin(origin)).is_some_and(|(_, host)| is_loopback_host(&host))
+}
+
+/// A loopback endpoint must never go through a proxy. reqwest's env lookup
+/// stops at the *first* of `NO_PROXY`/`no_proxy` that is set — an empty
+/// `NO_PROXY=` counts as set — so on a machine with both, even 127.0.0.1 is
+/// sent to the proxy, which is under no obligation to connect back to this
+/// Mac (Clash, for one, drops the request).
+pub(crate) fn without_proxy_for_loopback(
+    builder: reqwest::ClientBuilder,
+    origin: &str,
+) -> reqwest::ClientBuilder {
+    if is_loopback_origin(origin) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
 }
 
 #[must_use]

@@ -767,6 +767,7 @@ mod tests {
     async fn live_ollama_streams_tokens_when_running() {
         let probe = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
+            .no_proxy()
             .build()
             .unwrap();
         let Some(model) = live_ollama_chat_model(&probe).await else {
@@ -817,6 +818,7 @@ mod tests {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(90))
+            .no_proxy()
             .build()
             .unwrap();
         let (text, _usage) = generate_streaming(
@@ -859,6 +861,7 @@ mod tests {
         };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .no_proxy()
             .build()
             .unwrap();
         let (tx, mut rx) = mpsc::channel(16);
@@ -891,6 +894,7 @@ mod tests {
         };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .no_proxy()
             .build()
             .unwrap();
         let (tx, mut rx) = mpsc::channel(8);

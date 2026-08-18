@@ -186,7 +186,7 @@ pub async fn probe_context_tokens(config: &LlmRuntimeConfig, afford: usize) -> C
             let model = config.chat_model();
             let origin = config.resolved_base_url();
             if !model.is_empty() && !origin.is_empty() {
-                if let Some(client) = probe_client() {
+                if let Some(client) = probe_client(&origin) {
                     probe.architecture =
                         ollama_architecture_context(&client, &origin, model).await;
                     probe.running = ollama_running_context(&client, &origin, model).await;
@@ -250,14 +250,17 @@ fn ollama_api_url(origin: &str, path: &str) -> String {
     format!("{host}/api/{path}")
 }
 
-fn probe_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(3))
-        // A redirect would carry this probe to a host the user never approved.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .ok()
+fn probe_client(origin: &str) -> Option<reqwest::Client> {
+    crate::remote::without_proxy_for_loopback(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(3))
+            // A redirect would carry this probe to a host the user never approved.
+            .redirect(reqwest::redirect::Policy::none()),
+        origin,
+    )
+    .build()
+    .ok()
 }
 
 #[cfg(test)]
