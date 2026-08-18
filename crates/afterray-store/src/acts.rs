@@ -1146,6 +1146,8 @@ mod tests {
             command: None,
             bundle_identifier: Some("com.example.app".to_owned()),
             target_json: None,
+            text: None,
+            extra_json: None,
         }
     }
 

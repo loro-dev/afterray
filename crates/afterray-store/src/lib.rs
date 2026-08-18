@@ -90,7 +90,7 @@ pub use slot::{
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// How long the raw input-event stream lives.
 ///
@@ -111,8 +111,13 @@ pub const INPUT_EVENT_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
 /// decides what an act means — the T1 join is. A `kind` this build has never
 /// heard of must still round-trip; the shim can ship ahead of its reader.
 ///
-/// Never carries typed characters: a typing burst is a count, an end instant,
-/// and the key that ended it.
+/// Since event-capture v2 (schema 25) a row may carry content: the typed run in
+/// `text` and the focused field's value inside `target_json`. The ban that kept
+/// this table content-free (CAP-005) lapsed with the local trust model — all
+/// processing is local, the vault is encrypted, and nothing leaves the machine
+/// without an explicit export. The one guard left is the shim's, at the source:
+/// a secure field yields no keystream and no value, ever, and nothing here
+/// re-checks it because by this point the content is already absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputEventRow {
     /// When the observation began.
@@ -132,6 +137,19 @@ pub struct InputEventRow {
     pub bundle_identifier: Option<String>,
     /// The platform layer's resolved element identity, serialised verbatim.
     pub target_json: Option<String>,
+    /// What a typing run left standing, as the shim coalesced it. The secondary
+    /// content channel: measured, a CJK keystream is pinyin fragments, so the
+    /// primary one is the target's `value` inside `target_json`.
+    pub text: Option<String>,
+    /// Everything else the shim's record carries, as one JSON object with only
+    /// the present keys (`application_name`, `window_title`, `source`,
+    /// `destination`).
+    ///
+    /// One column rather than four because the vault does not model the input
+    /// vocabulary — it stores it. A shim that invents a fifth field needs a
+    /// mapping line in the daemon, not a migration here, and the columns that
+    /// do exist stay the ones every reader queries on.
+    pub extra_json: Option<String>,
 }
 
 /// Content type of a stored R3 edge snapshot.
@@ -3012,8 +3030,8 @@ impl Vault {
             let mut statement = transaction.prepare(
                 "INSERT INTO input_events
                    (at_ms, end_ms, kind, count, ended_with, command,
-                    bundle_identifier, target_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    bundle_identifier, target_json, text, extra_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for event in events {
                 statement.execute(params![
@@ -3025,6 +3043,8 @@ impl Vault {
                     event.command,
                     event.bundle_identifier,
                     event.target_json,
+                    event.text,
+                    event.extra_json,
                 ])?;
             }
         }
@@ -3056,7 +3076,7 @@ impl Vault {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT at_ms, end_ms, kind, count, ended_with, command,
-                    bundle_identifier, target_json
+                    bundle_identifier, target_json, text, extra_json
                FROM input_events
               WHERE at_ms < ?2 AND MAX(at_ms, COALESCE(end_ms, at_ms)) >= ?1
               ORDER BY at_ms ASC, id ASC",
@@ -3071,6 +3091,8 @@ impl Vault {
                 command: row.get(5)?,
                 bundle_identifier: row.get(6)?,
                 target_json: row.get(7)?,
+                text: row.get(8)?,
+                extra_json: row.get(9)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -4735,6 +4757,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_22(connection)?;
     migrate_schema_23(connection)?;
     migrate_schema_24(connection)?;
+    migrate_schema_25(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -5393,6 +5416,32 @@ fn migrate_schema_24(connection: &Connection) -> Result<(), StoreError> {
          CREATE INDEX IF NOT EXISTS edge_snapshots_at
            ON edge_snapshots(captured_at_ms);",
     )?;
+    Ok(())
+}
+
+/// Event-capture v2's content columns on `input_events`.
+///
+/// `text` is the typed run; `extra_json` is every other field the shim's record
+/// grew (`application_name`, `window_title`, `source`, `destination`) as one
+/// JSON object with only the present keys. Two columns rather than five: the
+/// vault stores the input vocabulary without modelling it, so the fields no
+/// reader ever filters on travel together, and the next field the shim invents
+/// costs a mapping line in the daemon instead of a migration here.
+///
+/// Purely additive — a schema-24 row reads back with both `NULL`, which is
+/// exactly what a pre-v2 shim produced.
+fn migrate_schema_25(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(input_events)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if !existing.iter().any(|held| held == "text") {
+        connection.execute("ALTER TABLE input_events ADD COLUMN text TEXT", [])?;
+    }
+    if !existing.iter().any(|held| held == "extra_json") {
+        connection.execute("ALTER TABLE input_events ADD COLUMN extra_json TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -9275,6 +9324,8 @@ mod tests {
             command: None,
             bundle_identifier: None,
             target_json: None,
+            text: None,
+            extra_json: None,
         }
     }
 
@@ -9687,6 +9738,8 @@ mod tests {
                 command: None,
                 bundle_identifier: Some("com.electron.lark".to_owned()),
                 target_json: None,
+                text: None,
+                extra_json: None,
             }])
             .unwrap();
 
@@ -9787,6 +9840,10 @@ mod tests {
                 r#"{"role":"AXTextArea","label":"lib.rs","frame":{"x":1,"y":2,"width":3,"height":4}}"#
                     .to_owned(),
             ),
+            text: Some("公司内部的".to_owned()),
+            extra_json: Some(
+                r#"{"application_name":"Zed","window_title":"lib.rs — afterray"}"#.to_owned(),
+            ),
         };
         vault
             .insert_input_events(std::slice::from_ref(&stored))
@@ -9830,6 +9887,8 @@ mod tests {
                         command: None,
                         bundle_identifier: Some("com.electron.lark".to_owned()),
                         target_json: None,
+                        text: None,
+                        extra_json: None,
                     },
                     InputEventRow {
                         at_ms: now - 60_000,
@@ -9840,6 +9899,8 @@ mod tests {
                         command: None,
                         bundle_identifier: Some("com.electron.lark".to_owned()),
                         target_json: None,
+                        text: None,
+                        extra_json: None,
                     },
                 ])
                 .unwrap();
@@ -9972,6 +10033,138 @@ mod tests {
         // The upgrade is additive: what was already there is still there.
         assert_eq!(vault.moments_sync(&session_id).unwrap().len(), 1);
         assert!(vault.input_events_between(0, 10).unwrap().is_empty());
+    }
+
+    /// A vault written by a schema-24 build gains the v2 content columns
+    /// without losing a row: the events it already holds read back with
+    /// `text`/`extra_json` empty, which is exactly what the shim that wrote
+    /// them sent.
+    #[test]
+    fn schema_25_adds_the_v2_content_columns_to_a_v24_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [25_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        // Recent, because reopening a vault also enforces retention.
+        let at_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+            - 60_000;
+        {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            // Put the table back the way schema 24 left it, rows and all.
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(&format!(
+                    "ALTER TABLE input_events DROP COLUMN text;
+                     ALTER TABLE input_events DROP COLUMN extra_json;
+                     INSERT INTO input_events
+                       (at_ms, end_ms, kind, count, ended_with, command,
+                        bundle_identifier, target_json)
+                     VALUES ({at_ms}, NULL, 'click', NULL, NULL, NULL,
+                             'dev.zed.Zed', '{{\"label\":\"Run\"}}');
+                     UPDATE schema_meta SET version = 24;"
+                ))
+                .unwrap();
+        }
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        {
+            let connection = vault.connection.lock().unwrap();
+            let columns: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('input_events')
+                      WHERE name IN ('text', 'extra_json')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, 2, "both content columns must come back");
+            let version: i64 = connection
+                .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, i64::from(SCHEMA_VERSION));
+        }
+        let carried = vault.input_events_between(at_ms - 1, at_ms + 1).unwrap();
+        assert_eq!(
+            carried,
+            vec![InputEventRow {
+                at_ms,
+                end_ms: None,
+                kind: "click".to_owned(),
+                count: None,
+                ended_with: None,
+                command: None,
+                bundle_identifier: Some("dev.zed.Zed".to_owned()),
+                target_json: Some(r#"{"label":"Run"}"#.to_owned()),
+                text: None,
+                extra_json: None,
+            }],
+            "a schema-24 row survives, with the new columns empty"
+        );
+    }
+
+    /// A batch shaped like the v2 shim's: the typed run in `text`, the field's
+    /// value inside `target_json`, and the drag's two ends in `extra_json`.
+    /// Every one of them must come back byte-identical — the vault does not
+    /// interpret any of it.
+    #[test]
+    fn a_v2_batch_round_trips_text_value_and_the_extra_fields() {
+        let (_directory, vault) = test_vault(10);
+        let target_json = r#"{"role":"AXTextField","subrole":"AXSearchField","label":"Message","value":"我们什么时候同意的","secure":false}"#;
+        let rows = vec![
+            InputEventRow {
+                at_ms: 1_000,
+                end_ms: Some(4_000),
+                kind: "burst".to_owned(),
+                count: Some(17),
+                ended_with: Some("return".to_owned()),
+                command: None,
+                bundle_identifier: Some("com.electron.lark".to_owned()),
+                target_json: Some(target_json.to_owned()),
+                text: Some("wsm tongyini".to_owned()),
+                extra_json: None,
+            },
+            InputEventRow {
+                at_ms: 5_000,
+                end_ms: None,
+                kind: "drag".to_owned(),
+                count: None,
+                ended_with: None,
+                command: None,
+                bundle_identifier: Some("com.apple.finder".to_owned()),
+                target_json: None,
+                text: None,
+                extra_json: Some(
+                    r#"{"source":{"label":"0817.log"},"destination":{"label":"Archive"}}"#
+                        .to_owned(),
+                ),
+            },
+            InputEventRow {
+                at_ms: 6_000,
+                end_ms: None,
+                kind: "window_changed".to_owned(),
+                count: None,
+                ended_with: None,
+                command: None,
+                bundle_identifier: Some("dev.zed.Zed".to_owned()),
+                target_json: None,
+                text: None,
+                extra_json: Some(
+                    r#"{"application_name":"Zed","window_title":"lib.rs"}"#.to_owned(),
+                ),
+            },
+        ];
+        assert_eq!(vault.insert_input_events(&rows).unwrap(), 3);
+        assert_eq!(vault.input_events_between(0, 10_000).unwrap(), rows);
     }
 
     /// Events arrive at interaction rate while T1 reads the same window from

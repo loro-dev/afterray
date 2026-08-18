@@ -2088,6 +2088,8 @@ async fn record_signal_gap(state: &Arc<AppState>, from_ms: i64, to_ms: i64, reas
         command: Some(reason.to_owned()),
         bundle_identifier: None,
         target_json: None,
+        text: None,
+        extra_json: None,
     };
     if let Err(error) = run_store(state, move |s| s.store.insert_input_events(&[marker])).await {
         eprintln!("input signal gap store failed: {error}");
@@ -2206,6 +2208,12 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
 /// the first reader that will. A target that somehow cannot be encoded is
 /// stored as absent rather than dropping the event — that an input happened is
 /// the load-bearing fact; where it landed is the refinement.
+/// The shim's record as the vault holds it.
+///
+/// Every field the shim sends lands somewhere: the ones readers filter on have
+/// columns, `target` and the rest are serialised verbatim. The store models
+/// none of it — a `kind` or a field this build has never heard of must still
+/// round-trip, because the shim can ship ahead of its reader.
 fn input_event_row(record: &InputEventRecord) -> InputEventRow {
     InputEventRow {
         at_ms: record.at_ms,
@@ -2219,7 +2227,44 @@ fn input_event_row(record: &InputEventRecord) -> InputEventRow {
             .target
             .as_ref()
             .and_then(|target| serde_json::to_string(target).ok()),
+        text: record.text.clone(),
+        extra_json: input_event_extra_json(record),
     }
+}
+
+/// The record fields with no column of their own, as one JSON object holding
+/// only the keys that are present.
+///
+/// Absent stays absent rather than becoming `null`: these fields are per-kind
+/// (`application_name`/`window_title` on `window_changed`, `source`/
+/// `destination` on `drag`), so on any given row most of them are missing by
+/// definition, and a row of nulls would be four times the bytes at interaction
+/// rate. An object with no keys at all is stored as SQL `NULL` for the same
+/// reason — `{}` and "nothing to say" are the same fact.
+fn input_event_extra_json(record: &InputEventRecord) -> Option<String> {
+    let mut extra = serde_json::Map::new();
+    for (key, held) in [
+        ("application_name", record.application_name.as_ref()),
+        ("window_title", record.window_title.as_ref()),
+    ] {
+        if let Some(held) = held {
+            extra.insert(key.to_owned(), serde_json::Value::String(held.clone()));
+        }
+    }
+    for (key, held) in [
+        ("source", record.source.as_ref()),
+        ("destination", record.destination.as_ref()),
+    ] {
+        if let Some(held) = held
+            && let Ok(value) = serde_json::to_value(held)
+        {
+            extra.insert(key.to_owned(), value);
+        }
+    }
+    if extra.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(extra)).ok()
 }
 
 /// Records the captured display's logical size, the only geometry the daemon
@@ -4357,6 +4402,60 @@ mod tests {
             )),
             "the URL must reach the domain exclusion check"
         );
+    }
+
+    /// Every field of a v2 record has to land somewhere in the row, and the
+    /// target has to keep arriving verbatim: `value`, `secure` and `subrole`
+    /// ride the platform crate's own `Serialize` into `target_json`, so nothing
+    /// here re-models element identity and nothing silently drops when the shim
+    /// adds a key.
+    #[test]
+    fn a_v2_record_maps_content_to_columns_and_the_rest_to_one_object() {
+        let burst: InputEventRecord = serde_json::from_str(
+            r#"{"at_ms":1000,"end_ms":4000,"kind":"burst","count":17,
+                "ended_with":"return","bundle_identifier":"com.electron.lark",
+                "text":"wsm tongyini",
+                "target":{"role":"AXTextField","subrole":"AXSearchField",
+                          "label":"Message","value":"我们什么时候同意的",
+                          "secure":false}}"#,
+        )
+        .unwrap();
+        let row = input_event_row(&burst);
+        assert_eq!(row.text.as_deref(), Some("wsm tongyini"));
+        assert_eq!(row.extra_json, None, "a burst names no extra field");
+        let target: serde_json::Value =
+            serde_json::from_str(row.target_json.as_deref().unwrap()).unwrap();
+        assert_eq!(target["value"], "我们什么时候同意的");
+        assert_eq!(target["secure"], false);
+        assert_eq!(target["subrole"], "AXSearchField");
+
+        let drag: InputEventRecord = serde_json::from_str(
+            r#"{"at_ms":5000,"kind":"drag","bundle_identifier":"com.apple.finder",
+                "source":{"label":"0817.log"},
+                "destination":{"label":"Archive"}}"#,
+        )
+        .unwrap();
+        let extra: serde_json::Value =
+            serde_json::from_str(input_event_extra_json(&drag).unwrap().as_str()).unwrap();
+        assert_eq!(extra["source"]["label"], "0817.log");
+        assert_eq!(extra["destination"]["label"], "Archive");
+        assert_eq!(extra.as_object().unwrap().len(), 2, "no null keys");
+
+        let switched: InputEventRecord = serde_json::from_str(
+            r#"{"at_ms":6000,"kind":"window_changed","bundle_identifier":"dev.zed.Zed",
+                "application_name":"Zed","window_title":"lib.rs"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            input_event_extra_json(&switched).as_deref(),
+            Some(r#"{"application_name":"Zed","window_title":"lib.rs"}"#)
+        );
+
+        // A pre-v2 batch still parses, and adds nothing.
+        let old: InputEventRecord =
+            serde_json::from_str(r#"{"at_ms":7000,"kind":"click"}"#).unwrap();
+        let row = input_event_row(&old);
+        assert_eq!((row.text, row.extra_json, row.target_json), (None, None, None));
     }
 
     /// The picker's list and the vault's accepted lengths are declared in two
