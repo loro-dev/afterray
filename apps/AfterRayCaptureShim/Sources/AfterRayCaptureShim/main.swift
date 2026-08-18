@@ -265,6 +265,10 @@ private struct AccessibilitySnapshot: Encodable {
     let truncated: Bool
     let digest: AccessibilityDigest
     let root: AccessibilityNode
+    /// The same tree as numbered indented text, or the diff from this window's
+    /// previous one (docs/event-capture-v2-plan.md §4). Purely additive: `root`
+    /// and `digest` are unchanged and every existing consumer keeps working.
+    let treeText: AccessibilityTreeText?
 
     enum CodingKeys: String, CodingKey {
         case capturedAtMs = "captured_at_ms"
@@ -274,8 +278,85 @@ private struct AccessibilitySnapshot: Encodable {
         case windowTitle = "window_title"
         case url, document, truncated, digest, root
         case privateBrowsing = "private_browsing"
+        case treeText = "tree_text"
     }
 }
+
+/// The wire shape of `CaptureTreeTextEnvelope`.
+private struct AccessibilityTreeText: Encodable {
+    let mode: String
+    let text: String?
+    let chain: String
+    let sequence: Int
+
+    enum CodingKeys: String, CodingKey {
+        case mode, text, chain
+        case sequence = "seq"
+    }
+
+    init(_ envelope: CaptureTreeTextEnvelope) {
+        mode = envelope.mode.rawValue
+        text = envelope.text
+        chain = envelope.chain
+        sequence = envelope.sequence
+    }
+}
+
+/// The shim's `AccessibilityNode` as the pure value type the text encoding and
+/// the diff work on. Frames round to whole points — the precision a citation's
+/// crop needs, and all the text encoding would ever carry.
+private func captureTreeNode(from node: AccessibilityNode) -> CaptureTreeNode {
+    CaptureTreeNode(
+        role: node.role,
+        subrole: node.subrole,
+        title: node.title,
+        nodeDescription: node.nodeDescription,
+        value: node.value,
+        url: node.url,
+        document: node.document,
+        frame: node.frame.map {
+            CaptureTreeFrame(
+                x: Int($0.x.rounded()),
+                y: Int($0.y.rounded()),
+                width: Int($0.width.rounded()),
+                height: Int($0.height.rounded())
+            )
+        },
+        children: node.children.map(captureTreeNode(from:))
+    )
+}
+
+/// The process-wide diff chains, shared by the heartbeat walk (main thread) and
+/// the attached walks (the input monitor's worker queue).
+///
+/// A lock rather than an actor: both callers are synchronous at the point they
+/// stage and commit, and the critical section is one dictionary lookup plus a
+/// tree render the caller has to pay for anyway.
+private final class CaptureTreeChainStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var chains: CaptureTreeChains
+
+    init() {
+        chains = CaptureTreeChains(processTag: String(UUID().uuidString.prefix(8)))
+    }
+
+    func stage(scope: CaptureTreeScope, tree: CaptureTreeNode) -> StagedCaptureTreeText {
+        lock.lock()
+        defer { lock.unlock() }
+        return chains.stage(scope: scope, tree: tree)
+    }
+
+    /// Advances the chain, once the artifact carrying the staged text is on its
+    /// way out. Never call it for an artifact that was dropped or deleted: the
+    /// next diff would be taken against a tree the consumer never received.
+    func commit(_ staged: StagedCaptureTreeText) {
+        lock.lock()
+        defer { lock.unlock() }
+        chains.commit(staged)
+    }
+}
+
+private let captureTreeChains = CaptureTreeChainStore()
 
 private struct AccessibilityDigest: Encodable {
     let applicationName: String?
@@ -596,7 +677,10 @@ private func appendUnique(_ items: inout [String], _ value: String, limit: Int) 
 }
 
 private enum AccessibilityCapture {
-    case artifact(URL, context: ForegroundCaptureContext)
+    /// The written snapshot, plus the tree-text decision that snapshot carries.
+    /// The decision travels with it because the caller can still drop the
+    /// artifact — only a caller that emits it may advance the chain.
+    case artifact(URL, context: ForegroundCaptureContext, treeText: StagedCaptureTreeText)
     case privateBrowsing(BrowserPrivacyEvidence)
     case foregroundChanged
 }
@@ -790,6 +874,16 @@ private func captureAccessibilityTree(
     let encoder = AccessibilityTreeEncoder()
     let encodedRoot = encoder.encode(captureRoot)
     let privateBrowsing = false
+    let staged = captureTreeChains.stage(
+        scope: CaptureTreeScope(
+            processId: application.processIdentifier,
+            windowTitle: windowTitle ?? encoder.windowTitle,
+            // A browser capture is rooted at the window, everything else at the
+            // application element; the chain has to know which.
+            walk: preflightDetector.isKnownBrowser ? .window : .application
+        ),
+        tree: captureTreeNode(from: encodedRoot)
+    )
     let snapshot = AccessibilitySnapshot(
         capturedAtMs: capturedAtMs,
         processId: application.processIdentifier,
@@ -806,7 +900,8 @@ private func captureAccessibilityTree(
             windowTitle: windowTitle ?? encoder.windowTitle,
             privateBrowsing: privateBrowsing
         ),
-        root: encodedRoot
+        root: encodedRoot,
+        treeText: AccessibilityTreeText(staged.envelope)
     )
     guard foregroundCaptureContextIsCurrent(context) else {
         return .foregroundChanged
@@ -816,7 +911,7 @@ private func captureAccessibilityTree(
         .appendingPathExtension("json")
     try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
     try hardenPrivateFile(url)
-    return .artifact(url, context: context)
+    return .artifact(url, context: context, treeText: staged)
 }
 
 private func capturedForegroundApplication() -> NSRunningApplication? {
@@ -1330,7 +1425,7 @@ private func captureScreen(
     if case .foregroundChanged = accessibility {
         return
     }
-    guard case let .artifact(accessibilityURL, context) = accessibility else { return }
+    guard case let .artifact(accessibilityURL, context, treeText) = accessibility else { return }
     guard foregroundCaptureContextIsCurrent(context) else {
         try? FileManager.default.removeItem(at: accessibilityURL)
         return
@@ -1388,6 +1483,10 @@ private func captureScreen(
             endedAtMs: now,
             requestId: requestId
         ))
+        // The snapshot is out; only now may the chain move past it. Every
+        // `return` above this line leaves the artifact deleted and the chain
+        // exactly where the consumer's last received tree left it.
+        captureTreeChains.commit(treeText)
     } catch {
         try? FileManager.default.removeItem(at: screenURL)
         try? FileManager.default.removeItem(at: accessibilityURL)
@@ -1821,6 +1920,16 @@ private final class InputEventMonitor: @unchecked Sendable {
         guard let root = edgeWalkRoot(pid: pid) else { return false }
         let encoder = AccessibilityTreeEncoder()
         let encodedRoot = encoder.encode(root)
+        // Attached walks start at one window, so they chain with each other and
+        // not with the heartbeat's whole-application walk of the same app.
+        let staged = captureTreeChains.stage(
+            scope: CaptureTreeScope(
+                processId: pid,
+                windowTitle: encoder.windowTitle,
+                walk: .window
+            ),
+            tree: captureTreeNode(from: encodedRoot)
+        )
         let snapshot = AccessibilitySnapshot(
             capturedAtMs: nowMs,
             processId: pid,
@@ -1837,7 +1946,8 @@ private final class InputEventMonitor: @unchecked Sendable {
                 windowTitle: encoder.windowTitle,
                 privateBrowsing: false
             ),
-            root: encodedRoot
+            root: encodedRoot,
+            treeText: AccessibilityTreeText(staged.envelope)
         )
         let url = outputDirectory
             .appendingPathComponent("accessibility-edge-\(UUID().uuidString)")
@@ -1853,6 +1963,7 @@ private final class InputEventMonitor: @unchecked Sendable {
         events.send(
             .artifact(kind: .accessibilityEdge, url: url, startedAtMs: nowMs, endedAtMs: nowMs)
         )
+        captureTreeChains.commit(staged)
         return true
     }
 
