@@ -319,7 +319,7 @@ public enum ChatFixtures {
                 .tool(
                     ChatToolCall(
                         id: "think-t1",
-                        name: "list_moments",
+                        name: "list_activity",
                         argsJSON: #"{"from_ms":50400000,"to_ms":52200000}"#,
                         resultChars: 640
                     )
