@@ -465,8 +465,17 @@ pub fn local_day_for(at_ms: i64) -> String {
 /// Original persisted card shape: `title`, `bullets`, and optional category.
 pub const LEGACY_SLOT_SUMMARY_SCHEMA_VERSION: i64 = 1;
 
-/// Current persisted card shape with description, threads, entities, and gaps.
-pub const SLOT_SUMMARY_SCHEMA_VERSION: i64 = 2;
+/// The JSON card shape: description, threads, entities, decisions, gaps.
+///
+/// Not written any more — kept because every row a model produced before v3 is
+/// still on disk and must stay readable, and because three gates in the vault
+/// mean "at least v2" rather than "is v2". Bumping the current constant without
+/// this one would have silently un-indexed every stored card.
+pub const V2_SLOT_SUMMARY_SCHEMA_VERSION: i64 = 2;
+
+/// Current persisted card shape: `title` / `description` / `details`, where
+/// `details` is a Markdown document rather than a structured field set.
+pub const SLOT_SUMMARY_SCHEMA_VERSION: i64 = 3;
 
 /// Persisted / UI state for a slot row. Wider than T1's gate result:
 /// `degraded` is "T1 facts only", `done` means a T2 title is on the card.
@@ -699,6 +708,407 @@ pub fn parse_t2_card_v2(raw: &str) -> Option<T2CardV2> {
     Some(card)
 }
 
+// ------------------------------------------------------------- the v3 card
+
+/// Longest a card's description may be, in characters. Unchanged from v2: the
+/// day panel renders it as one bounded paragraph and clips at the same number.
+const DESCRIPTION_MAX_CHARS: usize = 400;
+/// Longest a card body may be. Measured on the corpus this contract came from:
+/// median 6.4 KB, p90 8.2 KB, so this is roughly 4× the p90 — high enough that
+/// no honest card meets it, low enough that a model looping on one sentence
+/// cannot write a megabyte into the vault.
+const DETAILS_MAX_CHARS: usize = 32_000;
+/// How much of a matching section a mention shows. The mention exists to name
+/// a stretch of time, not to reproduce it.
+const MENTION_SNIPPET_CHARS: usize = 300;
+
+/// The v3 card: a frontmatter header the code owns, and a Markdown body the
+/// model owns.
+///
+/// The carrier is not a style choice. Measured across four model tiers, asking
+/// for a long Markdown body *inside a JSON string* broke three of them (a 4b ran
+/// away, a 9b exploded on escapes, a 35b burned all eight tool rounds); the same
+/// content as frontmatter + Markdown came back valid 4/4
+/// (`docs/event-capture-v2-plan.md` §5). `threads` / `entities` / `decisions` /
+/// `category` / `confidence` went with it: `threads` made every model write
+/// exactly three bullets whatever the evidence held, `entities` counts pushed a
+/// model into calling a three-message conversation "reading", and a
+/// model-reported confidence was measured wrong at 0.95 — noise the code was
+/// treating as a signal.
+///
+/// `applications` is deliberately **not** here: it is derived from facts at
+/// render time, because the model has no better source for it than the facts do.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct T2CardV3 {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// The card body: Markdown, with `![label](afterray://moment/<id>)`
+    /// citations. Every id here is one this slot's evidence holds —
+    /// [`ground_t2_details`] is what makes that true.
+    #[serde(default)]
+    pub details: String,
+    /// The document arrived without frontmatter and the header was recovered by
+    /// heuristic. Not persisted: it describes one parse, not the card, and a
+    /// column for it would answer a question nobody asks of a stored row.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub low_trust: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` shape.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl T2CardV3 {
+    /// The legacy bullet list, derived from the body's headings. Everything
+    /// that still reads v1 fields — old CLI output, a client that predates v3 —
+    /// keeps getting a usable list without the model writing one.
+    #[must_use]
+    pub fn derived_bullets(&self) -> Vec<String> {
+        let headings: Vec<String> = details_sections(&self.details)
+            .into_iter()
+            .map(|section| section.name)
+            .filter(|name| !name.is_empty())
+            .collect();
+        if headings.is_empty() {
+            let description = self.description.trim();
+            if description.is_empty() {
+                return Vec::new();
+            }
+            return vec![description.to_owned()];
+        }
+        headings
+    }
+}
+
+/// Splits a v3 body into its `#`-headed sections, reusing the v2 thread shape.
+///
+/// This is what keeps stored cards searchable: `find_slot_mentions` matches
+/// against thread names and prose, and a v3 card whose body were one opaque
+/// string would answer every query with its title alone. Sections carry their
+/// **whole** text, so the match sees everything the card says; only what a
+/// mention displays is clipped.
+#[must_use]
+pub fn details_sections(details: &str) -> Vec<T2Thread> {
+    let mut sections: Vec<T2Thread> = Vec::new();
+    let mut current: Option<T2Thread> = None;
+    let mut preamble = String::new();
+    for line in details.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = heading_text(trimmed) {
+            if let Some(section) = current.take() {
+                sections.push(finish_section(section));
+            }
+            current = Some(T2Thread {
+                name: rest.to_owned(),
+                prose: String::new(),
+                moment_ids: Vec::new(),
+            });
+        } else if let Some(section) = current.as_mut() {
+            section.prose.push_str(line);
+            section.prose.push('\n');
+        } else {
+            preamble.push_str(line);
+            preamble.push('\n');
+        }
+    }
+    if let Some(section) = current.take() {
+        sections.push(finish_section(section));
+    }
+    if sections.is_empty() && !preamble.trim().is_empty() {
+        sections.push(T2Thread {
+            name: String::new(),
+            prose: preamble.trim().to_owned(),
+            moment_ids: Vec::new(),
+        });
+    }
+    sections
+}
+
+fn finish_section(mut section: T2Thread) -> T2Thread {
+    section.prose = section.prose.trim().to_owned();
+    section
+}
+
+/// `### text` → `text`, for one to six hashes. `#hashtag` is not a heading.
+fn heading_text(line: &str) -> Option<&str> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &line[hashes..];
+    if !rest.starts_with(' ') {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+/// Parses a model reply into a v3 card: the word `FINAL`, then `---`
+/// frontmatter carrying `title` and `description`, then the Markdown body.
+///
+/// Deliberately tolerant of the three ways the measured models missed the
+/// shape, because each one costs a whole card and none of them is a reason to
+/// throw the writing away:
+///
+/// * the `FINAL` line missing — the document is still a document;
+/// * the whole answer wrapped in a code fence, opened and sometimes not closed;
+/// * no frontmatter at all — then the first heading is the title and the first
+///   paragraph the description, and the card is flagged `low_trust`.
+///
+/// `None` only when there is no prose at all to make a title from.
+#[must_use]
+pub fn parse_t2_card_v3(raw: &str) -> Option<T2CardV3> {
+    let body = strip_code_fence(strip_final_marker(raw)).trim();
+    if body.is_empty() {
+        return None;
+    }
+    let (front, rest) = split_frontmatter(body);
+    let mut card = if let Some((title, description)) = front {
+        T2CardV3 {
+            title,
+            description,
+            details: rest.trim().to_owned(),
+            low_trust: false,
+        }
+    } else {
+        let (title, description, details) = recover_header(rest);
+        T2CardV3 {
+            title,
+            description,
+            details,
+            low_trust: true,
+        }
+    };
+    card.title = clip(&normalise_line(&card.title), 200);
+    card.description = clip(&normalise_line(&card.description), DESCRIPTION_MAX_CHARS);
+    card.details = clip(card.details.trim(), DETAILS_MAX_CHARS);
+    if card.title.is_empty() {
+        return None;
+    }
+    Some(card)
+}
+
+/// Everything after the last standalone `FINAL` line, or the whole text when
+/// the model never wrote one.
+fn strip_final_marker(raw: &str) -> &str {
+    let mut cut = None;
+    let mut offset = 0_usize;
+    for line in raw.split_inclusive('\n') {
+        if line.trim() == "FINAL" {
+            cut = Some(offset + line.len());
+        }
+        offset += line.len();
+    }
+    cut.map_or(raw, |at| &raw[at..])
+}
+
+/// Unwraps one outer code fence. A fence opened and never closed still yields
+/// its contents: the closing marker carries no information the body needs.
+fn strip_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return text;
+    };
+    // Drop the info string ("markdown", "md", …) on the opening line.
+    let rest = rest.split_once('\n').map_or("", |(_, body)| body);
+    match rest.rfind("```") {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
+}
+
+/// `---` … `---` at the top of the document, as `(title, description)`.
+///
+/// Values may run onto following lines (a model wrapping a long description is
+/// the common case), which is why this is not a `key: value` split per line.
+fn split_frontmatter(body: &str) -> (Option<(String, String)>, &str) {
+    let mut lines = body.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return (None, body);
+    };
+    if first.trim() != "---" {
+        return (None, body);
+    }
+    let mut title = String::new();
+    let mut description = String::new();
+    let mut key: Option<&str> = None;
+    let mut consumed = first.len();
+    let mut closed = false;
+    for line in lines {
+        consumed += line.len();
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            closed = true;
+            break;
+        }
+        let field = trimmed
+            .split_once(':')
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim()));
+        match field.as_ref().map(|(name, value)| (name.as_str(), *value)) {
+            Some(("title", value)) => {
+                unquote(value).clone_into(&mut title);
+                key = Some("title");
+            }
+            Some(("description", value)) => {
+                unquote(value).clone_into(&mut description);
+                key = Some("description");
+            }
+            // A continuation of the previous value, not a new key.
+            _ if !trimmed.is_empty() => match key {
+                Some("title") => {
+                    title.push(' ');
+                    title.push_str(trimmed);
+                }
+                Some("description") => {
+                    description.push(' ');
+                    description.push_str(trimmed);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if !closed && title.trim().is_empty() {
+        // An opening `---` that was really a horizontal rule.
+        return (None, body);
+    }
+    (Some((title, description)), &body[consumed..])
+}
+
+fn unquote(value: &str) -> &str {
+    let trimmed = value.trim();
+    for quote in ['"', '\''] {
+        if trimmed.len() >= 2
+            && trimmed.starts_with(quote)
+            && trimmed.ends_with(quote)
+        {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
+}
+
+/// Header recovery for a document that arrived without frontmatter: the first
+/// heading (or first line) is the title, the first paragraph under it the
+/// description, and the whole document stays the body.
+///
+/// The body is kept whole on purpose. A card that lost its header still holds
+/// everything the model wrote, and dropping the opening paragraph to avoid
+/// repeating it in the panel would be throwing away content to fix a
+/// presentation problem.
+fn recover_header(body: &str) -> (String, String, String) {
+    let mut title = String::new();
+    let mut description = String::new();
+    let mut after_title = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if after_title && !description.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if title.is_empty() {
+            heading_text(trimmed).unwrap_or(trimmed).clone_into(&mut title);
+            after_title = true;
+            continue;
+        }
+        if heading_text(trimmed).is_some() {
+            break;
+        }
+        if !description.is_empty() {
+            description.push(' ');
+        }
+        description.push_str(trimmed);
+    }
+    (title, description, body.trim().to_owned())
+}
+
+/// What grounding removed from a card. Counted rather than silent: a model that
+/// keeps inventing frame ids is a model problem, and a card that quietly lost
+/// its citations looks exactly like one that never wrote any.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct T2GroundingReport {
+    pub citations_dropped: usize,
+}
+
+/// Code-side grounding for a v3 card — the guard the prompt alone cannot be.
+///
+/// Every `afterray://moment/<id>` in the card must name a frame this slot
+/// holds; `#el<N>` fragments ride along, since an element number is only
+/// meaningful against the frame it was numbered in. An ungrounded citation is
+/// **stripped, not fatal**: the sentence around it is usually true and was
+/// usually written from evidence — throwing the card away to punish one bad id
+/// loses far more than it protects.
+pub fn ground_t2_details<S: std::hash::BuildHasher>(
+    card: &mut T2CardV3,
+    valid_moment_ids: &HashSet<String, S>,
+) -> T2GroundingReport {
+    let (details, details_dropped) = strip_ungrounded_citations(&card.details, valid_moment_ids);
+    let (description, description_dropped) =
+        strip_ungrounded_citations(&card.description, valid_moment_ids);
+    card.details = details;
+    card.description = description;
+    T2GroundingReport {
+        citations_dropped: details_dropped + description_dropped,
+    }
+}
+
+/// Removes every `afterray://moment/` reference whose id this slot does not
+/// hold, keeping the human-readable label around it. Returns the text and how
+/// many references went.
+#[must_use]
+pub fn strip_ungrounded_citations<S: std::hash::BuildHasher>(
+    text: &str,
+    valid: &HashSet<String, S>,
+) -> (String, usize) {
+    const SCHEME: &str = "afterray://moment/";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut dropped = 0_usize;
+    while let Some(at) = rest.find(SCHEME) {
+        let id_start = at + SCHEME.len();
+        let after = &rest[id_start..];
+        let id_len = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .unwrap_or(after.len());
+        let id = &after[..id_len];
+        let mut url_end = id_start + id_len;
+        // `#el12` — an element anchor inside the same frame, part of the url.
+        if let Some(fragment) = rest[url_end..].strip_prefix('#') {
+            let len = fragment
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(fragment.len());
+            url_end += 1 + len;
+        }
+        if !id.is_empty() && valid.contains(id) {
+            out.push_str(&rest[..url_end]);
+            rest = &rest[url_end..];
+            continue;
+        }
+        dropped += 1;
+        let head = &rest[..at];
+        if let Some(label_end) = head.strip_suffix("](") {
+            // A Markdown link or image: keep the label, drop the link.
+            let (before, label) = label_end
+                .rfind('[')
+                .map_or((label_end, ""), |open| (&label_end[..open], &label_end[open + 1..]));
+            out.push_str(before.strip_suffix('!').unwrap_or(before));
+            out.push_str(label);
+            let close = rest[url_end..].find(')').map_or(rest.len(), |at| url_end + at + 1);
+            rest = &rest[close..];
+        } else {
+            // A bare url: it renders as a citation on its own, so it goes too.
+            out.push_str(head);
+            rest = &rest[url_end..];
+        }
+    }
+    out.push_str(rest);
+    (out, dropped)
+}
+
 /// Stored T2 overlay merged onto a live T1 card.
 #[derive(Debug, Clone, Default)]
 pub struct StoredSlotOverlay {
@@ -708,6 +1118,10 @@ pub struct StoredSlotOverlay {
     pub bullets: Option<Vec<String>>,
     pub category: Option<String>,
     pub description: Option<String>,
+    /// The v3 Markdown body. `None` for a v1 or v2 row — three card shapes now
+    /// live in this table, and which one a row is comes from `schema_version`,
+    /// never from which columns happen to be null.
+    pub details: Option<String>,
     pub threads: Option<Vec<T2Thread>>,
     pub entities: Option<Vec<T2Entity>>,
     pub decisions: Option<Vec<String>>,
@@ -735,6 +1149,11 @@ pub struct DaySlot {
     pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The v3 card body, Markdown. Present only on a v3 row; a client that
+    /// renders it must keep rendering `threads` and `bullets` for the rows
+    /// written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<Vec<T2Thread>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -836,11 +1255,15 @@ pub fn match_slot_mention(
     let mut matched_threads = Vec::new();
     for thread in threads {
         if hits(&thread.name) || hits(&thread.prose) {
-            matched_threads.push(match (thread.name.trim(), thread.prose.trim()) {
+            // Matched against the whole thread, shown as a snippet: a v3 card's
+            // sections are the body of the card, and a mention that returned
+            // one whole would be answering "where" with the card itself.
+            let rendered = match (thread.name.trim(), thread.prose.trim()) {
                 ("", prose) => prose.to_owned(),
                 (name, "") => name.to_owned(),
                 (name, prose) => format!("{name}: {prose}"),
-            });
+            };
+            matched_threads.push(clip(&normalise_line(&rendered), MENTION_SNIPPET_CHARS));
             for id in &thread.moment_ids {
                 push_id(id, &mut moment_ids);
             }
@@ -1012,6 +1435,7 @@ pub fn assemble_day_summary(
             bullets: overlay.and_then(|row| row.bullets.clone()),
             category: overlay.and_then(|row| row.category.clone()),
             description: overlay.and_then(|row| row.description.clone()),
+            details: overlay.and_then(|row| row.details.clone()),
             threads: overlay.and_then(|row| row.threads.clone()),
             entities: overlay.and_then(|row| row.entities.clone()),
             decisions: overlay.and_then(|row| row.decisions.clone()),
@@ -3988,5 +4412,129 @@ mod tests {
             confidence < 0.9,
             "a pruned card must not keep its confidence"
         );
+    }
+
+    // -------------------------------------------------------- the v3 card
+
+    #[test]
+    fn parse_v3_reads_frontmatter_and_keeps_the_markdown_body() {
+        let reply = "I have enough to write this.\nFINAL\n---\ntitle: PR #41 review and merge\ndescription: Reviewed the acts join, then merged it.\n---\n\n### Review\nRead `slot.rs`, left one comment.\n\n### Merge\nMerged after CI.\n";
+        let card = parse_t2_card_v3(reply).expect("v3 document");
+
+        assert_eq!(card.title, "PR #41 review and merge");
+        assert_eq!(
+            card.description,
+            "Reviewed the acts join, then merged it."
+        );
+        assert!(card.details.starts_with("### Review"), "{}", card.details);
+        assert!(card.details.ends_with("Merged after CI."));
+        assert!(!card.low_trust, "a document with frontmatter is trusted");
+        assert_eq!(card.derived_bullets(), vec!["Review", "Merge"]);
+        // The reasoning before FINAL is not part of the card.
+        assert!(!card.details.contains("I have enough"));
+    }
+
+    /// The three ways the measured models missed the shape. Each one costs a
+    /// whole card if the parser is strict, and none of them is a reason to
+    /// throw away writing that is otherwise sound.
+    #[test]
+    fn parse_v3_tolerates_a_missing_final_a_fence_and_missing_frontmatter() {
+        let no_final = "---\ntitle: Quiet stretch\ndescription: One page, read.\n---\n\nNothing else happened.";
+        let card = parse_t2_card_v3(no_final).expect("no FINAL line");
+        assert_eq!(card.title, "Quiet stretch");
+        assert_eq!(card.details, "Nothing else happened.");
+
+        let fenced = "FINAL\n```markdown\n---\ntitle: Fenced\ndescription: Wrapped in a fence.\n---\n\n### Body\ntext\n```";
+        let card = parse_t2_card_v3(fenced).expect("fenced document");
+        assert_eq!(card.title, "Fenced");
+        assert_eq!(card.details, "### Body\ntext");
+
+        let unclosed = "FINAL\n```\n---\ntitle: Unclosed\ndescription: No closing fence.\n---\n\nbody";
+        assert_eq!(
+            parse_t2_card_v3(unclosed).expect("unclosed fence").title,
+            "Unclosed"
+        );
+
+        let bare = "## Debugging the packer\n\nChased a GOP that would not close, then found the keyint.\n\n### Detail\nmore";
+        let card = parse_t2_card_v3(bare).expect("heuristic header");
+        assert_eq!(card.title, "Debugging the packer");
+        assert_eq!(
+            card.description,
+            "Chased a GOP that would not close, then found the keyint."
+        );
+        assert!(card.low_trust, "a recovered header is flagged as one");
+        assert!(
+            card.details.starts_with("## Debugging"),
+            "the body is kept whole: {}",
+            card.details
+        );
+
+        assert!(parse_t2_card_v3("   \n\n").is_none(), "nothing to title");
+    }
+
+    #[test]
+    fn v3_grounding_strips_citations_this_slot_cannot_show() {
+        let valid: HashSet<String> = ["m-real".to_owned()].into();
+        let mut card = T2CardV3 {
+            title: "Merged the branch".into(),
+            description: "Saw it land, see ![proof](afterray://moment/m-ghost).".into(),
+            details: "The diff was ready ![10:23 diff](afterray://moment/m-real)\n\n\
+                 and the element was ![field](afterray://moment/m-real#el33), \
+                 while [this frame](afterray://moment/m-fake) never existed. \
+                 Bare afterray://moment/m-other too."
+                .into(),
+            low_trust: false,
+        };
+
+        let report = ground_t2_details(&mut card, &valid);
+
+        assert_eq!(report.citations_dropped, 3);
+        assert!(card.details.contains("![10:23 diff](afterray://moment/m-real)"));
+        assert!(
+            card.details.contains("![field](afterray://moment/m-real#el33)"),
+            "an element anchor rides on a valid frame: {}",
+            card.details
+        );
+        assert!(
+            card.details.contains("while this frame never existed"),
+            "an invalid link keeps its label: {}",
+            card.details
+        );
+        assert!(!card.details.contains("m-fake"));
+        assert!(!card.details.contains("m-other"));
+        assert_eq!(card.description, "Saw it land, see proof.");
+    }
+
+    #[test]
+    fn v3_sections_carry_the_whole_body_so_a_card_stays_searchable() {
+        let details = "### Rebasing\nFixed `crates/afterray-store/src/gop.rs`.\n\n### Release\nCut v0.0.4.";
+        let sections = details_sections(details);
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "Rebasing");
+        assert_eq!(sections[0].prose, "Fixed `crates/afterray-store/src/gop.rs`.");
+        assert_eq!(sections[1].name, "Release");
+
+        // A body with no headings is still one searchable section.
+        let flat = details_sections("Just one paragraph, no headings.");
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].name, "");
+
+        // A mention shows a snippet, never the whole card.
+        let long = format!("### Long\n{}", "x".repeat(900));
+        let sections = details_sections(&long);
+        let (mention, kind) = match_slot_mention(
+            "xxx",
+            0,
+            600_000,
+            "2026-08-18",
+            Some("A title"),
+            &sections,
+            &[],
+            &[],
+        )
+        .expect("the section matches");
+        assert_eq!(kind, MentionKind::Prose);
+        assert_eq!(mention.matched_threads[0].chars().count(), 300);
     }
 }

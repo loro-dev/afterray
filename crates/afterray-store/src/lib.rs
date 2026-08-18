@@ -79,18 +79,19 @@ pub use slot::{
     SLOT_DURATION_MS, SLOT_SUMMARY_SCHEMA_VERSION, SlotBounds, SlotCard, SlotEvidence,
     SlotExportFacts, SlotFacts, SlotMention, SlotMomentRow, SlotSegment, SlotState,
     SlotSummaryExport, SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2,
-    T2Card, T2CardV2, T2Entity, T2Thread, T2VerifyReport, TimelineEntry, assemble_day_summary,
+    T2Card, T2CardV2, T2CardV3, T2Entity, T2GroundingReport, T2Thread,
+    T2VerifyReport, TimelineEntry, V2_SLOT_SUMMARY_SCHEMA_VERSION, assemble_day_summary,
     attach_entity_candidates, build_slot_card, build_slot_card_with_end, dedup_key_of,
-    extract_json_object, legacy_segments, local_day_bounds, local_day_for, match_slot_mention,
-    next_legacy_slot_boundary, parse_t2_card, parse_t2_card_v2, render_t2_prompt, shorten_place,
-    slot_bounds_for, slot_bounds_in, slot_clock_label, slot_duration_ms_for_minutes,
-    slot_start_for, verify_t2_card,
+    details_sections, extract_json_object, ground_t2_details, legacy_segments, local_day_bounds,
+    local_day_for, match_slot_mention, next_legacy_slot_boundary, parse_t2_card, parse_t2_card_v2,
+    parse_t2_card_v3, render_t2_prompt, shorten_place, slot_bounds_for, slot_bounds_in,
+    slot_clock_label, slot_duration_ms_for_minutes, slot_start_for, verify_t2_card,
 };
 
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 25;
+pub const SCHEMA_VERSION: u32 = 26;
 
 /// How long a runtime marker in the event stream lives.
 ///
@@ -749,6 +750,8 @@ type SlotSummaryExportRow = (
     Option<String>,
     Option<i64>,
     Option<i64>,
+    // details — the v3 card body.
+    Option<String>,
 );
 
 
@@ -1890,6 +1893,7 @@ impl Vault {
                 produced_at_ms = excluded.produced_at_ms,
                 latency_ms = excluded.latency_ms,
                 description = NULL,
+                details = NULL,
                 threads_json = NULL,
                 entities_json = NULL,
                 decisions_json = NULL,
@@ -1916,8 +1920,54 @@ impl Vault {
         Ok(())
     }
 
+    /// Persists a v3 card: title, description, and the Markdown body.
+    ///
+    /// Written through `put_t2_summary` first, exactly like v2 — that write
+    /// nulls every column belonging to another card shape, so a slot
+    /// re-summarised across a version change never keeps half of its old card.
+    /// Bullets are derived from the body's headings so every v1 reader keeps
+    /// working without the model writing a list it no longer has a field for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be written.
+    pub fn put_t2_summary_v3(
+        &self,
+        card: &slot::SlotCard,
+        t2: &slot::T2CardV3,
+        producer: &str,
+        produced_at_ms: i64,
+        latency_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let compat = slot::T2Card {
+            artifacts: Vec::new(),
+            title: t2.title.clone(),
+            bullets: t2.derived_bullets(),
+            category: None,
+            confidence: None,
+        };
+        self.put_t2_summary(card, &compat, producer, produced_at_ms, latency_ms)?;
+        self.connection.lock().unwrap().execute(
+            "UPDATE slot_summaries SET
+                schema_version = ?2,
+                description = ?3,
+                details = ?4
+              WHERE slot_start_ms = ?1",
+            params![
+                card.slot_start_ms,
+                SLOT_SUMMARY_SCHEMA_VERSION,
+                t2.description.trim(),
+                t2.details.trim(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Persists a v2 card. Bullets are derived from threads so every v1
     /// reader — the day panel, old CLI output — keeps working unchanged.
+    ///
+    /// Kept for the cards already on disk and for any caller still producing
+    /// the JSON shape; the T2 loop writes v3.
     ///
     /// # Errors
     ///
@@ -1949,7 +1999,7 @@ impl Vault {
               WHERE slot_start_ms = ?1",
             params![
                 card.slot_start_ms,
-                SLOT_SUMMARY_SCHEMA_VERSION,
+                V2_SLOT_SUMMARY_SCHEMA_VERSION,
                 t2.description.trim(),
                 serde_json::to_string(&t2.threads).ok(),
                 serde_json::to_string(&t2.entities).ok(),
@@ -2058,9 +2108,14 @@ impl Vault {
         // words to search for, and each one filled the window with rows that
         // `match_slot_mention` then discarded — reaching nothing while
         // reporting nothing, for exactly the terms a person would try.
+        //
+        // `details` is raw Markdown, not JSON, so a `LIKE` on it *is* a value
+        // test — there are no serde key names inside it to match by accident.
+        // It is in the gate because a v3 card keeps its whole body there: left
+        // out, every card written after v3 would be findable by title alone.
         let mut statement = connection.prepare(&format!(
             "SELECT slot_start_ms, slot_end_ms, local_day, title,
-                    threads_json, entities_json, decisions_json
+                    threads_json, entities_json, decisions_json, details
                FROM slot_summaries
               WHERE schema_version >= ?1
                 AND (?2 IS NULL OR slot_start_ms >= ?2)
@@ -2070,8 +2125,10 @@ impl Vault {
                 -- pattern implies the raw JSON does too.
                 AND (title LIKE ?4 ESCAPE '\\'
                      OR threads_json LIKE ?4 ESCAPE '\\'
-                     OR entities_json LIKE ?4 ESCAPE '\\')
-                AND (title LIKE ?4 ESCAPE '\\' OR {ENTITY_VALUE_MATCH} OR {THREAD_VALUE_MATCH})
+                     OR entities_json LIKE ?4 ESCAPE '\\'
+                     OR details LIKE ?4 ESCAPE '\\')
+                AND (title LIKE ?4 ESCAPE '\\' OR details LIKE ?4 ESCAPE '\\'
+                     OR {ENTITY_VALUE_MATCH} OR {THREAD_VALUE_MATCH})
                 AND (?6 IS NULL OR EXISTS (
                       SELECT 1 FROM moments frame
                        WHERE frame.captured_at_ms >= slot_start_ms
@@ -2087,7 +2144,11 @@ impl Vault {
         ))?;
         let rows = statement.query_map(
             params![
-                slot::SLOT_SUMMARY_SCHEMA_VERSION,
+                // "at least v2": the gate rejects the v1 rows, which hold no
+                // searchable field but their title. Bumping the *current*
+                // version constant here would have un-indexed every v2 card on
+                // disk the day v3 shipped.
+                slot::V2_SLOT_SUMMARY_SCHEMA_VERSION,
                 filter.from_ms,
                 filter.to_ms,
                 pattern,
@@ -2098,13 +2159,20 @@ impl Vault {
                 let threads: Option<String> = row.get(4)?;
                 let entities: Option<String> = row.get(5)?;
                 let decisions: Option<String> = row.get(6)?;
+                let details: Option<String> = row.get(7)?;
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    threads
-                        .and_then(|raw| serde_json::from_str::<Vec<slot::T2Thread>>(&raw).ok())
+                    // A v3 body enters the matcher as its own sections, so one
+                    // card answers with the section that mentions the string
+                    // rather than with the whole document.
+                    details
+                        .as_deref()
+                        .map(slot::details_sections)
+                        .or_else(|| threads
+                        .and_then(|raw| serde_json::from_str::<Vec<slot::T2Thread>>(&raw).ok()))
                         .unwrap_or_default(),
                     entities
                         .and_then(|raw| serde_json::from_str::<Vec<slot::T2Entity>>(&raw).ok())
@@ -2163,7 +2231,7 @@ impl Vault {
                 "SELECT state, generation, schema_version, title, bullets_json, artifacts_json,
                         category, description, threads_json, entities_json,
                         decisions_json, not_captured_json, confidence, produced_at_ms, producer,
-                        latency_ms, slot_end_ms
+                        latency_ms, slot_end_ms, details
                    FROM slot_summaries
                   WHERE slot_start_ms = ?1",
                 [card.slot_start_ms],
@@ -2172,7 +2240,7 @@ impl Vault {
                         row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
                         row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
                         row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
-                        row.get(15)?, row.get(16)?,
+                        row.get(15)?, row.get(16)?, row.get(17)?,
                     ))
                 },
             )
@@ -2181,7 +2249,7 @@ impl Vault {
         let Some((
             state_raw, generation, schema_version, title, bullets_json, artifacts_json, category,
             description, threads_json, entities_json, decisions_json, not_captured_json, confidence,
-            produced_at_ms, producer, latency_ms, stored_end_ms,
+            produced_at_ms, producer, latency_ms, stored_end_ms, details,
         )) = row else {
             return Ok(slot::SlotSummaryExport {
                 slot_start_ms: card.slot_start_ms,
@@ -2197,8 +2265,19 @@ impl Vault {
             });
         };
 
+        // Three card shapes, exported as themselves. Which one a row is comes
+        // from `schema_version` alone — never from which columns are null,
+        // since every write path nulls the columns of the other two.
         let summary = title.as_ref().map(|title| {
             if schema_version >= slot::SLOT_SUMMARY_SCHEMA_VERSION {
+                serde_json::to_value(slot::T2CardV3 {
+                    title: title.clone(),
+                    description: description.unwrap_or_default(),
+                    details: details.unwrap_or_default(),
+                    low_trust: false,
+                })
+                .unwrap_or(serde_json::Value::Null)
+            } else if schema_version >= slot::V2_SLOT_SUMMARY_SCHEMA_VERSION {
                 serde_json::to_value(slot::T2CardV2 {
                     title: title.clone(),
                     description: description.unwrap_or_default(),
@@ -2394,7 +2473,7 @@ impl Vault {
         let mut statement = connection.prepare(
             "SELECT slot_start_ms, slot_end_ms, state, schema_version, title, bullets_json, category,
                     description, threads_json, entities_json, decisions_json,
-                    not_captured_json
+                    not_captured_json, details
                FROM slot_summaries
               WHERE local_day = ?1
               ORDER BY slot_start_ms",
@@ -2412,12 +2491,23 @@ impl Vault {
             let entities_json: Option<String> = row.get(9)?;
             let decisions_json: Option<String> = row.get(10)?;
             let not_captured_json: Option<String> = row.get(11)?;
-            let is_v2 = schema_version >= slot::SLOT_SUMMARY_SCHEMA_VERSION;
+            let details: Option<String> = row.get(12)?;
+            // A row's shape is its `schema_version`, never the nullness of a
+            // column: "at least v2" is what carries a description, and only v3
+            // carries a body. A v3 row has the v2 columns null, so reading them
+            // by presence would answer "v1" for the newest card in the vault.
+            let is_v2 = schema_version >= slot::V2_SLOT_SUMMARY_SCHEMA_VERSION;
+            let is_v3 = schema_version >= slot::SLOT_SUMMARY_SCHEMA_VERSION;
             let parse_list =
                 |json: Option<String>| json.and_then(|raw| serde_json::from_str(&raw).ok());
             let bullets = bullets_json.and_then(|json| serde_json::from_str(&json).ok());
             let description = if is_v2 {
                 description.filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            let details = if is_v3 {
+                details.filter(|text| !text.trim().is_empty())
             } else {
                 None
             };
@@ -2442,6 +2532,7 @@ impl Vault {
                     bullets,
                     category,
                     description,
+                    details,
                     threads,
                     entities,
                     decisions,
@@ -4812,6 +4903,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_23(connection)?;
     migrate_schema_24(connection)?;
     migrate_schema_25(connection)?;
+    migrate_schema_26(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -5495,6 +5587,27 @@ fn migrate_schema_25(connection: &Connection) -> Result<(), StoreError> {
     }
     if !existing.iter().any(|held| held == "extra_json") {
         connection.execute("ALTER TABLE input_events ADD COLUMN extra_json TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// `slot_summaries.details` — the v3 card body, one Markdown document.
+///
+/// One column, not a set: v3 replaced five structured fields with prose the
+/// model writes, and the shape the vault needs to store is "a document". The v1
+/// and v2 columns stay exactly where they are; three card shapes now live in
+/// this table and `schema_version` is what tells them apart.
+///
+/// Purely additive — a schema-25 row reads back with `details` `NULL`, which is
+/// what every card written before v3 is.
+fn migrate_schema_26(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(slot_summaries)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if !existing.iter().any(|held| held == "details") {
+        connection.execute("ALTER TABLE slot_summaries ADD COLUMN details TEXT", [])?;
     }
     Ok(())
 }
@@ -6212,13 +6325,197 @@ mod tests {
 
         let exported = vault.slot_summary_export(bounds.start_ms, 10_000).unwrap();
         assert_eq!(exported.slot_end_ms, bounds.end_ms);
-        assert_eq!(exported.schema_version, Some(SLOT_SUMMARY_SCHEMA_VERSION));
+        // This test writes a v2 card, so the row must claim v2 — the current
+        // constant moved to 3 with the Markdown carrier, and a row's version is
+        // the shape it was written in, not the newest shape the code knows.
+        assert_eq!(
+            exported.schema_version,
+            Some(V2_SLOT_SUMMARY_SCHEMA_VERSION)
+        );
         assert_eq!(exported.generation, Some(1));
         assert!(exported.summary.is_some());
         let json = serde_json::to_string(&exported).unwrap();
         for forbidden in ["ocr", "accessibility", "evidence", "prompt", "completion", "tool_result"] {
             assert!(!json.contains(forbidden), "export leaked {forbidden}: {json}");
         }
+    }
+
+    /// Three card shapes now live in `slot_summaries`, and each must come back
+    /// as itself: a v3 row exports its Markdown body, a v2 row written beside
+    /// it still exports threads, and the day panel sees exactly one `details`.
+    #[test]
+    fn v3_cards_round_trip_beside_the_v2_rows_already_on_disk() {
+        let (_directory, vault) = test_vault(10);
+        let bounds = vault.summary_slot_bounds(1_600_000_000_000);
+        let session = vault.create_session_sync(bounds.start_ms).unwrap();
+        for offset in [1_000_i64, 20_000, 40_000] {
+            vault
+                .insert_moment(&session.id, bounds.start_ms + offset, "image/jpeg", b"px")
+                .unwrap();
+        }
+        let card = vault.slot_card(bounds.start_ms, 10_000).unwrap();
+        let older = vault.summary_slot_bounds(bounds.start_ms - 1);
+        let older_session = vault.create_session_sync(older.start_ms).unwrap();
+        vault
+            .insert_moment(&older_session.id, older.start_ms + 1_000, "image/jpeg", b"px")
+            .unwrap();
+        let older_card = vault.slot_card(older.start_ms, 10_000).unwrap();
+        vault
+            .put_t2_summary_v2(
+                &older_card,
+                &slot::T2CardV2 {
+                    title: "The shape before".into(),
+                    description: "Written by the JSON contract".into(),
+                    threads: vec![slot::T2Thread {
+                        name: "Thread".into(),
+                        prose: "still readable".into(),
+                        moment_ids: Vec::new(),
+                    }],
+                    ..slot::T2CardV2::default()
+                },
+                "t2-agent",
+                older.end_ms,
+                None,
+            )
+            .unwrap();
+
+        let v3 = slot::T2CardV3 {
+            title: "Cut the 0.0.4 release".into(),
+            description: "Notarised the DMG and published the appcast.".into(),
+            details: "### Notarising\nRan `make release`, waited on `notarytool`.\n\n\
+                      ### Appcast\nPublished to R2."
+                .into(),
+            low_trust: false,
+        };
+        vault
+            .put_t2_summary_v3(&card, &v3, "t2-agent", bounds.end_ms, Some(42))
+            .unwrap();
+
+        let exported = vault.slot_summary_export(bounds.start_ms, 10_000).unwrap();
+        assert_eq!(exported.schema_version, Some(SLOT_SUMMARY_SCHEMA_VERSION));
+        let summary = exported.summary.expect("a v3 card exports");
+        assert_eq!(summary["title"], "Cut the 0.0.4 release");
+        assert!(summary["details"].as_str().unwrap().contains("notarytool"));
+        assert!(
+            summary.get("threads").is_none(),
+            "a v3 card has no threads to export"
+        );
+        assert!(
+            summary.get("low_trust").is_none(),
+            "parse quality is not a stored fact"
+        );
+
+        let older_export = vault.slot_summary_export(older.start_ms, 10_000).unwrap();
+        assert_eq!(
+            older_export.schema_version,
+            Some(V2_SLOT_SUMMARY_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            older_export.summary.expect("v2 still exports")["threads"][0]["prose"],
+            "still readable"
+        );
+
+        let day = vault.day_summary(bounds.start_ms, 10_000).unwrap();
+        let row = day
+            .slots
+            .iter()
+            .find(|slot| slot.slot_start_ms == bounds.start_ms)
+            .expect("the v3 slot is on the day");
+        assert_eq!(row.title.as_deref(), Some("Cut the 0.0.4 release"));
+        assert!(row.details.as_deref().unwrap().contains("### Appcast"));
+        assert!(row.threads.is_none(), "a v3 row carries no threads");
+        assert_eq!(
+            row.bullets.as_ref().expect("headings become bullets"),
+            &vec!["Notarising".to_owned(), "Appcast".to_owned()],
+            "v1 readers keep a usable list without the model writing one"
+        );
+
+        // The body is the searchable half of a v3 card: a string that appears
+        // only inside it must still find the slot.
+        let mentions = vault
+            .find_slot_mentions("notarytool", &SearchFilter::default(), 5)
+            .unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].slot_start_ms, bounds.start_ms);
+        assert!(mentions[0].matched_threads[0].contains("Notarising"));
+    }
+
+    /// A vault written by a schema-25 build gains `details` without losing a
+    /// row, and the v2 cards it already holds keep reading as v2.
+    #[test]
+    fn schema_26_adds_details_to_a_v25_vault_without_touching_its_cards() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [26_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let start_ms = {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let bounds = vault.summary_slot_bounds(1_600_000_000_000);
+            let session = vault.create_session_sync(bounds.start_ms).unwrap();
+            vault
+                .insert_moment(&session.id, bounds.start_ms + 1_000, "image/jpeg", b"px")
+                .unwrap();
+            let card = vault.slot_card(bounds.start_ms, 10_000).unwrap();
+            vault
+                .put_t2_summary_v2(
+                    &card,
+                    &slot::T2CardV2 {
+                        title: "Written before v3".into(),
+                        description: "Still a v2 row".into(),
+                        threads: vec![slot::T2Thread {
+                            name: "Work".into(),
+                            prose: "kept".into(),
+                            moment_ids: Vec::new(),
+                        }],
+                        ..slot::T2CardV2::default()
+                    },
+                    "t2-agent",
+                    bounds.end_ms,
+                    None,
+                )
+                .unwrap();
+            // Put the table back the way schema 25 left it.
+            vault
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "ALTER TABLE slot_summaries DROP COLUMN details;
+                     UPDATE schema_meta SET version = 25;",
+                )
+                .unwrap();
+            bounds.start_ms
+        };
+
+        let vault = Vault::open_with_key(config, key).unwrap();
+        {
+            let connection = vault.connection.lock().unwrap();
+            let column: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('slot_summaries')
+                      WHERE name = 'details'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(column, 1, "the v3 column must come back");
+            let version: i64 = connection
+                .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, i64::from(SCHEMA_VERSION));
+        }
+        let exported = vault.slot_summary_export(start_ms, 10_000).unwrap();
+        assert_eq!(
+            exported.schema_version,
+            Some(V2_SLOT_SUMMARY_SCHEMA_VERSION),
+            "an upgrade does not re-label a card it did not rewrite"
+        );
+        assert_eq!(
+            exported.summary.expect("v2 card survives")["threads"][0]["name"],
+            "Work"
+        );
     }
 
     /// Conversations were outside every budget: an unbounded growth path, and
