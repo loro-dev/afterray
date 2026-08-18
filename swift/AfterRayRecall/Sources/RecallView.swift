@@ -93,6 +93,11 @@ public struct RecallView: View {
     private static let searchScrollPointsPerCell: CGFloat = 46
     @State private var highlightRegions: [OcrRegion] = []
     @State private var highlightMomentID: String?
+    /// OCR boxes behind the selectable text layer, and the flag that mounts it.
+    /// Both are cleared the instant anything moves; see `prepareTextLayer`.
+    @State private var textLayerRegions: [OcrRegion] = []
+    @State private var textLayerReady = false
+    @State private var textSelection = OcrTextSelectionCoordinator()
 
     public init(
         moments: [RecallMoment],
@@ -245,6 +250,16 @@ public struct RecallView: View {
                     regions: highlightRegions,
                     pixelSize: still.pixelSize,
                     blinkToken: still.id
+                )
+            }
+
+            // Below the chrome in the stack so the timeline and the buttons
+            // over the picture keep their own clicks and their own cursors.
+            if textLayerReady, !renderedIsLive, let still = settledStill {
+                OcrTextSelectionLayer(
+                    regions: textLayerRegions,
+                    pixelSize: still.pixelSize,
+                    selection: textSelection
                 )
             }
 
@@ -406,6 +421,12 @@ public struct RecallView: View {
         .task(id: "\(highlightKey):\(isScrubbing)") {
             await loadHighlightRegions()
         }
+        // Any change to this key cancels the task, which is the whole
+        // mechanism: the quiet period restarts from zero on every scrub, every
+        // scroll, every new frame.
+        .task(id: textLayerKey) {
+            await prepareTextLayer()
+        }
         .task(id: "\(searchSession?.selectedIndex ?? -1):\(isScrubbing)") {
             guard !isScrubbing else { return }
             prefetchFilmstripThumbnails()
@@ -419,6 +440,19 @@ public struct RecallView: View {
     /// Reloading is only worth it when the frame or the query actually changed.
     private var highlightKey: String {
         "\(selectedMoment?.id ?? "-")|\(searchSession?.query ?? "")"
+    }
+
+    /// Everything that means "the picture is not standing still yet". Motion
+    /// state is in here as well as identity: `isScrubbing` only goes false once
+    /// the scroll inertia has run out, so it already carries the glide.
+    private var textLayerKey: String {
+        [
+            selectedMoment?.id ?? "-",
+            settledStill?.id ?? "-",
+            String(isScrubbing),
+            String(isZoomingTimeline),
+            String(renderedIsLive),
+        ].joined(separator: "|")
     }
 
     private var selectedDate: Date {
@@ -449,6 +483,33 @@ public struct RecallView: View {
         // The selection may have moved on while this was in flight.
         guard highlightMomentID == moment.id else { return }
         highlightRegions = OcrHighlight.matching(regions: evidence.regions, query: query)
+    }
+
+    /// Mounts the selectable text layer once the frame has been standing still
+    /// for a full quiet period.
+    ///
+    /// Nothing about the layer is visible — it draws only a selection that does
+    /// not exist yet — so mounting it late costs the user nothing but an I-beam
+    /// that appears a beat after the frame does. Mounting it *early* costs an
+    /// evidence round trip and a view rebuild for every frame a flick passes
+    /// through, none of which anyone was going to select on.
+    private func prepareTextLayer() async {
+        textLayerReady = false
+        textLayerRegions = []
+        textSelection.clearSelection()
+        guard
+            !isScrubbing, !isZoomingTimeline, !renderedIsLive,
+            let ocrLoader,
+            let moment = selectedMoment,
+            let still = settledStill,
+            still.id == moment.displayCacheKey
+        else { return }
+        try? await Task.sleep(for: OcrTextSelectionLayer.quietDuration)
+        guard !Task.isCancelled else { return }
+        let regions = await OcrRegionCache.shared.regions(momentID: moment.id, loader: ocrLoader)
+        guard !Task.isCancelled, !regions.isEmpty else { return }
+        textLayerRegions = regions
+        textLayerReady = true
     }
 
     private func prefetchFilmstripThumbnails() {
@@ -612,6 +673,11 @@ public struct RecallView: View {
     private var recallDrag: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
+                // A drag that began on OCR text belongs to the text layer.
+                // This gesture is simultaneous, so it fires anyway unless it
+                // is told not to — and the flag has to be read live, not from
+                // a `@State` snapshot taken before the mouse went down.
+                if textSelection.isSelecting { return }
                 if isZoomingTimeline {
                     dragOrigin = nil
                     searchDragOrigin = nil
@@ -664,6 +730,9 @@ public struct RecallView: View {
     }
 
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
+        // Two fingers on the trackpad while the other hand drags a selection
+        // is not a request to travel through time.
+        if textSelection.isSelecting { return }
         if ended {
             searchScrollAccumulator = 0
             finishScrubbing()
@@ -754,6 +823,10 @@ public struct RecallView: View {
 
     private func beginScrubbing(holdsPlayhead: Bool = true) {
         guard !isScrubbing else { return }
+        // The gate task tears the layer down too, but only after the next turn
+        // of the run loop; a selection must not survive even one frame of
+        // travel, or it sits over text it no longer describes.
+        textSelection.clearSelection()
         if holdsPlayhead {
             scrubPlayheadMs = playheadMs
             scrubIsLive = isLive

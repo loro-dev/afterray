@@ -1197,6 +1197,7 @@ private struct AfterRayRootView: View {
             clearRecallDecodedImageCache()
             RecallThumbnailCache.shared.clearSensitiveData()
             RecallChatPreviewCache.shared.clearSensitiveData()
+            OcrRegionCache.shared.clearSensitiveData()
             Task { await images.clearSensitiveData() }
             Task { try? await SummaryExportFileStore.shared.cleanupAll() }
         }

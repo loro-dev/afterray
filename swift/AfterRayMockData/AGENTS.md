@@ -8,6 +8,7 @@ Implements AfterRayRecall's model protocols with deterministic fixture data so t
 - `Sources/SettingsPreviewModel.swift:6` `SettingsPreviewModel` — `AfterRaySettingsModeling` over in-memory state.
 - `Sources/ComputePreviewModel.swift` `ComputePreviewModel` + `ComputeFixtures` — the compute dashboard without a daemon. The default fixture is the awkward case (on battery, summaries held, a model resident and idle), because that is the state the panel has to read well in.
 - `Sources/ChatPreviewModel.swift:25` `ChatPreviewModel` — `AfterRayChatModeling` with scripted replies. The `.thinking` fixture is think → tool → think so chat-lab shows ordered parts.
+- `Sources/RecallScenarios.swift` `MockScreenText` — the strings a mock frame draws **and** the OCR boxes describing them, measured from the same table and font. `MockArtifactFactory.renderFrame` and `MockSearchData.ocrLoader` both read it; hand-written box coordinates drift the first time either side is edited.
 
 ## Invariants
 
