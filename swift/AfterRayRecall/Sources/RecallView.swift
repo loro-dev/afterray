@@ -36,6 +36,17 @@ public struct RecallView: View {
     public var playingAudioArtifactID: String?
     public var onReload: (() -> Void)?
     public var onOpenSettings: (() -> Void)?
+    /// Opens the address of a recalled browser frame. The overlay panel sits
+    /// at `.statusBar` level, so the app must lower it before the browser
+    /// comes forward or the new tab opens invisibly behind a full-screen
+    /// overlay. Nil falls back to opening in place, which is right for the
+    /// labs and snapshots — they have no overlay in the way.
+    public var onOpenWebLink: ((URL) -> Void)?
+    /// Opens the local-computation dashboard. Nil hides the button, which is
+    /// how the Visual Lab renders scenes without a daemon to ask.
+    public var onOpenCompute: (() -> Void)?
+    /// What that button shows at a glance, without being opened.
+    public var computeIndicator: ComputeIndicator
     /// Capture state shown as a word next to the gear. Nil `onToggleRecording`
     /// hides the control entirely — the Visual Lab drives scenes without a daemon.
     public var recordingState: DaemonRecordingState?
@@ -88,6 +99,11 @@ public struct RecallView: View {
     private static let searchScrollPointsPerCell: CGFloat = 46
     @State private var highlightRegions: [OcrRegion] = []
     @State private var highlightMomentID: String?
+    /// OCR boxes behind the selectable text layer, and the flag that mounts it.
+    /// Both are cleared the instant anything moves; see `prepareTextLayer`.
+    @State private var textLayerRegions: [OcrRegion] = []
+    @State private var textLayerReady = false
+    @State private var textSelection = OcrTextSelectionCoordinator()
 
     public init(
         moments: [RecallMoment],
@@ -104,6 +120,9 @@ public struct RecallView: View {
         playingAudioArtifactID: String? = nil,
         onReload: (() -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil,
+        onOpenWebLink: ((URL) -> Void)? = nil,
+        onOpenCompute: (() -> Void)? = nil,
+        computeIndicator: ComputeIndicator = .idle,
         recordingState: DaemonRecordingState? = nil,
         isChangingRecording: Bool = false,
         onToggleRecording: (() -> Void)? = nil,
@@ -136,6 +155,9 @@ public struct RecallView: View {
         self.playingAudioArtifactID = playingAudioArtifactID
         self.onReload = onReload
         self.onOpenSettings = onOpenSettings
+        self.onOpenWebLink = onOpenWebLink
+        self.onOpenCompute = onOpenCompute
+        self.computeIndicator = computeIndicator
         self.recordingState = recordingState
         self.isChangingRecording = isChangingRecording
         self.onToggleRecording = onToggleRecording
@@ -236,6 +258,16 @@ public struct RecallView: View {
                     regions: highlightRegions,
                     pixelSize: still.pixelSize,
                     blinkToken: still.id
+                )
+            }
+
+            // Below the chrome in the stack so the timeline and the buttons
+            // over the picture keep their own clicks and their own cursors.
+            if textLayerReady, !renderedIsLive, let still = settledStill {
+                OcrTextSelectionLayer(
+                    regions: textLayerRegions,
+                    pixelSize: still.pixelSize,
+                    selection: textSelection
                 )
             }
 
@@ -397,6 +429,12 @@ public struct RecallView: View {
         .task(id: "\(highlightKey):\(isScrubbing)") {
             await loadHighlightRegions()
         }
+        // Any change to this key cancels the task, which is the whole
+        // mechanism: the quiet period restarts from zero on every scrub, every
+        // scroll, every new frame.
+        .task(id: textLayerKey) {
+            await prepareTextLayer()
+        }
         .task(id: "\(searchSession?.selectedIndex ?? -1):\(isScrubbing)") {
             guard !isScrubbing else { return }
             prefetchFilmstripThumbnails()
@@ -410,6 +448,19 @@ public struct RecallView: View {
     /// Reloading is only worth it when the frame or the query actually changed.
     private var highlightKey: String {
         "\(selectedMoment?.id ?? "-")|\(searchSession?.query ?? "")"
+    }
+
+    /// Everything that means "the picture is not standing still yet". Motion
+    /// state is in here as well as identity: `isScrubbing` only goes false once
+    /// the scroll inertia has run out, so it already carries the glide.
+    private var textLayerKey: String {
+        [
+            selectedMoment?.id ?? "-",
+            settledStill?.id ?? "-",
+            String(isScrubbing),
+            String(isZoomingTimeline),
+            String(renderedIsLive),
+        ].joined(separator: "|")
     }
 
     private var selectedDate: Date {
@@ -440,6 +491,33 @@ public struct RecallView: View {
         // The selection may have moved on while this was in flight.
         guard highlightMomentID == moment.id else { return }
         highlightRegions = OcrHighlight.matching(regions: evidence.regions, query: query)
+    }
+
+    /// Mounts the selectable text layer once the frame has been standing still
+    /// for a full quiet period.
+    ///
+    /// Nothing about the layer is visible — it draws only a selection that does
+    /// not exist yet — so mounting it late costs the user nothing but an I-beam
+    /// that appears a beat after the frame does. Mounting it *early* costs an
+    /// evidence round trip and a view rebuild for every frame a flick passes
+    /// through, none of which anyone was going to select on.
+    private func prepareTextLayer() async {
+        textLayerReady = false
+        textLayerRegions = []
+        textSelection.clearSelection()
+        guard
+            !isScrubbing, !isZoomingTimeline, !renderedIsLive,
+            let ocrLoader,
+            let moment = selectedMoment,
+            let still = settledStill,
+            still.id == moment.displayCacheKey
+        else { return }
+        try? await Task.sleep(for: OcrTextSelectionLayer.quietDuration)
+        guard !Task.isCancelled else { return }
+        let regions = await OcrRegionCache.shared.regions(momentID: moment.id, loader: ocrLoader)
+        guard !Task.isCancelled, !regions.isEmpty else { return }
+        textLayerRegions = regions
+        textLayerReady = true
     }
 
     private func prefetchFilmstripThumbnails() {
@@ -496,7 +574,7 @@ public struct RecallView: View {
         // window title, and the chrome cluster must not grow with it.
         HStack(alignment: .top, spacing: RecallGeometry.overlayChromeItemGap) {
             if !renderedIsLive {
-                AppIdentity(moment: selectedMoment)
+                AppIdentity(moment: selectedMoment, onOpenWebLink: onOpenWebLink)
             }
 
             Spacer(minLength: 24)
@@ -524,6 +602,19 @@ public struct RecallView: View {
                                     showsDetails = true
                                 }
                             }
+                        )
+                    }
+
+                    // Left of the gear: a whole-app control, like Settings, but
+                    // one the user reaches for mid-task ("give me my GPU back")
+                    // rather than to configure something. It carries its own
+                    // state so the overlay answers "is AfterRay busy right now"
+                    // without being opened — the menu-bar copy of this button
+                    // can be hidden by a crowded menu bar, this one cannot.
+                    if let onOpenCompute {
+                        ComputeActivityButton(
+                            indicator: computeIndicator,
+                            action: onOpenCompute
                         )
                     }
 
@@ -590,6 +681,11 @@ public struct RecallView: View {
     private var recallDrag: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
+                // A drag that began on OCR text belongs to the text layer.
+                // This gesture is simultaneous, so it fires anyway unless it
+                // is told not to — and the flag has to be read live, not from
+                // a `@State` snapshot taken before the mouse went down.
+                if textSelection.isSelecting { return }
                 if isZoomingTimeline {
                     dragOrigin = nil
                     searchDragOrigin = nil
@@ -642,6 +738,9 @@ public struct RecallView: View {
     }
 
     private func handleScroll(delta: CGFloat, isPrecise: Bool, ended: Bool) {
+        // Two fingers on the trackpad while the other hand drags a selection
+        // is not a request to travel through time.
+        if textSelection.isSelecting { return }
         if ended {
             searchScrollAccumulator = 0
             finishScrubbing()
@@ -732,6 +831,10 @@ public struct RecallView: View {
 
     private func beginScrubbing(holdsPlayhead: Bool = true) {
         guard !isScrubbing else { return }
+        // The gate task tears the layer down too, but only after the next turn
+        // of the run loop; a selection must not survive even one frame of
+        // travel, or it sits over text it no longer describes.
+        textSelection.clearSelection()
         if holdsPlayhead {
             scrubPlayheadMs = playheadMs
             scrubIsLive = isLive
@@ -1166,6 +1269,7 @@ public func clearRecallDecodedImageCache() {
 
 private struct AppIdentity: View {
     let moment: RecallMoment?
+    var onOpenWebLink: ((URL) -> Void)?
 
     /// The app name alone rarely identifies a frame — a day in one editor is a
     /// dozen different files. The window title is what tells them apart.
@@ -1177,6 +1281,13 @@ private struct AppIdentity: View {
         return title
     }
 
+    /// Set when this frame was a web page we can reopen. It does not replace
+    /// the window title — the title still identifies the frame — it only makes
+    /// that line openable.
+    private var webLink: RecallWebLink? { moment?.webLink }
+
+    private var hasSubline: Bool { webLink != nil || windowTitle != nil }
+
     var body: some View {
         HStack(spacing: 9) {
             ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 24)
@@ -1185,7 +1296,15 @@ private struct AppIdentity: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .lineLimit(1)
-                if let windowTitle {
+                if let webLink {
+                    // A browser can leave the title empty; the address is the
+                    // fallback so the affordance never appears unlabelled.
+                    OpenableTitle(
+                        text: windowTitle ?? webLink.display,
+                        link: webLink,
+                        onOpen: onOpenWebLink
+                    )
+                } else if let windowTitle {
                     Text(windowTitle)
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.62))
@@ -1197,9 +1316,72 @@ private struct AppIdentity: View {
         }
         .padding(.leading, 7)
         .padding(.trailing, 12)
-        .padding(.vertical, windowTitle == nil ? 0 : 6)
+        .padding(.vertical, hasSubline ? 0 : 6)
         .frame(minHeight: RecallGeometry.overlayChromeButtonSize)
         .recallGlass(in: .capsule)
+    }
+}
+
+/// The window title of a recalled browser frame, carrying a link back to the
+/// live page. The title still reads as the title; the underline and the
+/// `arrow.up.right` — the same glyph a chat moment citation uses for "open
+/// this" — are what say it can be followed.
+private struct OpenableTitle: View {
+    let text: String
+    let link: RecallWebLink
+    var onOpen: ((URL) -> Void)?
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button {
+            if let onOpen {
+                onOpen(link.url)
+            } else {
+                NSWorkspace.shared.open(link.url)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(text)
+                    .underline()
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .accessibilityHidden(true)
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(.white.opacity(isHovering ? 0.95 : 0.62))
+            .frame(maxWidth: RecallGeometry.appIdentityTitleMaxWidth, alignment: .leading)
+            // The glyphs are ~11pt in a 40pt capsule, so without this the
+            // clickable region is a sliver of the row it appears to be.
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        // `push`/`pop` rather than `set`, so the overlay's own cursor comes
+        // back when the pointer leaves. Every push must be matched exactly
+        // once or the pointing hand outlives the link: the state guard drops
+        // repeat callbacks, and `onDisappear` covers the two ways the label
+        // goes away *while* hovered — the click hides the overlay, and
+        // travelling to a non-browser frame swaps in the plain title.
+        .onHover { hovering in
+            guard hovering != isHovering else { return }
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .onDisappear {
+            guard isHovering else { return }
+            isHovering = false
+            NSCursor.pop()
+        }
+        // The visible text is normally the page title, so the tooltip is the
+        // one place the address can be read in full before clicking it.
+        .help("Open \(link.url.absoluteString)")
+        .accessibilityLabel("Open \(text) at \(link.display)")
     }
 }
 

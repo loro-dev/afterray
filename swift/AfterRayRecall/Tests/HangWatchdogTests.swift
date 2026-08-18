@@ -97,7 +97,7 @@ final class DaemonTimeoutTests: XCTestCase {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            _ = path.utf8CString.withUnsafeBytes { source in
+            path.utf8CString.withUnsafeBytes { source in
                 destination.copyBytes(from: source.prefix(destination.count))
             }
         }

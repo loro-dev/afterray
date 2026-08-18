@@ -78,12 +78,15 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
             "The daemon should own storage while the interface stays replaceable.",
             "We can validate this with a real day of recording before adding more product surface.",
         ]
-        let applications = [
-            ("Figma", "com.figma.Desktop"),
-            ("Safari", "com.apple.Safari"),
-            ("Xcode", "com.apple.dt.Xcode"),
-            ("Slack", "com.tinyspeck.slackmacgap"),
-            ("Notion", "notion.id"),
+        // Browser entries carry a URL so the identity capsule's clickable
+        // address is drivable from the labs and snapshots; the rest leave it
+        // nil, which is the window-title path.
+        let applications: [(name: String, bundle: String, url: String?)] = [
+            ("Figma", "com.figma.Desktop", nil),
+            ("Safari", "com.apple.Safari", "https://www.example.com/moments/capture-pipeline?ref=recall"),
+            ("Xcode", "com.apple.dt.Xcode", nil),
+            ("Slack", "com.tinyspeck.slackmacgap", nil),
+            ("Notion", "notion.id", nil),
         ]
         return (0..<count).map { index in
             let app = applications[min(index / 7, applications.count - 1) % applications.count]
@@ -96,8 +99,9 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
                 ocrText: processing && index > count - 4 ? nil : screenCopy[index % screenCopy.count],
                 transcriptText: processing && index > count - 6 ? nil : transcriptCopy[index % transcriptCopy.count],
                 audioArtifactId: index.isMultiple(of: 3) ? "mock://audio/\(index)" : nil,
-                applicationName: app.0,
-                bundleIdentifier: app.1
+                applicationName: app.name,
+                bundleIdentifier: app.bundle,
+                url: app.url
             )
         }
     }
@@ -283,25 +287,10 @@ public extension DaySummary {
 public enum MockSearchData {
     public static let query = "Moment"
 
-    /// Where `MockArtifactFactory` draws the frame title, in Vision's
-    /// bottom-left-origin unit square. Keeping this next to the drawing code is
-    /// what makes the overlay land on the actual glyphs.
-    public static let titleRegion = OcrRegion(
-        text: "Moment",
-        confidence: 0.96,
-        x: 0.093,
-        y: 0.664,
-        width: 0.209,
-        height: 0.068
-    )
-    public static let bodyRegion = OcrRegion(
-        text: "capture pipeline",
-        confidence: 0.81,
-        x: 0.093,
-        y: 0.366,
-        width: 0.520,
-        height: 0.014
-    )
+    /// The title and one body line of frame 0, for surfaces that want a couple
+    /// of boxes rather than a whole screen of them.
+    public static let titleRegion = MockScreenText.regions(index: 0)[0]
+    public static let bodyRegion = MockScreenText.regions(index: 0)[1]
 
     /// Ages chosen to exercise every branch of `RelativeStamp.short`.
     private static let agesMs: [Int64] = [
@@ -376,12 +365,120 @@ public enum MockSearchData {
         }.value
     }
 
-    public static let ocrLoader: RecallOcrLoader = { momentID in
-        OcrEvidence(
-            momentId: momentID,
-            text: "Moment · capture pipeline",
-            regions: [titleRegion, bodyRegion]
+    /// Same pixels as the filmstrip mock — already 1280px — plus a fixture
+    /// moment so citation cards can show a real captured-at stamp in labs.
+    public static let previewLoader: RecallChatPreviewLoader = thumbnailLoader
+
+    public static let momentLoader: RecallMomentLoader = { momentID in
+        if let match = RecallScenario.long.moments.first(where: { $0.id == momentID }) {
+            return match
+        }
+        let index = Int(momentID.split(separator: "-").last ?? "0") ?? 0
+        return RecallMoment(
+            id: momentID,
+            sessionId: "session-today",
+            capturedAtMs: RecallScenario.baseMs + Int64(index * 42_000),
+            imageArtifactId: "mock://frame/\(index)",
+            applicationName: "Xcode"
         )
+    }
+
+    public static let ocrLoader: RecallOcrLoader = { momentID in
+        let index = Int(momentID.split(separator: "-").last ?? "0") ?? 0
+        let regions = MockScreenText.regions(index: index)
+        return OcrEvidence(
+            momentId: momentID,
+            text: regions.map(\.text).joined(separator: "\n"),
+            regions: regions
+        )
+    }
+}
+
+/// The text a mock frame actually carries, and the OCR boxes that describe it.
+///
+/// Drawing and recognition read the same table and measure with the same font,
+/// which is the only reason the transparent text layer lands on the glyphs in
+/// the Visual Lab. Hand-written box coordinates drift away from the drawing the
+/// first time either one is edited.
+public enum MockScreenText {
+    public struct Line: Sendable {
+        public let text: String
+        /// Fractions of the frame with the origin at the bottom left — Vision's
+        /// convention, and the one an unflipped AppKit context draws in.
+        public let x: Double
+        public let y: Double
+        /// Point size as a fraction of the frame width.
+        public let size: Double
+        public let weight: NSFont.Weight
+    }
+
+    public static let imageSize = NSSize(width: 1_280, height: 800)
+
+    public static func lines(index: Int) -> [Line] {
+        [
+            Line(
+                text: "Moment \(String(format: "%02d", index + 1))",
+                x: 0.0935,
+                y: 0.67,
+                size: 0.042,
+                weight: .semibold
+            ),
+            Line(
+                text: "capture pipeline · shim → daemon → vault",
+                x: 0.0935,
+                y: 0.435,
+                size: 0.020,
+                weight: .regular
+            ),
+            Line(
+                text: "OCR regions arrive as Vision unit-square boxes",
+                x: 0.0935,
+                y: 0.380,
+                size: 0.020,
+                weight: .regular
+            ),
+            // Mixed scripts on one line: word segmentation and the caret math
+            // both behave differently here than on the Latin rows above.
+            Line(
+                text: "拖动即可选中这一帧上的文字，⌘C 复制",
+                x: 0.0935,
+                y: 0.325,
+                size: 0.020,
+                weight: .regular
+            ),
+        ]
+    }
+
+    public static func regions(index: Int) -> [OcrRegion] {
+        lines(index: index).map { line in
+            let measured = (line.text as NSString).size(withAttributes: attributes(for: line))
+            return OcrRegion(
+                text: line.text,
+                confidence: 0.94,
+                x: line.x,
+                y: line.y,
+                width: Double(measured.width) / Double(imageSize.width),
+                height: Double(measured.height) / Double(imageSize.height)
+            )
+        }
+    }
+
+    /// Draws into the currently focused context, which the caller has set up at
+    /// `imageSize` with the default bottom-left origin.
+    public static func draw(index: Int) {
+        for line in lines(index: index) {
+            line.text.draw(
+                at: NSPoint(x: line.x * imageSize.width, y: line.y * imageSize.height),
+                withAttributes: attributes(for: line)
+            )
+        }
+    }
+
+    private static func attributes(for line: Line) -> [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.systemFont(ofSize: line.size * imageSize.width, weight: line.weight),
+            .foregroundColor: NSColor.white.withAlphaComponent(line.weight == .semibold ? 1 : 0.86),
+        ]
     }
 }
 
@@ -403,7 +500,7 @@ public enum MockArtifactFactory {
     }
 
     public static func renderFrame(index: Int) throws -> Data {
-        let size = NSSize(width: 1_280, height: 800)
+        let size = MockScreenText.imageSize
         let image = NSImage(size: size)
         image.lockFocus()
 
@@ -421,19 +518,12 @@ public enum MockArtifactFactory {
         NSColor.white.withAlphaComponent(0.075).setFill()
         panel.fill()
 
-        let title = "Moment \(String(format: "%02d", index + 1))"
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: size.width * 0.042, weight: .semibold),
-            .foregroundColor: NSColor.white,
-        ]
-        title.draw(at: NSPoint(x: inset * 1.7, y: size.height * 0.67), withAttributes: attributes)
-
         palette.1.withAlphaComponent(0.88).setFill()
         NSBezierPath(roundedRect: NSRect(x: inset * 1.7, y: size.height * 0.52, width: size.width * 0.24, height: max(5, size.height * 0.018)), xRadius: 4, yRadius: 4).fill()
-        NSColor.white.withAlphaComponent(0.16).setFill()
-        for row in 0..<3 {
-            NSBezierPath(roundedRect: NSRect(x: inset * 1.7, y: size.height * (0.37 - Double(row) * 0.075), width: size.width * (0.52 - Double(row) * 0.08), height: max(4, size.height * 0.013)), xRadius: 3, yRadius: 3).fill()
-        }
+
+        // Real strings rather than grey placeholder bars: the selectable text
+        // layer can only be judged against glyphs it is actually drawn over.
+        MockScreenText.draw(index: index)
         image.unlockFocus()
 
         guard let tiff = image.tiffRepresentation,

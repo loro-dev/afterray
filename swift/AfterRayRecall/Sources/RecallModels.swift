@@ -137,6 +137,58 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         if let gop { return "gop-poster:\(gop.segmentId)#\(gop.keyframeIndex)" }
         return displayCacheKey
     }
+
+    /// The page this frame was on, when it was a web page we may reopen.
+    public var webLink: RecallWebLink? { RecallWebLink(captured: url) }
+}
+
+/// A web address recovered from a captured frame: what to show, and what to
+/// hand the browser when the overlay's address is clicked.
+///
+/// `RecallMoment.url` is whatever the foreground app published in its
+/// accessibility tree. Browsers publish `http(s)` from the web area's `AXURL`,
+/// but other apps publish `file:` paths, private schemes, or junk, and the
+/// value reached the vault without ever being validated as a link. So the
+/// overlay must never pass a captured string to `NSWorkspace` unfiltered:
+/// only `http` and `https` become an openable link here, and everything else
+/// stays nil rather than becoming a click that runs an arbitrary handler.
+public struct RecallWebLink: Equatable, Sendable {
+    /// Safe to open: guaranteed `http`/`https` with a host.
+    public let url: URL
+    /// Compact form for the overlay — no scheme, no `www.`, no trailing
+    /// slash. A query or fragment is elided to `…` rather than shown, so a
+    /// tracking-laden address cannot push the rest of the chrome off screen;
+    /// `url` still carries it, and the tooltip shows the address in full.
+    public let display: String
+
+    public init?(captured: String?) {
+        guard
+            let raw = captured?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !raw.isEmpty,
+            let url = URL(string: raw),
+            let scheme = url.scheme?.lowercased(),
+            scheme == "http" || scheme == "https",
+            let host = url.host(), !host.isEmpty
+        else { return nil }
+
+        self.url = url
+
+        var text = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        if let port = url.port {
+            text += ":\(port)"
+        }
+        var path = url.path(percentEncoded: false)
+        while path.count > 1, path.hasSuffix("/") {
+            path.removeLast()
+        }
+        if path != "/" {
+            text += path
+        }
+        if url.query()?.isEmpty == false || url.fragment()?.isEmpty == false {
+            text += "…"
+        }
+        display = text
+    }
 }
 
 public struct RecallGopRef: Codable, Equatable, Sendable {

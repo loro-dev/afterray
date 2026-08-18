@@ -53,6 +53,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var updatesSupported = true
     @Published public var automaticUpdates = true
     @Published public var updateStatus = "You are on 0.0.1 (build 1). AfterRay checks once a day."
+    @Published public var computeDashboardEnabled = false
     @Published public var developerOptionsUnlocked = false
     @Published public var developerOptionsEnabled = false
     @Published public var recentJobs: [ModelJob] = [
@@ -597,6 +598,10 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     public func setDeveloperOptionsEnabled(_ enabled: Bool) {
         guard developerOptionsUnlocked else { return }
         developerOptionsEnabled = enabled
+    }
+
+    public func setComputeDashboardEnabled(_ enabled: Bool) {
+        computeDashboardEnabled = enabled
     }
 
     public func replayOnboarding() {

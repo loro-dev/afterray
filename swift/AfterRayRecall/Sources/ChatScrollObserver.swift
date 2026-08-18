@@ -119,7 +119,8 @@ struct ChatScrollObserver: NSViewRepresentable {
             onChange(
                 ChatScrollMetrics(
                     distanceFromBottom: max(0, distance),
-                    isUserScrolling: isLiveScrolling
+                    isUserScrolling: isLiveScrolling,
+                    contentHeight: documentView.bounds.height
                 )
             )
         }

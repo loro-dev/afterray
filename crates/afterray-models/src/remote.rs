@@ -254,7 +254,7 @@ impl ModelAdapter for LlmRouterAdapter {
                 // stored by an older build or forced through
                 // `AFTERRAY_LLM_BASE_URL`, before any evidence is on the wire.
                 check_origin(&config.resolved_base_url()).map_err(AdapterError::Process)?;
-                let text = generate_remote(
+                let (text, usage) = generate_remote(
                     &self.client,
                     &config,
                     prompt,
@@ -264,7 +264,10 @@ impl ModelAdapter for LlmRouterAdapter {
                     cancellation,
                 )
                 .await?;
-                Ok(ModelOutput::Llm { text })
+                Ok(match usage {
+                    Some(usage) => ModelOutput::llm_with_usage(text, usage),
+                    None => ModelOutput::llm(text),
+                })
             }
         }
     }
@@ -399,7 +402,7 @@ async fn generate_remote(
     system: Option<&str>,
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
-) -> Result<String, AdapterError> {
+) -> Result<(String, Option<crate::LlmUsage>), AdapterError> {
     if let Some(token_tx) = token_tx {
         return stream::generate_streaming(
             client,
@@ -462,8 +465,20 @@ async fn generate_remote(
     }
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| AdapterError::InvalidOutput(format!("LLM returned non-JSON: {error}")))?;
-    chat_message_content(&value).ok_or_else(|| {
+    let content = chat_message_content(&value).ok_or_else(|| {
         AdapterError::InvalidOutput("OpenAI-compatible response had no assistant text".into())
+    })?;
+    Ok((content, openai_completion_usage(&value)))
+}
+
+fn openai_completion_usage(value: &Value) -> Option<crate::LlmUsage> {
+    let usage = value.get("usage")?;
+    let prompt_tokens = usize::try_from(usage.get("prompt_tokens")?.as_u64()?).ok()?;
+    let completion_tokens = usize::try_from(usage.get("completion_tokens")?.as_u64()?).ok()?;
+    Some(crate::LlmUsage {
+        prompt_tokens,
+        completion_tokens,
+        generation_ms: 0,
     })
 }
 

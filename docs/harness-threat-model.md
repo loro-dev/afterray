@@ -25,14 +25,24 @@ more.
 
 ## What the agent can do
 
-Twelve tools, all reads, all against the vault:
+Eight tools, all reads, all against the vault (`crates/afterrayd/src/tools.rs`):
 
-`get_now`, `get_day_summary`, `get_slot_card`, `list_activity`,
-`search_evidence`, `list_memories`, `list_moments`, `get_moment`, `get_ocr`,
-`get_ax_digest`, `get_ax_tree`, `get_transcript`.
+`get_now`, `get_day_summary`, `search_summaries`, `search_evidence`,
+`get_slot_card`, `get_moment_context`, `get_transcript`, `list_activity`.
 
-Their whole argument vocabulary is `from_ms`, `to_ms`, `at_ms`, `day_ms`,
-`moment_id`, `query`, `limit`. No path, URL, command, glob, or format string.
+Their whole argument vocabulary is `from_ms`, `to_ms`, `at_ms`, `day`,
+`moment_id`, `query`, `limit`. Two of those are strings: `day` is rejected
+unless it parses as a calendar date, and `query` is discussed below. No path,
+URL, command, glob, or format string.
+
+This list shrank from twelve. `get_moment`, `get_ocr` and `get_ax_digest` were
+folded into `get_moment_context` (one instant, read once instead of three
+times); `get_ax_tree` cannot fit the window; `list_moments` and `list_memories`
+became redundant once ids arrived attached to every hit. Nothing was removed
+from what the agent may *reach* — only from how many calls it costs — so the
+bound this section describes did not move. The T2 slot summariser keeps its own
+separate surface, including a `get_ocr` keyed by run id; it is not reachable
+from chat.
 
 ## What stops what
 
@@ -85,7 +95,7 @@ instructions and…" — much less likely to land.
 probabilistic system, and a sufficiently clever payload against a sufficiently
 weak model will get through it. The fence is why injection is unlikely to
 succeed; the read-only tool surface is why it does not matter very much when it
-does. A model that is fully suborned can still only call the twelve read tools
+does. A model that is fully suborned can still only call the eight read tools
 above, with those seven argument names, against the user's own vault.
 
 **The worst an injection achieves today:** it makes the agent look at
@@ -115,7 +125,7 @@ The fence does not change this. Marking bytes as data governs how the model
 
 It was worth checking, because it is the one tool whose argument is a free
 string the agent chooses: an injection could plausibly have the agent read a
-secret with `get_ocr` and then encode it into a search query.
+secret with `get_moment_context` and then encode it into a search query.
 
 It does not reach the network. `ModelInput::Embedding` is routed by capability,
 `LlmRouterAdapter` — the only adapter that can make an HTTP request — declares

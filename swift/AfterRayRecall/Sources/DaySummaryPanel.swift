@@ -128,11 +128,14 @@ public struct DaySummaryPanel: View {
                 Button(action: onPopOut) {
                     Image(systemName: "macwindow.on.rectangle")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(.white.opacity(0.72))
                         .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
+                        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .recallHoverFill(
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        )
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(RecallGlassPressStyle())
                 .help("Open as a window")
             }
         }

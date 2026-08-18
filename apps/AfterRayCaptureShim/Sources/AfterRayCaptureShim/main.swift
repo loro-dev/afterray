@@ -1340,15 +1340,19 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
     private let microphone: AudioSegmentWriter?
     let audioGate = ExcludedAudioGate()
 
-    init(options: Options, events: EventWriter) {
+    init(options: Options, audioPlan: AudioCapturePlan, events: EventWriter) {
         self.events = events
-        if options.recordAudio {
+        if audioPlan.capturesSystemAudio {
             systemAudio = AudioSegmentWriter(
                 kind: .systemAudio,
                 outputDirectory: options.outputDirectory,
                 segmentDuration: options.audioSegmentSeconds,
                 events: events
             )
+        } else {
+            systemAudio = nil
+        }
+        if audioPlan.capturesMicrophone {
             microphone = AudioSegmentWriter(
                 kind: .microphone,
                 outputDirectory: options.outputDirectory,
@@ -1356,7 +1360,6 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
                 events: events
             )
         } else {
-            systemAudio = nil
             microphone = nil
         }
     }
@@ -2409,6 +2412,11 @@ private enum AfterRayCaptureShim {
         let events = EventWriter()
         do {
             let options = try Options.parse(CommandLine.arguments)
+            let audioPlan = AudioCapturePlan(
+                recordsAudio: options.recordAudio,
+                hasMicrophoneInput: AVCaptureDevice.default(for: .audio) != nil,
+                microphoneAuthorized: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            )
             try FileManager.default.createDirectory(
                 at: options.outputDirectory,
                 withIntermediateDirectories: true
@@ -2423,7 +2431,13 @@ private enum AfterRayCaptureShim {
             // launched Electron app can time out while it builds its AX
             // tree, degrading that one tick; the next heartbeat recovers.
             AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.1)
-            log("starting recordAudio=\(options.recordAudio) output=\(options.outputDirectory.path)")
+            log(
+                "starting systemAudio=\(audioPlan.capturesSystemAudio) "
+                    + "microphone=\(audioPlan.capturesMicrophone) output=\(options.outputDirectory.path)"
+            )
+            if options.recordAudio, !audioPlan.capturesMicrophone {
+                log("microphone capture is off (input missing or not authorized); continuing with system audio only")
+            }
             log("requesting SCShareableContent")
             let content = try await SCShareableContent.excludingDesktopWindows(
                 false,
@@ -2441,11 +2455,11 @@ private enum AfterRayCaptureShim {
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: 5)
             configuration.queueDepth = 3
             configuration.showsCursor = true
-            configuration.capturesAudio = options.recordAudio
+            configuration.capturesAudio = audioPlan.capturesSystemAudio
             configuration.excludesCurrentProcessAudio = true
             configuration.sampleRate = 48_000
             configuration.channelCount = 2
-            configuration.captureMicrophone = options.recordAudio
+            configuration.captureMicrophone = audioPlan.capturesMicrophone
 
             let excludedApplications = content.applications.filter {
                 $0.bundleIdentifier == afterRayAppBundleIdentifier
@@ -2455,16 +2469,18 @@ private enum AfterRayCaptureShim {
                 excludingApplications: excludedApplications,
                 exceptingWindows: []
             )
-            let output = CaptureOutput(options: options, events: events)
+            let output = CaptureOutput(options: options, audioPlan: audioPlan, events: events)
             let stream = SCStream(filter: streamFilter, configuration: configuration, delegate: output)
             let callbackQueue = DispatchQueue(label: "dev.afterray.capture.samples", qos: .userInitiated)
-            if options.recordAudio {
+            if audioPlan.capturesSystemAudio {
                 // Its own queue: the sample handler must never wait on this,
                 // and the main thread is blocked in `readLine` most of the time.
                 output.audioGate.start(
                     queue: DispatchQueue(label: "dev.afterray.capture.foreground", qos: .utility)
                 )
                 try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: callbackQueue)
+            }
+            if audioPlan.capturesMicrophone {
                 try stream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: callbackQueue)
             }
             log("calling SCStream.startCapture")

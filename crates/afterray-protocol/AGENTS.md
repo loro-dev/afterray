@@ -11,6 +11,7 @@ Single source of truth for the wire contract between `afterrayd` and its clients
 - CLI vs app: `cli_access.rs` classifies each `Request` as Query / Evidence / Privileged. Unprivileged socket peers (`afterray` CLI, agents) get Query always, Evidence only while `cli_evidence_until_ms` is in the future, and never Privileged. The AfterRay app is recognized by socket audit token + code signature (`afterray-platform-macos::peer_is_afterray_app`), never by path.
 - Evolve additively only: new optional fields with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Never rename variants/fields — the `*_wire_shape_is_stable` tests (`src/lib.rs:890+`) pin exact JSON bytes and will fail. Add a wire-shape test for every new/changed request, and mirror new request fields in Swift's `WireRequest` (manual snake_case CodingKeys in `DaemonClient.swift`).
 - Enums persisted in settings follow `LlmProvider` (`src/lib.rs:323`): lenient custom `Deserialize` degrading unknown/retired labels (`builtin`, `local`) to the default; strict serialization.
+- Compute dashboard types (`ComputeMode`, `ComputeWorkload`, `ComputeLane`, `ComputeGateCode`, `ComputeStatusReport`) sit next to `LlmProvider`. `ComputeLane` exists because macOS publishes no per-process GPU accounting — name the lane, never invent a percentage.
 - Shared helpers both daemon and clients rely on: `local_calendar_day_bounds_ms` (`src/lib.rs:864`), `summary_language_options()` (`src/lib.rs:436`).
 
 ## Socket paths (`src/socket.rs`)

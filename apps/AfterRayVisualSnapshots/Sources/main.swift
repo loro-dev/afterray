@@ -105,7 +105,7 @@ struct SnapshotScene {
     @MainActor
     static var all: [SnapshotScene] {
         chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
-            + mixedHistoryScene + captionScenes + chatScenes
+            + mixedHistoryScene + captionScenes + chatScenes + computeScenes
     }
 }
 
@@ -258,15 +258,39 @@ private var chromeScenes: [SnapshotScene] {
 
 @MainActor
 private func headerScenes() -> [SnapshotScene] {
-    let titles: [(String, String?)] = [
-        ("06-header-no-title", nil),
-        ("07-header-normal-title", "RecallView.swift — AfterRay"),
+    // A browser frame keeps its window title and makes that line openable, so
+    // the last three cases carry a URL: one ordinary, one long enough to prove
+    // the capsule still cannot push the chrome cluster off screen, and one
+    // with no title at all, where the address stands in as the label.
+    let cases: [(name: String, app: (String, String), title: String?, url: String?)] = [
+        ("06-header-no-title", ("Xcode", "com.apple.dt.Xcode"), nil, nil),
+        ("07-header-normal-title", ("Xcode", "com.apple.dt.Xcode"), "RecallView.swift — AfterRay", nil),
         (
             "08-header-very-long-title",
-            "Q3 planning · roadmap review · search presentation and timeline rebuild — Google Docs"
+            ("Xcode", "com.apple.dt.Xcode"),
+            "Q3 planning · roadmap review · search presentation and timeline rebuild — Google Docs",
+            nil
+        ),
+        (
+            "08-header-openable-title",
+            ("Safari", "com.apple.Safari"),
+            "Example Domain",
+            "https://www.example.com/docs/recall/capture-pipeline"
+        ),
+        (
+            "08-header-openable-long-title",
+            ("Safari", "com.apple.Safari"),
+            "Q3 planning · roadmap review · search presentation and timeline rebuild — Google Docs",
+            "https://docs.example.com/document/d/1a2b3c4d5e6f7g8h9i0j/edit?usp=sharing"
+        ),
+        (
+            "08-header-openable-untitled",
+            ("Safari", "com.apple.Safari"),
+            nil,
+            "https://www.example.com/docs/recall/capture-pipeline"
         ),
     ]
-    return titles.map { name, title in
+    return cases.map { name, app, title, url in
         let moment = RecallMoment(
             id: "header-moment",
             sessionId: "session-header",
@@ -274,9 +298,10 @@ private func headerScenes() -> [SnapshotScene] {
             imageArtifactId: "mock://frame/1",
             isFavorite: false,
             ocrText: "Header check",
-            applicationName: "Xcode",
-            bundleIdentifier: "com.apple.dt.Xcode",
-            windowTitle: title
+            applicationName: app.0,
+            bundleIdentifier: app.1,
+            windowTitle: title,
+            url: url
         )
         return chromeScene(
             name: name,
@@ -557,6 +582,23 @@ private var mixedHistoryScene: [SnapshotScene] {
 MainActor.assumeIsolated { SnapshotRunner.main() }
 
 
+/// The compute dashboard in the states that actually shape it: work held back
+/// with a backlog to start, and a summary running with an estimate.
+@MainActor
+private var computeScenes: [SnapshotScene] {
+    [
+        ("30-compute-held-on-battery", ComputeFixtures.onBattery),
+        ("31-compute-summarising", ComputeFixtures.summarising),
+    ].map { name, status in
+        SnapshotScene(
+            name: name,
+            size: CGSize(width: 420, height: 620),
+            settleSeconds: 0.6,
+            content: AnyView(ComputeActivityPanel(model: ComputePreviewModel(status: status)))
+        )
+    }
+}
+
 /// Privacy exclusions and gated developer controls, rendered offscreen so
 /// settings layout changes are checked against pixels rather than assumed.
 @MainActor
@@ -724,16 +766,19 @@ private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
     let model = ChatPreviewModel(scenario: scenario)
     return SnapshotScene(
         name: name,
-        size: CGSize(width: 980, height: 680),
+        size: CGSize(width: 1_080, height: 720),
         settleSeconds: 1.2,
         content: AnyView(
             AfterRayChatView(
                 model: model,
                 onClose: {},
                 onOpenMoment: { _ in },
-                thumbnailLoader: MockSearchData.thumbnailLoader
+                thumbnailLoader: MockSearchData.thumbnailLoader,
+                previewLoader: MockSearchData.previewLoader,
+                momentLoader: MockSearchData.momentLoader,
+                fillsAvailableSpace: true
             )
-                .frame(width: 980, height: 680)
+                .frame(width: 1_080, height: 720)
         )
     )
 }

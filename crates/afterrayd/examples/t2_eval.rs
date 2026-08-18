@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let elapsed = started.elapsed();
 
         let raw = match snapshot.output {
-            Some(ModelOutput::Llm { text }) => text,
+            Some(ModelOutput::Llm { text, .. }) => text,
             _ => {
                 println!(
                     "  FAILED after {:.1}s: {}",

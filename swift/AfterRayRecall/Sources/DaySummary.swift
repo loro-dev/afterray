@@ -470,35 +470,34 @@ public enum DaySummaryLayout {
 
         for block in StreamingMarkdown.blocks(from: details) {
             switch block {
-            case let .heading(_, text):
-                flush()
-                // The streaming parser folds the lines under a heading into the
-                // heading block, so a card's whole first paragraph can arrive
-                // attached to its title. The heading is the first line; the
-                // rest is already this section's body.
-                var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-                heading = plainText(lines.removeFirst())
-                let rest = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !rest.isEmpty {
-                    body.append(plainText(rest))
+            case let .markdown(text):
+                // MarkdownUI owns rendering in chat; this panel wants plain
+                // sections, so headings are split on the raw lines and inline
+                // syntax is resolved to the words it wraps.
+                for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+                    let line = String(rawLine)
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if let hashes = trimmed.prefix(while: { $0 == "#" }).count as Int?,
+                        (1...6).contains(hashes),
+                        trimmed.dropFirst(hashes).first == " " {
+                        flush()
+                        heading = plainText(String(trimmed.dropFirst(hashes + 1)))
+                        continue
+                    }
+                    if trimmed.isEmpty { continue }
+                    if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+                        body.append("• " + plainText(String(trimmed.dropFirst(2))))
+                    } else {
+                        body.append(plainText(trimmed))
+                    }
                 }
-            case let .paragraph(text):
-                body.append(plainText(text))
             case let .momentImage(label, momentID):
                 // No media in the panel: the label is what the citation says,
                 // and an unlabelled one still marks that a frame was cited.
                 let text = plainText(label)
                 body.append(text.isEmpty ? "Frame \(momentID)" : text)
-            case let .bulletedList(items):
-                body.append(contentsOf: items.map { "• " + plainText($0) })
-            case let .numberedList(items):
-                body.append(contentsOf: items.enumerated().map { "\($0.offset + 1). " + plainText($0.element) })
             case let .code(_, text, _):
                 body.append(text)
-            case let .quote(text):
-                body.append(plainText(text))
-            case .rule:
-                continue
             }
         }
         flush()
