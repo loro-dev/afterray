@@ -502,9 +502,16 @@ pub struct ActEvent {
     /// The named command of a `command` row.
     pub command: Option<String>,
     pub bundle_identifier: Option<String>,
-    /// The target element's label, never its value.
+    /// The target element's label.
     pub label: Option<String>,
     pub role: Option<String>,
+    /// What a typing run left standing, as the shim coalesced it. The
+    /// secondary content channel: a CJK keystream is pinyin fragments.
+    pub typed: Option<String>,
+    /// The focused field's value at this instant — read at the end of a typing
+    /// run and at a submit. The **primary** content channel: measured, 1,796
+    /// typing events carried no Chinese at all while 451 target values did.
+    pub value: Option<String>,
     pub frame: Option<AxRect>,
     /// Engaged scope resolved against the nearest frame's tree. `None` means
     /// unresolved, which never forces a run boundary — an unknown scope is not
@@ -541,6 +548,15 @@ struct StoredTarget {
     label: Option<String>,
     #[serde(default)]
     frame: Option<AxRect>,
+    /// The field's content at the instant the event fired.
+    #[serde(default)]
+    value: Option<String>,
+    /// The shim's secure-input verdict. The guard runs at the source and a
+    /// secure row carries no content at all; this is read anyway, and read as
+    /// a veto, because a field that once announced itself as secure is not
+    /// something to reconsider downstream on the strength of a stray value.
+    #[serde(default)]
+    secure: Option<bool>,
 }
 
 /// Decodes one stored row. Never fails: a target that will not parse costs the
@@ -559,6 +575,7 @@ pub fn parse_event(row: &crate::InputEventRow) -> ActEvent {
         SIGNAL_GAP_KIND => ActKind::SignalGap,
         _ => ActKind::Other,
     };
+    let secure = target.as_ref().is_some_and(|held| held.secure == Some(true));
     ActEvent {
         at_ms: row.at_ms,
         end_ms: row.end_ms.filter(|end| *end >= row.at_ms),
@@ -568,6 +585,11 @@ pub fn parse_event(row: &crate::InputEventRow) -> ActEvent {
         bundle_identifier: row.bundle_identifier.clone(),
         label: target.as_ref().and_then(|held| held.label.clone()),
         role: target.as_ref().and_then(|held| held.role.clone()),
+        typed: row.text.clone().filter(|_| !secure),
+        value: target
+            .as_ref()
+            .and_then(|held| held.value.clone())
+            .filter(|_| !secure),
         frame: target
             .and_then(|held| held.frame)
             .filter(AxRect::is_measurable),
@@ -619,6 +641,108 @@ pub fn fold_acts(events: &[ActEvent]) -> Acts {
     acts
 }
 
+/// What the user actually wrote during a stretch.
+///
+/// Deliberately **beside** [`Acts`], not inside it. `Acts` is the join's
+/// verdict — counts, labels and instants — and it is what gets frozen into
+/// `slot_summaries.acts_json` when the events expire; keeping its shape means
+/// the frozen copy needs no version and every reader of it keeps working.
+/// Content is a different kind of thing: it exists only while the events do, it
+/// is what the *prompt* needs, and it is never materialised. See
+/// `context/acts-join.md` — the invariant is now "the join carries no content",
+/// and this type is the exception that proves where the line is.
+///
+/// Everything here was captured under the local trust model that retired
+/// CAP-005 (`docs/event-capture-v2-plan.md` §信任模型变更): the one guard is the
+/// shim's secure-input guard, at the source, and [`parse_event`] refuses to
+/// read a field the shim flagged even if a value somehow rode along.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActContent {
+    /// Typed runs, chronological, as the shim coalesced them (2s pauses).
+    pub typed: Vec<String>,
+    /// Field values read at a submit instant — the sentence that was sent, the
+    /// command that was run.
+    pub submitted: Vec<String>,
+    /// Entries the caps dropped. The count is the honest half: a stretch with
+    /// forty typed runs is not a stretch with six.
+    pub not_shown: usize,
+}
+
+impl ActContent {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.typed.is_empty() && self.submitted.is_empty()
+    }
+
+    /// Folds `other` in, keeping the caps and counting what they dropped.
+    pub fn merge(&mut self, other: &Self) {
+        self.not_shown = self.not_shown.saturating_add(other.not_shown);
+        for entry in &other.typed {
+            push_content(&mut self.typed, entry.clone(), &mut self.not_shown);
+        }
+        for entry in &other.submitted {
+            push_content(&mut self.submitted, entry.clone(), &mut self.not_shown);
+        }
+    }
+}
+
+/// Entries of each kind kept for one stretch.
+const MAX_CONTENT_ENTRIES: usize = 6;
+/// Characters kept per entry, matching the card's other excerpt caps.
+const CONTENT_ENTRY_CAP_CHARS: usize = 240;
+/// Below this an entry is a keystroke or two, not something written.
+const CONTENT_MIN_CHARS: usize = 2;
+
+/// Folds the events' content channels into one bounded block.
+///
+/// Order is chronological and duplicates fold: a value read at the end of a
+/// typing run and again at the submit that closed it is one sentence, and
+/// printing it twice would read as two.
+#[must_use]
+pub fn fold_act_content(events: &[ActEvent]) -> ActContent {
+    let mut content = ActContent::default();
+    for event in events {
+        if event.kind == ActKind::Command {
+            if let Some(value) = excerpt(event.value.as_deref()) {
+                push_content(&mut content.submitted, value, &mut content.not_shown);
+            }
+            continue;
+        }
+        // The field's value wins over the keystream: measured, a CJK keystream
+        // is pinyin fragments while the value is the sentence. The keystream is
+        // the fallback for a field whose value could not be read.
+        let entry = excerpt(event.value.as_deref()).or_else(|| excerpt(event.typed.as_deref()));
+        if let Some(entry) = entry {
+            push_content(&mut content.typed, entry, &mut content.not_shown);
+        }
+    }
+    // A sentence that was composed and then sent is one sentence. Keeping it in
+    // both lists would read as two, and "sent" is the stronger fact.
+    content
+        .typed
+        .retain(|entry| !content.submitted.contains(entry));
+    content
+}
+
+fn excerpt(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    (trimmed.chars().count() >= CONTENT_MIN_CHARS).then(|| {
+        let clipped: String = trimmed.chars().take(CONTENT_ENTRY_CAP_CHARS).collect();
+        clipped.replace(['\n', '\r'], " ")
+    })
+}
+
+fn push_content(bucket: &mut Vec<String>, entry: String, not_shown: &mut usize) {
+    if bucket.iter().any(|held| held == &entry) {
+        return;
+    }
+    if bucket.len() >= MAX_CONTENT_ENTRIES {
+        *not_shown += 1;
+        return;
+    }
+    bucket.push(entry);
+}
+
 /// A click's target: its label, else its role, else honestly unknown.
 fn click_label(event: &ActEvent) -> String {
     event
@@ -638,6 +762,10 @@ pub struct ActRun {
     pub start_ms: i64,
     pub end_ms: i64,
     pub acts: Acts,
+    /// What was written during this stretch. Folded from the same events as
+    /// `acts`, so content and counts can never be attributed to two different
+    /// runs of the timeline.
+    pub content: ActContent,
 }
 
 /// Splits an event stream (in time order) into runs by engaged scope, with
@@ -675,6 +803,7 @@ pub fn split_act_runs(events: &[ActEvent]) -> Vec<ActRun> {
             start_ms,
             end_ms,
             acts: fold_acts(&picked),
+            content: fold_act_content(&picked),
         });
     };
     let sustained = |pending: &[usize]| {
@@ -1151,6 +1280,53 @@ mod tests {
         }
     }
 
+    /// The content channels reach the join, and a field the shim called secure
+    /// contributes nothing — even if a value somehow rode along with the row.
+    /// The guard is the shim's, at the source; this is the second lock on a
+    /// door that should already be shut.
+    #[test]
+    fn content_rides_the_row_except_where_the_shim_said_secure() {
+        let mut typed = row(1_000, "burst");
+        typed.text = Some("ollama run qwen3.5:4b".to_owned());
+        typed.target_json = Some(r#"{"role":"AXTextField","value":"run it"}"#.to_owned());
+        let parsed = parse_event(&typed);
+        assert_eq!(parsed.typed.as_deref(), Some("ollama run qwen3.5:4b"));
+        assert_eq!(parsed.value.as_deref(), Some("run it"));
+
+        let mut secure = row(2_000, "burst");
+        secure.text = Some("hunter2".to_owned());
+        secure.target_json =
+            Some(r#"{"role":"AXTextField","secure":true,"value":"hunter2"}"#.to_owned());
+        let parsed = parse_event(&secure);
+        assert_eq!(parsed.typed, None, "a secure field carries no keystream");
+        assert_eq!(parsed.value, None, "and no value");
+        assert_eq!(parsed.kind, ActKind::Burst, "the act itself still counts");
+
+        let folded = fold_act_content(&[parse_event(&typed), parse_event(&secure)]);
+        assert_eq!(folded.typed, vec!["run it"]);
+        assert!(!folded.typed.iter().any(|entry| entry.contains("hunter2")));
+    }
+
+    /// The caps are a promise the prompt can rely on, and what they drop is
+    /// counted rather than silently missing.
+    #[test]
+    fn act_content_is_bounded_and_says_what_it_dropped() {
+        let events: Vec<ActEvent> = (0..12)
+            .map(|index| {
+                let mut event = event(i64::from(index) * 1_000, ActKind::Burst, None);
+                event.typed = Some(format!("typed run number {index}"));
+                event
+            })
+            .collect();
+        let folded = fold_act_content(&events);
+        assert_eq!(folded.typed.len(), 6);
+        assert_eq!(folded.not_shown, 6);
+
+        let mut long = event(0, ActKind::Burst, None);
+        long.typed = Some("x".repeat(1_000));
+        assert_eq!(fold_act_content(&[long]).typed[0].chars().count(), 240);
+    }
+
     fn event(at_ms: i64, kind: ActKind, scope: Option<&str>) -> ActEvent {
         ActEvent {
             at_ms,
@@ -1161,6 +1337,8 @@ mod tests {
             bundle_identifier: None,
             label: None,
             role: None,
+            typed: None,
+            value: None,
             frame: None,
             scope: scope.map(ToOwned::to_owned),
         }

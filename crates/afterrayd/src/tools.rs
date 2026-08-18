@@ -406,6 +406,10 @@ impl ToolHost {
             &[],
             "the user's language",
             &background,
+            // The same derivation the summariser uses, from this turn's window:
+            // a card read through a tool and a card written by T2 should be the
+            // same view of the same evidence.
+            crate::t2_prompt_budget_chars(self.budget),
         ))
     }
 

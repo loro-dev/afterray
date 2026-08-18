@@ -79,12 +79,13 @@ pub use slot::{
     SLOT_DURATION_MS, SLOT_SUMMARY_SCHEMA_VERSION, SlotBounds, SlotCard, SlotEvidence,
     SlotExportFacts, SlotFacts, SlotMention, SlotMomentRow, SlotSegment, SlotState,
     SlotSummaryExport, SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2,
-    T2Card, T2CardV2, T2CardV3, T2Entity, T2GroundingReport, T2Thread,
+    T2_SYSTEM_PROMPT_V3, T2Card, T2CardV2, T2CardV3, T2Entity, T2GroundingReport, T2Thread,
     T2VerifyReport, TimelineEntry, V2_SLOT_SUMMARY_SCHEMA_VERSION, assemble_day_summary,
     attach_entity_candidates, build_slot_card, build_slot_card_with_end, dedup_key_of,
     details_sections, extract_json_object, ground_t2_details, legacy_segments, local_day_bounds,
     local_day_for, match_slot_mention, next_legacy_slot_boundary, parse_t2_card, parse_t2_card_v2,
-    parse_t2_card_v3, render_t2_prompt, shorten_place, slot_bounds_for, slot_bounds_in,
+    parse_t2_card_v3, render_t2_prompt, render_t2_system_prompt, shorten_place, slot_bounds_for,
+    slot_bounds_in,
     slot_clock_label, slot_duration_ms_for_minutes, slot_start_for, verify_t2_card,
 };
 
@@ -2010,8 +2011,13 @@ impl Vault {
         Ok(())
     }
 
-    /// Neighbouring T2 titles, oldest first. Fed to the next T2 pass as a
+    /// Neighbouring cards, oldest first: title **and** description.
+    ///
+    /// Fed to the next T2 pass as the context to continue from, and as a
     /// negative constraint so adjacent cards do not copy each other's wording.
+    /// The description rides along because the tool that used to serve these
+    /// was never called by any measured model, and a bare title cannot say
+    /// what the previous stretch left unfinished.
     ///
     /// # Errors
     ///
@@ -2023,7 +2029,7 @@ impl Vault {
     ) -> Result<Vec<slot::PrevCard>, StoreError> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "SELECT slot_start_ms, title FROM slot_summaries
+            "SELECT slot_start_ms, title, description FROM slot_summaries
               WHERE title IS NOT NULL AND TRIM(title) != '' AND slot_start_ms < ?1
               ORDER BY slot_start_ms DESC
               LIMIT ?2",
@@ -2032,9 +2038,11 @@ impl Vault {
         let rows = statement.query_map(params![before_start_ms, limit], |row| {
             let start_ms: i64 = row.get(0)?;
             let title: String = row.get(1)?;
+            let description: Option<String> = row.get(2)?;
             Ok(slot::PrevCard {
                 from_label: slot::slot_clock_label(start_ms),
                 title,
+                description: description.unwrap_or_default(),
             })
         })?;
         let mut cards = rows.collect::<Result<Vec<_>, _>>()?;

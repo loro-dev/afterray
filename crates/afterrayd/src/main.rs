@@ -954,7 +954,14 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             .await
         }
         Request::SlotPrompt { at_ms } => {
-            run_store(state, move |s| match slot_prompt_for(s, at_ms) {
+            // The same budget the summariser would use, probed the same way:
+            // an inspection that showed a different prompt than the one the
+            // model gets would be worse than no inspection.
+            let budget_chars = t2_prompt_budget_chars(ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..resolve_context_budget(state).await
+            });
+            run_store(state, move |s| match slot_prompt_for(s, at_ms, budget_chars) {
                 Ok(prompt) => Response::success(prompt),
                 Err(error) => Response::failure(error.to_string()),
             })
@@ -1418,6 +1425,42 @@ async fn resolve_context_budget(state: &AppState) -> ContextBudget {
         eprintln!("llm.{}", probe.summary());
     }
     ContextBudget::for_window(probe.resolved)
+}
+
+/// Bytes assumed per token when a token budget becomes a character budget.
+///
+/// Conservative on purpose: real tokenizers average well above this on English
+/// prose, and CJK screen text is the case that must not overrun. Written as a
+/// ratio because 2.5 is not an integer and rounding it up would spend the
+/// margin this exists to keep.
+const T2_PROMPT_BYTES_PER_TOKEN_NUMERATOR: usize = 5;
+const T2_PROMPT_BYTES_PER_TOKEN_DENOMINATOR: usize = 2;
+/// Floor. Exactly the fixed constant this replaced (`PROMPT_LINES_BUDGET_CHARS`
+/// in the store), so no machine ever gets a *worse* card than it did before the
+/// window became a variable — a small window means fewer rounds, not a card
+/// written from four lines.
+const T2_PROMPT_FLOOR_CHARS: usize = 12_000;
+/// Ceiling: 4× the old fixed budget. Not a limit of the models — a limit of
+/// what has been evaluated. The corpus run (WS7) is what lifts it; until then a
+/// 256k window buys depth up to here and no further, because an unevaluated
+/// 200k-character prompt is a guess with a large bill attached.
+const T2_PROMPT_CEILING_CHARS: usize = 48_000;
+
+/// How many characters of evidence one T2 prompt may inline, derived from the
+/// window the model actually has.
+///
+/// The same `resolve_context_budget` chat uses — that asymmetry was a bug: T2
+/// planned against a 16k default while chat measured the real window, so the
+/// summariser wrote from a twelfth of a 256k model's context and nothing said
+/// so. The share taken is the opening allowance: the T2 prompt *is* the
+/// opening, and what is left after every round can hold a full tool result.
+fn t2_prompt_budget_chars(budget: ContextBudget) -> usize {
+    budget
+        .opening_allowance()
+        .saturating_mul(T2_PROMPT_BYTES_PER_TOKEN_NUMERATOR)
+        .checked_div(T2_PROMPT_BYTES_PER_TOKEN_DENOMINATOR)
+        .unwrap_or(T2_PROMPT_FLOOR_CHARS)
+        .clamp(T2_PROMPT_FLOOR_CHARS, T2_PROMPT_CEILING_CHARS)
 }
 
 fn current_llm_config(state: &AppState) -> LlmRuntimeConfig {
@@ -2779,18 +2822,21 @@ async fn slot_summarize(state: &Arc<AppState>, at_ms: i64) -> Response {
 /// through the configured model, persist the card. Shared by the RPC and the
 /// background sweeper so both agree on what "summarised" means.
 async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Value, String> {
-    /// Rounds are model calls, so this bounds both cost and transcript
-    /// growth. The transcript is append-only — never pruned — so a
-    /// prefix-caching runtime re-prefills only each round's delta.
-    const T2_MAX_ROUNDS: usize = 8;
-
     let started = std::time::Instant::now();
-    let inputs = run_store(state, move |s| slot_t2_inputs(s, at_ms))
+    // Before the budget, not after: the provider only reports its window once
+    // the model is resident, so a budget resolved first would be the default's
+    // guess exactly when it mattered.
+    ensure_remote_llm_model(state).await;
+    let budget = afterray_harness::ContextBudget {
+        max_rounds: T2_MAX_ROUNDS,
+        ..resolve_context_budget(state).await
+    };
+    let budget_chars = t2_prompt_budget_chars(budget);
+    let inputs = run_store(state, move |s| slot_t2_inputs(s, at_ms, budget_chars))
         .await
         .map_err(|error| error.to_string())?;
     let slot_start_ms = inputs.card.slot_start_ms;
 
-    ensure_remote_llm_model(state).await;
     // Reserve the LLM lane for this loop's rounds. Interactive chat still
     // preempts; other background summaries wait until the guard drops.
     let lease_hold = state.models.hold_llm_lease();
@@ -2810,10 +2856,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         &tools,
         &mut afterray_harness::Discard,
         &afterray_harness::LoopConfig {
-            budget: afterray_harness::ContextBudget {
-                max_rounds: T2_MAX_ROUNDS,
-                ..afterray_harness::ContextBudget::DEFAULT
-            },
+            budget,
             // The background sweeper has no user waiting on it to stop.
             cancel: afterray_harness::CancelToken::new(),
             // Append-only. A prefix-caching runtime re-prefills only each
@@ -2822,7 +2865,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
             // card, so it is bounded by construction.
             compaction: None,
         },
-        inputs.system,
+        &inputs.system,
         // The T2 prompt is one slot's card: no history, and the card itself is
         // the task.
         afterray_harness::Opening {
@@ -2836,19 +2879,15 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     drop(lease_hold);
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let mut parsed = afterray_store::parse_t2_card_v2(&turn.answer);
-    // Grounding: a claim may come from the prompt or from anything a tool
-    // returned this turn. Entities that match neither are dropped in code —
-    // the check the prompt alone can never be.
+    let mut parsed = afterray_store::parse_t2_card_v3(&turn.answer);
+    // Grounding: every frame a card points at must be one this slot holds.
+    // What replaced the v2 entity check is not weaker, it is the same check on
+    // what the v3 card actually asserts — a citation is a promise that a frame
+    // can be shown, and only the code knows which frames exist.
     let verification = parsed.as_mut().map(|card| {
-        let mut evidence = inputs.user.clone();
-        for result in &turn.tool_results {
-            evidence.push('\n');
-            evidence.push_str(result);
-        }
         let valid_ids: std::collections::HashSet<String> =
             inputs.card.evidence.moment_ids.iter().cloned().collect();
-        afterray_store::verify_t2_card(card, &evidence, &valid_ids)
+        afterray_store::ground_t2_details(card, &valid_ids)
     });
 
     let tool_names: Vec<&str> = turn
@@ -2858,15 +2897,16 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         .collect();
     eprintln!(
         "slot.t2 slot={slot_start_ms} prompt_tokens={}/{} rounds={} tools={tool_names:?} \
-         out_chars={} latency_ms={latency_ms} parsed={} entities_dropped={}",
+         out_chars={} latency_ms={latency_ms} parsed={} low_trust={} citations_dropped={}",
         turn.usage.prompt_tokens,
         turn.usage.window_tokens,
         turn.tool_calls.len() + 1,
         turn.answer.chars().count(),
         parsed.is_some(),
+        parsed.as_ref().is_some_and(|card| card.low_trust),
         verification
             .as_ref()
-            .map_or(0, |report| report.entities_dropped.len()),
+            .map_or(0, |report| report.citations_dropped),
     );
 
     let Some(t2) = parsed else {
@@ -2880,7 +2920,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
     let t2_for_store = t2.clone();
     if let Err(error) = run_store(state, move |s| {
         s.store
-            .put_t2_summary_v2(&card, &t2_for_store, "t2-agent", now_ms(), latency_i64)
+            .put_t2_summary_v3(&card, &t2_for_store, "t2-agent", now_ms(), latency_i64)
     })
     .await
     {
@@ -2898,6 +2938,11 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
         "raw": turn.answer,
     }))
 }
+
+/// Rounds are model calls, so this bounds both cost and transcript growth. The
+/// transcript is append-only — never pruned — so a prefix-caching runtime
+/// re-prefills only each round's delta.
+const T2_MAX_ROUNDS: usize = 8;
 
 /// How long after a slot closes before it is eligible. Frames captured near the
 /// boundary land in the vault a beat late; summarising immediately would read a
@@ -3470,13 +3515,19 @@ fn slot_card_for(
 /// persistence) and the rendered prompt pair.
 struct SlotT2Inputs {
     card: afterray_store::SlotCard,
-    system: &'static str,
+    system: String,
     user: String,
 }
+
+/// Neighbouring cards injected as context. Two, not three: they carry their
+/// descriptions now, and the third one only pushed the slot's own evidence out
+/// of the window.
+const T2_PREV_CARDS: usize = 2;
 
 fn slot_t2_inputs(
     state: &AppState,
     at_ms: i64,
+    budget_chars: usize,
 ) -> Result<SlotT2Inputs, afterray_store::StoreError> {
     let mut card = slot_card_for(state, at_ms)?;
     let stored = state
@@ -3486,7 +3537,7 @@ fn slot_t2_inputs(
     let language = resolve_summary_language(&stored);
     let prev_cards = state
         .store
-        .previous_slot_titles(card.slot_start_ms, 3)
+        .previous_slot_titles(card.slot_start_ms, T2_PREV_CARDS)
         .unwrap_or_default();
     // History-aware rendering: the DF corpus decides which lines carry
     // information and which are the user's everyday chrome. An empty corpus
@@ -3496,15 +3547,19 @@ fn slot_t2_inputs(
         afterray_store::infoscore::BackgroundStats::empty()
     });
     afterray_store::attach_entity_candidates(&mut card, &background);
-    let user = afterray_store::render_t2_prompt(&card, &prev_cards, &language, &background);
+    let user =
+        afterray_store::render_t2_prompt(&card, &prev_cards, &language, &background, budget_chars);
     eprintln!(
-        "slot.prompt slot={} language={language} user_chars={}",
+        "slot.prompt slot={} language={language} budget_chars={budget_chars} user_chars={}",
         card.slot_start_ms,
         user.chars().count()
     );
+    // The catalog is cut to this slot's evidence: a silent slot is never told
+    // about a transcript tool, which measured as a whole wasted round.
+    let system = afterray_store::render_t2_system_prompt(card.facts.has_audio);
     Ok(SlotT2Inputs {
         card,
-        system: afterray_store::T2_SYSTEM_PROMPT_V2,
+        system,
         user,
     })
 }
@@ -3513,8 +3568,9 @@ fn slot_t2_inputs(
 fn slot_prompt_for(
     state: &AppState,
     at_ms: i64,
+    budget_chars: usize,
 ) -> Result<serde_json::Value, afterray_store::StoreError> {
-    let inputs = slot_t2_inputs(state, at_ms)?;
+    let inputs = slot_t2_inputs(state, at_ms, budget_chars)?;
     Ok(serde_json::json!({
         "slot_start_ms": inputs.card.slot_start_ms,
         "slot_end_ms": inputs.card.slot_end_ms,
@@ -3537,43 +3593,6 @@ struct SlotT2Tools<'a> {
 const T2_TOOL_PAGE_CHARS: usize = 3_000;
 
 impl SlotT2Tools<'_> {
-    fn run_by_id(&self, id: &str) -> Option<&afterray_store::RunRow> {
-        self.card.timeline.iter().find_map(|entry| match entry {
-            afterray_store::TimelineEntry::Run(run) if run.moment_id == id => Some(run),
-            _ => None,
-        })
-    }
-
-    fn get_run_text(&self, args: &serde_json::Value) -> Result<String, String> {
-        let id = args
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "get_run_text requires id (a run id from the input)".to_owned())?;
-        let offset = args
-            .get("offset")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
-        let run = self
-            .run_by_id(id)
-            .ok_or_else(|| format!("no run with id `{id}` in this slot"))?;
-        let full = run.lines.join("\n");
-        let total = full.chars().count();
-        if offset >= total {
-            return Ok(format!(
-                "(no text beyond offset {offset}; total {total} chars)"
-            ));
-        }
-        let page: String = full.chars().skip(offset).take(T2_TOOL_PAGE_CHARS).collect();
-        let next = offset + page.chars().count();
-        if next < total {
-            Ok(format!(
-                "{page}\n…(continues; call again with offset {next}; total {total} chars)"
-            ))
-        } else {
-            Ok(page)
-        }
-    }
-
     fn get_transcript(&self) -> Result<String, String> {
         let rows = self
             .store
@@ -3619,25 +3638,6 @@ impl SlotT2Tools<'_> {
         Ok(clipped)
     }
 
-    fn get_prev_cards(&self, args: &serde_json::Value) -> Result<String, String> {
-        let n = args
-            .get("n")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(3)
-            .clamp(1, 8) as usize;
-        let cards = self
-            .store
-            .previous_slot_titles(self.card.slot_start_ms, n)
-            .map_err(|error| error.to_string())?;
-        if cards.is_empty() {
-            return Ok("(no earlier cards)".to_owned());
-        }
-        Ok(cards
-            .into_iter()
-            .map(|card| format!("{}: {}", card.from_label, card.title))
-            .collect::<Vec<_>>()
-            .join("\n"))
-    }
 }
 
 impl afterray_harness::ToolSurface for SlotT2Tools<'_> {
@@ -3646,13 +3646,16 @@ impl afterray_harness::ToolSurface for SlotT2Tools<'_> {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<afterray_harness::Budgeted, String> {
+        // Two tools, both answering about evidence the card already stands on.
+        // `get_run_text` and `get_prev_cards` are gone: measured, the small
+        // models never called either, the large one spent rounds on them, and
+        // what they served is now inlined (prev cards) or honestly disclosed
+        // and left there (`more_chars`).
         let text = match name {
-            "get_run_text" => self.get_run_text(args),
             "get_transcript" => self.get_transcript(),
             "get_ocr" => self.get_ocr(args),
-            "get_prev_cards" => self.get_prev_cards(args),
             other => Err(format!(
-                "unknown tool `{other}`; available: get_run_text, get_transcript, get_ocr, get_prev_cards"
+                "unknown tool `{other}`; available: get_transcript, get_ocr"
             )),
         }?;
         // These tools already page themselves against `T2_TOOL_PAGE_CHARS`, so
@@ -4477,6 +4480,41 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
+    /// T2 used to plan against `ContextBudget::DEFAULT` while chat measured the
+    /// real window: on a 256k model the summariser wrote from a twelfth of the
+    /// context it had, and nothing in the logs said so. Now both derive from
+    /// the same probe — bounded below by the constant this replaced, and above
+    /// by what has actually been evaluated.
+    #[test]
+    fn the_t2_prompt_budget_follows_the_window_between_a_floor_and_a_ceiling() {
+        let for_window = |tokens: usize| {
+            t2_prompt_budget_chars(ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..ContextBudget::for_window(tokens)
+            })
+        };
+
+        // A small window buys fewer rounds, never a card written from scraps.
+        assert_eq!(for_window(4_096), T2_PROMPT_FLOOR_CHARS);
+        assert_eq!(for_window(16_384), T2_PROMPT_FLOOR_CHARS);
+        let large = for_window(131_072);
+        assert!(
+            large > T2_PROMPT_FLOOR_CHARS && large < T2_PROMPT_CEILING_CHARS,
+            "a real window must move the budget: {large}"
+        );
+        assert_eq!(for_window(262_144), T2_PROMPT_CEILING_CHARS);
+        // Monotone: a bigger window is never a smaller prompt.
+        assert!(for_window(65_536) <= large);
+        // And whatever it derives still fits the turn it was derived from.
+        assert!(
+            ContextBudget {
+                max_rounds: T2_MAX_ROUNDS,
+                ..ContextBudget::for_window(131_072)
+            }
+            .is_coherent()
+        );
+    }
+
     /// The import path for an R3 edge snapshot is fail-closed: it stores the
     /// tree only when the snapshot names the app it came from, because that name
     /// is the only thing the exclusion list can be checked against.
@@ -5108,6 +5146,7 @@ mod tests {
             title: None,
             bullets: None,
             category: None,
+            details: None,
             description: None,
             threads: None,
             entities: None,
