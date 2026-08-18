@@ -977,6 +977,15 @@ private struct AfterRayRootView: View {
             playingAudioArtifactID: audioPlayer.playingArtifactID,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
+            // Dismiss first: the overlay panel is `.statusBar` level and
+            // full-screen, so a browser brought forward under it would look
+            // like the click did nothing. `returnFocus: false` because focus
+            // belongs to the page being opened, not to whatever was frontmost
+            // when recall was summoned.
+            onOpenWebLink: { url in
+                RecallOverlayController.shared.hide(returnFocus: false)
+                NSWorkspace.shared.open(url)
+            },
             recordingState: control.status?.recordingState,
             isChangingRecording: control.isChangingRecording,
             onToggleRecording: toggleRecording,

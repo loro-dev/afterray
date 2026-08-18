@@ -6,8 +6,8 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 
 - `Sources/DaemonClient.swift:148` `UnixSocketDaemonClient` (actor) — JSON-line requests over a Unix socket; `protocolVersion` (:175) checked on every response. Protocols `RecallDaemonServing` (:22), `AfterRayChatServing` (:67), `AfterRayDaemonServing` (:99) are the injection seam; `WireRequest` (:442) is the snake_case wire shape.
 - `Sources/RecallStore.swift:4` `RecallStore` — `@MainActor` timeline/playhead state; `Sources/RecallStore.swift:302` `RecallImageRepository` (actor) — NSCache + in-flight dedup of artifact bytes.
-- `Sources/RecallModels.swift` — `RecallSession` (:3), `RecallMoment` (:21), `RecallGopRef` (:133), `ArtifactPayload` (:163); all `Codable` with explicit snake_case `CodingKeys`.
-- `Sources/RecallView.swift:9` `RecallView` — the main recall surface (`RecallPalette` at :2211).
+- `Sources/RecallModels.swift` — `RecallSession` (:3), `RecallMoment` (:21), `RecallWebLink` (:155), `RecallGopRef` (:194), `ArtifactPayload` (:224); all wire models are `Codable` with explicit snake_case `CodingKeys`.
+- `Sources/RecallView.swift:24` `RecallView` — the main recall surface (`RecallPalette` at :2597); `AppIdentity` (:1175) is the top-left capsule and `OpenableTitle` (:1234) the window-title line when the frame was a web page.
 - `Sources/AfterRayControlModel.swift:4` — recording/search state; `Sources/AfterRayChatModel.swift:46` chat model behind `AfterRayChatModeling` (:4).
 - `Sources/StreamingMarkdown.swift` + `Sources/ChatMomentCitationView.swift` — streaming-safe chat Markdown and protocol-backed screenshot citations; only standalone `![label](afterray://moment/ID)` loads media.
 - `Sources/ChatAutoScrollState.swift` + `Sources/ChatScrollObserver.swift` — macOS 14 chat bottom-follow state machine and the narrow AppKit live-scroll/geometry bridge; content growth follows only until the user scrolls away.
@@ -27,6 +27,7 @@ Dependency-free (system frameworks only) SwiftUI library holding everything cros
 - On lock/sleep the app calls `clearSensitiveState()`/`clearSensitiveData()` (zeroes cached bytes) — hook any new decrypted-content cache in (`apps/AfterRay/Sources/AfterRayApp.swift:1097`).
 - Decode artifact bytes by `contentType`, never by assumption (`DaemonClient.swift:34-35`): moments packed before thumbnails answer with raw IVF/AV1 frames.
 - Chat Markdown never loads general image URLs. Only `afterray://moment` image references may call `ReadThumbnail`; http/file/data images stay selectable text, and missing captures stay clickable citations.
+- A captured address only ever reaches `NSWorkspace` through `RecallWebLink`, which admits `http`/`https` alone. `RecallMoment.url` is unvalidated AX output — apps also publish `file:`, `javascript:` and private schemes there — so never open it directly.
 - Every surface must stay drivable by `AfterRayMockData`; `RecallView` hides daemon-only chrome when callbacks are nil.
 - Panels with their own `ScrollView` inside the overlay must mount `.background(ScrollFenceView())`, or the global scroll monitor (`RecallView.swift:1597`) eats their gesture phases and kills momentum.
 - Streaming chat scrolls to a stable bottom sentinel without per-token animation. Only AppKit live-scroll notifications may disable following; token/image/layout growth must never be interpreted as user intent.
