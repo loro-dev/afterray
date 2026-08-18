@@ -86,17 +86,32 @@
 
 ## 实施工作流
 
-| WS | 内容 | 落点 |
-|---|---|---|
-| 1 | 树文本化 + 折叠 + 人话角色 + diff 引擎 + keyframe 策略（纯函数，XCTest） | `AfterRayCapturePolicy` |
-| 2 | 事件词汇表 v2：text_input(text+value) / drag 两端 / secure 护栏 / 停顿合并 | shim `InputEventMonitor` |
-| 3 | submit value + 截图节流 + `screenshot_id`/citable 标记 + 心跳降兜底 | shim 主循环 |
-| 4 | 链存储（keyframe+diff artifact 类型）、保留期统一、`INPUT_EVENT_RETENTION_MS` 废除 | afterray-store |
-| 5 | T1/T2 契约 v3：frontmatter+MD 解析、五段指导、`#el` 引用、预算窗口化、工具目录裁剪、prev-card 注入 | store slot.rs + afterrayd |
-| 6 | OCR 窗口裁剪 + 碎片过滤 | afterrayd 导入路径 |
-| 7 | 语料回归（复用 phase 5 计划：≥20 slot 盲评） | scripts/t2-eval.py |
+| WS | 内容 | 落点 | 状态 |
+|---|---|---|---|
+| 1 | 树文本化 + 折叠 + 人话角色 + diff 引擎 + keyframe 策略（纯函数，XCTest） | `AfterRayCapturePolicy` | ✅ 2026-08-18 `e871ca3` |
+| 2 | 事件词汇表 v2：text_input(text+value) / drag 两端 / secure 护栏 / 停顿合并 | shim `InputEventMonitor` | ✅ 2026-08-18 `11c401e`（+ 解析 `cf5e01d`） |
+| 3 | submit value + 截图节流 + `screenshot_id`/citable 标记 + 心跳降兜底 | shim 主循环 | 🟡 submit value + 附树分级已落（`11c401e`）、`tree_text` 落盘已落（`21246e3`）；截图节流 / `screenshot_id` / 心跳降兜底属 daemon 侧，未做 |
+| 4 | 链存储（keyframe+diff artifact 类型）、保留期统一、`INPUT_EVENT_RETENTION_MS` 废除 | afterray-store | ⬜ |
+| 5 | T1/T2 契约 v3：frontmatter+MD 解析、五段指导、`#el` 引用、预算窗口化、工具目录裁剪、prev-card 注入 | store slot.rs + afterrayd | ⬜ |
+| 6 | OCR 窗口裁剪 + 碎片过滤 | afterrayd 导入路径 | ⬜ |
+| 7 | 语料回归（复用 phase 5 计划：≥20 slot 盲评） | scripts/t2-eval.py | ⬜ |
 
 依赖：WS1 → WS2/WS3 → WS4 → WS5；WS6 独立可先行；WS7 收尾。
+
+### WS2/3 实现偏差（2026-08-18）
+
+代码即事实，与上文设计的出入逐条记在这里。实现说明见 [context/event-capture-v2.md](../context/event-capture-v2.md)。
+
+1. **`tree_text` 信封多带 `chain` + `seq`**（设计只写 `{mode, text}`）。diff 链按窗口分组，所以一条 `diffFromPrevious` 的基帧不是"时间上的前一个 artifact"，而是"同链的前一次发射"。不给出链标识，消费方根本无法定位基帧 —— 不可解码的 diff 不如不发。
+2. **链的 key 含"走树根"**（`.application` / `.window`）。心跳走 app 元素、附树走单窗口，同一窗口两种根互 diff 会把 `AXApplication` 对齐到 `AXWindow`，退化成"全删全加"，比它想省下的 keyframe 还大。
+3. **`windowChanged` = 该 scope 尚无链**。按窗口分链后，切回一个仍在缓存里的窗口不再强制 keyframe（比设计更省），LRU 只保 6 条链（每条持有整棵渲染树，是常驻进程的内存上限），被淘汰的窗口回来时付一个 keyframe。
+4. **事件 kind 名沿用 `burst` / `command`**，未改名为 `text_input` / `submit`。`afterray-store` 的 acts join 按这些字符串匹配（`acts.rs parse_event`），本工作流按契约只做加法；`text` / `target.value` 作为新字段挂在原 kind 上。改名留给 WS4/WS5 一并处理。
+5. **secure 护栏比设计更严**：除 `AXSecureTextField`（本体或祖先 subrole）外，还看"像密码的 label"（Electron/Web 常把密码框渲染成普通 `AXTextField`），且**焦点解析失败一律按 secure 处理**（fail closed）。误判的代价只是丢一个字段的文本。
+6. **value 取"光标附近 500 字符窗口"**而非前 500 字符（`kAXSelectedTextRange`）。长文档的前 500 字符与"刚刚输入的那句话"无关。AX 给的是 UTF-16 偏移、裁剪按字符计，CJK 下窗口可能偏几个字符 —— 它是窗口不是索引。
+7. **drag 的 mouse-down 仍照旧产生一条 `click`**。它确实是一次点击，且老消费方依赖它；drag 记录是额外的一条。
+8. **`window_changed` 只由 bundle 轮询触发**：同一 app 内换窗口（改标题）暂不产生事件。
+9. **截图节流 / `screenshot_id` / 心跳降兜底未做** —— 那是 daemon 侧的排程，本工作流按边界只动 shim 与 `afterray-platform-macos`。截图仍是纯拉取式，配对不变量原样保留。
+10. **`captureEdgeSnapshot` 未改名**，尽管它已泛化为 §3 的附树分级入口（新的统一入口是 `requestTreeWalk`）。产物 kind 仍是 `accessibility_edge`，改名会牵动 daemon 与文档锚点。
 
 ## 明确不抄
 

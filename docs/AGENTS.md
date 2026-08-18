@@ -17,7 +17,7 @@ Specs, plans, and design docs for AfterRay. **Plan docs are historical: when a d
 - `slot-summaries-and-ax-pipeline.md` — 30-minute slot summaries + Accessibility pipeline (draft).
 - `t1-t2-card-quality-plan.md` — T1/T2 card quality work; pairs with `scripts/t2-eval.py`.
 - `input-events-and-t1-acts-plan.md` — approved (2026-08-17): input-event capture + T1 acts; phases 0-4 landed (PR #41). Partly superseded by event-capture-v2.
-- `event-capture-v2-plan.md` — approved (2026-08-18, in progress): event-driven capture, AX text/diff encoding, screenshot throttling, element-level citations, T2 card v3; records the CAP-005 retirement under the local trust model.
+- `event-capture-v2-plan.md` — approved (2026-08-18, in progress): event-driven capture, AX text/diff encoding, screenshot throttling, element-level citations, T2 card v3; records the CAP-005 retirement under the local trust model. WS1–WS3's shim half has landed — see the "WS2/3 实现偏差" section there and [context/event-capture-v2.md](../context/event-capture-v2.md) for what the code actually does.
 - `agent-chat-plan.md`, `harness-plan.md` — agent chat / harness plans.
 - `auto-update-plan.md` — Sparkle + Cloudflare update plan (marked implemented).
 - `qwen3.5-4b-mlx-integration-plan.md` — MLX VLM integration plan.
