@@ -28,7 +28,7 @@ The ScreenCaptureKit boundary for the Rust daemon. It exists because the Rust wo
 ## Build / test
 
 - `make capture-shim` → `swift build --package-path apps/AfterRayCaptureShim --product AfterRayCaptureShim` (Makefile:14-15); binary at `.build/release/AfterRayCaptureShim` under this directory
-- `swift test --package-path apps/AfterRayCaptureShim` — the package's own XCTest suite (`Tests/AfterRayCaptureShimTests`), covering the pure policy target `Sources/AfterRayCapturePolicy` (browser privacy, display selection, R3 pacing). `make test` runs it; plain `swift test` at the root does not. Logic that must be tested belongs in that target — the executable needs live TCC permissions.
+- `swift test --package-path apps/AfterRayCaptureShim` — the package's own XCTest suite (`Tests/AfterRayCaptureShimTests`), covering the pure policy target `Sources/AfterRayCapturePolicy` (browser privacy, display selection, R3 pacing, and the AX text encoding: `CaptureTree` → `TreeText` numbered-indented render → `TreeDiff` → `KeyframePolicy`, per docs/event-capture-v2-plan.md §4 — not yet wired into `main.swift`). `make test` runs it; plain `swift test` at the root does not. Logic that must be tested belongs in that target — the executable needs live TCC permissions.
 - Smoke test: run the binary with `--output-dir /tmp/…`, then send `{"command":"capture_screen","request_id":"smoke-1"}` on stdin (see this directory's `README.md`)
 
 ## Watch out
