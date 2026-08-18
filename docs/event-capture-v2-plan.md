@@ -100,8 +100,8 @@
 |---|---|---|---|
 | 1 | 树文本化 + 折叠 + 人话角色 + diff 引擎 + keyframe 策略（纯函数，XCTest） | `AfterRayCapturePolicy` | ✅ 2026-08-18 `e871ca3` |
 | 2 | 事件词汇表 v2：text_input(text+value) / drag 两端 / secure 护栏 / 停顿合并 | shim `InputEventMonitor` | ✅ 2026-08-18 `11c401e`（+ 解析 `cf5e01d`） |
-| 3 | submit value + 截图节流 + `screenshot_id`/citable 标记 + 心跳降兜底 | shim 主循环 | 🟡 submit value + 附树分级已落（`11c401e`）、`tree_text` 落盘已落（`21246e3`）；截图节流 / `screenshot_id` / 心跳降兜底属 daemon 侧，未做 |
-| 4 | 链存储（keyframe+diff artifact 类型）、保留期统一、`INPUT_EVENT_RETENTION_MS` 废除 | afterray-store | ⬜ |
+| 3 | submit value + 截图节流 + `screenshot_id`/citable 标记 + 心跳降兜底 | shim 主循环 + daemon | 🟡 submit value + 附树分级（`11c401e`）、`tree_text` 落盘（`21246e3`）、**截图节流 + 心跳降兜底**（daemon 侧，见下）已落；**`screenshot_id` / citable 标记推迟到 WS5** —— 标记的唯一消费者是 T2 prompt（"无截图的 AX 时刻不可出图级引用"），在写 prompt 的同一个工作流里落地才能被验证，否则只是没人读的字段 |
+| 4 | 链存储（keyframe+diff artifact 类型）、保留期统一、`INPUT_EVENT_RETENTION_MS` 废除 | afterray-store | ✅ 2026-08-18 schema 25（`text` + `extra_json` 列）+ 保留期统一（`prune_input_events_before` / `prune_edge_snapshots_before`，48h 只剩 `signal_gap`）。链的 keyframe/diff **不另立 artifact 类型**：`tree_text` 是 AX 快照信封里的字段，另存一份会让同一棵树有两个真相 |
 | 5 | T1/T2 契约 v3：frontmatter+MD 解析、五段指导、`#el` 引用、预算窗口化、工具目录裁剪、prev-card 注入 | store slot.rs + afterrayd | ⬜ |
 | 6 | OCR 窗口裁剪 + 碎片过滤 | afterrayd 导入路径 `ocr_crop.rs` | ✅ 2026-08-18 `1a7ed62` |
 | 7 | 语料回归（复用 phase 5 计划：≥20 slot 盲评） | scripts/t2-eval.py | ⬜ |
@@ -120,7 +120,7 @@
 6. **value 取"光标附近 500 字符窗口"**而非前 500 字符（`kAXSelectedTextRange`）。长文档的前 500 字符与"刚刚输入的那句话"无关。AX 给的是 UTF-16 偏移、裁剪按字符计，CJK 下窗口可能偏几个字符 —— 它是窗口不是索引。
 7. **drag 的 mouse-down 仍照旧产生一条 `click`**。它确实是一次点击，且老消费方依赖它；drag 记录是额外的一条。
 8. **`window_changed` 只由 bundle 轮询触发**：同一 app 内换窗口（改标题）暂不产生事件。
-9. **截图节流 / `screenshot_id` / 心跳降兜底未做** —— 那是 daemon 侧的排程，本工作流按边界只动 shim 与 `afterray-platform-macos`。截图仍是纯拉取式，配对不变量原样保留。
+9. **截图节流 / 心跳降兜底已在 WS4 落于 daemon**（`fire_capture_tick` / `event_capture_is_due`），`screenshot_id` 仍未做。截图依旧是纯拉取式 —— 事件只是把下一次拉取提前，shim 侧一行未改，配对不变量原样保留。
 10. **`captureEdgeSnapshot` 未改名**，尽管它已泛化为 §3 的附树分级入口（新的统一入口是 `requestTreeWalk`）。产物 kind 仍是 `accessibility_edge`，改名会牵动 daemon 与文档锚点。
 
 ## 明确不抄
@@ -129,8 +129,17 @@
 - 无 scroll 事件（我们保留：阅读行为的主信号）。
 - 文件级 Citations（我们的行内 moment/元素引用更强）。
 
+### WS4 实现偏差（2026-08-18）
+
+1. **保留期的"统一"落成了随帧过期**，不是第二个时钟。vault 的通用保留本就只有容量驱动的最旧优先淘汰，所以事件与 R3 树按**保留水位线**（仍在库里的最旧一帧）清理：一段时间里"用户做了什么"与"屏幕上有什么"同生共死。容量之内什么都不过期 —— 与帧一致。
+2. **没有帧就不扫**。"比空更旧"会把一台从未采集过帧的机器上的实时事件删掉，所以水位线未知时跳过而不猜。代价：无帧 vault 上的 R3 artifact 回收不了（`delete_history` 仍能删）。
+3. **`INPUT_EVENT_RETENTION_MS` 改名为 `SIGNAL_MARKER_RETENTION_MS`（48h）而非删除**：`signal_gap` 是"录制器自己的记账"，它的全部含义就是一个期限，仍需独立于容量按时钟过期。
+4. **不新增 keyframe/diff artifact 类型**：`tree_text` 是 AX 快照信封内的字段，另存一份会让同一棵树有两个真相。
+5. **事件驱动截图的节流取 `max(10s, 用户配置的间隔)`**。配 60s 心跳的用户想要的是更少的帧，不是"一打字就 10s 一张"。
+6. **心跳改为"从 `last_capture_ms` 起睡"**而不是固定 interval：这才是"降为兜底" —— 任何一次采集（心跳的或事件拉起的）都重置相位，两个任务之间不需要通道。
+
 ## 开放 PoC
 
 - diff 树对齐在 Electron 大树上的稳定性与性能（20k 节点上限内）。
 - `#el` 编号在"同帧存储→渲染"往返中的一致性。
-- 截图节流与 `capture_paused`（overlay 前台）的交互。
+- 截图节流与 `capture_paused`（overlay 前台）的交互：代码上走同一道 `fire_capture_tick` 闸门（paused 时事件也拉不起截图），但**未经实机验证** —— 需要活的 shim。

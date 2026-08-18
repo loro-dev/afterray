@@ -1,8 +1,8 @@
 # Event capture v2 — tree text, diff chains, and the input vocabulary
 
-Verified against code 2026-08-18 (WS1–WS3 shim half).
+Verified against code 2026-08-18 (WS1–WS3 shim half, WS4).
 
-What the shim emits after [docs/event-capture-v2-plan.md](../docs/event-capture-v2-plan.md). Owners: `apps/AfterRayCaptureShim` (`Sources/AfterRayCapturePolicy` for everything pure, `Sources/AfterRayCaptureShim/main.swift` for the live-AX wiring), `crates/afterray-platform-macos` (parsing). The daemon and vault consume the new fields in a later workstream; until then serde defaults let them ride along ignored.
+What the shim emits after [docs/event-capture-v2-plan.md](../docs/event-capture-v2-plan.md), and what the daemon and vault now do with it. Owners: `apps/AfterRayCaptureShim` (`Sources/AfterRayCapturePolicy` for everything pure, `Sources/AfterRayCaptureShim/main.swift` for the live-AX wiring), `crates/afterray-platform-macos` (parsing), `crates/afterrayd` (mapping + scheduling), `crates/afterray-store` (storage + retention). Every field the shim sends is now stored (§3b); nothing *reads* the new ones yet — that is WS5.
 
 ## 1. `tree_text` — the AX tree as readable text
 
@@ -90,6 +90,33 @@ Two decisions the plan left open, made here:
 R3 trees moved off the events' 48h for a reason worth keeping: that rule existed
 while the events were the shortest-lived thing in the vault. Now that they are
 not, following them would have made the trees the *longest*-lived.
+
+## 3c. When the screenshot lands (daemon)
+
+Capture is still **pull-based** — the shim never decides to take a frame, and
+not a line of it changed for this. What changed is when the daemon pulls.
+
+- `event_capture_is_due(batch, last_capture_ms, now, interval)` — an
+  `input_events` batch may pull the next capture forward once
+  `max(EVENT_CAPTURE_MIN_INTERVAL_MS 10s, the configured interval)` has passed
+  since the last **request**. A 60s heartbeat means the user wants fewer frames,
+  not 10s frames whenever they type; a 2s heartbeat does not let interaction
+  drive the shim at interaction rate. `last_capture_ms <= 0` (fresh or reset
+  session) is due outright, said in the function rather than left to the epoch
+  making the subtraction large.
+- `fire_capture_tick` — the single door both callers use: `capture_paused`,
+  `capture_busy` (compare-exchange; the two callers genuinely race now, where
+  the heartbeat's own spacing used to be the only guard), `recording_active`.
+  A held tick moves nothing, so the caller decides when to ask again.
+- The heartbeat sleeps until `last_capture_ms + interval` instead of running on
+  a `tokio::time::interval`. That is what demotes it to a fallback: any capture
+  re-phases it, and the atomic every tick already writes is the whole handshake
+  between the two tasks. Cadence unchanged, phase follows the user.
+
+The pairing invariant is untouched: a screenshot still always carries AX, and
+an AX moment may still have no screenshot. `screenshot_id` and the citable
+marking are **not** implemented — their only consumer is the T2 prompt, so they
+land in WS5 where something reads them.
 
 ## 4. Attachment tiers
 
