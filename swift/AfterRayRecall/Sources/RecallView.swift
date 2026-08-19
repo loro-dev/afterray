@@ -55,7 +55,7 @@ public struct RecallView: View {
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
     public var daySummary: DaySummary
-    /// Newest first; SwiftUI's LazyVStack only instantiates visible summary
+    /// Newest first; the history panel's LazyVStack only instantiates visible
     /// sections while the store pages older days from the daemon.
     public var summaryHistory: [DaySummary]
     public var summaryHistoryHasMore: Bool

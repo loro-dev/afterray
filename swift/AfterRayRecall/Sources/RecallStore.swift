@@ -223,8 +223,8 @@ public final class RecallStore: ObservableObject {
     }
 
     /// Fetches one small page when the history-summary panel reaches its
-    /// bottom. Keeping this cursor in the store avoids virtual-list rows ever
-    /// querying the daemon on their own.
+    /// bottom. The list virtualizes rows; this cursor is the only thing that
+    /// walks the vault, so a row never queries the daemon on its own.
     public func loadOlderSummaryHistory() async {
         guard summaryHistoryHasMore,
               !isLoadingSummaryHistory,

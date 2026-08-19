@@ -318,6 +318,7 @@ final class DaySummaryLayoutTests: XCTestCase {
         )
         XCTAssertTrue(today.isToday)
         XCTAssertEqual(today.kicker, "TODAY")
+        XCTAssertEqual(DaySummaryLayout.headingLabel(today).hasPrefix("Today ·"), true)
 
         let yesterday = DaySummaryLayout.dateHeading(
             dayStartMs: bounds.start - 86_400_000,
