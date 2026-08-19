@@ -471,11 +471,9 @@ final class RecallOverlayController: RecallHotKeyBinding {
             queue: .main
         ) { _ in
             Task { @MainActor in
-                // Settings, the compute dashboard and chat are their own windows
-                // now. Losing key to one of them is not a reason to tear the
-                // overlay down behind it.
-                if AfterRaySettingsController.shared.isVisible { return }
-                if ComputeActivityWindowController.shared.isVisible { return }
+                // A status-bar overlay covers every normal window. Losing key
+                // means the user moved on — keep covering and Esc / the hotkey
+                // have nothing they can reach.
                 RecallOverlayController.shared.hide(returnFocus: false)
             }
         }
@@ -583,6 +581,13 @@ final class RecallOverlayController: RecallHotKeyBinding {
         }
     }
 
+    /// Standard windows sit below this panel. Opening one while recall is
+    /// up must drop the overlay or the window appears behind a surface the
+    /// hotkey can no longer dismiss.
+    func dismissForStandardWindow() {
+        hide(returnFocus: false)
+    }
+
     func hide(returnFocus: Bool) {
         guard let panel, panel.isVisible else { return }
         NotificationCenter.default.post(name: .afterRayRecallWillHide, object: nil)
@@ -617,13 +622,14 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 
     fileprivate func shouldConsumeCloseKey(_ event: NSEvent) -> Bool {
-        if PermissionGuideController.shared.isVisible {
-            return event.keyCode == 53
-        }
-        guard panel?.isVisible == true, panel?.isKeyWindow == true else { return false }
-        if event.keyCode == 53 { return true }
-        return event.modifierFlags.contains(.command)
-            && event.charactersIgnoringModifiers == "w"
+        OverlayCloseKey.shouldDismiss(
+            keyCode: event.keyCode,
+            isCommandW: event.modifierFlags.contains(.command)
+                && event.charactersIgnoringModifiers == "w",
+            overlayVisible: panel?.isVisible == true,
+            overlayIsKey: panel?.isKeyWindow == true,
+            permissionGuideVisible: PermissionGuideController.shared.isVisible
+        )
     }
 
     fileprivate func shouldConsumeAudioToggleKey(_ event: NSEvent) -> Bool {
@@ -1573,6 +1579,10 @@ private struct ImmersiveQueryBar: View {
                     .onSubmit(onSubmit)
                     .onKeyPress(keys: [.tab], phases: .down) { _ in
                         toggleMode()
+                        return .handled
+                    }
+                    .onKeyPress(.escape) {
+                        onClose()
                         return .handled
                     }
                 if model.isSearching {

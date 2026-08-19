@@ -73,6 +73,7 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
     }
 
     func show() {
+        RecallOverlayController.shared.dismissForStandardWindow()
         if let window {
             AfterRayStandardWindowPresence.activate()
             window.makeKeyAndOrderFront(nil)

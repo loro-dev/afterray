@@ -60,6 +60,7 @@ final class AfterRaySettingsController: NSObject, NSWindowDelegate {
     }
 
     func show(page: AfterRaySettingsPage = .general) {
+        RecallOverlayController.shared.dismissForStandardWindow()
         if let window {
             AfterRayStandardWindowPresence.activate()
             window.makeKeyAndOrderFront(nil)

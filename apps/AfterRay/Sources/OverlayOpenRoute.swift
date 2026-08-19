@@ -26,3 +26,22 @@ enum OverlayOpenRoute: Equatable {
         }
     }
 }
+
+/// Esc / ⌘W while recall is up. The query bar is often first responder, so
+/// SwiftUI's `onExitCommand` is not enough — AppKit must consume the key
+/// before a text field eats it.
+enum OverlayCloseKey {
+    static let escapeKeyCode: UInt16 = 53
+
+    static func shouldDismiss(
+        keyCode: UInt16,
+        isCommandW: Bool,
+        overlayVisible: Bool,
+        overlayIsKey: Bool,
+        permissionGuideVisible: Bool
+    ) -> Bool {
+        if permissionGuideVisible { return keyCode == escapeKeyCode }
+        guard overlayVisible, overlayIsKey else { return false }
+        return keyCode == escapeKeyCode || isCommandW
+    }
+}

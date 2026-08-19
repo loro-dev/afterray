@@ -8,8 +8,9 @@ import SwiftUI
 /// panel above a full-screen surface which is itself a panel: Esc dismissed the
 /// wrong thing, the dashboard could not be read beside the app that was making
 /// the machine slow, and answering "what is my Mac doing" forced the whole
-/// recall surface open. A window sits next to anything, and macOS already knows
-/// how to close, move and remember one.
+/// recall surface open. `show()` dismisses the recall overlay first so the
+/// window is not trapped under a status-bar panel. A window sits next to
+/// anything, and macOS already knows how to close, move and remember one.
 ///
 /// Two entry points open it — the overlay's chrome cluster and the menu bar —
 /// because menu-bar space is scarce and that icon is often hidden behind the
@@ -30,6 +31,7 @@ final class ComputeActivityWindowController: NSObject, NSWindowDelegate {
     var isVisible: Bool { window?.isVisible == true }
 
     func show() {
+        RecallOverlayController.shared.dismissForStandardWindow()
         if let window {
             // Checked before ordering front, which would make it visible and
             // leave a reopened window never polling.

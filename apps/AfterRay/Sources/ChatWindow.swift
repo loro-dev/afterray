@@ -34,6 +34,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
         } else if !draft.isEmpty {
             chat.draft = draft
         }
+        RecallOverlayController.shared.dismissForStandardWindow()
         if let window {
             AfterRayStandardWindowPresence.activate()
             window.makeKeyAndOrderFront(nil)

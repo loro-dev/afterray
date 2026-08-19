@@ -31,3 +31,65 @@ final class OverlayOpenRouteTests: XCTestCase {
         )
     }
 }
+
+final class OverlayCloseKeyTests: XCTestCase {
+    func testEscapeDismissesWhenOverlayIsKey() {
+        XCTAssertTrue(
+            OverlayCloseKey.shouldDismiss(
+                keyCode: OverlayCloseKey.escapeKeyCode,
+                isCommandW: false,
+                overlayVisible: true,
+                overlayIsKey: true,
+                permissionGuideVisible: false
+            )
+        )
+    }
+
+    func testEscapeDoesNothingWhenOverlayIsHidden() {
+        XCTAssertFalse(
+            OverlayCloseKey.shouldDismiss(
+                keyCode: OverlayCloseKey.escapeKeyCode,
+                isCommandW: false,
+                overlayVisible: false,
+                overlayIsKey: false,
+                permissionGuideVisible: false
+            )
+        )
+    }
+
+    func testEscapeDoesNotStealFromAStandardWindow() {
+        XCTAssertFalse(
+            OverlayCloseKey.shouldDismiss(
+                keyCode: OverlayCloseKey.escapeKeyCode,
+                isCommandW: false,
+                overlayVisible: true,
+                overlayIsKey: false,
+                permissionGuideVisible: false
+            )
+        )
+    }
+
+    func testCommandWDismissesWhenOverlayIsKey() {
+        XCTAssertTrue(
+            OverlayCloseKey.shouldDismiss(
+                keyCode: 13,
+                isCommandW: true,
+                overlayVisible: true,
+                overlayIsKey: true,
+                permissionGuideVisible: false
+            )
+        )
+    }
+
+    func testEscapeDismissesThePermissionGuide() {
+        XCTAssertTrue(
+            OverlayCloseKey.shouldDismiss(
+                keyCode: OverlayCloseKey.escapeKeyCode,
+                isCommandW: false,
+                overlayVisible: false,
+                overlayIsKey: false,
+                permissionGuideVisible: true
+            )
+        )
+    }
+}
