@@ -593,14 +593,18 @@ public struct ChatCompactionNotice: Equatable, Identifiable, Sendable {
     /// The line drawn across the thread. It says what went and that it is
     /// recoverable — a shorter answer with no explanation just reads as the
     /// assistant getting worse.
-    public var summary: String {
-        let noun = droppedResults == 1 ? "lookup" : "lookups"
+    public var summary: String { summary(.english) }
+
+    public func summary(_ copy: AfterRayCopy) -> String {
         // Deliberately short: this is a rule across the thread, and a line that
         // wraps stops reading as a divider and starts reading as a message.
         let counts = tokensBefore > 0
             ? " · \(ChatContextUsage.compact(tokensBefore)) → \(ChatContextUsage.compact(tokensAfter))"
             : ""
-        return "Dropped \(droppedResults) earlier \(noun)\(counts)"
+        let lead = droppedResults == 1
+            ? copy.chat.droppedOneLookup
+            : copy.chat.droppedLookups(droppedResults)
+        return "\(lead)\(counts)"
     }
 }
 
@@ -1067,52 +1071,60 @@ public enum ChatToolLog {
 public enum ChatToolSummary {
     public static func headline(
         _ call: ChatToolCall,
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> String {
         let args = call.args
         switch call.name {
         case "get_slot_card":
             if let at = int64Value(args["at_ms"]) {
-                return "Looked up \(ChatTimeLabel.slotRange(atMs: at, calendar: calendar))"
+                return copy.chat.lookedUpSlot(ChatTimeLabel.slotRange(atMs: at, calendar: calendar))
             }
-            return "Looked up a half-hour card"
+            return copy.chat.lookedUpHalfHour
         case "list_moments":
             if let range = windowLabel(args, calendar: calendar) {
-                return "Browsed moments from \(range)"
+                return copy.chat.browsedMomentsFrom(range)
             }
-            return "Browsed the timeline"
+            return copy.chat.browsedTimeline
         case "get_transcript":
             if let range = windowLabel(args, calendar: calendar) {
-                return "Read the transcript from \(range)"
+                return copy.chat.readTranscriptFrom(range)
             }
-            return "Read a transcript"
+            return copy.chat.readATranscript
         case "list_activity":
             if let range = windowLabel(args, calendar: calendar) {
-                return "Checked activity from \(range)"
+                return copy.chat.checkedActivityFrom(range)
             }
-            return "Checked activity"
+            return copy.chat.checkedActivity
         case "list_memories":
-            return "Read saved memories"
+            return copy.chat.readSavedMemories
         case "search_evidence":
             if let query = args["query"] as? String, !query.isEmpty {
-                return "Searched “\(query)”"
+                return copy.chat.searchedQuery(query)
             }
-            return "Searched the vault"
+            return copy.chat.searchedVault
         case "get_moment":
-            return "Opened a moment"
+            return copy.chat.openedMoment
         case "get_ocr":
-            return "Read on-screen text"
+            return copy.chat.readOnScreenText
         case "get_ax_digest", "get_ax_tree":
-            return "Read the interface tree"
+            return copy.chat.readInterfaceTree
         default:
-            return "Called \(call.name)"
+            return copy.chat.calledTool(call.name)
         }
     }
 
-    public static func collapsed(_ tools: [ChatToolCall], calendar: Calendar = .current) -> String {
-        guard let first = tools.first else { return "Looked something up" }
-        if tools.count == 1 { return headline(first, calendar: calendar) }
-        return "\(headline(first, calendar: calendar)) · \(tools.count - 1) more"
+    public static func collapsed(
+        _ tools: [ChatToolCall],
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
+    ) -> String {
+        guard let first = tools.first else { return copy.chat.lookedSomethingUp }
+        if tools.count == 1 { return headline(first, calendar: calendar, copy: copy) }
+        return copy.chat.headlineAndMore(
+            headline(first, calendar: calendar, copy: copy),
+            tools.count - 1
+        )
     }
 
     private static func windowLabel(_ args: [String: Any], calendar: Calendar) -> String? {

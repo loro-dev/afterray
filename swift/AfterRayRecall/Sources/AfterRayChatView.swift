@@ -890,7 +890,7 @@ private struct ChatContextRing: View {
         }
         .help(copy.chat.contextUsed(usage.shortLabel))
         .accessibilityLabel(copy.chat.contextWindow)
-        .accessibilityValue("\(usage.percentLabel) used, \(usage.shortLabel)")
+        .accessibilityValue(copy.chat.contextUsedA11y(usage.percentLabel, usage.shortLabel))
         .accessibilityIdentifier("chat-context-ring")
     }
 
@@ -1225,7 +1225,7 @@ private struct ChatToolChip: View {
             .padding(.top, 6)
         } label: {
             HStack(spacing: 5) {
-                Text(ChatToolSummary.headline(tool))
+                Text(ChatToolSummary.headline(tool, copy: copy))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(ChatPalette.tertiary)
                 if tool.truncated {
@@ -1256,8 +1256,8 @@ private struct ChatToolChip: View {
     /// rather than the budget biting.
     private var resultNote: String {
         guard let chars = tool.resultChars else { return "" }
-        guard tool.truncated else { return "\(chars) characters back" }
-        return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
+        guard tool.truncated else { return copy.chat.charactersBack(chars) }
+        return copy.chat.charactersBackShortened(chars, tool.droppedTokens)
     }
 }
 

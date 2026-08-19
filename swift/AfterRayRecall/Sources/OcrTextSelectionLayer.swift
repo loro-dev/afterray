@@ -210,15 +210,16 @@ final class OcrTextSelectionView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         guard textLayout.lineIndex(at: point, padding: Self.hitPadding) != nil else { return nil }
         let menu = NSMenu()
+        let copy = AfterRayLocalization.shared.copy
         if hasSelection {
             menu.addItem(
-                withTitle: "Copy",
+                withTitle: copy.common.copy,
                 action: #selector(copySelection),
                 keyEquivalent: ""
             ).target = self
         }
         menu.addItem(
-            withTitle: "Copy All Text",
+            withTitle: copy.recall.copyAllText,
             action: #selector(copyEverything),
             keyEquivalent: ""
         ).target = self

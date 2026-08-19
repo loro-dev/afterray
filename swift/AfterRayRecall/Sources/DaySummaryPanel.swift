@@ -349,7 +349,7 @@ private struct DaySummaryRow: View {
 
                 if !sections.isEmpty {
                     Button(action: onToggleDetails) {
-                        Text(isExpanded ? "Hide details" : "Full details")
+                        Text(isExpanded ? copy.recall.hideDetails : copy.recall.fullDetails)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.white.opacity(0.48))
                             .underline()

@@ -37,20 +37,21 @@ final class OnboardingExclusions: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        panel.prompt = "Exclude"
-        panel.message = "Choose an app to skip."
+        let copy = AfterRayLocalization.shared.copy
+        panel.prompt = copy.common.exclude
+        panel.message = copy.settings.chooseAppToSkip
         let response = await present(panel)
         guard response == .OK, let url = panel.url else { return }
         guard let bundleID = Bundle(url: url)?.bundleIdentifier else {
-            message = "Could not read that app's identifier."
+            message = copy.settings.couldNotReadAppIdentifier
             return
         }
         guard bundleID != "dev.afterray.app" else {
-            message = "AfterRay already excludes its own windows."
+            message = copy.settings.alreadyExcludesOwnWindows
             return
         }
         guard !bundleIds.contains(bundleID) else {
-            message = "That app is already excluded."
+            message = copy.settings.appAlreadyExcluded
             return
         }
         await save(bundleIds: bundleIds + [bundleID], domains: nil)
@@ -58,7 +59,7 @@ final class OnboardingExclusions: ObservableObject {
 
     func removeApp(_ bundleID: String) async {
         guard !protectedBundleIds.contains(bundleID) else {
-            message = "Password apps are always skipped."
+            message = AfterRayLocalization.shared.copy.settings.passwordAppsAlwaysSkipped
             return
         }
         await save(bundleIds: bundleIds.filter { $0 != bundleID }, domains: nil)

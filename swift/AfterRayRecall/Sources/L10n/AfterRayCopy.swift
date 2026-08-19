@@ -346,6 +346,42 @@ extension AfterRayCopy {
         public var cliBinaryMissing: String
         public var hoursShort: (Int) -> String
         public var hoursAndMinutes: (Int, Int) -> String
+        public var evidenceOnFor30Minutes: String
+        public var evidenceOffToast: String
+        public var updateReadyOnQuit: (String) -> String
+        public var onVersionChecking: (String) -> String
+        public var onVersionChecksOff: (String) -> String
+        public var developerUnlocked: String
+        public var passwordManagersAlwaysExcluded: String
+        public var chooseAppNeverRecord: String
+        public var couldNotReadAppIdentifier: String
+        public var doesNotRecordOwnWindow: String
+        public var deletedOneMoment: String
+        public var deletedMoments: (Int) -> String
+        public var packReady: (String) -> String
+        public var cancelledDownload: (String) -> String
+        public var downloadsUseOfficial: String
+        public var downloadsUseEndpoint: (String) -> String
+        public var removedPack: (String) -> String
+        public var assistantConnectionSaved: String
+        public var modelDownloadsFinished: String
+        public var versionBuild: (String, String) -> String
+        public var moveToApplicationsQuestion: String
+        public var moveFromDiskImage: String
+        public var moveFromElsewhere: String
+        public var moveToApplications: String
+        public var notNow: String
+        public var keepWhereItIs: String
+        public var couldNotMove: String
+        public var dragToApplicationsManually: String
+        public var alreadyRunningInApplications: String
+        public var chooseAppToSkip: String
+        public var alreadyExcludesOwnWindows: String
+        public var appAlreadyExcluded: String
+        public var passwordAppsAlwaysSkipped: String
+        public var askUsesMlx: String
+        public var askUsesOllama: String
+        public var askUsesOpenAI: String
     }
 
     public struct Recall {
@@ -404,6 +440,20 @@ extension AfterRayCopy {
         public var pausing: String
         public var offline: String
         public var recording: String
+        public var hideTodaySummary: String
+        public var showTodaySummary: String
+        public var noMomentsMatched: (String) -> String
+        public var gapNotRecorded: (String) -> String
+        public var ocrProcessing: String
+        public var noScreenTextFound: String
+        public var transcriptProcessing: String
+        public var noTranscriptNear: String
+        public var capturedContext: String
+        public var noSnapshot: String
+        public var snapshotFailed: String
+        public var hideDetails: String
+        public var fullDetails: String
+        public var copyAllText: String
     }
 
     public struct Chat {
@@ -439,6 +489,37 @@ extension AfterRayCopy {
         public var send: String
         public var deleteConversation: String
         public var goToLatest: String
+        public var conversationTitle: String
+        public var notServingYet: String
+        public var couldNotReachDaemon: String
+        public var contextUsedA11y: (String, String) -> String
+        public var charactersBack: (Int) -> String
+        public var charactersBackShortened: (Int, Int) -> String
+        public var droppedOneLookup: String
+        public var droppedLookups: (Int) -> String
+        public var lookedUpSlot: (String) -> String
+        public var lookedUpHalfHour: String
+        public var browsedMomentsFrom: (String) -> String
+        public var browsedTimeline: String
+        public var readTranscriptFrom: (String) -> String
+        public var readATranscript: String
+        public var checkedActivityFrom: (String) -> String
+        public var checkedActivity: String
+        public var readSavedMemories: String
+        public var searchedQuery: (String) -> String
+        public var searchedVault: String
+        public var openedMoment: String
+        public var readOnScreenText: String
+        public var readInterfaceTree: String
+        public var calledTool: (String) -> String
+        public var lookedSomethingUp: String
+        public var headlineAndMore: (String, Int) -> String
+        public var openCapturedMoment: String
+        public var openCapturedMomentAt: (String) -> String
+        public var openCapturedTitled: (String) -> String
+        public var openCapturedTitledAt: (String, String) -> String
+        public var screenshotUnavailable: String
+        public var capturedMoment: String
     }
 
     public struct Compute {

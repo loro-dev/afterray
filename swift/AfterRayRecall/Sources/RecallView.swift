@@ -645,7 +645,7 @@ public struct RecallView: View {
                 symbol: daySummaryExpanded
                     ? "rectangle.bottomhalf.inset.filled"
                     : "list.bullet.rectangle",
-                help: daySummaryExpanded ? "Hide today's summary" : "Show today's summary",
+                help: daySummaryExpanded ? copy.recall.hideTodaySummary : copy.recall.showTodaySummary,
                 tint: daySummaryExpanded ? RecallPalette.ray : .white,
                 action: {
                     withAnimation(.easeOut(duration: 0.18)) {
@@ -1273,6 +1273,7 @@ public func clearRecallDecodedImageCache() {
 }
 
 private struct AppIdentity: View {
+    @Environment(\.afterRayCopy) private var copy
     let moment: RecallMoment?
     var onOpenWebLink: ((URL) -> Void)?
 
@@ -1297,7 +1298,7 @@ private struct AppIdentity: View {
         HStack(spacing: 9) {
             ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 24)
             VStack(alignment: .leading, spacing: 1) {
-                Text(moment?.applicationName ?? "Idle")
+                Text(moment?.applicationName ?? copy.format.idle)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .lineLimit(1)
@@ -1392,6 +1393,7 @@ private struct OpenableTitle: View {
 }
 
 private struct AppUsageTimeline: View {
+    @Environment(\.afterRayCopy) private var copy
     let layout: TimelineLayout
     let playheadMs: Int64
     let isLive: Bool
@@ -1480,7 +1482,9 @@ private struct AppUsageTimeline: View {
                     .position(x: run.startX + run.width / 2, y: 28)
                     .help(
                         run.isIdle
-                            ? "这段时间没有录制 · \(DurationFormatter.short(milliseconds: run.durationMs))"
+                            ? copy.recall.gapNotRecorded(
+                                DurationFormatter.short(milliseconds: run.durationMs)
+                            )
                             : "\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))"
                     )
             }
@@ -2328,14 +2332,16 @@ private struct RecallDetailsMenu: View {
                     RecallDetailsTextPage(
                         title: copy.recall.onScreen,
                         text: moment.ocrText,
-                        emptyText: isProcessing ? "OCR is processing…" : "No screen text found",
+                        emptyText: isProcessing ? copy.recall.ocrProcessing : copy.recall.noScreenTextFound,
                         fileName: "afterray-ocr.txt"
                     )
                 case .transcript:
                     RecallDetailsTextPage(
                         title: copy.recall.heard,
                         text: moment.transcriptText,
-                        emptyText: isProcessing ? "Transcript is processing…" : "No transcript near this moment",
+                        emptyText: isProcessing
+                            ? copy.recall.transcriptProcessing
+                            : copy.recall.noTranscriptNear,
                         fileName: "afterray-transcript.txt"
                     )
                 case .accessibility:
@@ -2366,7 +2372,7 @@ private struct RecallDetailsMenu: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            Text(page == .root ? "CAPTURED CONTEXT" : pageTitle)
+            Text(page == .root ? copy.recall.capturedContext : pageTitle)
                 .font(.system(size: 10, weight: .bold, design: .rounded))
                 .tracking(1.4)
                 .foregroundStyle(.secondary)
@@ -2383,7 +2389,7 @@ private struct RecallDetailsMenu: View {
 
     private var pageTitle: String {
         switch page {
-        case .root: "CAPTURED CONTEXT"
+        case .root: copy.recall.capturedContext
         case .ocr: "ON SCREEN"
         case .transcript: "HEARD"
         case .accessibility: "ACCESSIBILITY TREE"
@@ -2416,7 +2422,7 @@ private struct RecallDetailsMenu: View {
                     icon: "point.3.connected.trianglepath.dotted",
                     title: copy.recall.accessibilityTree,
                     subtitle: moment.accessibilityArtifactId == nil
-                        ? "No snapshot for this moment"
+                        ? copy.recall.noSnapshot
                         : "Full AX JSON for this screen"
                 ) {
                     page = .accessibility
@@ -2544,6 +2550,7 @@ private struct RecallDetailsTextPage: View {
 }
 
 private struct RecallDetailsAccessibilityPage: View {
+    @Environment(\.afterRayCopy) private var copy
     let artifactID: String?
     let loader: RecallArtifactLoader?
     @State private var snapshot = ""
@@ -2583,9 +2590,9 @@ private struct RecallDetailsAccessibilityPage: View {
     }
 
     private var emptyText: String {
-        if artifactID == nil { return "No snapshot for this moment" }
-        if snapshot == " " { return "Loading…" }
-        return "The snapshot could not be loaded."
+        if artifactID == nil { return copy.recall.noSnapshot }
+        if snapshot == " " { return copy.chat.loading }
+        return copy.recall.snapshotFailed
     }
 }
 

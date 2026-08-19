@@ -61,20 +61,15 @@ enum AfterRayInstallLocation {
     }
 
     private static func askToMove(readOnly: Bool) -> Choice {
+        let copy = AfterRayLocalization.shared.copy
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = "Move AfterRay to your Applications folder?"
+        alert.messageText = copy.settings.moveToApplicationsQuestion
         alert.informativeText = readOnly
-            ? """
-            AfterRay is running from the disk image. It needs to live in \
-            Applications to record reliably and to install its own updates.
-            """
-            : """
-            AfterRay installs updates by replacing itself, which only works \
-            from your Applications folder.
-            """
-        alert.addButton(withTitle: "Move to Applications")
-        alert.addButton(withTitle: readOnly ? "Not Now" : "Keep Where It Is")
+            ? copy.settings.moveFromDiskImage
+            : copy.settings.moveFromElsewhere
+        alert.addButton(withTitle: copy.settings.moveToApplications)
+        alert.addButton(withTitle: readOnly ? copy.settings.notNow : copy.settings.keepWhereItIs)
         return alert.runModal() == .alertFirstButtonReturn ? .move : .decline
     }
 
@@ -87,7 +82,9 @@ enum AfterRayInstallLocation {
             // Replacing a copy that is running would leave the user with two
             // daemons fighting over one socket.
             if isRunningElsewhere(at: destination) {
-                throw InstallLocationError.destinationRunning
+                throw InstallLocationError.destinationRunning(
+                    AfterRayLocalization.shared.copy.settings.alreadyRunningInApplications
+                )
             }
             try manager.trashItem(at: destination, resultingItemURL: nil)
         }
@@ -126,14 +123,14 @@ enum AfterRayInstallLocation {
 
     private static func presentFailure(_ error: Error) {
         AfterRayLog.info("could not relocate the app: \(error)")
+        let copy = AfterRayLocalization.shared.copy
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "AfterRay could not move itself"
+        alert.messageText = copy.settings.couldNotMove
         alert.informativeText = """
         \(error.localizedDescription)
 
-        Drag AfterRay to your Applications folder manually, then open it from \
-        there.
+        \(copy.settings.dragToApplicationsManually)
         """
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -141,12 +138,12 @@ enum AfterRayInstallLocation {
 }
 
 enum InstallLocationError: LocalizedError {
-    case destinationRunning
+    case destinationRunning(String)
 
     var errorDescription: String? {
         switch self {
-        case .destinationRunning:
-            "Another copy of AfterRay is already running from your Applications folder."
+        case .destinationRunning(let message):
+            message
         }
     }
 }

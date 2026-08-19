@@ -25,7 +25,7 @@ final class AfterRayUpdater: NSObject {
         // One source of truth for the build number: the daemon handshake
         // compares against the same value.
         guard let build = DaemonSupervisor.hostBuild else { return version }
-        return "\(version) (build \(build))"
+        return AfterRayLocalization.shared.copy.settings.versionBuild(version, build)
     }
 
     var automaticallyChecksForUpdates: Bool {

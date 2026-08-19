@@ -158,7 +158,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
             return item
         case .chatTitle:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "Conversation title"
+            item.label = AfterRayLocalization.shared.copy.chat.conversationTitle
             item.paletteLabel = item.label
             item.view = NSHostingView(
                 rootView: ChatToolbarTitleView(model: AfterRayServices.shared.chat)
