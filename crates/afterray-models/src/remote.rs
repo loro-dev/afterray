@@ -6,7 +6,7 @@ use crate::{
 };
 use afterray_protocol::{LlmEndpointStatus, LlmProvider, LlmRemoteModel};
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
@@ -14,7 +14,6 @@ pub use stream::{ollama_chat_delta, ollama_chat_url, openai_sse_delta};
 
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const GENERATE_TIMEOUT: Duration = Duration::from_secs(180);
 
 const PREFERRED_CHAT_MODELS: &[&str] = &["qwen3.7", "qwen3.6", "qwen3.5", "qwen3", "qwen2.5"];
 
@@ -161,7 +160,11 @@ pub struct LlmRouterAdapter {
 fn generate_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
-        .timeout(GENERATE_TIMEOUT)
+        // No total request timeout. reqwest's `.timeout` covers the whole
+        // body, so a thinking model that is still emitting tokens after 3
+        // minutes is killed mid-answer (`context canceled` on Ollama, a
+        // frozen caret in chat). Time-to-headers and inter-chunk idle live
+        // in `stream.rs`.
         // The prompt carries retrieved history and the header carries
         // the API key: neither follows a redirect to a host the user
         // did not configure.
@@ -425,83 +428,21 @@ async fn generate_remote(
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
 ) -> Result<(String, Option<crate::LlmUsage>), AdapterError> {
-    if let Some(token_tx) = token_tx {
-        return stream::generate_streaming(
-            client,
-            config,
-            prompt,
-            messages,
-            system,
-            token_tx,
-            cancellation,
-        )
-        .await;
-    }
-    let model = config.chat_model();
-    if model.is_empty() {
-        return Err(AdapterError::MissingModel(
-            "no remote LLM model is configured; pick one in Settings".into(),
-        ));
-    }
-    let origin = config.resolved_base_url();
-    if origin.is_empty() {
-        return Err(AdapterError::MissingModel(
-            "OpenAI-compatible URL is empty; set it in Settings".into(),
-        ));
-    }
-    let url = chat_completions_url(&origin);
-    let mut messages = Vec::new();
-    if let Some(system) = system.filter(|value| !value.is_empty()) {
-        messages.push(json!({"role": "system", "content": system}));
-    }
-    messages.push(json!({"role": "user", "content": prompt}));
-    let body = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-
-    let mut request = client.post(&url).json(&body);
-    if let Some(api_key) = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        request = request.bearer_auth(api_key);
-    }
-
-    let response = tokio::select! {
-        () = cancellation.cancelled() => return Err(AdapterError::Cancelled),
-        result = request.send() => result.map_err(|error| {
-            AdapterError::Process(format!("could not reach {url}: {error}"))
-        })?,
-    };
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| AdapterError::Process(format!("LLM response body failed: {error}")))?;
-    if !status.is_success() {
-        return Err(remote_http_error(status.as_u16(), &text, model));
-    }
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| AdapterError::InvalidOutput(format!("LLM returned non-JSON: {error}")))?;
-    let content = chat_message_content(&value).ok_or_else(|| {
-        AdapterError::InvalidOutput("OpenAI-compatible response had no assistant text".into())
-    })?;
-    Ok((content, openai_completion_usage(&value)))
-}
-
-fn openai_completion_usage(value: &Value) -> Option<crate::LlmUsage> {
-    let usage = value.get("usage")?;
-    let prompt_tokens = usize::try_from(usage.get("prompt_tokens")?.as_u64()?).ok()?;
-    let completion_tokens = usize::try_from(usage.get("completion_tokens")?.as_u64()?).ok()?;
-    Some(crate::LlmUsage {
-        prompt_tokens,
-        completion_tokens,
-        generation_ms: 0,
-    })
+    // Always stream. The non-stream `/v1/chat/completions` path inherited the
+    // same 180s total timeout and killed T2 summaries the same way chat froze:
+    // prefill of a 22k-token prompt is already a minute of silence, then
+    // thinking, then the answer. Idle-on-chunk in `fold_lines` is what lets
+    // both surfaces run as long as the model is still producing.
+    stream::generate_streaming(
+        client,
+        config,
+        prompt,
+        messages,
+        system,
+        token_tx,
+        cancellation,
+    )
+    .await
 }
 
 pub(crate) fn remote_http_error(status: u16, body: &str, model: &str) -> AdapterError {
@@ -721,6 +662,7 @@ pub fn models_from_openai_list(value: &Value) -> Vec<LlmRemoteModel> {
         .collect()
 }
 
+#[cfg(test)]
 fn chat_message_content(value: &Value) -> Option<String> {
     let content = value.pointer("/choices/0/message/content")?;
     let text = match content {
@@ -816,7 +758,10 @@ mod tests {
         let _guard_b = sink.install("job-b", tx_b);
         drop(guard_a);
         assert!(sink.take("job-a").is_none());
-        assert!(sink.take("job-b").is_some(), "job-b's outlet was collateral");
+        assert!(
+            sink.take("job-b").is_some(),
+            "job-b's outlet was collateral"
+        );
     }
 
     /// The only adapter that can reach the network declares itself LLM-only,
@@ -828,9 +773,8 @@ mod tests {
     /// says `search_evidence` is not an exfiltration path.
     #[tokio::test]
     async fn the_remote_router_refuses_everything_that_is_not_an_llm_call() {
-        let adapter = LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(
-            LlmRuntimeConfig::default(),
-        )));
+        let adapter =
+            LlmRouterAdapter::new(Arc::new(std::sync::Mutex::new(LlmRuntimeConfig::default())));
         assert_eq!(adapter.capability(), ModelCapability::Llm);
 
         let refused = adapter
@@ -851,6 +795,7 @@ mod tests {
         );
     }
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn https_endpoints_are_accepted() {

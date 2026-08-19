@@ -9,7 +9,34 @@ use super::{LlmRuntimeConfig, chat_completions_url, normalize_origin, remote_htt
 use crate::{AdapterError, Cancellation, ChatMessage, LlmDelta, LlmUsage};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Timeouts for a remote generate. There is no total request budget: a 27B
+/// thinking model with a 22k-token chat prompt routinely streams for longer
+/// than three minutes while still producing tokens. reqwest's `.timeout`
+/// covered the whole body, which is why a live answer froze halfway and
+/// Ollama logged `context canceled`.
+#[derive(Clone, Copy)]
+struct StreamDeadlines {
+    /// Time to response headers. Covers model load, not prefill — prefill
+    /// happens after 200, while the body is idle.
+    headers: Duration,
+    /// Reset on every body chunk. Prefill of ~22k tokens measured at ~60s
+    /// with no bytes; 180s leaves headroom for a loaded machine.
+    idle: Duration,
+}
+
+const STREAM_DEADLINES: StreamDeadlines = StreamDeadlines {
+    headers: Duration::from_secs(180),
+    idle: Duration::from_secs(180),
+};
+
+fn timeout_error(limit: Duration) -> AdapterError {
+    AdapterError::Timeout {
+        seconds: limit.as_secs().max(1),
+    }
+}
 
 /// Ollama native chat endpoint. `/v1` is stripped so a Settings URL that
 /// was stored for the OpenAI-compatible path still hits `/api/chat`.
@@ -30,16 +57,34 @@ pub(super) async fn generate_streaming(
     prompt: &str,
     messages: &[ChatMessage],
     system: Option<&str>,
-    token_tx: mpsc::Sender<LlmDelta>,
+    token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
 ) -> Result<(String, Option<LlmUsage>), AdapterError> {
-    let body = chat_messages(prompt, messages, system);
+    generate_with(
+        client,
+        config,
+        chat_messages(prompt, messages, system),
+        token_tx,
+        cancellation,
+        STREAM_DEADLINES,
+    )
+    .await
+}
+
+async fn generate_with(
+    client: &reqwest::Client,
+    config: &LlmRuntimeConfig,
+    body: Vec<Value>,
+    token_tx: Option<mpsc::Sender<LlmDelta>>,
+    cancellation: Cancellation,
+    deadlines: StreamDeadlines,
+) -> Result<(String, Option<LlmUsage>), AdapterError> {
     match config.provider {
         afterray_protocol::LlmProvider::Ollama => {
-            generate_ollama_stream(client, config, body, token_tx, cancellation).await
+            generate_ollama_stream(client, config, body, token_tx, cancellation, deadlines).await
         }
         afterray_protocol::LlmProvider::OpenaiCompatible => {
-            generate_openai_stream(client, config, body, token_tx, cancellation).await
+            generate_openai_stream(client, config, body, token_tx, cancellation, deadlines).await
         }
         afterray_protocol::LlmProvider::MlxLocal => Err(AdapterError::InvalidOutput(
             "MLX local generation uses the persistent worker protocol".into(),
@@ -51,8 +96,9 @@ async fn generate_ollama_stream(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     messages: Vec<Value>,
-    token_tx: mpsc::Sender<LlmDelta>,
+    token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
+    deadlines: StreamDeadlines,
 ) -> Result<(String, Option<LlmUsage>), AdapterError> {
     let model = require_model(config)?;
     let origin = require_origin(config)?;
@@ -70,21 +116,29 @@ async fn generate_ollama_stream(
     if let Some(num_ctx) = config.context_tokens {
         body["options"] = json!({ "num_ctx": num_ctx });
     }
-    let response = send_chat(client, &url, None, &body, &cancellation).await?;
+    let response = send_chat(client, &url, None, &body, &cancellation, deadlines.headers).await?;
     let status = response.status();
     if !status.is_success() {
-        let text = response_text(response).await?;
+        let text = response_text(response, deadlines.idle).await?;
         return Err(remote_http_error(status.as_u16(), &text, model));
     }
-    fold_lines(response, cancellation, &token_tx, ollama_chat_line).await
+    fold_lines(
+        response,
+        cancellation,
+        token_tx.as_ref(),
+        ollama_chat_line,
+        deadlines.idle,
+    )
+    .await
 }
 
 async fn generate_openai_stream(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     messages: Vec<Value>,
-    token_tx: mpsc::Sender<LlmDelta>,
+    token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
+    deadlines: StreamDeadlines,
 ) -> Result<(String, Option<LlmUsage>), AdapterError> {
     let model = require_model(config)?;
     let origin = require_origin(config)?;
@@ -100,20 +154,43 @@ async fn generate_openai_stream(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    let mut response = send_chat(client, &url, api_key, &body, &cancellation).await?;
+    let mut response = send_chat(
+        client,
+        &url,
+        api_key,
+        &body,
+        &cancellation,
+        deadlines.headers,
+    )
+    .await?;
     if response.status().as_u16() == 400 {
         // Older OpenAI-compatible servers reject `stream_options`.
         if let Some(object) = body.as_object_mut() {
             object.remove("stream_options");
         }
-        response = send_chat(client, &url, api_key, &body, &cancellation).await?;
+        response = send_chat(
+            client,
+            &url,
+            api_key,
+            &body,
+            &cancellation,
+            deadlines.headers,
+        )
+        .await?;
     }
     let status = response.status();
     if !status.is_success() {
-        let text = response_text(response).await?;
+        let text = response_text(response, deadlines.idle).await?;
         return Err(remote_http_error(status.as_u16(), &text, model));
     }
-    fold_lines(response, cancellation, &token_tx, openai_sse_line).await
+    fold_lines(
+        response,
+        cancellation,
+        token_tx.as_ref(),
+        openai_sse_line,
+        deadlines.idle,
+    )
+    .await
 }
 
 fn require_model(config: &LlmRuntimeConfig) -> Result<&str, AdapterError> {
@@ -165,6 +242,7 @@ async fn send_chat(
     api_key: Option<&str>,
     body: &Value,
     cancellation: &Cancellation,
+    headers: Duration,
 ) -> Result<reqwest::Response, AdapterError> {
     let mut request = client.post(url).json(body);
     if let Some(api_key) = api_key {
@@ -172,24 +250,33 @@ async fn send_chat(
     }
     tokio::select! {
         () = cancellation.cancelled() => Err(AdapterError::Cancelled),
-        result = request.send() => result.map_err(|error| {
-            AdapterError::Process(format!("could not reach {url}: {error}"))
-        }),
+        result = tokio::time::timeout(headers, request.send()) => match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => Err(AdapterError::Process(format!("could not reach {url}: {error}"))),
+            Err(_) => Err(timeout_error(headers)),
+        },
     }
 }
 
-async fn response_text(response: reqwest::Response) -> Result<String, AdapterError> {
-    response
-        .text()
-        .await
-        .map_err(|error| AdapterError::Process(format!("LLM response body failed: {error}")))
+async fn response_text(
+    response: reqwest::Response,
+    idle: Duration,
+) -> Result<String, AdapterError> {
+    match tokio::time::timeout(idle, response.text()).await {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => Err(AdapterError::Process(format!(
+            "LLM response body failed: {error}"
+        ))),
+        Err(_) => Err(timeout_error(idle)),
+    }
 }
 
 async fn fold_lines(
     response: reqwest::Response,
     cancellation: Cancellation,
-    token_tx: &mpsc::Sender<LlmDelta>,
+    token_tx: Option<&mpsc::Sender<LlmDelta>>,
     parse_line: fn(&str) -> ParsedLine,
+    idle: Duration,
 ) -> Result<(String, Option<LlmUsage>), AdapterError> {
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
@@ -199,7 +286,10 @@ async fn fold_lines(
     loop {
         let chunk = tokio::select! {
             () = cancellation.cancelled() => return Err(AdapterError::Cancelled),
-            next = stream.next() => next,
+            next = tokio::time::timeout(idle, stream.next()) => match next {
+                Ok(next) => next,
+                Err(_) => return Err(timeout_error(idle)),
+            },
         };
         let Some(chunk) = chunk else {
             break;
@@ -249,7 +339,7 @@ async fn drain_complete_lines(
     assembled: &mut String,
     usage: &mut Option<LlmUsage>,
     decode_started: &mut Option<std::time::Instant>,
-    token_tx: &mpsc::Sender<LlmDelta>,
+    token_tx: Option<&mpsc::Sender<LlmDelta>>,
     parse_line: fn(&str) -> ParsedLine,
 ) {
     while let Some(idx) = pending.iter().position(|&byte| byte == b'\n') {
@@ -274,13 +364,17 @@ async fn apply_line(
     assembled: &mut String,
     usage: &mut Option<LlmUsage>,
     decode_started: &mut Option<std::time::Instant>,
-    token_tx: &mpsc::Sender<LlmDelta>,
+    token_tx: Option<&mpsc::Sender<LlmDelta>>,
     line: ParsedLine,
 ) {
     if line.usage.is_some() {
         *usage = line.usage;
     }
-    if line.delta.as_ref().is_some_and(|delta| !delta.text.is_empty()) {
+    if line
+        .delta
+        .as_ref()
+        .is_some_and(|delta| !delta.text.is_empty())
+    {
         decode_started.get_or_insert_with(std::time::Instant::now);
     }
     push_delta(assembled, token_tx, line.delta).await;
@@ -294,7 +388,7 @@ async fn apply_line(
 /// let a stray "FINAL" inside a reasoning block end the turn.
 async fn push_delta(
     assembled: &mut String,
-    token_tx: &mpsc::Sender<LlmDelta>,
+    token_tx: Option<&mpsc::Sender<LlmDelta>>,
     delta: Option<LlmDelta>,
 ) {
     let Some(delta) = delta.filter(|delta| !delta.text.is_empty()) else {
@@ -303,7 +397,9 @@ async fn push_delta(
     if delta.is_content() {
         assembled.push_str(&delta.text);
     }
-    let _ = token_tx.send(delta).await;
+    if let Some(token_tx) = token_tx {
+        let _ = token_tx.send(delta).await;
+    }
 }
 
 struct ParsedLine {
@@ -444,8 +540,8 @@ fn json_text(value: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use afterray_protocol::LlmProvider;
     use crate::DEFAULT_OLLAMA_BASE_URL;
+    use afterray_protocol::LlmProvider;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
@@ -531,9 +627,7 @@ mod tests {
         );
         // Content still wins when an endpoint sends both on one line.
         assert_eq!(
-            openai_sse_delta(
-                r#"data: {"choices":[{"delta":{"content":"A","reasoning":"why"}}]}"#
-            ),
+            openai_sse_delta(r#"data: {"choices":[{"delta":{"content":"A","reasoning":"why"}}]}"#),
             Some(LlmDelta::content("A"))
         );
     }
@@ -559,7 +653,10 @@ mod tests {
         assert_eq!(text, "OK");
         assert_eq!(
             deltas,
-            vec![LlmDelta::reasoning("FINAL nonsense"), LlmDelta::content("OK")]
+            vec![
+                LlmDelta::reasoning("FINAL nonsense"),
+                LlmDelta::content("OK")
+            ]
         );
     }
 
@@ -627,6 +724,113 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, AdapterError::Cancelled));
+    }
+
+    /// The production bug: tokens arrived, then prefill+thinking+answer ran
+    /// past reqwest's 180s *total* timeout and the stream died mid-sentence.
+    /// Idle-on-chunk must not fire while the server is still writing.
+    #[tokio::test]
+    async fn a_slow_but_live_stream_is_not_killed_by_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n";
+            socket.write_all(header.as_bytes()).await.unwrap();
+            for (i, token) in ["你", "好"].into_iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+                let line = format!(r#"{{"message":{{"content":"{token}"}},"done":false}}"#);
+                socket.write_all(line.as_bytes()).await.unwrap();
+                socket.write_all(b"\n").await.unwrap();
+            }
+            socket
+                .write_all(br#"{"message":{"content":""},"done":true}"#)
+                .await
+                .unwrap();
+            socket.write_all(b"\n").await.unwrap();
+        });
+        let (text, tokens) = generate_against_timed(
+            LlmProvider::Ollama,
+            &format!("http://{addr}"),
+            Cancellation::default(),
+            StreamDeadlines {
+                headers: Duration::from_secs(2),
+                idle: Duration::from_millis(400),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "你好");
+        assert_eq!(tokens, [LlmDelta::content("你"), LlmDelta::content("好")]);
+    }
+
+    /// Once the body goes silent, stop. That is the hung-model case, not the
+    /// long-but-alive one.
+    #[tokio::test]
+    async fn idle_timeout_stops_a_stalled_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n";
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket
+                .write_all(br#"{"message":{"content":"x"},"done":false}"#)
+                .await
+                .unwrap();
+            socket.write_all(b"\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let error = generate_against_timed(
+            LlmProvider::Ollama,
+            &format!("http://{addr}"),
+            Cancellation::default(),
+            StreamDeadlines {
+                headers: Duration::from_secs(2),
+                idle: Duration::from_millis(150),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, AdapterError::Timeout { .. }),
+            "stalled stream should idle-timeout, got {error:?}"
+        );
+    }
+
+    /// Headers never arriving is a hang before prefill, not a long generate.
+    #[tokio::test]
+    async fn headers_timeout_stops_a_silent_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let error = generate_against_timed(
+            LlmProvider::Ollama,
+            &format!("http://{addr}"),
+            Cancellation::default(),
+            StreamDeadlines {
+                headers: Duration::from_millis(150),
+                idle: Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, AdapterError::Timeout { .. }),
+            "silent server should time out waiting for headers, got {error:?}"
+        );
     }
 
     /// Tag to use when this machine has it. A preference, never a requirement:
@@ -760,7 +964,10 @@ mod tests {
         let legacy: Vec<Value> =
             serde_json::from_str(r#"[{"name":"nomic-embed-text:latest"},{"name":"llama3:8b"}]"#)
                 .unwrap();
-        assert_eq!(pick_ollama_chat_model(&legacy).as_deref(), Some("llama3:8b"));
+        assert_eq!(
+            pick_ollama_chat_model(&legacy).as_deref(),
+            Some("llama3:8b")
+        );
     }
 
     #[tokio::test]
@@ -827,7 +1034,7 @@ mod tests {
             "Reply with exactly the two characters: OK",
             &[],
             Some("You reply with the requested characters and nothing else."),
-            tx,
+            Some(tx),
             Cancellation::default(),
         )
         .await
@@ -852,6 +1059,15 @@ mod tests {
         origin: &str,
         cancellation: Cancellation,
     ) -> Result<(String, Vec<LlmDelta>), AdapterError> {
+        generate_against_timed(provider, origin, cancellation, STREAM_DEADLINES).await
+    }
+
+    async fn generate_against_timed(
+        provider: LlmProvider,
+        origin: &str,
+        cancellation: Cancellation,
+        deadlines: StreamDeadlines,
+    ) -> Result<(String, Vec<LlmDelta>), AdapterError> {
         let config = LlmRuntimeConfig {
             provider,
             base_url: origin.to_owned(),
@@ -860,17 +1076,28 @@ mod tests {
             context_tokens: None,
         };
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(2))
             .no_proxy()
             .build()
             .unwrap();
         let (tx, mut rx) = mpsc::channel(16);
-        let (text, _usage) =
-            generate_streaming(&client, &config, "hi", &[], None, tx, cancellation).await?;
-        let mut tokens = Vec::new();
-        while let Ok(token) = rx.try_recv() {
-            tokens.push(token);
-        }
+        let collector = tokio::spawn(async move {
+            let mut tokens = Vec::new();
+            while let Some(token) = rx.recv().await {
+                tokens.push(token);
+            }
+            tokens
+        });
+        let (text, _usage) = generate_with(
+            &client,
+            &config,
+            chat_messages("hi", &[], None),
+            Some(tx),
+            cancellation,
+            deadlines,
+        )
+        .await?;
+        let tokens = collector.await.expect("token collector panicked");
         Ok((text, tokens))
     }
 
@@ -905,7 +1132,7 @@ mod tests {
             "prompt",
             &[],
             None,
-            tx,
+            Some(tx),
             Cancellation::default(),
         )
         .await
