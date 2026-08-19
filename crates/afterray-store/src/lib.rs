@@ -2171,7 +2171,7 @@ impl Vault {
         policy: &PackPolicy,
     ) -> Result<ComputeBacklog, StoreError> {
         let archive_stills = packable_frame_count(
-            &self.list_pack_candidates(now_ms, policy)?,
+            &self.list_pack_candidates_read(now_ms, policy)?,
             policy.keyint,
         );
         let connection = self.readers.get();
@@ -6629,7 +6629,7 @@ mod tests {
         assert_eq!(
             backlog.archive_stills,
             packable_frame_count(
-                &vault.list_pack_candidates(now, &policy).unwrap(),
+                &vault.list_pack_candidates_read(now, &policy).unwrap(),
                 policy.keyint
             ),
             "the archive count must match what the packer would actually pack"

@@ -198,13 +198,10 @@ fn sort_runs_oldest_first(runs: &mut [Vec<PackCandidate>]) {
 
 /// Which stills may be packed, as one predicate over `moments m`.
 ///
-/// Shared with `Vault::compute_backlog`'s count so the number on the
-/// dashboard's "start now" button is the number this query will hand the
-/// packer. Two hand-copies drifted once — the count was missing the
-/// loginwindow exclusions below, so it could never reach zero.
-///
-/// Bind order: `?1` hot-window cutoff, `?2` hot-still floor, `?3` OCR grace
-/// cutoff.
+/// Shared with `list_pack_candidates`. The dashboard number is
+/// `packable_frame_count` over that list, not a raw `COUNT(*)` — leftover
+/// 1-frame runs are not drainable. Bind order: `?1` hot-window cutoff,
+/// `?2` hot-still floor, `?3` OCR grace cutoff.
 pub(crate) const PACK_CANDIDATE_PREDICATE: &str = "m.gop_segment_id IS NULL
             AND m.image_artifact_id IS NOT NULL
             AND m.width IS NOT NULL AND m.height IS NOT NULL
@@ -279,7 +276,24 @@ impl Vault {
         now_ms: i64,
         policy: &PackPolicy,
     ) -> Result<Vec<PackCandidate>, StoreError> {
-        let connection = self.connection.lock().unwrap();
+        Self::pack_candidates_on(&self.connection.lock().unwrap(), now_ms, policy)
+    }
+
+    /// Same selection as [`Self::list_pack_candidates`], on the reader pool.
+    /// Dashboard polling must not take the writer.
+    pub fn list_pack_candidates_read(
+        &self,
+        now_ms: i64,
+        policy: &PackPolicy,
+    ) -> Result<Vec<PackCandidate>, StoreError> {
+        Self::pack_candidates_on(&self.readers.get(), now_ms, policy)
+    }
+
+    fn pack_candidates_on(
+        connection: &rusqlite::Connection,
+        now_ms: i64,
+        policy: &PackPolicy,
+    ) -> Result<Vec<PackCandidate>, StoreError> {
         let cutoff = now_ms.saturating_sub(policy.hot_window_ms);
         let ocr_cutoff = now_ms.saturating_sub(policy.ocr_grace_ms);
         let floor = i64::try_from(policy.hot_min_stills).unwrap_or(i64::MAX);

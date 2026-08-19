@@ -12,7 +12,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Read as _},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::io::AsyncWriteExt as _;
 
@@ -267,19 +267,18 @@ pub fn staging_directory(pack: &PackSpec) -> PathBuf {
     staging_path(&pack.path)
 }
 
-/// Staging dirs whose last write is newer than this are left alone.
+/// Staging dirs whose newest file is newer than this are left alone.
 ///
-/// Protects an in-flight `afterray download` (CLI does not talk to the daemon)
-/// and a same-day paused resume. Ready packs are never in this set: they do
-/// not end in `.download`.
+/// Age the newest file, not the directory: a CLI resume appends to an
+/// existing `.partial` and that does not bump the directory mtime.
 pub const ABANDONED_DOWNLOAD_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Delete abandoned `<name>.download` directories that are not in `keep`.
 ///
 /// Only the staging suffix is eligible — installed pack directories
 /// (`Qwen3.5-4B-MLX-4bit`) are never listed. Callers pass in-flight staging
-/// paths; anything modified inside [`ABANDONED_DOWNLOAD_GRACE`] is skipped
-/// even if `keep` is empty.
+/// paths; anything whose newest file is inside [`ABANDONED_DOWNLOAD_GRACE`]
+/// is skipped even if `keep` is empty.
 pub fn reclaim_abandoned_downloads(directory: &Path, keep: &HashSet<PathBuf>) -> usize {
     reclaim_abandoned_downloads_older_than(directory, keep, ABANDONED_DOWNLOAD_GRACE)
 }
@@ -310,9 +309,7 @@ fn reclaim_abandoned_downloads_older_than(
         if !metadata.is_dir() {
             continue;
         }
-        if metadata
-            .modified()
-            .ok()
+        if newest_modified(&path)
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age < grace)
         {
@@ -323,6 +320,27 @@ fn reclaim_abandoned_downloads_older_than(
         }
     }
     removed
+}
+
+fn newest_modified(path: &Path) -> Option<SystemTime> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let mut newest = metadata.modified().ok();
+    if !metadata.is_dir() {
+        return newest;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return newest;
+    };
+    for entry in entries.flatten() {
+        let Some(child) = newest_modified(&entry.path()) else {
+            continue;
+        };
+        newest = Some(match newest {
+            Some(current) => current.max(child),
+            None => child,
+        });
+    }
+    newest
 }
 
 fn remove_path_if_present(path: &Path) -> Result<(), DownloadError> {
@@ -950,30 +968,39 @@ mod tests {
         fs::create_dir_all(&fresh_dir).unwrap();
         fs::create_dir_all(&drop_dir).unwrap();
         fs::create_dir_all(&ready_dir).unwrap();
-        fs::write(drop_dir.join("partial.bin"), b"x").unwrap();
+        fs::write(drop_dir.join("weights.partial"), b"x").unwrap();
         fs::write(ready_dir.join("config.json"), b"{}").unwrap();
+        // Directory mtime can stay old while a .partial is appended. Stamp
+        // both the dir and the file so this staging looks abandoned.
+        let stamped = drop_dir.join("weights.partial");
+        let status = std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(&drop_dir)
+            .arg(&stamped)
+            .status()
+            .expect("touch");
+        assert!(status.success());
         let mut keep = HashSet::new();
         keep.insert(keep_dir.clone());
-        // Fresh dirs (mtime now) survive even with an empty keep / zero grace
-        // would still keep them via the age gate; stale + not kept is dropped.
         assert_eq!(
             reclaim_abandoned_downloads_older_than(
                 &directory,
                 &keep,
                 Duration::from_secs(24 * 60 * 60)
             ),
-            0,
-            "same-day staging must not be swept"
+            1,
+            "stale .partial is abandoned; same-day staging is not"
         );
+        assert!(!drop_dir.exists());
+        assert!(fresh_dir.is_dir());
         assert_eq!(
             reclaim_abandoned_downloads_older_than(&directory, &keep, Duration::from_secs(0)),
-            2,
-            "keep listed, drop the other two .download dirs, never the ready pack"
+            1,
+            "keep listed, drop remaining .download, never the ready pack"
         );
         assert!(keep_dir.is_dir());
         assert!(ready_dir.is_dir(), "installed pack must not be touched");
         assert!(!fresh_dir.exists());
-        assert!(!drop_dir.exists());
         let _ = fs::remove_dir_all(&directory);
     }
 
