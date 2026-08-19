@@ -54,20 +54,28 @@ final class ArtifactAudioPlaybackSessionTests: XCTestCase {
         XCTAssertNil(session.artifactID)
     }
 
-    func testToggleOnTheSameMomentPausesAndResumes() {
+    func testTogglePausesAndResumesRegardlessOfFrame() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1", offset: 4)
+        let generation = session.beginPlay(artifactID: "audio-1")
         XCTAssertTrue(session.finishLoad(generation: generation))
 
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 4, hasPlayer: true),
+            session.toggleDecision(artifactID: "audio-1", hasPlayer: true),
+            .pause
+        )
+        XCTAssertEqual(
+            session.toggleDecision(artifactID: "audio-2", hasPlayer: true),
             .pause
         )
 
         session.pause()
         XCTAssertEqual(session.phase, .paused)
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 4.2, hasPlayer: true),
+            session.toggleDecision(artifactID: "audio-1", hasPlayer: true),
+            .resume
+        )
+        XCTAssertEqual(
+            session.toggleDecision(artifactID: "other", hasPlayer: true),
             .resume
         )
 
@@ -75,59 +83,22 @@ final class ArtifactAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(session.isPlaying)
     }
 
-    func testToggleUsesOriginOffsetNotDecoderCurrentTime() {
-        var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1", offset: 2)
-        XCTAssertTrue(session.finishLoad(generation: generation))
-
-        // After a couple of seconds of playback the decoder clock has walked
-        // off the moment, but the button is still "this moment". That used to
-        // be read as a seek, so pause never stuck and resume always rewound.
-        XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 2, hasPlayer: true),
-            .pause
-        )
-
-        session.pause()
-        XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 2, hasPlayer: true),
-            .resume
-        )
-    }
-
-    func testToggleOnADifferentMomentSeeksInsteadOfPausing() {
-        var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1", offset: 2)
-        XCTAssertTrue(session.finishLoad(generation: generation))
-
-        XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 8, hasPlayer: true),
-            .seekAndPlay(8)
-        )
-
-        session.pause()
-        XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 8, hasPlayer: true),
-            .seekAndPlay(8)
-        )
-    }
-
     func testToggleWhileBufferingCancelsViaDecision() {
         var session = ArtifactAudioPlaybackSession()
-        _ = session.beginPlay(artifactID: "audio-1", offset: 1)
+        _ = session.beginPlay(artifactID: "audio-1")
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 1, hasPlayer: false),
+            session.toggleDecision(artifactID: "audio-1", hasPlayer: false),
             .cancelBuffering
         )
     }
 
     func testToggleWithoutAPlayerReloads() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1", offset: 1)
+        let generation = session.beginPlay(artifactID: "audio-1")
         XCTAssertTrue(session.finishLoad(generation: generation))
         session.pause()
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", offset: 1, hasPlayer: false),
+            session.toggleDecision(artifactID: "audio-1", hasPlayer: false),
             .loadAndPlay
         )
     }
@@ -218,6 +189,26 @@ final class ArtifactAudioPlayerTests: XCTestCase {
         XCTAssertFalse(player.isBuffering)
         XCTAssertTrue(player.isPlaying)
         XCTAssertEqual(player.playingArtifactID, "audio-1")
+    }
+
+    func testToggleIgnoresAMovedPlayhead() async throws {
+        let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav())
+        let player = ArtifactAudioPlayer(repository: RecallImageRepository(daemon: daemon))
+        let start = moment(capturedAtMs: 1_000, startedAtMs: 1_000, audioID: "audio-1")
+        let later = moment(capturedAtMs: 8_000, startedAtMs: 1_000, audioID: "audio-1")
+
+        player.play(moment: start)
+        try await waitUntil(player.isPlaying, timeoutMs: 400)
+        let generation = player.generation
+
+        player.toggle(moment: later)
+        XCTAssertFalse(player.isPlaying)
+        XCTAssertEqual(player.generation, generation)
+
+        player.toggle(moment: later)
+        XCTAssertTrue(player.isPlaying)
+        XCTAssertFalse(player.isBuffering)
+        XCTAssertEqual(player.generation, generation)
     }
 
     func testRepeatedPausePlayStaysOnTheSameSession() async throws {

@@ -2248,7 +2248,7 @@ private struct TranscriptCaption: View {
     private var playHelp: String {
         if isBuffering { return "Cancel audio" }
         if isPlaying { return "Pause audio" }
-        return "Play audio from this moment"
+        return "Play audio"
     }
 
     var body: some View {
@@ -2479,7 +2479,7 @@ private struct RecallDetailsMenu: View {
     private func detailsAudioTitle(isThis: Bool) -> String {
         if isThis && isAudioBuffering { return "Cancel audio" }
         if isThis && isAudioPlaying { return "Pause audio" }
-        return "Play from this moment"
+        return "Play audio"
     }
 
     private func detailsAudioSymbol(isThis: Bool) -> String {

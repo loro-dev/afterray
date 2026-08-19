@@ -11,50 +11,30 @@ struct ArtifactAudioPlaybackSession: Equatable, Sendable {
         case paused
     }
 
-    /// How close two moment offsets must be to count as "the same moment".
-    /// This is compared against the last *requested* origin, never against
-    /// `AVAudioPlayer.currentTime` — that clock walks forward while audio
-    /// plays, so a 1.5s slop against it made pause stop working after the
-    /// first second and a half.
-    static let momentSlop: TimeInterval = 1.5
-
     private(set) var phase: Phase = .idle
     private(set) var artifactID: String?
     private(set) var generation: UInt64 = 0
-    /// Offset we last started or seeked to — the selected moment.
-    private(set) var originOffset: TimeInterval = 0
 
     var isPlaying: Bool { phase == .playing }
     var isBuffering: Bool { phase == .buffering }
 
-    func isSameMoment(offset: TimeInterval) -> Bool {
-        abs(originOffset - offset) < Self.momentSlop
-    }
-
-    /// What a play/pause click should do. Pure so the 1.5s slop cannot drift
-    /// between the player and its tests.
-    func toggleDecision(
-        artifactID: String,
-        offset: TimeInterval,
-        hasPlayer: Bool
-    ) -> ArtifactAudioToggleDecision {
+    /// Play/pause is a transport key: playing → pause, paused → resume.
+    /// The selected frame is ignored. Offset is only used when a session
+    /// first loads, not on later clicks.
+    func toggleDecision(artifactID: String, hasPlayer: Bool) -> ArtifactAudioToggleDecision {
         if phase == .buffering, self.artifactID == artifactID {
             return .cancelBuffering
         }
-        guard self.artifactID == artifactID, hasPlayer, phase == .playing || phase == .paused else {
+        guard hasPlayer, phase == .playing || phase == .paused else {
             return .loadAndPlay
         }
-        if isSameMoment(offset: offset) {
-            return phase == .playing ? .pause : .resume
-        }
-        return .seekAndPlay(offset)
+        return phase == .playing ? .pause : .resume
     }
 
     @discardableResult
-    mutating func beginPlay(artifactID: String, offset: TimeInterval = 0) -> UInt64 {
+    mutating func beginPlay(artifactID: String) -> UInt64 {
         generation &+= 1
         self.artifactID = artifactID
-        originOffset = offset
         phase = .buffering
         return generation
     }
@@ -81,10 +61,6 @@ struct ArtifactAudioPlaybackSession: Equatable, Sendable {
         phase = .playing
     }
 
-    mutating func noteSeek(to offset: TimeInterval) {
-        originOffset = offset
-    }
-
     mutating func stop() {
         generation &+= 1
         resetKeepingGeneration()
@@ -100,7 +76,6 @@ struct ArtifactAudioPlaybackSession: Equatable, Sendable {
     private mutating func resetKeepingGeneration() {
         phase = .idle
         artifactID = nil
-        originOffset = 0
     }
 }
 
@@ -108,7 +83,6 @@ enum ArtifactAudioToggleDecision: Equatable, Sendable {
     case cancelBuffering
     case pause
     case resume
-    case seekAndPlay(TimeInterval)
     case loadAndPlay
 }
 
@@ -128,7 +102,7 @@ public final class ArtifactAudioPlayer: NSObject, ObservableObject, RecallAudioP
     private var prefetchTask: Task<Void, Never>?
     private var prefetchArtifactID: String?
     /// AAC `AVAudioPlayer` can fire `audioPlayerDidFinishPlaying` immediately
-    /// after a paused seek. Ignore those until the decoder has had a beat.
+    /// after a paused `play()`. Ignore those until the decoder has had a beat.
     private var ignoreFinishUntil: Date?
 
     public init(repository: RecallImageRepository) {
@@ -137,10 +111,8 @@ public final class ArtifactAudioPlayer: NSObject, ObservableObject, RecallAudioP
 
     public func toggle(moment: RecallMoment) {
         guard let artifactID = moment.audioArtifactId else { return }
-        let offset = Self.offset(for: moment)
         switch session.toggleDecision(
             artifactID: artifactID,
-            offset: offset,
             hasPlayer: player != nil
         ) {
         case .cancelBuffering:
@@ -153,36 +125,17 @@ public final class ArtifactAudioPlayer: NSObject, ObservableObject, RecallAudioP
             pause()
         case .resume:
             resumeInPlace(fallback: moment)
-        case .seekAndPlay:
-            seekAndPlay(offset: offset, fallback: moment)
         case .loadAndPlay:
-            play(moment: moment)
+            startLoad(moment: moment)
         }
     }
 
     public func play(moment: RecallMoment) {
-        guard let artifactID = moment.audioArtifactId else { return }
-        let offset = Self.offset(for: moment)
-
-        if session.artifactID == artifactID, let player, !session.isBuffering {
-            if startEngine(player, seekTo: offset) {
-                session.noteSeek(to: offset)
-                session.resume()
-                publish()
-                return
-            }
+        if player != nil, !session.isBuffering, session.phase == .playing || session.phase == .paused {
+            resumeInPlace(fallback: moment)
+            return
         }
-
-        player?.stop()
-        player = nil
-
-        let request = session.beginPlay(artifactID: artifactID, offset: offset)
-        publish()
-
-        loadTask?.cancel()
-        loadTask = Task { [weak self] in
-            await self?.loadAndStart(artifactID: artifactID, offset: offset, generation: request)
-        }
+        startLoad(moment: moment)
     }
 
     public func pause() {
@@ -224,73 +177,57 @@ public final class ArtifactAudioPlayer: NSObject, ObservableObject, RecallAudioP
 
     private func resumeInPlace(fallback moment: RecallMoment) {
         guard let player else {
-            play(moment: moment)
+            startLoad(moment: moment)
             return
         }
-        // Resume first, seek never. Setting `currentTime` on a paused AAC
-        // player and then calling `play()` is the path that silently fails
-        // and leaves the button stuck on pause.
-        if startEngine(player, seekTo: nil) {
+        // Do not seek. Setting `currentTime` on a paused AAC player and then
+        // calling `play()` is the path that silently fails.
+        if startEngine(player) {
             session.resume()
             publish()
             return
         }
-        play(moment: moment)
+        startLoad(moment: moment)
     }
 
-    private func seekAndPlay(offset: TimeInterval, fallback moment: RecallMoment) {
-        guard let player else {
-            play(moment: moment)
-            return
+    private func startLoad(moment: RecallMoment) {
+        guard let artifactID = moment.audioArtifactId else { return }
+        let offset = Self.offset(for: moment)
+        player?.stop()
+        player = nil
+
+        let request = session.beginPlay(artifactID: artifactID)
+        publish()
+
+        loadTask?.cancel()
+        loadTask = Task { [weak self] in
+            await self?.loadAndStart(artifactID: artifactID, offset: offset, generation: request)
         }
-        if startEngine(player, seekTo: offset) {
-            session.noteSeek(to: offset)
-            session.resume()
-            publish()
-            return
-        }
-        play(moment: moment)
     }
 
-    /// Start (or restart) the decoder. Always `play()` before assigning
-    /// `currentTime`: AAC-in-M4A from capture refuses the inverse order
-    /// after `pause()`.
     @discardableResult
-    private func startEngine(_ existing: AVAudioPlayer, seekTo offset: TimeInterval?) -> Bool {
+    private func startEngine(_ existing: AVAudioPlayer) -> Bool {
         ignoreFinishUntil = Date().addingTimeInterval(0.35)
         existing.prepareToPlay()
-        let started = existing.play()
-        if started {
-            if let offset {
-                seek(existing, to: offset)
-                if !existing.isPlaying {
-                    existing.prepareToPlay()
-                    _ = existing.play()
-                }
-            }
-            if existing.isPlaying {
-                player = existing
-                return true
-            }
+        if existing.play(), existing.isPlaying {
+            player = existing
+            return true
         }
-        return rebuildEngine(seekTo: offset ?? existing.currentTime)
+        return rebuildEngine(at: existing.currentTime)
     }
 
     @discardableResult
-    private func rebuildEngine(seekTo offset: TimeInterval) -> Bool {
+    private func rebuildEngine(at offset: TimeInterval) -> Bool {
         guard let data = loadedData else { return false }
         do {
             let rebuilt = try AVAudioPlayer(data: data)
             rebuilt.delegate = self
             rebuilt.prepareToPlay()
             ignoreFinishUntil = Date().addingTimeInterval(0.35)
-            guard rebuilt.play() else { return false }
             seek(rebuilt, to: offset)
-            if !rebuilt.isPlaying {
-                _ = rebuilt.play()
-            }
+            guard rebuilt.play(), rebuilt.isPlaying else { return false }
             player = rebuilt
-            return rebuilt.isPlaying
+            return true
         } catch {
             return false
         }
@@ -307,7 +244,11 @@ public final class ArtifactAudioPlayer: NSObject, ObservableObject, RecallAudioP
             }
             loadedData = data
             newPlayer.delegate = self
-            if startEngine(newPlayer, seekTo: offset) {
+            newPlayer.prepareToPlay()
+            ignoreFinishUntil = Date().addingTimeInterval(0.35)
+            seek(newPlayer, to: offset)
+            if newPlayer.play(), newPlayer.isPlaying {
+                player = newPlayer
                 publish()
                 return
             }
@@ -348,10 +289,6 @@ public final class ArtifactAudioPlayer: NSObject, ObservableObject, RecallAudioP
         Task { @MainActor [weak self] in
             guard let self, self.player === finished else { return }
             if let until = self.ignoreFinishUntil, Date() < until {
-                // Spurious finish after a paused seek: snap back to paused
-                // rather than tearing the session down (the next click would
-                // otherwise reload, and a second click during that load
-                // cancelled it — the "click several times" loop).
                 if !finished.isPlaying, self.session.phase == .playing {
                     self.session.pause()
                     self.publish()
