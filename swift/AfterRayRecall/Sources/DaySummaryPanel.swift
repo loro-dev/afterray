@@ -25,13 +25,19 @@ private enum DaySummaryMetrics {
     static let iconLimit = 8
 }
 
-/// The history-summary panel is a virtualized list: `LazyVStack` only
-/// mounts the days (and their rows) in view, and the store pages older
-/// days from the daemon. Cross-row drag-select is not a text document —
-/// copy is structured (this slot, this day, all loaded days).
+/// The history-summary panel is an eager list. `LazyVStack` estimates
+/// off-screen rows at ~0 height, so a feed of wrapped titles makes the
+/// document height (and the scrollbar) jump on every recycle. Slot rows
+/// stay short enough that mounting the loaded pages is cheaper. The store
+/// still pages older days; load-more fires when the sentinel nears the
+/// viewport, not from `onAppear` (eager children appear immediately).
+/// Copy is structured (this slot, this day, all loaded days).
 public struct DaySummaryPanel: View {
+    fileprivate static let scrollSpace = "afterray.history-scroll"
+
     @State private var expandedSlotStarts: Set<Int64> = []
     @State private var followedSlot: Int64?
+    @State private var stickyChip: DayHeadingAnchor?
     var style: DaySummaryPanelStyle = .overlay
     var onPopOut: (() -> Void)? = nil
     let summaries: [DaySummary]
@@ -146,10 +152,7 @@ public struct DaySummaryPanel: View {
     private var historyList: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: style == .window) {
-                // Pinned headers: while a day's rows scroll, its date stays
-                // put at the top of the list — the reader always knows which
-                // day they are inside.
-                LazyVStack(alignment: .leading, spacing: 8, pinnedViews: [.sectionHeaders]) {
+                VStack(alignment: .leading, spacing: 8) {
                     ForEach(summaries, id: \.dayStartMs) { summary in
                         DaySummarySection(
                             summary: summary,
@@ -162,12 +165,23 @@ public struct DaySummaryPanel: View {
                         .id(summary.dayStartMs)
                     }
                     if hasMore {
-                        HistorySummaryLoadTrigger(isLoading: isLoadingMore, onAppear: onLoadMore)
+                        HistorySummaryLoadTrigger(isLoading: isLoadingMore)
+                            .background {
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: HistoryScrollMetricsKey.self,
+                                        value: HistoryScrollMetrics(
+                                            triggerMinY: geo.frame(in: .named(Self.scrollSpace)).minY
+                                        )
+                                    )
+                                }
+                            }
                     }
                 }
                 .padding(.horizontal, 6)
                 .padding(.bottom, 8)
             }
+            .coordinateSpace(name: Self.scrollSpace)
             .overlay(alignment: .topLeading) {
                 Rectangle()
                     .fill(Color.white.opacity(0.09))
@@ -175,10 +189,49 @@ public struct DaySummaryPanel: View {
                     .padding(.leading, 6 + DaySummaryMetrics.spineX)
                     .allowsHitTesting(false)
             }
+            .overlay(alignment: .topLeading) {
+                if let stickyChip {
+                    Text(stickyChip.label)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(
+                            stickyChip.isToday
+                                ? RecallPalette.ray.opacity(0.9)
+                                : .white.opacity(0.62)
+                        )
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.96),
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        )
+                        .padding(.leading, 6 + DaySummaryMetrics.textX)
+                        .padding(.top, 4)
+                        .allowsHitTesting(false)
+                        .animation(nil, value: stickyChip.label)
+                }
+            }
             .frame(
                 maxHeight: style == .overlay ? RecallGeometry.daySummaryListMaxHeight : .infinity
             )
+            .background {
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: HistoryScrollMetricsKey.self,
+                        value: HistoryScrollMetrics(viewportHeight: geo.size.height)
+                    )
+                }
+            }
             .background(ScrollFenceView())
+            .onPreferenceChange(HistoryScrollMetricsKey.self) { metrics in
+                guard HistoryLoadMore.isNearBottom(
+                    triggerMinY: metrics.triggerMinY,
+                    viewportHeight: metrics.viewportHeight
+                ) else { return }
+                if hasMore, !isLoadingMore { onLoadMore() }
+            }
+            .onPreferenceChange(DayHeadingAnchorKey.self) { anchors in
+                stickyChip = HistoryStickyHeading.chip(from: anchors)
+            }
             .onAppear { follow(proxy, settle: true) }
             .onChange(of: highlightedSlotStart) { _, _ in
                 follow(proxy, settle: false)
@@ -198,8 +251,8 @@ public struct DaySummaryPanel: View {
         ) else { return }
         // The user reading the panel outranks the playhead.
         if ScrollFenceRegistry.shared.pointerInsideAnyFence() { return }
-        // LazyVStack cannot scroll to a row inside an unmaterialised day
-        // section; target the section first so its rows exist, then the row.
+        // Target the day first so a playhead jump across an unmounted
+        // page still has a header to land on, then the slot.
         if let current,
            let day = summaries.first(where: {
                DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots) != nil
@@ -241,11 +294,36 @@ private struct DaySummarySection: View {
     }
 
     var body: some View {
-        // A real Section: `pinnedViews: [.sectionHeaders]` can only pin a
-        // Section's header, so the date stays visible while its rows scroll
-        // beneath it. The header wears an opaque backdrop for exactly that
-        // moment of overlap.
-        Section {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(DaySummaryLayout.headingLabel(heading))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(
+                    heading.isToday ? RecallPalette.ray.opacity(0.9) : .white.opacity(0.55)
+                )
+                .padding(.leading, DaySummaryMetrics.textX)
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background {
+                    GeometryReader { geo in
+                        Color.clear.preference(
+                            key: DayHeadingAnchorKey.self,
+                            value: [
+                                DayHeadingAnchor(
+                                    dayStartMs: summary.dayStartMs,
+                                    label: DaySummaryLayout.headingLabel(heading),
+                                    isToday: heading.isToday,
+                                    minY: geo.frame(in: .named(DaySummaryPanel.scrollSpace)).minY
+                                ),
+                            ]
+                        )
+                    }
+                }
+                .contextMenu {
+                    Button("Copy This Day") {
+                        copyToPasteboard(DaySummaryClipboard.dayText(summary))
+                    }
+                }
+
             if visibleSlots.isEmpty {
                 Text("No recordings")
                     .font(.system(size: 11))
@@ -264,21 +342,6 @@ private struct DaySummarySection: View {
                     .id(slot.slotStartMs)
                 }
             }
-        } header: {
-            Text(DaySummaryLayout.headingLabel(heading))
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(
-                    heading.isToday ? RecallPalette.ray.opacity(0.9) : .white.opacity(0.55)
-                )
-                .padding(.leading, DaySummaryMetrics.textX)
-                .padding(.vertical, 5)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.94))
-                .contextMenu {
-                    Button("Copy This Day") {
-                        copyToPasteboard(DaySummaryClipboard.dayText(summary))
-                    }
-                }
         }
     }
 }
@@ -441,9 +504,58 @@ private struct DaySummaryPanelChrome: ViewModifier {
     }
 }
 
+/// Whether the load-more sentinel is close enough to the visible scroller
+/// that the next page should be fetched. `triggerMinY` is the sentinel's
+/// top edge in the scroll view's named space (0 is the visible top).
+enum HistoryLoadMore {
+    static let lead: CGFloat = 400
+
+    static func isNearBottom(triggerMinY: CGFloat, viewportHeight: CGFloat) -> Bool {
+        viewportHeight > 0 && triggerMinY < viewportHeight + lead
+    }
+}
+
+/// A compact chip, not a full-width pinned bar: AppKit images in slot rows
+/// composite above a `Section` header, which is what made the sticky date
+/// look like icons sitting on a black strip.
+struct DayHeadingAnchor: Equatable {
+    var dayStartMs: Int64
+    var label: String
+    var isToday: Bool
+    var minY: CGFloat
+}
+
+enum HistoryStickyHeading {
+    /// The day's in-flow heading that just left the top. Nil while that
+    /// heading is still on screen — the chip must not duplicate it.
+    static func chip(from anchors: [DayHeadingAnchor]) -> DayHeadingAnchor? {
+        anchors.filter { $0.minY < 0 }.max { $0.minY < $1.minY }
+    }
+}
+
+private struct HistoryScrollMetrics: Equatable {
+    var viewportHeight: CGFloat = 0
+    var triggerMinY: CGFloat = .infinity
+}
+
+private struct HistoryScrollMetricsKey: PreferenceKey {
+    static var defaultValue = HistoryScrollMetrics()
+    static func reduce(value: inout HistoryScrollMetrics, nextValue: () -> HistoryScrollMetrics) {
+        let next = nextValue()
+        if next.viewportHeight > 0 { value.viewportHeight = next.viewportHeight }
+        if next.triggerMinY.isFinite { value.triggerMinY = next.triggerMinY }
+    }
+}
+
+private struct DayHeadingAnchorKey: PreferenceKey {
+    static var defaultValue: [DayHeadingAnchor] = []
+    static func reduce(value: inout [DayHeadingAnchor], nextValue: () -> [DayHeadingAnchor]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
 private struct HistorySummaryLoadTrigger: View {
     let isLoading: Bool
-    let onAppear: () -> Void
 
     var body: some View {
         Group {
@@ -454,9 +566,7 @@ private struct HistorySummaryLoadTrigger: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
             } else {
-                Color.clear
-                    .frame(height: 1)
-                    .onAppear(perform: onAppear)
+                Color.clear.frame(height: 1)
             }
         }
         .accessibilityLabel(isLoading ? "Loading older summaries" : "Load older summaries")

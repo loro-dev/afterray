@@ -55,8 +55,8 @@ public struct RecallView: View {
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
     public var daySummary: DaySummary
-    /// Newest first; the history panel's LazyVStack only instantiates visible
-    /// sections while the store pages older days from the daemon.
+    /// Newest first; the history panel mounts loaded days eagerly while the
+    /// store pages older days from the daemon.
     public var summaryHistory: [DaySummary]
     public var summaryHistoryHasMore: Bool
     public var isLoadingSummaryHistory: Bool
