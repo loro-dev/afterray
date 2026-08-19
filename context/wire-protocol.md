@@ -41,5 +41,6 @@ AfterRay has **three separate JSON protocols**: the versioned control socket bet
 - **stdout of every worker is protocol-only** — a stray `print` kills the job as invalid output (there is a regression test for this). Logs go to stderr (`WorkerLog` in Swift).
 - `$TMPDIR/afterray-v0.sock` is the **retired** socket default. Never fall back to `$TMPDIR` (world-writable, pre-bindable), and never key dev-socket detection off the working directory — only off the executable path. The Swift client's last-resort `$TMPDIR` fallback is dead in practice (the app always passes a path explicitly); don't "fix" Rust to match it.
 - Dead-but-present wire surface: `Request::FavoriteSet` (daemon replies "favorites are disabled", main.rs:676), `PackStatus.keep_stills` (always false), `LlmProvider` labels `builtin`/`local` (retired GGUF backends, kept decode-only).
+- `PackStatus` also carries `ready_frames` and `one_frame_segments` (additive defaults): mean frames/GOP is `ready_frames / ready_segments`. A rising `one_frame_segments` share means the per-resolution fold regressed.
 - Fixture JSON in daemon tests shows `"protocol_version": 1` — that is test data, not the real version.
 - `afterray download` bypasses the daemon and uses `afterray-models` directly — intentional, not a bug.

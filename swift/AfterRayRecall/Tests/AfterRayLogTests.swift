@@ -24,6 +24,28 @@ final class AfterRayLogTests: XCTestCase {
         XCTAssertTrue(snapshot.diskShareText.contains("disk"))
     }
 
+    func testStorageMeasureDoesNotDoubleCountNestedModels() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("afterray-storage-\(UUID().uuidString)", isDirectory: true)
+        let models = root.appendingPathComponent("Models", isDirectory: true)
+        let artifacts = root.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try Data(repeating: 1, count: 1_000).write(to: artifacts.appendingPathComponent("a.bin"))
+        try Data(repeating: 2, count: 4_000).write(to: models.appendingPathComponent("m.bin"))
+
+        let snapshot = AfterRayStorageSnapshot.measure(
+            dataDirectory: root,
+            modelDirectory: models,
+            runtimeDirectory: root.appendingPathComponent("mlx-runtime", isDirectory: true)
+        )
+        XCTAssertEqual(snapshot.vaultBytes, 1_000)
+        XCTAssertEqual(snapshot.modelBytes, 4_000)
+        XCTAssertEqual(snapshot.afterrayBytes, 5_000)
+    }
+
     func testLogDirectoryIsStable() {
         let first = AfterRayLog.directory
         let second = AfterRayLog.directory

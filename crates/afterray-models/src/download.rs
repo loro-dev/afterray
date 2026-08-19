@@ -7,6 +7,7 @@ use futures_util::StreamExt as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     fs::OpenOptions,
     io::{self, Read as _},
@@ -258,6 +259,70 @@ pub fn remove_pack(pack: &PackSpec) -> Result<(), DownloadError> {
         remove_path_if_present(&staging_path(&pack.path))?;
     }
     Ok(())
+}
+
+/// Staging directory for a pinned-snapshot download (`<name>.download`).
+#[must_use]
+pub fn staging_directory(pack: &PackSpec) -> PathBuf {
+    staging_path(&pack.path)
+}
+
+/// Staging dirs whose last write is newer than this are left alone.
+///
+/// Protects an in-flight `afterray download` (CLI does not talk to the daemon)
+/// and a same-day paused resume. Ready packs are never in this set: they do
+/// not end in `.download`.
+pub const ABANDONED_DOWNLOAD_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delete abandoned `<name>.download` directories that are not in `keep`.
+///
+/// Only the staging suffix is eligible — installed pack directories
+/// (`Qwen3.5-4B-MLX-4bit`) are never listed. Callers pass in-flight staging
+/// paths; anything modified inside [`ABANDONED_DOWNLOAD_GRACE`] is skipped
+/// even if `keep` is empty.
+pub fn reclaim_abandoned_downloads(directory: &Path, keep: &HashSet<PathBuf>) -> usize {
+    reclaim_abandoned_downloads_older_than(directory, keep, ABANDONED_DOWNLOAD_GRACE)
+}
+
+fn reclaim_abandoned_downloads_older_than(
+    directory: &Path,
+    keep: &HashSet<PathBuf>,
+    grace: Duration,
+) -> usize {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut removed = 0_usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".download") {
+            continue;
+        }
+        if keep.contains(&path) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        if metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < grace)
+        {
+            continue;
+        }
+        if remove_path_if_present(&path).is_ok() {
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
 }
 
 fn remove_path_if_present(path: &Path) -> Result<(), DownloadError> {
@@ -867,6 +932,49 @@ mod tests {
             partial_path(path),
             PathBuf::from("/tmp/models/weights.gguf.partial")
         );
+    }
+
+    #[test]
+    fn reclaim_drops_abandoned_staging_but_keeps_listed_and_fresh_ones() {
+        let directory = std::env::temp_dir().join(format!(
+            "afterray-reclaim-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let keep_dir = directory.join("QwenKeep.download");
+        let fresh_dir = directory.join("QwenFresh.download");
+        let drop_dir = directory.join("QwenDrop.download");
+        let ready_dir = directory.join("Qwen3.5-4B-MLX-4bit");
+        fs::create_dir_all(&keep_dir).unwrap();
+        fs::create_dir_all(&fresh_dir).unwrap();
+        fs::create_dir_all(&drop_dir).unwrap();
+        fs::create_dir_all(&ready_dir).unwrap();
+        fs::write(drop_dir.join("partial.bin"), b"x").unwrap();
+        fs::write(ready_dir.join("config.json"), b"{}").unwrap();
+        let mut keep = HashSet::new();
+        keep.insert(keep_dir.clone());
+        // Fresh dirs (mtime now) survive even with an empty keep / zero grace
+        // would still keep them via the age gate; stale + not kept is dropped.
+        assert_eq!(
+            reclaim_abandoned_downloads_older_than(
+                &directory,
+                &keep,
+                Duration::from_secs(24 * 60 * 60)
+            ),
+            0,
+            "same-day staging must not be swept"
+        );
+        assert_eq!(
+            reclaim_abandoned_downloads_older_than(&directory, &keep, Duration::from_secs(0)),
+            2,
+            "keep listed, drop the other two .download dirs, never the ready pack"
+        );
+        assert!(keep_dir.is_dir());
+        assert!(ready_dir.is_dir(), "installed pack must not be touched");
+        assert!(!fresh_dir.exists());
+        assert!(!drop_dir.exists());
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

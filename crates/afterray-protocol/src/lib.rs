@@ -1176,6 +1176,14 @@ pub struct PackStatus {
     pub done_jobs: u64,
     pub failed_jobs: u64,
     pub ready_segments: u64,
+    /// Sum of `frame_count` over ready segments. Mean frames/GOP is
+    /// `ready_frames / ready_segments`.
+    #[serde(default)]
+    pub ready_frames: u64,
+    /// Ready segments with `frame_count = 1`. A rising share means the
+    /// per-resolution fold is not compounding.
+    #[serde(default)]
+    pub one_frame_segments: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

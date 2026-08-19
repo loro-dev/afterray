@@ -4,9 +4,13 @@ use crate::{StoreError, Vault};
 use afterray_protocol::{GopFrameView, GopSegmentView};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const IDLE_GAP_MS: i64 = 30_000;
+/// rav1e closed GOP only pays for itself with P-frames. A 1-frame "GOP" is a
+/// still-picture encode (~3s, ~30% of JPEG) and is skipped by the packer.
+pub const MIN_PACK_FRAMES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackPolicy {
@@ -102,37 +106,94 @@ pub struct GopPackJob {
     pub error: Option<String>,
 }
 
+/// Job and segment counts for `PackStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackStatusCounts {
+    pub running: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub ready: u64,
+    pub ready_frames: u64,
+    pub one_frame_segments: u64,
+}
+
 /// Fold pack candidates into closed-GOP runs.
 ///
-/// Walk wall-clock order and close a run on idle gap, resolution change, or
-/// `keyint`. App switches stay in the same GOP so A↔B flicker does not
-/// collapse into one-frame stills.
+/// One open run per `(width, height)`. App switches stay in the same GOP so
+/// A↔B flicker does not collapse into one-frame stills. Display-focus flicker
+/// across two monitors of different pixel sizes used to cut on every frame
+/// (`size_changed` on a single wall-clock stream); those frames now join the
+/// run for their own resolution.
+///
+/// A run closes when it hits `keyint`, or when the wall-clock stream is idle
+/// (`IDLE_GAP_MS` with no frame of any size). A hole filled only by the other
+/// resolution is not idle — the user was on the other display.
 #[must_use]
 pub fn fold_pack_runs(candidates: &[PackCandidate], keyint: u16) -> Vec<Vec<PackCandidate>> {
     let keyint = usize::from(keyint.max(1));
-    let mut runs = Vec::new();
-    let mut current: Vec<PackCandidate> = Vec::new();
+    let mut open: HashMap<(u32, u32), Vec<PackCandidate>> = HashMap::new();
+    let mut closed: Vec<Vec<PackCandidate>> = Vec::new();
+    let mut last_wall_ms: Option<i64> = None;
     for candidate in candidates {
-        if let Some(previous) = current.last() {
-            let idle = candidate
+        if let Some(previous_ms) = last_wall_ms
+            && candidate
                 .captured_at_ms
-                .saturating_sub(previous.captured_at_ms)
-                > IDLE_GAP_MS;
-            let size_changed =
-                candidate.width != previous.width || candidate.height != previous.height;
-            if idle || size_changed {
-                runs.push(std::mem::take(&mut current));
-            }
+                .saturating_sub(previous_ms)
+                > IDLE_GAP_MS
+        {
+            closed.extend(drain_open_runs(&mut open));
         }
-        current.push(candidate.clone());
-        if current.len() >= keyint {
-            runs.push(std::mem::take(&mut current));
+        last_wall_ms = Some(candidate.captured_at_ms);
+        let key = (candidate.width, candidate.height);
+        open.entry(key).or_default().push(candidate.clone());
+        if open.get(&key).is_some_and(|run| run.len() >= keyint)
+            && let Some(run) = open.remove(&key)
+        {
+            closed.push(run);
         }
     }
-    if !current.is_empty() {
-        runs.push(current);
-    }
-    runs
+    closed.extend(drain_open_runs(&mut open));
+    sort_runs_oldest_first(&mut closed);
+    closed
+}
+
+/// Oldest runnable GOP: skip 1-frame leftovers so they can join a later
+/// same-size neighbour instead of becoming still-picture IVF.
+#[must_use]
+pub fn first_packable_run(runs: Vec<Vec<PackCandidate>>) -> Option<Vec<PackCandidate>> {
+    runs.into_iter().find(|run| run.len() >= MIN_PACK_FRAMES)
+}
+
+/// Frames the packer will actually encode — share with `compute_backlog` so
+/// leftover singles cannot pin "start now" above zero.
+#[must_use]
+pub fn packable_frame_count(candidates: &[PackCandidate], keyint: u16) -> usize {
+    fold_pack_runs(candidates, keyint)
+        .into_iter()
+        .filter(|run| run.len() >= MIN_PACK_FRAMES)
+        .map(|run| run.len())
+        .sum()
+}
+
+fn drain_open_runs(
+    open: &mut HashMap<(u32, u32), Vec<PackCandidate>>,
+) -> Vec<Vec<PackCandidate>> {
+    open.drain()
+        .map(|(_, run)| run)
+        .filter(|run| !run.is_empty())
+        .collect()
+}
+
+fn sort_runs_oldest_first(runs: &mut [Vec<PackCandidate>]) {
+    runs.sort_by(|left, right| {
+        let left_key = left
+            .first()
+            .map(|frame| (frame.captured_at_ms, frame.id.as_str()));
+        let right_key = right
+            .first()
+            .map(|frame| (frame.captured_at_ms, frame.id.as_str()));
+        left_key.cmp(&right_key)
+    });
 }
 
 /// Which stills may be packed, as one predicate over `moments m`.
@@ -285,13 +346,27 @@ impl Vault {
         Ok(())
     }
 
-    pub fn pack_status_counts(&self) -> Result<(u64, u64, u64, u64), StoreError> {
+    pub fn pack_status_counts(&self) -> Result<PackStatusCounts, StoreError> {
         let connection = self.readers.get();
         let running = count_where(&connection, "gop_pack_jobs", "state = 'running'")?;
         let done = count_where(&connection, "gop_pack_jobs", "state = 'done'")?;
         let failed = count_where(&connection, "gop_pack_jobs", "state = 'failed'")?;
         let ready = count_where(&connection, "gop_segments", "status = 'ready'")?;
-        Ok((running, done, failed, ready))
+        let (ready_frames, one_frame_segments): (i64, i64) = connection.query_row(
+            "SELECT COALESCE(SUM(frame_count), 0),
+                    COALESCE(SUM(CASE WHEN frame_count = 1 THEN 1 ELSE 0 END), 0)
+               FROM gop_segments WHERE status = 'ready'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(PackStatusCounts {
+            running,
+            done,
+            failed,
+            ready,
+            ready_frames: u64::try_from(ready_frames).unwrap_or(0),
+            one_frame_segments: u64::try_from(one_frame_segments).unwrap_or(0),
+        })
     }
 
     pub fn commit_gop(&self, request: GopCommitRequest<'_>) -> Result<String, StoreError> {
@@ -701,5 +776,111 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a1", "b1", "a2", "b2", "a3", "b3"]
         );
+    }
+
+    #[test]
+    fn fold_interleaved_resolutions_into_two_long_runs() {
+        // Dual-monitor desk: capture follows the focused window's display.
+        let frames: Vec<_> = (0..12)
+            .map(|index| {
+                let mut frame = candidate(
+                    &format!("m{index}"),
+                    i64::from(index) * 10_000,
+                    "Chrome",
+                    "chrome",
+                );
+                if index % 2 == 0 {
+                    frame.width = 3456;
+                    frame.height = 2234;
+                } else {
+                    frame.width = 3840;
+                    frame.height = 2160;
+                }
+                frame
+            })
+            .collect();
+        let runs = fold_pack_runs(&frames, 30);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].len(), 6);
+        assert_eq!(runs[1].len(), 6);
+        assert!(runs[0].iter().all(|frame| frame.width == 3456));
+        assert!(runs[1].iter().all(|frame| frame.width == 3840));
+        assert_eq!(
+            first_packable_run(runs.clone())
+                .expect("both runs packable")
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn fold_does_not_idle_cut_when_the_other_resolution_fills_the_gap() {
+        let mut laptop = candidate("lap0", 0, "Code", "code");
+        laptop.width = 3456;
+        laptop.height = 2234;
+        let mut desk: Vec<_> = (1..=4)
+            .map(|index| {
+                let mut frame = candidate(
+                    &format!("desk{index}"),
+                    i64::from(index) * 10_000,
+                    "Chrome",
+                    "chrome",
+                );
+                frame.width = 3840;
+                frame.height = 2160;
+                frame
+            })
+            .collect();
+        let mut laptop_back = candidate("lap1", 50_000, "Code", "code");
+        laptop_back.width = 3456;
+        laptop_back.height = 2234;
+        let mut frames = vec![laptop];
+        frames.append(&mut desk);
+        frames.push(laptop_back);
+        let runs = fold_pack_runs(&frames, 30);
+        assert_eq!(runs.len(), 2);
+        let laptop_run = runs
+            .iter()
+            .find(|run| run.first().is_some_and(|frame| frame.width == 3456))
+            .expect("laptop run");
+        assert_eq!(
+            laptop_run
+                .iter()
+                .map(|frame| frame.id.as_str())
+                .collect::<Vec<_>>(),
+            ["lap0", "lap1"]
+        );
+    }
+
+    #[test]
+    fn first_packable_run_skips_one_frame_islands() {
+        let frames = [
+            {
+                let mut alone = candidate("alone", 0, "Code", "code");
+                alone.width = 3456;
+                alone.height = 2234;
+                alone
+            },
+            candidate("a", 10_000, "Chrome", "chrome"),
+            candidate("b", 20_000, "Chrome", "chrome"),
+        ];
+        let runs = fold_pack_runs(&frames, 30);
+        let packable = first_packable_run(runs).expect("chrome run");
+        assert_eq!(
+            packable
+                .iter()
+                .map(|frame| frame.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(packable_frame_count(&frames, 30), 2);
+    }
+
+    #[test]
+    fn packable_frame_count_ignores_a_lone_resolution() {
+        let mut alone = candidate("alone", 0, "Code", "code");
+        alone.width = 3456;
+        alone.height = 2234;
+        assert_eq!(packable_frame_count(&[alone], 30), 0);
     }
 }

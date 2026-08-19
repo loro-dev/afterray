@@ -14,6 +14,7 @@ Every accessibility snapshot (heartbeat `accessibility` and attached `accessibil
 
 - `mode` — `fullTree` (a keyframe, and the base of a chain), `diffFromPrevious` (a `TreeDiff` against the previous emission of the same chain), or `unchanged` (the fingerprint says nothing moved; no `text`). `unchanged` is spelled out rather than omitted so a reader can tell a static screen from a shim too old to encode trees.
 - `text` — the numbered indented render (`CaptureTreeText`) or the diff render (`TreeDiff`). Measured: a JSON tree runs ~200 KB per frame, these diffs have a 913 B median.
+- **Vault write:** `attach_accessibility_snapshot` / `insert_edge_snapshot` zstd-3 the JSON (`ax_compress.rs`). `root` is kept — OCR crop, T1, and acts-join still parse it. Readers decompress by magic; older uncompressed artifacts still open.
 - `chain` + `seq` — beyond the plan's `{mode, text}`, and load-bearing. Chains are **per window**, so a `diffFromPrevious` is taken against the previous emission *of its own chain*, which is not in general the previous artifact in time. A diff whose base cannot be named is not decodable; these name it (`seq` n decodes against n-1 of the same `chain`).
 
 ### Chains (`CaptureTreeChains`)

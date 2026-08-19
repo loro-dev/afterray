@@ -46,6 +46,7 @@ tokio = { version = "1.49", features = ["full"] }
 unicode-normalization = "0.1"
 uuid = { version = "1.20", features = ["v7", "serde"] }
 zeroize = "1.8"
+zstd = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

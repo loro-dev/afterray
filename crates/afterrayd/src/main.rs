@@ -18,7 +18,7 @@ use afterray_models::{
     PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID,
     QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig,
     download_packs_with_cancellation, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
-    qwen35_mlx_manifest, remove_pack, spec_by_id, specs_for_download,
+    qwen35_mlx_manifest, reclaim_abandoned_downloads, remove_pack, spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, InputEventRecord, MacOsCaptureBackend,
@@ -312,6 +312,14 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     settle_orphaned_turns(&state);
+    {
+        let removed = reclaim_abandoned_downloads(&model_directory(), &std::collections::HashSet::new());
+        if removed > 0 {
+            eprintln!(
+                "reclaimed {removed} abandoned model download staging dir(s) older than 24h"
+            );
+        }
+    }
     println!("afterrayd listening on {}", socket.display());
     tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
         Ok(0) => {}
@@ -2685,28 +2693,40 @@ async fn import_artifact(
                 | ArtifactKind::Accessibility
                 | ArtifactKind::AccessibilityEdge => afterray_protocol::AudioTrack::System,
             };
-            let session_id = session_id.to_owned();
-            let content_type = content_type.to_owned();
-            run_store(state, move |s| {
-                s.store.insert_audio_segment(
-                    &session_id,
-                    track,
-                    started_at_ms,
-                    ended_at_ms,
-                    &content_type,
-                    &bytes,
-                )
-            })
-            .await?;
-            // The encrypted segment is the durable queue. Plaintext exists
-            // again only while the sweeper owns a claimed ASR item.
-            if let Err(error) = tokio::fs::remove_file(path).await {
-                eprintln!(
-                    "could not remove imported audio staging file {}: {error}",
-                    path.display()
-                );
+            // Near-silent AAC (idle mic / empty system track) is not speech and
+            // is not searchable. Drop it before encryption so overnight desks
+            // do not accrue megabytes of room tone.
+            if is_near_silent_audio(bytes.len(), started_at_ms, ended_at_ms) {
+                if let Err(error) = tokio::fs::remove_file(path).await {
+                    eprintln!(
+                        "could not remove silent audio staging file {}: {error}",
+                        path.display()
+                    );
+                }
+            } else {
+                let session_id = session_id.to_owned();
+                let content_type = content_type.to_owned();
+                run_store(state, move |s| {
+                    s.store.insert_audio_segment(
+                        &session_id,
+                        track,
+                        started_at_ms,
+                        ended_at_ms,
+                        &content_type,
+                        &bytes,
+                    )
+                })
+                .await?;
+                // The encrypted segment is the durable queue. Plaintext exists
+                // again only while the sweeper owns a claimed ASR item.
+                if let Err(error) = tokio::fs::remove_file(path).await {
+                    eprintln!(
+                        "could not remove imported audio staging file {}: {error}",
+                        path.display()
+                    );
+                }
+                state.asr_changed.notify_one();
             }
-            state.asr_changed.notify_one();
         }
         ArtifactKind::Accessibility => {
             // A snapshot that will not parse names no app, and an unnamed app
@@ -5085,19 +5105,37 @@ fn read_moment_thumbnail(
     )))
 }
 
+/// Drop AAC that sits at measured digital silence (~1.3 kbps for an idle
+/// 5-minute system track). The shim writes 300s segments at 96 kbps when
+/// there is speech; averaging that against minutes of silence must not
+/// look like "no speech" — 20s of talk in a 5-minute file is ~6.4 kbps.
+/// Short clips are never dropped.
+fn is_near_silent_audio(byte_len: usize, started_at_ms: i64, ended_at_ms: i64) -> bool {
+    const SILENCE_BPS: u128 = 2_000;
+    let duration_ms = ended_at_ms.saturating_sub(started_at_ms);
+    if duration_ms < 30_000 {
+        return false;
+    }
+    let bits = u128::try_from(byte_len).unwrap_or(u128::MAX).saturating_mul(8);
+    let bps = bits.saturating_mul(1000) / u128::try_from(duration_ms).unwrap_or(1);
+    bps < SILENCE_BPS
+}
+
 fn pack_status(state: &AppState) -> Response {
     match state.store.pack_status_counts() {
-        Ok((running, done, failed, ready)) => Response::success(PackStatus {
+        Ok(counts) => Response::success(PackStatus {
             archive_enabled: state.packer.config.archive,
             keep_stills: false,
             keyint: state.packer.config.policy.keyint,
             encoder: "rav1e".to_owned(),
             hot_window_seconds: u64::try_from(state.packer.config.policy.hot_window_ms / 1000)
                 .unwrap_or(7200),
-            running_jobs: running,
-            done_jobs: done,
-            failed_jobs: failed,
-            ready_segments: ready,
+            running_jobs: counts.running,
+            done_jobs: counts.done,
+            failed_jobs: counts.failed,
+            ready_segments: counts.ready,
+            ready_frames: counts.ready_frames,
+            one_frame_segments: counts.one_frame_segments,
         }),
         Err(error) => Response::failure(error.to_string()),
     }
@@ -5125,6 +5163,19 @@ mod tests {
     use super::*;
 
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn near_silent_audio_drops_long_quiet_tracks_but_keeps_speech() {
+        // 48 KB over 5 minutes ≈ 1.3 kbps (idle system track).
+        assert!(is_near_silent_audio(48 * 1024, 0, 300_000));
+        // 2 MB over 5 minutes ≈ 53 kbps (mic with room tone / speech).
+        assert!(!is_near_silent_audio(2 * 1024 * 1024, 0, 300_000));
+        // A one-second utterance is small but real — never drop short clips.
+        assert!(!is_near_silent_audio(8 * 1024, 0, 1_000));
+        // 20s of 96 kbps speech + 280s idle in one 5-minute file ≈ 6.4 kbps.
+        let twenty_seconds_talk = 20 * 96_000 / 8;
+        assert!(!is_near_silent_audio(twenty_seconds_talk, 0, 300_000));
+    }
 
     /// T2 used to plan against `ContextBudget::DEFAULT` while chat measured the
     /// real window: on a 256k model the summariser wrote from a twelfth of the
@@ -6792,9 +6843,8 @@ mod tests {
         let mut multi_frame = None;
         for _ in 0..max_segments {
             let candidates = vault.list_pack_candidates(now, &policy).unwrap();
-            let Some(run) = afterray_store::fold_pack_runs(&candidates, 12)
-                .into_iter()
-                .next()
+            let Some(run) =
+                afterray_store::first_packable_run(afterray_store::fold_pack_runs(&candidates, 12))
             else {
                 break;
             };

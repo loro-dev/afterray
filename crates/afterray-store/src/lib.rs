@@ -49,6 +49,7 @@ use zeroize::{Zeroize, Zeroizing};
 mod activity;
 pub use activity::ActivityMomentRow;
 pub mod acts;
+mod ax_compress;
 mod gop;
 pub mod infoscore;
 mod jpeg;
@@ -57,8 +58,9 @@ pub mod search_index;
 mod slot;
 
 pub use gop::{
-    GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, PackCandidate,
-    PackPolicy, fold_pack_runs,
+    GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, MIN_PACK_FRAMES,
+    PackCandidate, PackPolicy, PackStatusCounts, first_packable_run, fold_pack_runs,
+    packable_frame_count,
 };
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
@@ -1380,7 +1382,8 @@ impl Vault {
             application_name,
             bundle_identifier,
         );
-        let artifact_id = self.put_artifact(content_type, snapshot)?;
+        let prepared = ax_compress::prepare_accessibility_artifact(snapshot);
+        let artifact_id = self.put_artifact(content_type, &prepared)?;
         let update_result = {
             let connection = self.connection.lock().unwrap();
             connection.execute(
@@ -2167,19 +2170,11 @@ impl Vault {
         now_ms: i64,
         policy: &PackPolicy,
     ) -> Result<ComputeBacklog, StoreError> {
+        let archive_stills = packable_frame_count(
+            &self.list_pack_candidates(now_ms, policy)?,
+            policy.keyint,
+        );
         let connection = self.readers.get();
-        let archive_stills: i64 = connection.query_row(
-            &format!(
-                "SELECT count(*) FROM moments m WHERE {}",
-                gop::PACK_CANDIDATE_PREDICATE
-            ),
-            params![
-                now_ms.saturating_sub(policy.hot_window_ms),
-                i64::try_from(policy.hot_min_stills).unwrap_or(i64::MAX),
-                now_ms.saturating_sub(policy.ocr_grace_ms),
-            ],
-            |row| row.get(0),
-        )?;
         let transcripts: i64 = connection.query_row(
             &format!(
                 "SELECT count(*) FROM audio_segments a WHERE {AUDIO_CLAIMABLE_PREDICATE}"
@@ -2211,7 +2206,7 @@ impl Vault {
             |row| row.get(0),
         )?;
         Ok(ComputeBacklog {
-            archive_stills: usize::try_from(archive_stills).unwrap_or(0),
+            archive_stills,
             transcripts: usize::try_from(transcripts).unwrap_or(0),
             unindexed_moments: usize::try_from(unindexed_moments).unwrap_or(0),
         })
@@ -3634,7 +3629,8 @@ impl Vault {
         captured_at_ms: i64,
         snapshot: &[u8],
     ) -> Result<EdgeSnapshotRow, StoreError> {
-        let artifact_id = self.put_artifact(EDGE_SNAPSHOT_CONTENT_TYPE, snapshot)?;
+        let prepared = ax_compress::prepare_accessibility_artifact(snapshot);
+        let artifact_id = self.put_artifact(EDGE_SNAPSHOT_CONTENT_TYPE, &prepared)?;
         let row = EdgeSnapshotRow {
             id: Uuid::now_v7().to_string(),
             captured_at_ms,
@@ -4411,7 +4407,7 @@ impl Vault {
             return Ok(ArtifactPayload {
                 id: id.to_owned(),
                 content_type,
-                bytes: bytes.to_vec(),
+                bytes: ax_compress::maybe_zstd_decompress(bytes.to_vec()),
             });
         }
         if format_version != ARTIFACT_FORMAT_VERSION {
@@ -4431,7 +4427,7 @@ impl Vault {
         Ok(ArtifactPayload {
             id: id.to_owned(),
             content_type,
-            bytes: bytes.to_vec(),
+            bytes: ax_compress::maybe_zstd_decompress(bytes.to_vec()),
         })
     }
 
@@ -6632,7 +6628,10 @@ mod tests {
         // pressing start leaves a count that never reaches zero.
         assert_eq!(
             backlog.archive_stills,
-            vault.list_pack_candidates(now, &policy).unwrap().len(),
+            packable_frame_count(
+                &vault.list_pack_candidates(now, &policy).unwrap(),
+                policy.keyint
+            ),
             "the archive count must match what the packer would actually pack"
         );
         assert_eq!(backlog.transcripts, 0);
@@ -7616,6 +7615,46 @@ mod tests {
             )
             .unwrap();
         assert!(too_late.is_none());
+    }
+
+    #[test]
+    fn accessibility_snapshot_keeps_root_and_zstd_round_trips() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 10_000, "image/jpeg", b"screen")
+            .unwrap();
+        let snapshot = br#"{
+            "application_name":"Chrome",
+            "bundle_identifier":"com.google.Chrome",
+            "tree_text":{"mode":"unchanged","chain":"c1","seq":4},
+            "root":{"role":"AXWindow","children":[{"role":"AXButton","title":"Send"}]}
+        }"#;
+        let artifact = vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                10_000,
+                "application/vnd.afterray.ax+json",
+                snapshot,
+                Some("Chrome"),
+                Some("com.google.Chrome"),
+            )
+            .unwrap()
+            .expect("attached");
+        let bytes = vault
+            .accessibility_bytes_for_moment(&moment.id)
+            .unwrap()
+            .expect("artifact readable");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["root"]["role"], "AXWindow", "OCR/T1 still need root");
+        assert_eq!(value["tree_text"]["mode"], "unchanged");
+        let on_disk = std::fs::metadata(vault.artifact_path(&artifact))
+            .unwrap()
+            .len();
+        assert!(
+            on_disk < u64::try_from(snapshot.len()).unwrap_or(u64::MAX),
+            "zstd should shrink the stored AX payload"
+        );
     }
 
     /// The point of the reader pool: a long write transaction must not stall

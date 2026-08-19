@@ -34,8 +34,9 @@ pub use context::{
 };
 pub use delta::{LlmDelta, LlmDeltaKind};
 pub use download::{
-    DownloadError, DownloadProgress, download_pack, download_packs,
-    download_packs_with_cancellation, remove_pack, set_huggingface_endpoint, verify_files,
+    ABANDONED_DOWNLOAD_GRACE, DownloadError, DownloadProgress, download_pack, download_packs,
+    download_packs_with_cancellation, reclaim_abandoned_downloads, remove_pack,
+    set_huggingface_endpoint, staging_directory, verify_files,
 };
 pub use persistent_mlx::{
     MLX_WORKER_PROTOCOL_VERSION, MlxWorkerHealth, PersistentMlxAdapter, PersistentMlxConfig,

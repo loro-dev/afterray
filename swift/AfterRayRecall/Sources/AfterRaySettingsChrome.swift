@@ -140,10 +140,21 @@ public struct AfterRayStorageSnapshot: Equatable, Sendable {
             .volumeAvailableCapacityForImportantUsageKey,
         ])
         let free = values?.volumeAvailableCapacityForImportantUsage ?? 0
+        let modelBytes = itemBytes(at: modelDirectory)
+        let runtimeBytes = itemBytes(at: runtimeDirectory)
+        // Packaged Models/ lives inside the data dir; subtract so the bar
+        // matches Finder instead of counting those bytes twice.
+        var vaultBytes = itemBytes(at: dataDirectory)
+        if isDescendant(modelDirectory, of: dataDirectory) {
+            vaultBytes = vaultBytes > modelBytes ? vaultBytes - modelBytes : 0
+        }
+        if isDescendant(runtimeDirectory, of: dataDirectory) {
+            vaultBytes = vaultBytes > runtimeBytes ? vaultBytes - runtimeBytes : 0
+        }
         return Self(
-            vaultBytes: itemBytes(at: dataDirectory),
-            modelBytes: itemBytes(at: modelDirectory),
-            runtimeBytes: itemBytes(at: runtimeDirectory),
+            vaultBytes: vaultBytes,
+            modelBytes: modelBytes,
+            runtimeBytes: runtimeBytes,
             volumeTotal: UInt64(values?.volumeTotalCapacity ?? 0),
             volumeFree: UInt64(max(free, 0))
         )
@@ -170,6 +181,15 @@ public struct AfterRayStorageSnapshot: Equatable, Sendable {
             }
         }
         return total
+    }
+
+    /// True when `child` is `parent` or lives under it (packaged Models/).
+    static func isDescendant(_ child: URL, of parent: URL) -> Bool {
+        let parentPath = parent.standardizedFileURL.path
+        let childPath = child.standardizedFileURL.path
+        if childPath == parentPath { return true }
+        let prefix = parentPath.hasSuffix("/") ? parentPath : parentPath + "/"
+        return childPath.hasPrefix(prefix)
     }
 
     public static func byteCount(_ bytes: UInt64) -> String {

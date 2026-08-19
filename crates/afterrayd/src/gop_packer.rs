@@ -6,7 +6,8 @@ use afterray_codec::{
 };
 use afterray_protocol::{ArtifactPayload, GopReadMode};
 use afterray_store::{
-    GopCommitFrame, GopCommitRequest, PackCandidate, PackPolicy, StoreError, Vault, fold_pack_runs,
+    GopCommitFrame, GopCommitRequest, PackCandidate, PackPolicy, StoreError, Vault,
+    first_packable_run, fold_pack_runs,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,7 +136,9 @@ impl GopPacker {
     fn pack_one_inner(&self, vault: &Vault, now_ms: i64) -> Result<Option<String>, anyhow::Error> {
         let candidates = vault.list_pack_candidates(now_ms, &self.config.policy)?;
         let runs = fold_pack_runs(&candidates, self.config.policy.keyint);
-        let Some(run) = runs.into_iter().next() else {
+        // 1-frame "GOPs" are still-picture encodes: leave the JPEG until a
+        // same-size neighbour ages into the cold window.
+        let Some(run) = first_packable_run(runs) else {
             return Ok(None);
         };
         let moment_ids: Vec<String> = run.iter().map(|frame| frame.id.clone()).collect();
