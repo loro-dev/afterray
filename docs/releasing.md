@@ -54,7 +54,11 @@ after building, and a release that skips it reaches nobody.
 The marketing version in `apps/AfterRay/Resources/Info.plist` must match
 `workspace.package.version` in `Cargo.toml`. It must also be new for every
 published release: versioned DMG and zip names are immutable-cached, so reusing
-a version could point a new appcast signature at an old archive. The release
+a version could point a new appcast signature at an old archive. After those
+two files change, refresh **only** the workspace crate versions in
+`Cargo.lock` (the `afterray-*` packages) and commit that too. `make release`
+builds with `--locked`; a stale lockfile fails immediately. Do not run
+`cargo generate-lockfile` — it also rewrites transitive versions. The release
 script requires a clean Git worktree so the artifact maps to one source commit.
 
 `CFBundleVersion` is not maintained by hand. The source plist holds a
@@ -85,8 +89,10 @@ AFTERRAY_NOTARY_PROFILE='<notary profile>' \
 make release
 ```
 
-The script auto-detects the first `Developer ID Application` identity. To pick
-one explicitly, set `AFTERRAY_CODESIGN_IDENTITY` to its full name or SHA-1:
+If several `Developer ID Application` identities are installed, do not take
+the first listed. Set `AFTERRAY_CODESIGN_IDENTITY` to the identity that
+signed the last published `dist/AfterRay-<previous>-arm64/AfterRay.app`.
+The script only auto-detects when the variable is unset.
 
 Do not commit the concrete values used above. They are local Keychain and
 certificate configuration, not project configuration.
