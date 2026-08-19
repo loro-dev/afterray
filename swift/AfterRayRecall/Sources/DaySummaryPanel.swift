@@ -325,7 +325,7 @@ private struct DaySummaryRow: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Open this slot in the timeline")
+            .help(copy.recall.openThisSlot)
             .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -451,6 +451,7 @@ private struct DaySummaryPanelChrome: ViewModifier {
 }
 
 private struct HistorySummaryLoadTrigger: View {
+    @Environment(\.afterRayCopy) private var copy
     let isLoading: Bool
     let onAppear: () -> Void
 
@@ -468,7 +469,7 @@ private struct HistorySummaryLoadTrigger: View {
                     .onAppear(perform: onAppear)
             }
         }
-        .accessibilityLabel(isLoading ? "Loading older summaries" : "Load older summaries")
+        .accessibilityLabel(isLoading ? copy.recall.loadingOlderSummaries : copy.recall.loadOlderSummaries)
     }
 }
 
@@ -476,6 +477,7 @@ private struct HistorySummaryLoadTrigger: View {
 /// icon cannot resolve (uninstalled since capture) collapses to nothing —
 /// an empty placeholder square only says "something failed here".
 private struct SlotAppIconStrip: View {
+    @Environment(\.afterRayCopy) private var copy
     let apps: [DayAppFact]
 
     var body: some View {
@@ -489,7 +491,7 @@ private struct SlotAppIconStrip: View {
                     .foregroundStyle(.white.opacity(0.35))
             }
         }
-        .accessibilityLabel("Apps used: \(apps.map(\.name).joined(separator: ", "))")
+        .accessibilityLabel(copy.recall.appsUsed(apps.map(\.name).joined(separator: ", ")))
     }
 }
 

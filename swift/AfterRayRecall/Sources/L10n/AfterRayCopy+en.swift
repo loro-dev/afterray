@@ -320,7 +320,13 @@ extension AfterRayCopy {
             capabilityOcr: "Screen text",
             capabilityEmbedding: "Search index",
             capabilityLlm: "Assistant",
-            capabilitySummary: "Summaries"
+            capabilitySummary: "Summaries",
+            cliInstalledOnPath: { "Installed at \($0) and available on PATH." },
+            cliInstalledNeedPath: { "Installed at \($0). Add ~/.local/bin to your PATH." },
+            cliNotInstalledAgents: "Not installed. Other AI agents cannot call `afterray` yet.",
+            cliBinaryMissing: "Could not find the afterray CLI binary in the app bundle. Rebuild AfterRay and try again.",
+            hoursShort: { "\($0) hr" },
+            hoursAndMinutes: { hours, minutes in "\(hours) hr \(minutes) min" }
         ),
         recall: Recall(
             understanding: "Understanding",
@@ -366,7 +372,18 @@ extension AfterRayCopy {
             copyThisSlot: "Copy This Slot",
             nothingRecorded: "Nothing recorded yet.",
             pastDaysWillAppear: "Your past days will appear here as AfterRay captures them.",
-            noRecordings: "No recordings"
+            noRecordings: "No recordings",
+            openURL: { "Open \($0)" },
+            openAt: { text, display in "Open \(text) (\(display))" },
+            appsUsed: { "Apps used: \($0)" },
+            swipeToHistory: "Swipe right to enter history",
+            dragToZoom: "Drag left to zoom out, right to zoom in",
+            openThisSlot: "Open this slot in the timeline",
+            loadingOlderSummaries: "Loading older summaries",
+            loadOlderSummaries: "Load older summaries",
+            pausing: "Pausing",
+            offline: "Offline",
+            recording: "Recording"
         ),
         chat: Chat(
             loading: "Loading…",
@@ -395,7 +412,12 @@ extension AfterRayCopy {
             thoughtItThrough: "Thought it through",
             shortened: "shortened",
             streaming: "streaming",
-            code: "code"
+            code: "code",
+            thinking: "Thinking",
+            working: "Working",
+            send: "Send",
+            deleteConversation: "Delete this conversation",
+            goToLatest: "Go to latest"
         ),
         compute: Compute(
             windowTitle: "Local Computation",
@@ -439,8 +461,8 @@ extension AfterRayCopy {
             load: "Load",
             unavailable: "unavailable",
             thermal: { "level \($0)" },
-            onBatteryNote: "On battery, summaries and archive compression stand down, and transcription runs more slowly.",
-            overlayOpenNote: "The AfterRay overlay is open, so capture is paused and the machine is treated as busy.",
+            onBatteryNote: "On battery, summaries and archive compression stand down, and transcription slows to a fifth of its usual pace. Screen text keeps up.",
+            overlayOpenNote: "The AfterRay overlay is open, so capture is paused and the machine counts as in use — summaries wait for you to step away.",
             nothingToSuspend: "Nothing to suspend — local computation is already switched off",
             suspendHelp: "Stops taking new background work; anything mid-flight finishes",
             chatAlwaysRuns: "Chat and anything you are waiting on always runs, whatever is set here.",
@@ -464,7 +486,23 @@ extension AfterRayCopy {
             batteryAbove: { "Battery above \($0)%" },
             idleFor: { "Idle for \($0)s" },
             lastInput: { "last input \($0)s ago" },
-            loadBelow: { "Load below \($0)/core" }
+            loadBelow: { "Load below \($0)/core" },
+            thermalName: "Thermal",
+            runningNowAtRequest: "running now at your request",
+            heldShort: "held",
+            conditionsHelp: "What has to be true for this to start on its own",
+            noBatteryToConserve: "no battery to conserve",
+            unreadableBusy: "unreadable — treated as busy"
+        ),
+        hotKey: HotKey(
+            spotlightConflict: "macOS gives ⌘Space to Spotlight, so it may never reach AfterRay.",
+            inputSourceConflict: "macOS gives ⌃Space to input sources, so it may never reach AfterRay.",
+            needsModifier: "Hold ⌘, ⌥ or ⌃ too — otherwise this would fire while you type.",
+            commandAlone: { "\($0) already belongs to other apps. Add ⇧, ⌥ or ⌃ to make it yours." },
+            unsupportedKey: "That key can't anchor a shortcut. Try another one.",
+            recordNew: "Record a new shortcut",
+            shortcutActivate: { "Shortcut \($0). Activate to record a new one." },
+            pressKeys: "Press the keys you want"
         )
     )
 }

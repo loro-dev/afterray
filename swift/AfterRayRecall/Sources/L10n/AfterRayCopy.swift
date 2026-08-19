@@ -10,6 +10,7 @@ public struct AfterRayCopy {
     public var recall: Recall
     public var chat: Chat
     public var compute: Compute
+    public var hotKey: HotKey
 }
 
 extension AfterRayCopy {
@@ -339,6 +340,12 @@ extension AfterRayCopy {
         public var capabilityEmbedding: String
         public var capabilityLlm: String
         public var capabilitySummary: String
+        public var cliInstalledOnPath: (String) -> String
+        public var cliInstalledNeedPath: (String) -> String
+        public var cliNotInstalledAgents: String
+        public var cliBinaryMissing: String
+        public var hoursShort: (Int) -> String
+        public var hoursAndMinutes: (Int, Int) -> String
     }
 
     public struct Recall {
@@ -386,6 +393,17 @@ extension AfterRayCopy {
         public var nothingRecorded: String
         public var pastDaysWillAppear: String
         public var noRecordings: String
+        public var openURL: (String) -> String
+        public var openAt: (String, String) -> String
+        public var appsUsed: (String) -> String
+        public var swipeToHistory: String
+        public var dragToZoom: String
+        public var openThisSlot: String
+        public var loadingOlderSummaries: String
+        public var loadOlderSummaries: String
+        public var pausing: String
+        public var offline: String
+        public var recording: String
     }
 
     public struct Chat {
@@ -416,6 +434,11 @@ extension AfterRayCopy {
         public var shortened: String
         public var streaming: String
         public var code: String
+        public var thinking: String
+        public var working: String
+        public var send: String
+        public var deleteConversation: String
+        public var goToLatest: String
     }
 
     public struct Compute {
@@ -486,5 +509,22 @@ extension AfterRayCopy {
         public var idleFor: (Int) -> String
         public var lastInput: (Int) -> String
         public var loadBelow: (String) -> String
+        public var thermalName: String
+        public var runningNowAtRequest: String
+        public var heldShort: String
+        public var conditionsHelp: String
+        public var noBatteryToConserve: String
+        public var unreadableBusy: String
+    }
+
+    public struct HotKey {
+        public var spotlightConflict: String
+        public var inputSourceConflict: String
+        public var needsModifier: String
+        public var commandAlone: (String) -> String
+        public var unsupportedKey: String
+        public var recordNew: String
+        public var shortcutActivate: (String) -> String
+        public var pressKeys: String
     }
 }

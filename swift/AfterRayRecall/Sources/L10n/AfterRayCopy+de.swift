@@ -320,7 +320,13 @@ extension AfterRayCopy {
             capabilityOcr: "Bildschirmtext",
             capabilityEmbedding: "Suchindex",
             capabilityLlm: "Assistent",
-            capabilitySummary: "Zusammenfassungen"
+            capabilitySummary: "Zusammenfassungen",
+            cliInstalledOnPath: { "Installiert unter \($0) und über PATH verfügbar." },
+            cliInstalledNeedPath: { "Installiert unter \($0). Fügen Sie ~/.local/bin zu PATH hinzu." },
+            cliNotInstalledAgents: "Nicht installiert. Andere KI-Agenten können `afterray` noch nicht aufrufen.",
+            cliBinaryMissing: "Die afterray-CLI wurde im App-Paket nicht gefunden. Bauen Sie AfterRay neu und versuchen Sie es erneut.",
+            hoursShort: { "\($0) Std." },
+            hoursAndMinutes: { hours, minutes in "\(hours) Std. \(minutes) Min." }
         ),
         recall: Recall(
             understanding: "Verstehen",
@@ -366,7 +372,18 @@ extension AfterRayCopy {
             copyThisSlot: "Diesen Abschnitt kopieren",
             nothingRecorded: "Noch nichts aufgezeichnet.",
             pastDaysWillAppear: "Vergangene Tage erscheinen hier, sobald AfterRay sie erfasst.",
-            noRecordings: "Keine Aufzeichnungen"
+            noRecordings: "Keine Aufzeichnungen",
+            openURL: { "\($0) öffnen" },
+            openAt: { text, display in "\(text) öffnen (\(display))" },
+            appsUsed: { "Verwendete Apps: \($0)" },
+            swipeToHistory: "Nach rechts streichen, um den Verlauf zu öffnen",
+            dragToZoom: "Nach links ziehen zum Verkleinern, nach rechts zum Vergrößern",
+            openThisSlot: "Diesen Abschnitt in der Timeline öffnen",
+            loadingOlderSummaries: "Ältere Zusammenfassungen werden geladen",
+            loadOlderSummaries: "Ältere Zusammenfassungen laden",
+            pausing: "Wird pausiert",
+            offline: "Offline",
+            recording: "Zeichnet auf"
         ),
         chat: Chat(
             loading: "Laden…",
@@ -395,7 +412,12 @@ extension AfterRayCopy {
             thoughtItThrough: "Durchdacht",
             shortened: "gekürzt",
             streaming: "streamt",
-            code: "Code"
+            code: "Code",
+            thinking: "Denkt nach",
+            working: "Arbeitet",
+            send: "Senden",
+            deleteConversation: "Diese Unterhaltung löschen",
+            goToLatest: "Zum Neuesten"
         ),
         compute: Compute(
             windowTitle: "Lokale Berechnung",
@@ -436,7 +458,7 @@ extension AfterRayCopy {
             power: "Energie",
             pluggedIn: "Am Netz",
             onBattery: "Im Batteriebetrieb",
-            load: "Last",
+            load: "Auslastung",
             unavailable: "nicht verfügbar",
             thermal: { "Stufe \($0)" },
             onBatteryNote: "Im Batteriebetrieb setzen Zusammenfassungen und Archivkompression aus, und die Transkription läuft langsamer.",
@@ -464,7 +486,23 @@ extension AfterRayCopy {
             batteryAbove: { "Batterie über \($0)%" },
             idleFor: { "\($0) s im Leerlauf" },
             lastInput: { "letzte Eingabe vor \($0) s" },
-            loadBelow: { "Last unter \($0)/Kern" }
+            loadBelow: { "Auslastung unter \($0)/Kern" },
+            thermalName: "Thermisch",
+            runningNowAtRequest: "läuft jetzt auf Ihre Anforderung",
+            heldShort: "zurückgestellt",
+            conditionsHelp: "Was erfüllt sein muss, damit dies von selbst startet",
+            noBatteryToConserve: "keine Batterie zu schonen",
+            unreadableBusy: "unlesbar — als ausgelastet behandelt"
+        ),
+        hotKey: HotKey(
+            spotlightConflict: "macOS weist ⌘Leertaste Spotlight zu, daher erreicht sie AfterRay möglicherweise nicht.",
+            inputSourceConflict: "macOS weist ⌃Leertaste den Eingabequellen zu, daher erreicht sie AfterRay möglicherweise nicht.",
+            needsModifier: "Halten Sie zusätzlich ⌘, ⌥ oder ⌃ — sonst würde das beim Tippen auslösen.",
+            commandAlone: { "\($0) gehört bereits anderen Apps. Fügen Sie ⇧, ⌥ oder ⌃ hinzu." },
+            unsupportedKey: "Diese Taste kann keinen Kurzbefehl verankern. Versuchen Sie eine andere.",
+            recordNew: "Neuen Kurzbefehl aufzeichnen",
+            shortcutActivate: { "Kurzbefehl \($0). Aktivieren, um einen neuen aufzuzeichnen." },
+            pressKeys: "Drücken Sie die gewünschten Tasten"
         )
     )
 }

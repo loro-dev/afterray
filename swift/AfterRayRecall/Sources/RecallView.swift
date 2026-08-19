@@ -1332,6 +1332,7 @@ private struct AppIdentity: View {
 /// `arrow.up.right` — the same glyph a chat moment citation uses for "open
 /// this" — are what say it can be followed.
 private struct OpenableTitle: View {
+    @Environment(\.afterRayCopy) private var copy
     let text: String
     let link: RecallWebLink
     var onOpen: ((URL) -> Void)?
@@ -1385,8 +1386,8 @@ private struct OpenableTitle: View {
         }
         // The visible text is normally the page title, so the tooltip is the
         // one place the address can be read in full before clicking it.
-        .help("Open \(link.url.absoluteString)")
-        .accessibilityLabel("Open \(text) at \(link.display)")
+        .help(copy.recall.openURL(link.url.absoluteString))
+        .accessibilityLabel(copy.recall.openAt(text, link.display))
     }
 }
 
@@ -1591,7 +1592,7 @@ struct PlayheadTimestamp: View {
                 .foregroundStyle(RecallPalette.textPrimary)
             Text(
                 isLive
-                    ? "Swipe right to enter history"
+                    ? copy.recall.swipeToHistory
                     : date.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
             )
             .font(.system(size: 10, weight: .medium, design: .rounded))
@@ -1614,6 +1615,7 @@ struct PlayheadTimestamp: View {
 /// is wordier than a dot, but a dot alone cannot say which of the three it is,
 /// and the row has room to spare. Tapping toggles capture.
 private struct TimelineRecordingStatusButton: View {
+    @Environment(\.afterRayCopy) private var copy
     let state: DaemonRecordingState?
     let isChanging: Bool
     let action: () -> Void
@@ -1656,12 +1658,12 @@ private struct TimelineRecordingStatusButton: View {
 
     private var statusLabel: String {
         switch effectiveState {
-        case .idle: "Paused"
-        case .waiting: "Waiting"
-        case .recording: "Recording"
-        case .stopping: "Pausing"
-        case .failed: "Failed"
-        case nil: "Offline"
+        case .idle: copy.common.paused
+        case .waiting: copy.common.waiting
+        case .recording: copy.recall.recording
+        case .stopping: copy.recall.pausing
+        case .failed: copy.common.failed
+        case nil: copy.recall.offline
         }
     }
 
@@ -1677,13 +1679,14 @@ private struct TimelineRecordingStatusButton: View {
 
     private var toggleHelp: String {
         switch effectiveState {
-        case .waiting, .recording, .stopping: "Pause capture"
-        case .idle, .failed, nil: "Resume capture"
+        case .waiting, .recording, .stopping: copy.menu.pauseCapture
+        case .idle, .failed, nil: copy.menu.resumeCapture
         }
     }
 }
 
 private struct TimelineZoomStrip: View {
+    @Environment(\.afterRayCopy) private var copy
     @Binding var zoom: CGFloat
     @Binding var isDragging: Bool
     @State private var dragOrigin: CGFloat?
@@ -1722,7 +1725,7 @@ private struct TimelineZoomStrip: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .recallGlass(in: .capsule)
-        .help("Drag left to zoom out, right to zoom in")
+        .help(copy.recall.dragToZoom)
         .highPriorityGesture(drag)
     }
 

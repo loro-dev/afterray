@@ -320,7 +320,13 @@ extension AfterRayCopy {
             capabilityOcr: "螢幕文字",
             capabilityEmbedding: "搜尋索引",
             capabilityLlm: "助理",
-            capabilitySummary: "摘要"
+            capabilitySummary: "摘要",
+            cliInstalledOnPath: { "已安裝於 \($0)，且已在 PATH 中。" },
+            cliInstalledNeedPath: { "已安裝於 \($0)。請將 ~/.local/bin 加入 PATH。" },
+            cliNotInstalledAgents: "尚未安裝。其他 AI Agent 目前無法呼叫 `afterray`。",
+            cliBinaryMissing: "App 套件中找不到 afterray CLI。請重新建置 AfterRay 後再試。",
+            hoursShort: { "\($0) 小時" },
+            hoursAndMinutes: { hours, minutes in "\(hours) 小時 \(minutes) 分鐘" }
         ),
         recall: Recall(
             understanding: "正在理解",
@@ -366,7 +372,18 @@ extension AfterRayCopy {
             copyThisSlot: "複製此時段",
             nothingRecorded: "還沒有記錄。",
             pastDaysWillAppear: "AfterRay 擷取後，過去的日子會出現在這裡。",
-            noRecordings: "沒有記錄"
+            noRecordings: "沒有記錄",
+            openURL: { "打開 \($0)" },
+            openAt: { text, display in "打開\(text)（\(display)）" },
+            appsUsed: { "使用過的 App：\($0)" },
+            swipeToHistory: "向右滑動進入歷史",
+            dragToZoom: "向左拖移縮小，向右拖移放大",
+            openThisSlot: "在時間線上打開此時段",
+            loadingOlderSummaries: "正在載入更早的摘要",
+            loadOlderSummaries: "載入更早的摘要",
+            pausing: "正在暫停",
+            offline: "離線",
+            recording: "正在記錄"
         ),
         chat: Chat(
             loading: "正在載入…",
@@ -395,7 +412,12 @@ extension AfterRayCopy {
             thoughtItThrough: "已想過一遍",
             shortened: "已縮短",
             streaming: "產生中",
-            code: "程式碼"
+            code: "程式碼",
+            thinking: "正在思考",
+            working: "正在處理",
+            send: "傳送",
+            deleteConversation: "刪除此對話",
+            goToLatest: "跳到最新"
         ),
         compute: Compute(
             windowTitle: "本機運算",
@@ -464,7 +486,23 @@ extension AfterRayCopy {
             batteryAbove: { "電量高於 \($0)%" },
             idleFor: { "閒置 \($0) 秒" },
             lastInput: { "上次輸入在 \($0) 秒前" },
-            loadBelow: { "每核心負載低於 \($0)" }
+            loadBelow: { "每核心負載低於 \($0)" },
+            thermalName: "熱壓力",
+            runningNowAtRequest: "依你的要求正在執行",
+            heldShort: "暫緩",
+            conditionsHelp: "自動開始需要滿足哪些條件",
+            noBatteryToConserve: "沒有需要節省的電池",
+            unreadableBusy: "無法讀取 — 視為忙碌"
+        ),
+        hotKey: HotKey(
+            spotlightConflict: "macOS 將 ⌘空白鍵 分配給「聚焦」，因此可能無法傳到 AfterRay。",
+            inputSourceConflict: "macOS 將 ⌃空白鍵 分配給輸入方式，因此可能無法傳到 AfterRay。",
+            needsModifier: "請同時按住 ⌘、⌥ 或 ⌃，否則打字時也會觸發。",
+            commandAlone: { "\($0) 已被其他 App 占用。請加上 ⇧、⌥ 或 ⌃ 作為你的快捷鍵。" },
+            unsupportedKey: "這個鍵不能作為快捷鍵主鍵。請換一個。",
+            recordNew: "錄製新快捷鍵",
+            shortcutActivate: { "快捷鍵 \($0)。啟用以錄製新快捷鍵。" },
+            pressKeys: "請按下要使用的按鍵"
         )
     )
 }

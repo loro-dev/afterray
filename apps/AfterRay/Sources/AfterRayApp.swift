@@ -767,6 +767,7 @@ private final class PermissionGuideController {
                 permission: permission,
                 onDismiss: { [weak self] in self?.hide() }
             )
+                .afterRayLocalized()
                 .frame(width: panelSize.width, height: panelSize.height)
         )
         hostingView.frame = NSRect(origin: .zero, size: panelSize)
@@ -861,6 +862,7 @@ private struct PermissionSettingsGuide: View {
     let permission: RequiredPermission
     let onDismiss: () -> Void
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
+    @ObservedObject private var localization = AfterRayLocalization.shared
 
     private var applicationURL: URL { Bundle.main.bundleURL }
     private var guide: PermissionSettingsGuideContent { permission.settingsGuide }
@@ -893,7 +895,7 @@ private struct PermissionSettingsGuide: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.72))
-                .help("Dismiss")
+                .help(localization.copy.common.dismiss)
             }
 
             HStack(spacing: 12) {

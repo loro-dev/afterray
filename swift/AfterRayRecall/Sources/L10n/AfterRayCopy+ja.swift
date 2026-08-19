@@ -320,7 +320,13 @@ extension AfterRayCopy {
             capabilityOcr: "画面テキスト",
             capabilityEmbedding: "検索インデックス",
             capabilityLlm: "アシスタント",
-            capabilitySummary: "要約"
+            capabilitySummary: "要約",
+            cliInstalledOnPath: { "\($0) にインストール済みで、PATH にあります。" },
+            cliInstalledNeedPath: { "\($0) にインストール済みです。~/.local/bin を PATH に追加してください。" },
+            cliNotInstalledAgents: "未インストールです。ほかの AI エージェントはまだ `afterray` を呼び出せません。",
+            cliBinaryMissing: "アプリ本体に afterray CLI がありません。AfterRay を再ビルドしてから試してください。",
+            hoursShort: { "\($0)時間" },
+            hoursAndMinutes: { hours, minutes in "\(hours)時間\(minutes)分" }
         ),
         recall: Recall(
             understanding: "理解中",
@@ -366,7 +372,18 @@ extension AfterRayCopy {
             copyThisSlot: "このスロットをコピー",
             nothingRecorded: "まだ記録がない。",
             pastDaysWillAppear: "AfterRayがキャプチャすると、過去の日がここに並ぶ。",
-            noRecordings: "記録なし"
+            noRecordings: "記録なし",
+            openURL: { "\($0)を開く" },
+            openAt: { text, display in "\(text)を開く（\(display)）" },
+            appsUsed: { "使用したApp：\($0)" },
+            swipeToHistory: "右にスワイプして履歴へ",
+            dragToZoom: "左にドラッグで縮小、右にドラッグで拡大",
+            openThisSlot: "タイムラインでこのスロットを開く",
+            loadingOlderSummaries: "以前の要約を読み込み中",
+            loadOlderSummaries: "以前の要約を読み込む",
+            pausing: "一時停止中",
+            offline: "オフライン",
+            recording: "記録中"
         ),
         chat: Chat(
             loading: "読み込み中…",
@@ -395,7 +412,12 @@ extension AfterRayCopy {
             thoughtItThrough: "思考済み",
             shortened: "短縮",
             streaming: "生成中",
-            code: "コード"
+            code: "コード",
+            thinking: "思考中",
+            working: "処理中",
+            send: "送信",
+            deleteConversation: "このチャットを削除",
+            goToLatest: "最新へ移動"
         ),
         compute: Compute(
             windowTitle: "ローカル処理",
@@ -464,7 +486,23 @@ extension AfterRayCopy {
             batteryAbove: { "バッテリー \($0)%以上" },
             idleFor: { "アイドル \($0)秒" },
             lastInput: { "最後の入力は\($0)秒前" },
-            loadBelow: { "負荷 コアあたり\($0)未満" }
+            loadBelow: { "負荷 コアあたり\($0)未満" },
+            thermalName: "熱圧力",
+            runningNowAtRequest: "指定により実行中",
+            heldShort: "保留",
+            conditionsHelp: "自動で開始するために満たす条件",
+            noBatteryToConserve: "節約するバッテリーはない",
+            unreadableBusy: "読み取れないためビジーとみなす"
+        ),
+        hotKey: HotKey(
+            spotlightConflict: "macOSは⌘スペースをSpotlightに割り当てているため、AfterRayに届かないことがあります。",
+            inputSourceConflict: "macOSは⌃スペースを入力ソースに割り当てているため、AfterRayに届かないことがあります。",
+            needsModifier: "⌘、⌥、⌃のいずれかを同時に押してください。そうしないと入力中にも反応します。",
+            commandAlone: { "\($0) はほかのAppが使っています。⇧、⌥、⌃を加えて専用にしてください。" },
+            unsupportedKey: "このキーはショートカットの主キーにできません。別のキーを試してください。",
+            recordNew: "新しいショートカットを記録",
+            shortcutActivate: { "ショートカット \($0)。操作して新しいショートカットを記録します。" },
+            pressKeys: "使いたいキーを押してください"
         )
     )
 }

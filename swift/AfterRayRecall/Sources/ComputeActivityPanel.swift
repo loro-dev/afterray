@@ -135,7 +135,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(task.workload.title)
+                    Text(task.workload.title(copy))
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(RecallPalette.textPrimary)
                     // The lane, not a GPU percentage. macOS does not publish
@@ -239,7 +239,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                 sectionTitle(copy.compute.workTypes)
                 Spacer(minLength: 4)
                 if status.totalRemaining > 0 {
-                    Text("\(status.totalRemaining) items waiting")
+                    Text(copy.compute.itemsWaiting(status.totalRemaining))
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(RecallPalette.textTertiary)
                 }
@@ -260,7 +260,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(gate.workload.title)
+                    Text(gate.workload.title(copy))
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(gate.allowed
                             ? RecallPalette.textPrimary
@@ -268,7 +268,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                     // Always a count, even at zero: an empty right-hand column
                     // reads as "the panel is not telling me" rather than
                     // "nothing is waiting".
-                    Text(gate.remaining > 0 ? "\(gate.remaining) waiting" : "up to date")
+                    Text(gate.remaining > 0 ? copy.compute.waitingCount(gate.remaining) : copy.compute.upToDate)
                         .font(.system(size: 10))
                         .foregroundStyle(gate.remaining > 0
                             ? (gate.allowed ? RecallPalette.textSecondary : RecallPalette.ray)
@@ -297,13 +297,13 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     }
 
     private func gateSubtitle(_ gate: ComputeGate) -> String {
-        if gate.isForced { return "running now at your request" }
-        return gate.allowed ? gate.workload.engine : (gate.reason ?? "held")
+        if gate.isForced { return copy.compute.runningNowAtRequest }
+        return gate.allowed ? gate.workload.engine : (gate.reason ?? copy.compute.heldShort)
     }
 
     private func gateStateLabel(_ gate: ComputeGate) -> String {
-        if gate.isForced { return "Forced" }
-        return gate.allowed ? "On" : "Held"
+        if gate.isForced { return copy.compute.forced }
+        return gate.allowed ? copy.common.on : copy.compute.held
     }
 
     /// "Start" and the explanation beside it.
@@ -335,7 +335,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                     .font(.system(size: 12))
             }
             .buttonStyle(.borderless)
-            .help("What has to be true for this to start on its own")
+            .help(copy.compute.conditionsHelp)
             .popover(
                 isPresented: Binding(
                     get: { explainedWorkload == gate.workload },
@@ -364,7 +364,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(copy.compute.startsWhen(gate.workload.title(copy)))
                 .font(.system(size: 12, weight: .semibold))
-            let conditions = status.automaticConditions(for: gate.workload)
+            let conditions = status.automaticConditions(for: gate.workload, copy: copy)
             if conditions.isEmpty {
                 Text(copy.compute.noConditions)
                     .font(.caption)
@@ -387,13 +387,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
             }
             if gate.workload == .summary {
                 Divider()
-                Text(
-                    "Summaries are the most expensive thing AfterRay does, so they "
-                        + "wait for a moment you are not using the machine. "
-                        + "\"Start now\" ignores these for "
-                        + "\(ComputeFormat.duration(ms: Int64(status.thresholds.forceWindowSeconds) * 1000)) "
-                        + "or until the backlog is empty."
-                )
+                Text(copy.compute.summariesExpensive)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -454,13 +448,13 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
             sectionTitle(copy.compute.thisMachine)
             VStack(alignment: .leading, spacing: 4) {
                 machineRow(
-                    "Power",
-                    status.machine.onAc ? "Plugged in" : "On battery",
+                    copy.compute.power,
+                    status.machine.onAc ? copy.compute.pluggedIn : copy.compute.onBattery,
                     detail: ComputeFormat.battery(status.machine.batteryFraction)
                 )
-                machineRow("Load", ComputeFormat.load(status.machine.loadPerCore) ?? "unavailable")
+                machineRow(copy.compute.load, ComputeFormat.load(status.machine.loadPerCore) ?? copy.compute.unavailable)
                 if let thermal = status.machine.thermalLevel, thermal > 0 {
-                    machineRow("Thermal", "level \(thermal)")
+                    machineRow(copy.compute.thermalName, copy.compute.thermal("\(thermal)"))
                 }
                 machineRow(
                     "AfterRay",
@@ -471,18 +465,12 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
             if !status.machine.onAc {
                 // The behaviour the app used to claim and not have. Said plainly
                 // so nobody has to infer it from a quiet machine.
-                calloutText(
-                    "On battery, summaries and archive compression stand down, and "
-                        + "transcription slows to a fifth of its usual pace. Screen text keeps up."
-                )
+                calloutText(copy.compute.onBatteryNote)
             }
             if status.capturePaused {
                 // Without this, the panel is circular: the overlay it is shown
                 // in resets the idle timer that summaries wait on.
-                calloutText(
-                    "The AfterRay overlay is open, so capture is paused and the machine "
-                        + "counts as in use — summaries wait for you to step away."
-                )
+                calloutText(copy.compute.overlayOpenNote)
             }
         }
     }
@@ -529,8 +517,8 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
             .controlSize(.large)
             .disabled(model.isApplying || status.mode == .off)
             .help(status.mode == .off
-                ? "Nothing to suspend — local computation is already switched off"
-                : "Stops taking new background work; anything mid-flight finishes")
+                ? copy.compute.nothingToSuspend
+                : copy.compute.suspendHelp)
 
             // Hand-rolled rather than `Picker(.segmented)`: that style sizes
             // itself to its widest label and ignores `maxWidth: .infinity`,
@@ -555,7 +543,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
         return Button {
             Task { await model.setMode(mode) }
         } label: {
-            Text(mode.title)
+            Text(mode.title(copy))
                 .font(.system(size: 12, weight: selected ? .semibold : .regular))
                 .foregroundStyle(selected ? RecallPalette.textPrimary : RecallPalette.textSecondary)
                 .frame(maxWidth: .infinity)
@@ -580,9 +568,9 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(ComputeMode.allCases, id: \.self) { mode in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(mode.title)
+                    Text(mode.title(copy))
                         .font(.system(size: 12, weight: .semibold))
-                    Text(mode.detail)
+                    Text(mode.detail(copy))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -600,9 +588,9 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
 
     private var pauseButtonTitle: String {
         if let minutes = status.pauseMinutesRemaining(now: model.tick) {
-            return "Resume now — \(minutes) min left"
+            return copy.compute.resumeNow(minutes)
         }
-        return "Pause for an hour"
+        return copy.compute.pauseForHour
     }
 
     /// Sentence case, not caps. Shouting a five-word label at the reader buys

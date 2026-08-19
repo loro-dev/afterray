@@ -320,7 +320,13 @@ extension AfterRayCopy {
             capabilityOcr: "Texto en pantalla",
             capabilityEmbedding: "Índice de búsqueda",
             capabilityLlm: "Asistente",
-            capabilitySummary: "Resúmenes"
+            capabilitySummary: "Resúmenes",
+            cliInstalledOnPath: { "Instalado en \($0) y disponible en PATH." },
+            cliInstalledNeedPath: { "Instalado en \($0). Añade ~/.local/bin a tu PATH." },
+            cliNotInstalledAgents: "No instalado. Otros agentes de IA aún no pueden llamar a `afterray`.",
+            cliBinaryMissing: "No se encontró el CLI afterray en el paquete de la app. Vuelve a compilar AfterRay e inténtalo de nuevo.",
+            hoursShort: { "\($0) h" },
+            hoursAndMinutes: { hours, minutes in "\(hours) h \(minutes) min" }
         ),
         recall: Recall(
             understanding: "Entendiendo",
@@ -366,7 +372,18 @@ extension AfterRayCopy {
             copyThisSlot: "Copiar esta franja",
             nothingRecorded: "Aún no hay nada grabado.",
             pastDaysWillAppear: "Tus días anteriores aparecerán aquí a medida que AfterRay los capture.",
-            noRecordings: "Sin grabaciones"
+            noRecordings: "Sin grabaciones",
+            openURL: { "Abrir \($0)" },
+            openAt: { text, display in "Abrir \(text) (\(display))" },
+            appsUsed: { "Apps usadas: \($0)" },
+            swipeToHistory: "Desliza a la derecha para entrar en el historial",
+            dragToZoom: "Arrastra a la izquierda para alejar, a la derecha para acercar",
+            openThisSlot: "Abrir esta franja en la línea de tiempo",
+            loadingOlderSummaries: "Cargando resúmenes anteriores",
+            loadOlderSummaries: "Cargar resúmenes anteriores",
+            pausing: "Pausando",
+            offline: "Sin conexión",
+            recording: "Grabando"
         ),
         chat: Chat(
             loading: "Cargando…",
@@ -395,7 +412,12 @@ extension AfterRayCopy {
             thoughtItThrough: "Lo pensó a fondo",
             shortened: "acortado",
             streaming: "generando",
-            code: "código"
+            code: "código",
+            thinking: "Pensando",
+            working: "Trabajando",
+            send: "Enviar",
+            deleteConversation: "Eliminar esta conversación",
+            goToLatest: "Ir al más reciente"
         ),
         compute: Compute(
             windowTitle: "Computación local",
@@ -464,7 +486,23 @@ extension AfterRayCopy {
             batteryAbove: { "Batería por encima del \($0)%" },
             idleFor: { "Inactivo durante \($0)s" },
             lastInput: { "última entrada hace \($0)s" },
-            loadBelow: { "Carga por debajo de \($0)/núcleo" }
+            loadBelow: { "Carga por debajo de \($0)/núcleo" },
+            thermalName: "Térmico",
+            runningNowAtRequest: "en ejecución a petición tuya",
+            heldShort: "en espera",
+            conditionsHelp: "Qué debe cumplirse para que arranque solo",
+            noBatteryToConserve: "no hay batería que conservar",
+            unreadableBusy: "ilegible — se trata como ocupado"
+        ),
+        hotKey: HotKey(
+            spotlightConflict: "macOS asigna ⌘Espacio a Spotlight, así que puede que no llegue a AfterRay.",
+            inputSourceConflict: "macOS asigna ⌃Espacio a las fuentes de entrada, así que puede que no llegue a AfterRay.",
+            needsModifier: "Mantén también ⌘, ⌥ o ⌃; si no, se dispararía al escribir.",
+            commandAlone: { "\($0) ya pertenece a otras apps. Añade ⇧, ⌥ o ⌃ para que sea tuya." },
+            unsupportedKey: "Esa tecla no puede anclar un atajo. Prueba otra.",
+            recordNew: "Grabar un atajo nuevo",
+            shortcutActivate: { "Atajo \($0). Actívalo para grabar uno nuevo." },
+            pressKeys: "Pulsa las teclas que quieras"
         )
     )
 }

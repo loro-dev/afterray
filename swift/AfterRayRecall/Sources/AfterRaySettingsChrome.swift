@@ -1065,7 +1065,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     .foregroundStyle(SettingsPalette.label)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                SettingsPill(item.stageLabel, tone: queueStageTone(item.stage))
+                SettingsPill(item.stageLabel(copy), tone: queueStageTone(item.stage))
                 if let percent = item.percent, item.stage != .waiting, item.stage != .failed {
                     Text("\(percent)%")
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
@@ -1132,19 +1132,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             return item.error ?? copy.settings.downloadFailed
         }
         var parts: [String] = []
-        if let size = item.sizeText { parts.append(size) }
+        if let size = item.sizeText(copy) { parts.append(size) }
         switch item.stage {
         case .downloading:
             if let rate = model.downloadRateBytesPerSecond, rate >= 1 {
                 parts.append("\(AfterRayStorageSnapshot.byteCount(UInt64(rate)))/s")
             }
-            if let eta = item.etaText { parts.append(eta) }
+            if let eta = item.etaText(copy) { parts.append(eta) }
         case .verifying:
             parts.append(copy.settings.checkingChecksums)
         case .paused:
             parts.append(copy.settings.partialFilesKept)
         case .waiting:
-            parts.append(item.etaText.map { copy.settings.startsAfterCurrentEta($0) }
+            parts.append(item.etaText(copy).map { copy.settings.startsAfterCurrentEta($0) }
                 ?? copy.settings.startsAfterCurrent)
         case .failed:
             break

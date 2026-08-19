@@ -542,8 +542,10 @@ public struct ChatProgress: Equatable, Sendable {
         self.round = round
     }
 
-    public var title: String {
-        phase == .thinking ? "Thinking" : "Working"
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
+        phase == .thinking ? copy.chat.thinking : copy.chat.working
     }
 
     /// Elapsed time is honest and readable. `reasoningDeltas` is transport

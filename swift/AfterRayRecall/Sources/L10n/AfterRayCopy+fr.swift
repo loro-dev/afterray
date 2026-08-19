@@ -322,7 +322,13 @@ extension AfterRayCopy {
             capabilityOcr: "Texte à l’écran",
             capabilityEmbedding: "Index de recherche",
             capabilityLlm: "Assistant",
-            capabilitySummary: "Résumés"
+            capabilitySummary: "Résumés",
+            cliInstalledOnPath: { "Installé dans \($0) et disponible dans le PATH." },
+            cliInstalledNeedPath: { "Installé dans \($0). Ajoutez ~/.local/bin à votre PATH." },
+            cliNotInstalledAgents: "Non installé. Les autres agents IA ne peuvent pas encore appeler `afterray`.",
+            cliBinaryMissing: "Impossible de trouver le CLI afterray dans le paquet de l’app. Recompilez AfterRay puis réessayez.",
+            hoursShort: { "\($0) h" },
+            hoursAndMinutes: { hours, minutes in "\(hours) h \(minutes) min" }
         ),
         recall: Recall(
             understanding: "Analyse",
@@ -368,7 +374,18 @@ extension AfterRayCopy {
             copyThisSlot: "Copier ce créneau",
             nothingRecorded: "Rien n’a encore été enregistré.",
             pastDaysWillAppear: "Vos jours passés apparaîtront ici au fur et à mesure qu’AfterRay les capture.",
-            noRecordings: "Aucun enregistrement"
+            noRecordings: "Aucun enregistrement",
+            openURL: { "Ouvrir \($0)" },
+            openAt: { text, display in "Ouvrir \(text) (\(display))" },
+            appsUsed: { "Apps utilisées : \($0)" },
+            swipeToHistory: "Balayez vers la droite pour ouvrir l’historique",
+            dragToZoom: "Faites glisser vers la gauche pour réduire, vers la droite pour agrandir",
+            openThisSlot: "Ouvrir ce créneau dans la timeline",
+            loadingOlderSummaries: "Chargement des résumés plus anciens",
+            loadOlderSummaries: "Charger les résumés plus anciens",
+            pausing: "Pause en cours",
+            offline: "Hors ligne",
+            recording: "Enregistre"
         ),
         chat: Chat(
             loading: "Chargement…",
@@ -397,7 +414,12 @@ extension AfterRayCopy {
             thoughtItThrough: "A réfléchi",
             shortened: "raccourci",
             streaming: "en génération",
-            code: "code"
+            code: "code",
+            thinking: "Réfléchit",
+            working: "Travaille",
+            send: "Envoyer",
+            deleteConversation: "Supprimer cette conversation",
+            goToLatest: "Aller au plus récent"
         ),
         compute: Compute(
             windowTitle: "Calcul local",
@@ -466,7 +488,23 @@ extension AfterRayCopy {
             batteryAbove: { "Batterie au-dessus de \($0) %" },
             idleFor: { "Inactif depuis \($0) s" },
             lastInput: { "dernière saisie il y a \($0) s" },
-            loadBelow: { "Charge inférieure à \($0)/cœur" }
+            loadBelow: { "Charge inférieure à \($0)/cœur" },
+            thermalName: "Thermique",
+            runningNowAtRequest: "en cours à votre demande",
+            heldShort: "en attente",
+            conditionsHelp: "Ce qui doit être vrai pour que cela démarre tout seul",
+            noBatteryToConserve: "pas de batterie à économiser",
+            unreadableBusy: "illisible — considéré comme occupé"
+        ),
+        hotKey: HotKey(
+            spotlightConflict: "macOS attribue ⌘Espace à Spotlight, il peut donc ne jamais atteindre AfterRay.",
+            inputSourceConflict: "macOS attribue ⌃Espace aux sources de saisie, il peut donc ne jamais atteindre AfterRay.",
+            needsModifier: "Maintenez aussi ⌘, ⌥ ou ⌃ — sinon cela se déclencherait pendant la saisie.",
+            commandAlone: { "\($0) appartient déjà à d’autres apps. Ajoutez ⇧, ⌥ ou ⌃ pour en faire le vôtre." },
+            unsupportedKey: "Cette touche ne peut pas ancrer un raccourci. Essayez-en une autre.",
+            recordNew: "Enregistrer un nouveau raccourci",
+            shortcutActivate: { "Raccourci \($0). Activez pour en enregistrer un nouveau." },
+            pressKeys: "Appuyez sur les touches souhaitées"
         )
     )
 }

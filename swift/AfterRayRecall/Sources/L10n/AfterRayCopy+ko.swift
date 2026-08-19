@@ -74,7 +74,7 @@ extension AfterRayCopy {
             cliReady: "다른 에이전트에서 CLI를 사용할 수 있습니다.",
             cliInstalledNeedPath: "설치됨. 필요하면 ~/.local/bin을 PATH에 추가하십시오.",
             notInstalledYet: "아직 설치되지 않음.",
-            modelsBody: "받아쓰기와 검색은 로컬 모델 팩 2개를 사용합니다. 나중에 설정에서 관리할 수 있습니다.",
+            modelsBody: "텍스트 변환과 검색은 로컬 모델 팩 2개를 사용합니다. 나중에 설정에서 관리할 수 있습니다.",
             checkingModels: "모델 확인 중…",
             verifyingPack: { "\($0) 확인 중…" },
             downloadingPack: { "\($0) 다운로드 중…" },
@@ -128,7 +128,7 @@ extension AfterRayCopy {
             twoRequired: "로컬 권한 2개가 필요합니다",
             audioOffSummary: "오디오 녹음이 꺼져 있어 마이크는 선택 사항입니다. 화면과 손쉬운 사용은 여전히 필요합니다.",
             noMicSummary: "연결된 마이크가 없습니다. AfterRay는 화면과 시스템 오디오를 계속 기록할 수 있으므로 마이크 접근 권한은 필요하지 않습니다.",
-            micDeclinedSummary: "마이크 접근이 거부되어 받아쓰기는 시스템 오디오만 사용합니다. 시스템 설정에서 언제든지 켤 수 있습니다.",
+            micDeclinedSummary: "마이크 접근이 거부되어 텍스트 변환은 시스템 오디오만 사용합니다. 시스템 설정에서 언제든지 켤 수 있습니다.",
             allThreeSummary: "macOS가 세 권한을 모두 허용하면 AfterRay가 자동으로 기록을 시작합니다. 아무것도 업로드되지 않습니다.",
             afterChanging: { "권한을 변경한 후 \($0)을(를) 눌러 AfterRay로 돌아오십시오." },
             waitingApproval: "macOS 승인을 기다리는 중…",
@@ -161,7 +161,7 @@ extension AfterRayCopy {
             clickToRecord: "키를 클릭하여 새 조합을 기록하십시오.",
             capture: "캡처",
             recordAudio: "오디오 녹음",
-            recordAudioSubtitle: "받아쓰기를 위한 시스템 오디오와 마이크. 보관함에 이미 있는 녹음은 유지됩니다.",
+            recordAudioSubtitle: "텍스트 변환을 위한 시스템 오디오와 마이크. 보관함에 이미 있는 녹음은 유지됩니다.",
             summaries: "요약",
             summariesFootnote: "이미 작성된 요약은 작성 당시의 길이를 유지합니다.",
             summaryLength: "요약 길이",
@@ -316,11 +316,17 @@ extension AfterRayCopy {
             summarySet: { "요약 언어가 \($0)(으)로 설정되었습니다." },
             memoryLimitSet: { "기억 한도가 \($0)(으)로 설정되었습니다." },
             newSummariesCover: { "새 요약은 \($0)을(를) 다룹니다." },
-            capabilityAsr: "받아쓰기",
+            capabilityAsr: "텍스트 변환",
             capabilityOcr: "화면 텍스트",
             capabilityEmbedding: "검색 인덱스",
             capabilityLlm: "어시스턴트",
-            capabilitySummary: "요약"
+            capabilitySummary: "요약",
+            cliInstalledOnPath: { "\($0)에 설치되어 있으며 PATH에서 사용할 수 있습니다." },
+            cliInstalledNeedPath: { "\($0)에 설치되었습니다. ~/.local/bin을 PATH에 추가하십시오." },
+            cliNotInstalledAgents: "설치되지 않았습니다. 다른 AI 에이전트는 아직 `afterray`를 호출할 수 없습니다.",
+            cliBinaryMissing: "앱 번들에서 afterray CLI를 찾을 수 없습니다. AfterRay를 다시 빌드한 뒤 시도하십시오.",
+            hoursShort: { "\($0)시간" },
+            hoursAndMinutes: { hours, minutes in "\(hours)시간 \(minutes)분" }
         ),
         recall: Recall(
             understanding: "이해하는 중",
@@ -366,7 +372,18 @@ extension AfterRayCopy {
             copyThisSlot: "이 구간 복사",
             nothingRecorded: "아직 기록된 내용이 없습니다.",
             pastDaysWillAppear: "AfterRay가 캡처하면 지난 날들이 여기에 나타납니다.",
-            noRecordings: "기록 없음"
+            noRecordings: "기록 없음",
+            openURL: { "\($0) 열기" },
+            openAt: { text, display in "\(text) 열기(\(display))" },
+            appsUsed: { "사용한 앱: \($0)" },
+            swipeToHistory: "오른쪽으로 쓸어 넘겨 기록으로 이동",
+            dragToZoom: "왼쪽으로 드래그하면 축소, 오른쪽으로 드래그하면 확대",
+            openThisSlot: "타임라인에서 이 구간 열기",
+            loadingOlderSummaries: "이전 요약 로드 중",
+            loadOlderSummaries: "이전 요약 로드",
+            pausing: "일시 정지 중",
+            offline: "오프라인",
+            recording: "기록 중"
         ),
         chat: Chat(
             loading: "로드 중…",
@@ -395,7 +412,12 @@ extension AfterRayCopy {
             thoughtItThrough: "생각을 마침",
             shortened: "단축됨",
             streaming: "생성 중",
-            code: "코드"
+            code: "코드",
+            thinking: "생각 중",
+            working: "작업 중",
+            send: "보내기",
+            deleteConversation: "이 대화 삭제",
+            goToLatest: "최신으로 이동"
         ),
         compute: Compute(
             windowTitle: "로컬 연산",
@@ -403,10 +425,10 @@ extension AfterRayCopy {
             essential: "필수",
             off: "끔",
             fullDetail: "기기가 감당할 수 있을 때 모두 실행합니다.",
-            essentialDetail: "화면 텍스트와 받아쓰기는 따라갑니다. 요약과 압축은 하지 않습니다.",
+            essentialDetail: "화면 텍스트와 텍스트 변환은 따라갑니다. 요약과 압축은 하지 않습니다.",
             offDetail: "백그라운드에서 아무것도 실행하지 않습니다 — 새 화면은 인덱싱되지 않습니다.",
             screenText: "화면 텍스트",
-            transcription: "받아쓰기",
+            transcription: "텍스트 변환",
             searchIndex: "검색 인덱스",
             summaries: "요약",
             archive: "아카이브 압축",
@@ -439,7 +461,7 @@ extension AfterRayCopy {
             load: "부하",
             unavailable: "사용할 수 없음",
             thermal: { "수준 \($0)" },
-            onBatteryNote: "배터리 사용 중에는 요약과 아카이브 압축이 멈추고, 받아쓰기는 더 느리게 실행됩니다.",
+            onBatteryNote: "배터리 사용 중에는 요약과 아카이브 압축이 멈추고, 텍스트 변환은 더 느리게 실행됩니다.",
             overlayOpenNote: "AfterRay 오버레이가 열려 있어 캡처가 일시 정지되고 기기는 바쁜 것으로 간주됩니다.",
             nothingToSuspend: "일시 정지할 항목 없음 — 로컬 연산이 이미 꺼져 있습니다",
             suspendHelp: "새 백그라운드 작업을 받지 않습니다. 진행 중인 작업은 끝납니다",
@@ -464,7 +486,23 @@ extension AfterRayCopy {
             batteryAbove: { "배터리 \($0)% 초과" },
             idleFor: { "\($0)초 동안 유휴" },
             lastInput: { "마지막 입력 \($0)초 전" },
-            loadBelow: { "코어당 부하 \($0) 미만" }
+            loadBelow: { "코어당 부하 \($0) 미만" },
+            thermalName: "열 압력",
+            runningNowAtRequest: "요청에 따라 실행 중",
+            heldShort: "보류",
+            conditionsHelp: "자동으로 시작하려면 무엇이 참이어야 하는지",
+            noBatteryToConserve: "절전할 배터리 없음",
+            unreadableBusy: "읽을 수 없음 — 사용 중으로 간주"
+        ),
+        hotKey: HotKey(
+            spotlightConflict: "macOS가 ⌘스페이스 바를 Spotlight에 할당하므로 AfterRay에 전달되지 않을 수 있습니다.",
+            inputSourceConflict: "macOS가 ⌃스페이스 바를 입력 소스에 할당하므로 AfterRay에 전달되지 않을 수 있습니다.",
+            needsModifier: "⌘, ⌥ 또는 ⌃를 함께 누르십시오. 그렇지 않으면 입력 중에도 실행됩니다.",
+            commandAlone: { "\($0)은(는) 다른 앱이 사용합니다. ⇧, ⌥ 또는 ⌃를 더해 전용으로 만드십시오." },
+            unsupportedKey: "이 키는 단축키의 기본 키로 쓸 수 없습니다. 다른 키를 시도하십시오.",
+            recordNew: "새로운 단축키 기록",
+            shortcutActivate: { "단축키 \($0). 활성화하여 새로 기록하십시오." },
+            pressKeys: "원하는 키를 누르십시오"
         )
     )
 }

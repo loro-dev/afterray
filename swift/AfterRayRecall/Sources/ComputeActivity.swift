@@ -474,13 +474,16 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
     /// importantly, to "what would make it run?". Built from thresholds the
     /// daemon sent rather than numbers written into the UI, so it cannot drift
     /// from the gate that actually decides.
-    public func automaticConditions(for workload: ComputeWorkload) -> [ComputeCondition] {
+    public func automaticConditions(
+        for workload: ComputeWorkload,
+        copy: AfterRayCopy = .english
+    ) -> [ComputeCondition] {
         var conditions: [ComputeCondition] = []
         if mode == .off {
             conditions.append(
                 ComputeCondition(
-                    label: "Local computation switched on",
-                    detail: "currently off",
+                    label: copy.compute.switchedOn,
+                    detail: copy.compute.currentlyOff,
                     met: false
                 )
             )
@@ -491,8 +494,8 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         if workload != .ocr, let minutes = pauseMinutesRemaining() {
             conditions.append(
                 ComputeCondition(
-                    label: "Not suspended",
-                    detail: "you suspended it — \(minutes) min left",
+                    label: copy.compute.notSuspended,
+                    detail: copy.compute.youSuspended(minutes),
                     met: false
                 )
             )
@@ -501,8 +504,8 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         case .summary, .archive:
             conditions.append(
                 ComputeCondition(
-                    label: "Plugged in",
-                    detail: machine.onAc ? "on power" : "on battery",
+                    label: copy.compute.pluggedIn,
+                    detail: machine.onAc ? copy.compute.onPower : copy.compute.onBatteryShort,
                     met: machine.onAc
                 )
             )
@@ -513,8 +516,8 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
             if workload == .asr, !machine.onAc {
                 conditions.append(
                     ComputeCondition(
-                        label: "Full speed",
-                        detail: "on battery it runs five times slower, not never",
+                        label: copy.compute.fullSpeed,
+                        detail: copy.compute.batterySlower,
                         met: true
                     )
                 )
@@ -526,22 +529,22 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         let battery = machine.batteryFraction
         conditions.append(
             ComputeCondition(
-                label: "Battery above \(Int(thresholds.summaryMinBatteryFraction * 100))%",
-                detail: ComputeFormat.battery(battery) ?? "no battery to conserve",
+                label: copy.compute.batteryAbove(Int(thresholds.summaryMinBatteryFraction * 100)),
+                detail: ComputeFormat.battery(battery) ?? copy.compute.noBatteryToConserve,
                 met: battery.map { $0 >= thresholds.summaryMinBatteryFraction } ?? true
             )
         )
         conditions.append(
             ComputeCondition(
-                label: "Idle for \(Int(thresholds.summaryMinIdleSeconds))s",
-                detail: "last input \(Int(machine.idleSeconds))s ago",
+                label: copy.compute.idleFor(Int(thresholds.summaryMinIdleSeconds)),
+                detail: copy.compute.lastInput(Int(machine.idleSeconds)),
                 met: machine.idleSeconds >= thresholds.summaryMinIdleSeconds
             )
         )
         conditions.append(
             ComputeCondition(
-                label: String(format: "Load below %.2f/core", thresholds.summaryMaxLoadPerCore),
-                detail: ComputeFormat.load(machine.loadPerCore) ?? "unreadable — treated as busy",
+                label: copy.compute.loadBelow(String(format: "%.2f", thresholds.summaryMaxLoadPerCore)),
+                detail: ComputeFormat.load(machine.loadPerCore) ?? copy.compute.unreadableBusy,
                 met: machine.loadPerCore.map { $0 <= thresholds.summaryMaxLoadPerCore } ?? false
             )
         )

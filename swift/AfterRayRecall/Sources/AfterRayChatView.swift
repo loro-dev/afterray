@@ -564,7 +564,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
             .buttonStyle(ChatPressStyle())
             .disabled(!model.canSend)
-            .help("Send")
+            .help(copy.chat.send)
         }
     }
 
@@ -781,6 +781,7 @@ private struct ChatCompactionRule: View {
 }
 
 private struct ChatConversationRow: View {
+    @Environment(\.afterRayCopy) private var copy
     let conversation: ChatConversation
     let isSelected: Bool
     let onSelect: () -> Void
@@ -808,7 +809,7 @@ private struct ChatConversationRow: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .help("删除该对话")
+                .help(copy.chat.deleteConversation)
                 .onHover { isHoveringTrash = $0 }
                 .opacity(isHovering ? 1 : 0)
                 .allowsHitTesting(isHovering)
@@ -823,7 +824,7 @@ private struct ChatConversationRow: View {
             isHovering = hovering
             if !hovering { isHoveringTrash = false }
         }
-        .help(isHoveringTrash ? "删除该对话" : conversation.title)
+        .help(isHoveringTrash ? copy.chat.deleteConversation : conversation.title)
     }
 
     private var rowFill: Color {
@@ -1036,13 +1037,13 @@ private struct ChatBubbleView: View {
                                     .font(.system(size: 10.5, weight: .medium, design: .rounded))
                                     .monospacedDigit()
                                     .foregroundStyle(ChatPalette.tertiary)
-                                    .help("Estimated tokens per second for this turn")
+                                    .help(copy.chat.tokensPerSecondHelp)
                                     .accessibilityIdentifier("chat-tokens-per-second-\(bubble.id)")
                             }
                             if !bubble.isStreaming, !bubble.text.isEmpty {
                                 Button(action: copyOutput) {
                                     Label(
-                                        copied ? "Copied" : "Copy",
+                                        copied ? copy.common.copied : copy.common.copy,
                                         systemImage: copied ? "checkmark" : "doc.on.doc"
                                     )
                                     .font(.system(size: 10.5, weight: .medium))
@@ -1052,7 +1053,7 @@ private struct ChatBubbleView: View {
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .help(copied ? "Agent output copied" : "Copy agent output")
+                                .help(copied ? copy.chat.agentCopied : copy.chat.copyAgentOutput)
                                 .accessibilityIdentifier("chat-copy-output-\(bubble.id)")
                             }
                         }
@@ -1190,9 +1191,9 @@ private struct ChatReasoningChip: View {
     private var label: String {
         if isActive {
             if let progress {
-                return "\(progress.title) · \(progress.detail)"
+                return "\(progress.title(copy)) · \(progress.detail)"
             }
-            return "Thinking"
+            return copy.chat.thinking
         }
         return copy.chat.thoughtItThrough
     }
@@ -1298,6 +1299,7 @@ private struct ChatLeadingDisclosureStyle: DisclosureGroupStyle {
 /// answers "is it stuck". It is also the only half that survives into a
 /// screenshot or a snapshot test.
 private struct ChatWorkingIndicator: View {
+    @Environment(\.afterRayCopy) private var copy
     let progress: ChatProgress
     @State private var phase = 0.0
 
@@ -1311,7 +1313,7 @@ private struct ChatWorkingIndicator: View {
                         .opacity(opacity(index))
                 }
             }
-            Text(progress.title)
+            Text(progress.title(copy))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(ChatPalette.secondary)
             Text(progress.detail)

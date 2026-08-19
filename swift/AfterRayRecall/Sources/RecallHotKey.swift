@@ -77,9 +77,13 @@ public struct RecallHotKey: Equatable, Sendable, Codable {
     /// succeeds, so warn rather than refuse — the user may have already
     /// turned the system shortcut off.
     public var systemConflictNote: String? {
+        systemConflictNote(.english)
+    }
+
+    public func systemConflictNote(_ copy: AfterRayCopy) -> String? {
         guard keyCode == 49 else { return nil }
-        if modifiers == [.command] { return "macOS gives ⌘Space to Spotlight, so it may never reach AfterRay." }
-        if modifiers == [.control] { return "macOS gives ⌃Space to input sources, so it may never reach AfterRay." }
+        if modifiers == [.command] { return copy.hotKey.spotlightConflict }
+        if modifiers == [.control] { return copy.hotKey.inputSourceConflict }
         return nil
     }
 
@@ -188,14 +192,16 @@ public enum RecallHotKeyIssue: Error, Equatable, Sendable {
     case commandAlone(String)
     case unsupportedKey
 
-    public var message: String {
+    public var message: String { message(.english) }
+
+    public func message(_ copy: AfterRayCopy) -> String {
         switch self {
         case .needsModifier:
-            "Hold ⌘, ⌥ or ⌃ too — otherwise this would fire while you type."
+            copy.hotKey.needsModifier
         case .commandAlone(let shortcut):
-            "\(shortcut) already belongs to other apps. Add ⇧, ⌥ or ⌃ to make it yours."
+            copy.hotKey.commandAlone(shortcut)
         case .unsupportedKey:
-            "That key can't anchor a shortcut. Try another one."
+            copy.hotKey.unsupportedKey
         }
     }
 }
