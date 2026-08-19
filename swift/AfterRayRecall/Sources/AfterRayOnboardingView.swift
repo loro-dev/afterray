@@ -863,7 +863,7 @@ public struct AfterRayOnboardingView: View {
             // would be a second, louder signal in a colour AfterRay never uses.
             hintLabel(copy.onboarding.practiced, icon: "checkmark.circle.fill", tone: .white.opacity(0.9))
                 .transition(.opacity)
-        } else if let note = hotKeys.hotKey.systemConflictNote {
+        } else if let note = hotKeys.hotKey.systemConflictNote(copy) {
             hintLabel(note, icon: "exclamationmark.triangle", tone: Color(red: 0.98, green: 0.74, blue: 0.34))
         } else {
             hintLabel(copy.onboarding.tryIt, icon: "hand.point.up.left", tone: RecallPalette.textTertiary)

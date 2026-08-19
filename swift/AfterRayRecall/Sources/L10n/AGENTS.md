@@ -17,8 +17,12 @@ New chrome uses Apple system terms where they exist (聚焦 / Spotlight, 输入�
 
 ## Adding a string or language
 
-- String: field + all eight catalogs + wire the call site in the same change.
-- Language: `AfterRayUILanguage` case, `AfterRayCopy+xx.swift`, `Info.plist` `CFBundleLocalizations`, `apps/AfterRay/Resources/<loc>.lproj/InfoPlist.strings`, and the locale loops in `scripts/build-release.sh` / `scripts/run-v0.sh`.
+- String: field + all eight catalogs + wire the call site in the same change. `make check-i18n` must stay green; do not grow `scripts/i18n-allowlist.tsv` except for a documented exception.
+- Language: `AfterRayUILanguage` case, `AfterRayCopy+xx.swift`, `Info.plist` `CFBundleLocalizations`, `apps/AfterRay/Resources/<loc>.lproj/InfoPlist.strings`, and the locale loops in `scripts/build-release.sh` / `scripts/run-v0.sh`. The same check verifies those lists match.
+
+## Check
+
+`make check-i18n` (`scripts/check-i18n.sh`) is the static gate: locale lists in lockstep, no empty catalog strings, views must call `title(copy)` / `stageLabel(copy)` / `systemConflictNote(copy)` rather than the English default, and shipped `Text` / `.help` / alerts / `return "…"` phrases must come from the catalog. The compiler still owns field-shape completeness. Visual Lab / snapshots are out of scope. Also runs from `make check` and `make test`.
 
 ## Key files
 

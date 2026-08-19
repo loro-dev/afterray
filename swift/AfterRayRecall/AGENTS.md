@@ -47,6 +47,7 @@ SwiftUI library holding everything cross-app: the recall surface, the Unix-socke
 ## Build / test
 
 - `swift test` (repo root), or filter e.g. `swift test --filter DaemonWireTests`.
+- `make check-i18n` — locale lists, empty catalogs, English-default leaks, hardcoded shipped chrome. See [Sources/L10n/AGENTS.md](Sources/L10n/AGENTS.md).
 - Exercise surfaces with `make visual-lab` / `make settings-lab` / `make chat-lab` / `make snapshots`.
 
 ## Watch out

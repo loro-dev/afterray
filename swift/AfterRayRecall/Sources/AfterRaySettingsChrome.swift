@@ -564,7 +564,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         // global shortcut is for needs no caption.
         SettingsSection(
             title: copy.settings.openingAfterRay,
-            footnote: hotKeys.failure ?? hotKeys.hotKey.systemConflictNote
+            footnote: hotKeys.failure ?? hotKeys.hotKey.systemConflictNote(copy)
         ) {
             SettingsRow(
                 title: copy.settings.globalShortcut,

@@ -2241,6 +2241,7 @@ private enum RecallDetailsPage: Equatable {
 }
 
 private struct TranscriptCaption: View {
+    @Environment(\.afterRayCopy) private var copy
     let text: String?
     let canPlay: Bool
     let isPlaying: Bool
@@ -2253,9 +2254,9 @@ private struct TranscriptCaption: View {
     }
 
     private var playHelp: String {
-        if isBuffering { return "Cancel audio" }
-        if isPlaying { return "Pause audio" }
-        return "Play audio"
+        if isBuffering { return copy.recall.cancelAudio }
+        if isPlaying { return copy.recall.pauseAudio }
+        return copy.recall.playAudio
     }
 
     var body: some View {

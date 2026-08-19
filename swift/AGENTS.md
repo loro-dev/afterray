@@ -9,7 +9,7 @@ SwiftPM library targets shared across the AfterRay apps, declared in the root `P
 
 ## Build / test
 
-- `swift test` (repo root) — runs `AfterRayRecallTests` and `AfterRayMlxVlmWorkerTests`; `make test` additionally runs `cargo test --workspace`.
+- `swift test` (repo root) — runs `AfterRayRecallTests` and `AfterRayMlxVlmWorkerTests`; `make test` additionally runs `cargo test --workspace` and `scripts/check-i18n.sh`.
 - `make visual-lab` / `make settings-lab` / `make chat-lab` — mock-data UI loops; `make snapshots` — offscreen PNGs to `/tmp/afterray-snapshots`.
 - No Swift linter or formatter is configured; the clippy gate (`cargo clippy --workspace --all-targets -- -D warnings`) is Rust-only.
 

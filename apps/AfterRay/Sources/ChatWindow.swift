@@ -168,13 +168,14 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
         case .chatNewConversation:
             return toolbarButton(
                 identifier: itemIdentifier,
-                label: "New conversation",
+                label: AfterRayLocalization.shared.copy.chat.newConversation,
                 symbol: "plus",
                 action: #selector(startNewConversation(_:))
             )
         case .chatMore:
+            let copy = AfterRayLocalization.shared.copy
             let item = NSMenuToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "More"
+            item.label = copy.chat.more
             item.paletteLabel = item.label
             item.toolTip = item.label
             item.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: item.label)
@@ -280,7 +281,8 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
     }
 
     private var sidebarToggleLabel: String {
-        sidebarState.isCollapsed ? "Show sidebar" : "Hide sidebar"
+        let copy = AfterRayLocalization.shared.copy
+        return sidebarState.isCollapsed ? copy.chat.showSidebar : copy.chat.hideSidebar
     }
 
     private func toolbarButton(
