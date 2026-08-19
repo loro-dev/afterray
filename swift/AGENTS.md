@@ -15,6 +15,6 @@ SwiftPM library targets shared across the AfterRay apps, declared in the root `P
 
 ## Index
 
-- [AfterRayRecall](AfterRayRecall/AGENTS.md) — recall UI, Unix-socket daemon client, wire models, settings/chat chrome
+- [AfterRayRecall](AfterRayRecall/AGENTS.md) — recall UI, Unix-socket daemon client, wire models, settings/chat chrome; typed UI i18n must stay complete ([L10n](AfterRayRecall/Sources/L10n/AGENTS.md))
 - [AfterRayMockData](AfterRayMockData/AGENTS.md) — fixture implementations of the recall protocols for previews, labs, and snapshots
 - [AfterRayMlxVlmWorker](AfterRayMlxVlmWorker/AGENTS.md) — Qwen3.5 MLX inference worker core and its line-delimited JSON protocol
