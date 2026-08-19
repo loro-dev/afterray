@@ -377,7 +377,7 @@ pub(crate) fn build_opening(history: History, message: &str, now_ms: i64) -> Ope
         seed: String::new(),
         history,
         task: format!(
-            "[asked at {}]\n{}\n\nInvestigate with tools if needed, then answer with FINAL.",
+            "[asked at {}]\n{}\n\nInvestigate with tools if needed. When you have the answer, write FINAL.",
             format_local_datetime(now_ms),
             message.trim()
         ),

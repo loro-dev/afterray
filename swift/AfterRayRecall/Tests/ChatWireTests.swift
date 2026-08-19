@@ -171,7 +171,18 @@ final class ChatWireTests: XCTestCase {
         }
         XCTAssertEqual(rated.completionTokens, 240)
         XCTAssertEqual(rated.generationMs, 2_000)
+        XCTAssertEqual(rated.elapsedMs, 0)
         XCTAssertEqual(rated.tokensPerSecond ?? 0, 120, accuracy: 0.01)
+
+        let withElapsed = try ChatStreamEventDecoder.decode(
+            line: Data(
+                #"{"kind":"usage","prompt_tokens":100,"window_tokens":16384,"round":1,"elapsed_ms":8420}"#.utf8
+            )
+        )
+        guard case .usage(let timed)? = withElapsed else {
+            return XCTFail("expected a usage event with elapsed_ms")
+        }
+        XCTAssertEqual(timed.elapsedMs, 8_420)
 
         let compaction = try ChatStreamEventDecoder.decode(
             line: Data(

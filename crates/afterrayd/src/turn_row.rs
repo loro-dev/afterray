@@ -42,6 +42,7 @@ pub(crate) struct TurnRow<'a> {
     tool_log: Option<String>,
     reasoning: Vec<RoundReasoning>,
     usage: Option<TurnUsage>,
+    started: Instant,
     last_flush: Instant,
     dirty: bool,
 }
@@ -69,6 +70,7 @@ impl<'a> TurnRow<'a> {
             tool_log: None,
             reasoning: Vec::new(),
             usage: None,
+            started: Instant::now(),
             last_flush: Instant::now(),
             dirty: false,
         };
@@ -134,6 +136,7 @@ impl<'a> TurnRow<'a> {
 
     fn write(&self, status: &str) -> Result<(), String> {
         let reasoning = self.reasoning_json();
+        let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let usage = self.usage.map(|usage| {
             serde_json::json!({
                 "prompt_tokens": usage.prompt_tokens,
@@ -141,6 +144,7 @@ impl<'a> TurnRow<'a> {
                 "round": usage.rounds,
                 "completion_tokens": usage.completion_tokens,
                 "generation_ms": usage.generation_ms,
+                "elapsed_ms": elapsed_ms,
             })
             .to_string()
         });
@@ -251,6 +255,7 @@ mod tests {
         let usage = assistant.usage_json.as_deref().unwrap();
         assert!(usage.contains("4000"), "{usage}");
         assert!(usage.contains("16384"), "{usage}");
+        assert!(usage.contains("elapsed_ms"), "{usage}");
     }
 
     /// Reasoning is much bigger than the answer it justifies, and the vault is

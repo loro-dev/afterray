@@ -86,13 +86,20 @@ question is the turn's new content regardless. It is how a model tells a
 catalog table from conversation start apart from a `get_now` result folded
 into history hours ago.
 
-Chat and ask also inject `Reply language: …` from `ui_language` (`auto`
-follows `AppleLanguages`). T2 keeps using `summary_language` in its input
-JSON.
+Chat and ask inject `Reply language: …` from `summary_language` — the same
+preference T2 uses — so a user who set summaries to Chinese does not get
+English chat. `auto` follows `AppleLanguages`. `ui_language` is chrome only.
 
 The cost of a later instant is one round: `get_now`.
 
 ## The catalog documents everything
+
+The catalog also carries the reply format — `TOOL`/`ARGS` or `FINAL`, never
+both, never Qwen `<tool_call>` markup. Chat's system prompt may not name a
+tool, so this block is the only place the model is told how to call one.
+The harness still accepts a leaked `<tool_call>` as a call (pi's rule: a
+parseable call always continues) so a 4B model that ignores the format does
+not end the turn.
 
 Every tool lists all of its arguments and the exact shape of what it returns.
 This is deliberately longer than one line per tool: a parameter a model has to

@@ -27,8 +27,11 @@ public protocol AfterRayChatModeling: ObservableObject {
     /// the time, including before a turn starts.
     var streamProgress: ChatProgress? { get }
     /// Elapsed work for the last finished turn, while this session still
-    /// remembers it. History reloads fall back to the user→assistant gap.
+    /// remembers it. History reloads fall back to stored `elapsed_ms`, then
+    /// the user→assistant gap.
     var lastWorkElapsedMs: Int? { get }
+    /// When the in-flight turn started, epoch-ms. Nil when nothing is sending.
+    var turnStartedAtMs: Int64? { get }
 
     func refresh() async
     func select(_ id: String) async
@@ -64,6 +67,8 @@ public extension AfterRayChatModeling {
 
     var lastWorkElapsedMs: Int? { nil }
 
+    var turnStartedAtMs: Int64? { nil }
+
     var selectedConversation: ChatConversation? {
         conversations.first(where: { $0.id == selectedID })
     }
@@ -81,17 +86,24 @@ public extension AfterRayChatModeling {
     }
 
     var bubbles: [ChatBubble] {
-        ChatTranscript.bubbles(
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        let elapsed: Int?
+        if isSending, let start = turnStartedAtMs {
+            elapsed = Int(max(0, nowMs - start))
+        } else {
+            elapsed = lastWorkElapsedMs
+        }
+        return ChatTranscript.bubbles(
             messages: messages,
             streamingText: streamText,
             streamingTools: streamTools,
             streamingReasoning: streamReasoning,
             streamingParts: streamParts,
             isSending: isSending,
-            nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            nowMs: nowMs,
             liveCompactions: isSending ? compactionNotices : [],
             progress: streamProgress,
-            lastWorkElapsedMs: lastWorkElapsedMs,
+            lastWorkElapsedMs: elapsed,
             liveUsage: contextUsage
         )
     }
@@ -116,6 +128,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
     @Published public private(set) var compactionNotices: [ChatCompactionNotice] = []
     @Published public private(set) var streamProgress: ChatProgress?
     @Published public private(set) var lastWorkElapsedMs: Int?
+    @Published public private(set) var turnStartedAtMs: Int64?
     @Published public private(set) var chatModels: [ChatModelChoice] = ChatModelChoice.previewCatalog
     @Published public private(set) var selectedChatModelID: String? = ChatModelChoice.previewCatalog.first?.id
 
@@ -231,6 +244,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamParts = []
         streamProgress = nil
         lastWorkElapsedMs = nil
+        turnStartedAtMs = nil
         errorMessage = nil
         contextUsage = nil
         compactionNotices = []
@@ -265,6 +279,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamParts = []
         streamProgress = nil
         lastWorkElapsedMs = nil
+        turnStartedAtMs = clock()
         cancelStreamPresentation()
         // A new turn starts from this conversation's stored history, not from
         // the last turn's live notices.
@@ -304,6 +319,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         contextUsage = nil
         compactionNotices = []
         lastWorkElapsedMs = nil
+        turnStartedAtMs = nil
     }
 
     private func performSend(_ text: String) async {
@@ -399,9 +415,12 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamReasoning = []
         streamParts = []
         streamProgress = nil
-        if state.lastElapsedMs > 0 {
+        if let start = turnStartedAtMs {
+            lastWorkElapsedMs = Int(max(0, clock() - start))
+        } else if state.lastElapsedMs > 0 {
             lastWorkElapsedMs = state.lastElapsedMs
         }
+        turnStartedAtMs = nil
     }
 
     /// Settle a turn that ended early.
@@ -417,6 +436,10 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         streamReasoning = []
         streamParts = []
         streamProgress = nil
+        if let start = turnStartedAtMs {
+            lastWorkElapsedMs = Int(max(0, clock() - start))
+        }
+        turnStartedAtMs = nil
         guard let conversationId = selectedID, !conversationId.isEmpty else { return }
         await loadHistory(conversationId)
     }
@@ -484,9 +507,6 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
         if let usage = state.usage, contextUsage != usage { contextUsage = usage }
         if !state.compactions.isEmpty, compactionNotices != state.compactions {
             compactionNotices = state.compactions
-        }
-        if state.lastElapsedMs > 0, lastWorkElapsedMs != state.lastElapsedMs {
-            lastWorkElapsedMs = state.lastElapsedMs
         }
     }
 

@@ -31,19 +31,29 @@ pub enum Step {
 
 /// Reads one round.
 ///
-/// Order matters. `FINAL` wins over `TOOL` because a model that writes both is
-/// far more often finishing than calling. Bare prose is accepted as an answer
-/// last: local models ignore the schema often enough that refusing would strand
-/// the turn on output the user could have read.
+/// A parseable tool call always continues the loop, even when the text also
+/// starts with `FINAL`. That is pi's rule — `content` contains a `toolCall` or
+/// it does not — applied to the text protocol this crate stores. The old order
+/// let `FINAL` win, so a 4B model that wrote `FINAL` then `TOOL` (or leaked
+/// Qwen `<tool_call>` XML) ended the turn without running anything.
+///
+/// Bare prose is accepted as an answer last: local models ignore the schema
+/// often enough that refusing would strand the turn on output the user could
+/// have read.
 #[must_use]
 pub fn classify(text: &str) -> Step {
-    if let Some(answer) = parse_final(text) {
-        return Step::Answer(answer);
-    }
     match parse_tool_call(text) {
         ToolCall::Parsed { name, args } => return Step::Call { name, args },
         ToolCall::Malformed { name, reason } => return Step::Malformed { name, reason },
         ToolCall::Absent => {}
+    }
+    match parse_native_tool_call(text) {
+        ToolCall::Parsed { name, args } => return Step::Call { name, args },
+        ToolCall::Malformed { name, reason } => return Step::Malformed { name, reason },
+        ToolCall::Absent => {}
+    }
+    if let Some(answer) = parse_final(text) {
+        return Step::Answer(answer);
     }
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -156,6 +166,172 @@ pub fn parse_tool_call(text: &str) -> ToolCall {
     }
 }
 
+/// Qwen 3.5 / Hermes native tool XML, when the runtime leaked it as text.
+///
+/// Two bodies, both wrapped in `<tool_call>…</tool_call>`:
+///
+/// * Hermes JSON: `{"name":"get_now","arguments":{}}`
+/// * Qwen XML: `<function=get_now><parameter=query>foo</parameter></function>`
+///
+/// A bare mention of the tag in prose is [`ToolCall::Absent`]. An opened block
+/// that does not parse is [`ToolCall::Malformed`], so the loop can correct it
+/// instead of treating the XML as the answer.
+#[must_use]
+pub fn parse_native_tool_call(text: &str) -> ToolCall {
+    let Some((inner, closed)) = native_tool_inner(text) else {
+        return ToolCall::Absent;
+    };
+    if !closed {
+        return ToolCall::Malformed {
+            name: "unknown".into(),
+            reason: "unclosed <tool_call>".into(),
+        };
+    }
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return ToolCall::Malformed {
+            name: "unknown".into(),
+            reason: "empty <tool_call>".into(),
+        };
+    }
+    if let Some(slice) = extract_json_object(inner) {
+        return parse_hermes_tool_json(slice);
+    }
+    parse_qwen_xml_function(inner)
+}
+
+/// The body of the first `<tool_call>`… and whether `</tool_call>` closed it.
+///
+/// `None` when the tag is only mentioned, not opened as a call — e.g. the
+/// catalog line that says not to wrap a call in this markup.
+fn native_tool_inner(text: &str) -> Option<(&str, bool)> {
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("<tool_call>")?;
+    let after = start + "<tool_call>".len();
+    if let Some(rel_end) = lower[after..].find("</tool_call>") {
+        return Some((&text[after..after + rel_end], true));
+    }
+    let rest = text[after..].trim_start();
+    // A mention of the tag in prose is not a call. An opened body that
+    // looks like Hermes JSON or Qwen XML, with no closer, is.
+    if rest.is_empty()
+        || rest.starts_with('{')
+        || rest.to_ascii_lowercase().starts_with("<function=")
+    {
+        Some((&text[after..], false))
+    } else {
+        None
+    }
+}
+
+fn parse_hermes_tool_json(slice: &str) -> ToolCall {
+    match serde_json::from_str::<Value>(slice) {
+        Ok(Value::Object(map)) => {
+            let name = map
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            if name.is_empty() {
+                return ToolCall::Malformed {
+                    name: "unknown".into(),
+                    reason: "<tool_call> JSON has no name".into(),
+                };
+            }
+            let args = map
+                .get("arguments")
+                .or_else(|| map.get("args"))
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            match args {
+                Value::Object(_) => ToolCall::Parsed { name, args },
+                Value::String(raw) => match serde_json::from_str::<Value>(&raw) {
+                    Ok(Value::Object(parsed)) => {
+                        ToolCall::Parsed { name, args: Value::Object(parsed) }
+                    }
+                    Ok(_) => ToolCall::Malformed {
+                        name,
+                        reason: "arguments must be a JSON object".into(),
+                    },
+                    Err(error) => ToolCall::Malformed {
+                        name,
+                        reason: format!("arguments is not valid JSON: {error}"),
+                    },
+                },
+                _ => ToolCall::Malformed {
+                    name,
+                    reason: "arguments must be a JSON object".into(),
+                },
+            }
+        }
+        Ok(_) => ToolCall::Malformed {
+            name: "unknown".into(),
+            reason: "<tool_call> JSON must be an object".into(),
+        },
+        Err(error) => ToolCall::Malformed {
+            name: "unknown".into(),
+            reason: format!("<tool_call> JSON is invalid: {error}"),
+        },
+    }
+}
+
+fn parse_qwen_xml_function(inner: &str) -> ToolCall {
+    let lower = inner.to_ascii_lowercase();
+    let Some(fn_at) = lower.find("<function=") else {
+        return ToolCall::Malformed {
+            name: "unknown".into(),
+            reason: "<tool_call> has no JSON object or <function=…>".into(),
+        };
+    };
+    let name_start = fn_at + "<function=".len();
+    let rest = &inner[name_start..];
+    let name_end = rest
+        .find(['>', ' ', '\n', '\r', '\t', '/'])
+        .unwrap_or(rest.len());
+    let name = rest[..name_end].trim().to_owned();
+    if name.is_empty() {
+        return ToolCall::Malformed {
+            name: "unknown".into(),
+            reason: "empty function name".into(),
+        };
+    }
+
+    let mut args = serde_json::Map::new();
+    let mut offset = 0;
+    let hay_lower = inner.to_ascii_lowercase();
+    while let Some(rel) = hay_lower[offset..].find("<parameter=") {
+        let abs = offset + rel + "<parameter=".len();
+        let after = &inner[abs..];
+        let Some(key_end) = after.find('>') else {
+            return ToolCall::Malformed {
+                name,
+                reason: "unclosed <parameter>".into(),
+            };
+        };
+        let key = after[..key_end].trim().to_owned();
+        let value_start = abs + key_end + 1;
+        let close = hay_lower[value_start..].find("</parameter>");
+        let Some(close) = close else {
+            return ToolCall::Malformed {
+                name,
+                reason: "unclosed <parameter>".into(),
+            };
+        };
+        let raw = inner[value_start..value_start + close].trim();
+        let value = serde_json::from_str::<Value>(raw)
+            .unwrap_or_else(|_| Value::String(raw.to_owned()));
+        if !key.is_empty() {
+            args.insert(key, value);
+        }
+        offset = value_start + close + "</parameter>".len();
+    }
+    ToolCall::Parsed {
+        name,
+        args: Value::Object(args),
+    }
+}
+
 /// The first balanced `{…}` in `text`, ignoring braces inside JSON strings.
 ///
 /// Counting braces blindly breaks on the arguments most worth getting right:
@@ -242,10 +418,29 @@ impl AnswerGate {
     fn classify(&mut self) -> Vec<String> {
         let trimmed = self.buf.trim_start();
         let upper = trimmed.to_ascii_uppercase();
-        if is_open_prefix("FINAL", &upper) || is_open_prefix("TOOL", &upper) {
+        if is_open_prefix("FINAL", &upper)
+            || is_open_prefix("TOOL", &upper)
+            || is_open_native_tool_prefix(trimmed)
+        {
             return Vec::new();
         }
-        if let Some(body) = strip_final_prefix(trimmed) {
+        // Do not `trim()` the whole buffer: a trailing space on "FINAL\nIt "
+        // is the first character of the answer, not padding. `parse_final`
+        // still trims the completed text.
+        if let Some(body) = strip_keyword(trimmed, "FINAL") {
+            let body_trim = body.trim_start();
+            if body_trim.is_empty()
+                || is_open_prefix("TOOL", &body_trim.to_ascii_uppercase())
+                || is_open_native_tool_prefix(body_trim)
+            {
+                return Vec::new();
+            }
+            if first_line_is_hidden_call(body_trim) {
+                self.state = GateState::Hidden;
+                self.buf.clear();
+                return Vec::new();
+            }
+            let body = body.to_owned();
             self.state = GateState::Answer;
             self.buf.clear();
             if body.is_empty() {
@@ -254,7 +449,7 @@ impl AnswerGate {
             self.emitted = true;
             return vec![body];
         }
-        if first_line_is_tool(trimmed) {
+        if first_line_is_hidden_call(trimmed) {
             self.state = GateState::Hidden;
             self.buf.clear();
             return Vec::new();
@@ -279,6 +474,24 @@ fn first_line_is_tool(text: &str) -> bool {
         .lines()
         .next()
         .is_some_and(|line| line.trim().to_ascii_uppercase().starts_with("TOOL"))
+}
+
+fn first_line_is_native_tool(text: &str) -> bool {
+    text.trim_start().lines().next().is_some_and(|line| {
+        line.trim()
+            .to_ascii_lowercase()
+            .starts_with("<tool_call")
+    })
+}
+
+fn first_line_is_hidden_call(text: &str) -> bool {
+    first_line_is_tool(text) || first_line_is_native_tool(text)
+}
+
+/// Whether `text` could still grow into a `<tool_call>` open tag.
+fn is_open_native_tool_prefix(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    is_open_prefix("<tool_call", &lower)
 }
 
 #[cfg(test)]
@@ -402,7 +615,14 @@ ARGS {"query": "a } b"}"#),
     }
 
     #[test]
-    fn classify_prefers_final_then_tool_then_prose() {
+    fn classify_prefers_a_parseable_call_over_final() {
+        assert_eq!(
+            classify("FINAL\nTOOL get_now\nARGS {}"),
+            Step::Call {
+                name: "get_now".into(),
+                args: json!({})
+            }
+        );
         assert_eq!(classify("FINAL\ndone"), Step::Answer("done".into()));
         assert_eq!(
             classify("TOOL get_now\nARGS {}"),
@@ -416,11 +636,71 @@ ARGS {"query": "a } b"}"#),
     }
 
     #[test]
+    fn classify_accepts_hermes_and_qwen_xml_tool_calls() {
+        assert_eq!(
+            classify(
+                r#"<tool_call>
+{"name":"get_now","arguments":{}}
+</tool_call>"#
+            ),
+            Step::Call {
+                name: "get_now".into(),
+                args: json!({})
+            }
+        );
+        assert_eq!(
+            classify(
+                "FINAL\n<tool_call>\n<function=search_evidence>\n<parameter=query>\nfoo\n</parameter>\n<parameter=limit>\n5\n</parameter>\n</function>\n</tool_call>"
+            ),
+            Step::Call {
+                name: "search_evidence".into(),
+                args: json!({"query": "foo", "limit": 5}),
+            }
+        );
+        // A mention of the tag in an answer is not a call.
+        assert_eq!(
+            classify("Do not wrap the call in <tool_call> markup."),
+            Step::Answer("Do not wrap the call in <tool_call> markup.".into())
+        );
+        match classify("<tool_call>\n{\"name\":\"get_now\"") {
+            Step::Malformed { .. } => {}
+            other => panic!("unclosed native call classified as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_streams_final_in_three_byte_chunks() {
+        let text = "FINAL\nIt is Tuesday afternoon.";
+        let mut gate = AnswerGate::default();
+        let mut out = String::new();
+        for chunk in text.as_bytes().chunks(3) {
+            let piece = String::from_utf8_lossy(chunk);
+            for part in gate.push(&piece) {
+                out.push_str(&part);
+            }
+        }
+        if let Some(rest) = gate.leftover_answer("It is Tuesday afternoon.") {
+            out.push_str(&rest);
+        }
+        assert_eq!(out, "It is Tuesday afternoon.", "got {out:?}");
+    }
+
+    #[test]
     fn gate_hides_tool_drafts_and_streams_final() {
         let mut gate = AnswerGate::default();
         assert!(gate.push("TO").is_empty());
         assert!(gate.push("OL list_activity\nARGS {}").is_empty());
         assert!(gate.leftover_answer("ignored").is_none());
+
+        let mut native = AnswerGate::default();
+        assert!(native.push("<to").is_empty());
+        assert!(native.push("ol_call>\n{\"name\":\"get_now\"}").is_empty());
+        assert!(native.leftover_answer("ignored").is_none());
+
+        let mut after_final = AnswerGate::default();
+        assert!(after_final.push("FINAL\n").is_empty());
+        assert!(after_final.push("TOOL get_now\nARGS {}").is_empty());
+        assert!(after_final.leftover_answer("ignored").is_none());
 
         let mut answer = AnswerGate::default();
         assert!(answer.push("FI").is_empty());

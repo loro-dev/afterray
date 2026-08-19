@@ -109,8 +109,6 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installAppMenu() {
-        let mainMenu = NSMenu()
-        let appMenuItem = NSMenuItem()
         let appMenu = NSMenu()
         let settingsItem = NSMenuItem(
             title: "Settings…",
@@ -130,9 +128,7 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         )
         quitItem.target = self
         appMenu.addItem(quitItem)
-        appMenuItem.submenu = appMenu
-        mainMenu.addItem(appMenuItem)
-        NSApp.mainMenu = mainMenu
+        AfterRayMainMenu.install(appMenu: appMenu)
     }
 
     private func makeUpdateMenuItem() -> NSMenuItem? {

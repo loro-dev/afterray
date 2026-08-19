@@ -181,6 +181,42 @@ final class ChatTranscriptTests: XCTestCase {
         )
     }
 
+    func testStoredElapsedMsBeatsCreatedAtGap() {
+        let messages = [
+            ChatMessage(
+                id: "u1",
+                conversationId: "c1",
+                role: .user,
+                content: "what",
+                createdAtMs: 1_000
+            ),
+            ChatMessage(
+                id: "a1",
+                conversationId: "c1",
+                role: .assistant,
+                content: "that",
+                createdAtMs: 1_100,
+                usageJSON: #"{"prompt_tokens":100,"window_tokens":16384,"round":1,"elapsed_ms":8420}"#
+            ),
+        ]
+        XCTAssertEqual(ChatTranscript.bubbles(messages: messages)[1].workElapsedMs, 8_420)
+        XCTAssertEqual(ChatProgress.formatElapsed(8_420), "8.4s")
+    }
+
+    func testStreamingElapsedPrefersWallClockOverRoundProgress() {
+        let bubbles = ChatTranscript.bubbles(
+            messages: [
+                ChatMessage(id: "u1", conversationId: "c1", role: .user, content: "q", createdAtMs: 1),
+            ],
+            streamingText: "working",
+            isSending: true,
+            nowMs: 10_000,
+            progress: ChatProgress(phase: .generating, reasoningDeltas: 0, elapsedMs: 400, round: 2),
+            lastWorkElapsedMs: 12_300
+        )
+        XCTAssertEqual(bubbles.last?.workElapsedMs, 12_300)
+    }
+
     func testTinyCreatedAtGapIsNotADuration() {
         let messages = [
             ChatMessage(id: "u1", conversationId: "c1", role: .user, content: "q", createdAtMs: 10),

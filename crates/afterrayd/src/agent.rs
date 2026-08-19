@@ -47,6 +47,15 @@ pub(crate) fn render_recall_system(now_ms: i64, language: &str) -> String {
     )
 }
 
+/// Chat and ask read the **summary** preference, not the UI one. The two
+/// settings exist so chrome can be English while cards and replies stay
+/// Chinese; pointing chat at `ui_language` made the agent ignore the
+/// language the user already picked for model output.
+#[must_use]
+pub(crate) fn reply_language_from_prefs(_ui_language: &str, summary_language: &str) -> String {
+    resolve_language(summary_language)
+}
+
 /// Resolves a stored language preference to the English name a model should
 /// be told to write in. `auto` follows the system language, defaulting to
 /// English when the locale is unset or unrecognised.
@@ -220,5 +229,15 @@ mod tests {
         assert_eq!(resolve_language("zh-Hans"), "Chinese (Simplified)");
         assert_eq!(resolve_language("ja"), "Japanese");
         assert_eq!(resolve_language("en"), "English");
+    }
+
+    #[test]
+    fn chat_and_ask_follow_summary_language_not_ui() {
+        assert_eq!(
+            reply_language_from_prefs("en", "zh-Hans"),
+            "Chinese (Simplified)"
+        );
+        assert_eq!(reply_language_from_prefs("zh-Hans", "ja"), "Japanese");
+        assert_eq!(reply_language_from_prefs("en", "auto"), resolve_language("auto"));
     }
 }

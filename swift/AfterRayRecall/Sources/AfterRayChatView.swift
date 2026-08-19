@@ -980,6 +980,7 @@ private struct ChatBubbleView: View {
 
     private var showsTurnMeta: Bool {
         if let rate = bubble.tokensPerSecond, rate > 0 { return true }
+        if let elapsed = bubble.workElapsedMs, elapsed > 0 { return true }
         return !bubble.isStreaming && !bubble.text.isEmpty
     }
 
@@ -1024,6 +1025,14 @@ private struct ChatBubbleView: View {
                     if showsTurnMeta {
                         HStack(spacing: 8) {
                             Spacer(minLength: 0)
+                            if let elapsed = bubble.workElapsedMs, elapsed > 0 {
+                                Text(ChatProgress.formatElapsed(elapsed))
+                                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                                    .monospacedDigit()
+                                    .foregroundStyle(ChatPalette.tertiary)
+                                    .help("Wall time for this turn, including lookups")
+                                    .accessibilityIdentifier("chat-turn-elapsed-\(bubble.id)")
+                            }
                             if let rate = bubble.tokensPerSecond {
                                 Text(ChatTokenEstimate.rateLabel(rate))
                                     .font(.system(size: 10.5, weight: .medium, design: .rounded))
@@ -1436,8 +1445,11 @@ private struct ChatComposerField: NSViewRepresentable {
         }
         context.coordinator.onSend = onSend
         textView.isEditable = isEnabled
-        if textView.string != text {
-            textView.string = text
+        // Typing already wrote the same bytes through `textDidChange`.
+        // Replacing `string` here would drop the undo stack and the caret.
+        // Only an external draft change (send, new conversation) may replace.
+        if !context.coordinator.isApplyingFromView, textView.string != text {
+            context.coordinator.replaceText(in: textView, with: text)
         }
         scroll.alphaValue = isEnabled ? 1 : 0.55
     }
@@ -1446,6 +1458,7 @@ private struct ChatComposerField: NSViewRepresentable {
         var text: Binding<String>
         var onSend: () -> Void
         weak var textView: ChatSendTextView?
+        var isApplyingFromView = false
 
         init(text: Binding<String>, onSend: @escaping () -> Void) {
             self.text = text
@@ -1454,7 +1467,22 @@ private struct ChatComposerField: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
+            isApplyingFromView = true
             text.wrappedValue = view.string
+            isApplyingFromView = false
+        }
+
+        /// External draft change (send / new conversation). One replacement,
+        /// then the undo stack is emptied: this is not an edit the user made.
+        func replaceText(in textView: NSTextView, with replacement: String) {
+            let range = NSRange(location: 0, length: (textView.string as NSString).length)
+            if textView.shouldChangeText(in: range, replacementString: replacement) {
+                textView.textStorage?.replaceCharacters(in: range, with: replacement)
+                textView.didChangeText()
+            } else {
+                textView.string = replacement
+            }
+            textView.undoManager?.removeAllActions()
         }
     }
 }

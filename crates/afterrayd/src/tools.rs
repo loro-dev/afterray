@@ -1219,6 +1219,19 @@ fn indent_lines(text: &str, prefix: &str) -> String {
 
 const CATALOG_TEMPLATE: &str = r#"Tools. Call at most one per reply, then wait for its result.
 
+Reply with exactly one of:
+
+TOOL <name>
+ARGS <one JSON object>
+
+or
+
+FINAL
+<answer>
+
+Never write FINAL and a tool call in the same reply. Do not wrap the call in
+<tool_call> or any other markup. Do not put analysis before those lines.
+
 Timestamps are Unix milliseconds. Every one you use must be copied from a tool
 result — never work one out yourself, you will get the year wrong. Values
 written key=value are there to be copied verbatim.
@@ -1706,6 +1719,28 @@ mod catalog_drift {
                 );
             }
         }
+    }
+
+    /// The reply format lives in the catalog, next to the tools it applies to.
+    /// Chat's system prompt is forbidden from naming tools; if this block
+    /// disappears again the model falls back to Qwen XML / FINAL-then-TOOL
+    /// and the turn ends without running anything.
+    #[test]
+    fn the_catalog_documents_the_reply_format() {
+        let catalog = tool_catalog_text(0);
+        assert!(
+            catalog.contains("TOOL <name>") && catalog.contains("ARGS <one JSON object>"),
+            "catalog dropped TOOL/ARGS: {catalog}"
+        );
+        assert!(
+            catalog.contains("FINAL"),
+            "catalog dropped FINAL: {catalog}"
+        );
+        let system = crate::agent::render_recall_system(0, "English");
+        assert!(
+            system.contains("TOOL <name>") && system.contains("ARGS <one JSON object>"),
+            "chat system does not carry the catalog reply format"
+        );
     }
 
     /// The seed is gone and must stay gone: a clock in the opening changes

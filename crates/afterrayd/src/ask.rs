@@ -24,11 +24,6 @@ Use ordinary afterray://moment links for additional citations. Be concise. Never
 The seed below already holds memories, activity and search hits for the range; \
 reach for a tool when it is not enough, following the catalog's own ordering.";
 
-const QWEN35_TOOL_PROTOCOL_SUFFIX: &str = "\
-For tools, output exactly two lines: TOOL <allowlisted tool name> followed by \
-ARGS <one JSON object>. Do not put analysis, thinking markers, or prose before \
-those lines. For a user-facing response, output FINAL followed by the answer.";
-
 const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
 /// What the model layer offers a turn: whether there is a model at all, and
@@ -447,7 +442,7 @@ pub(crate) async fn handle_ask(
     // folded history; the question is inside the seed block it built.
     let opening = afterray_harness::Opening {
         task: format!(
-            "{seed}\n\nUse tools if the seed evidence is incomplete. Then answer with FINAL."
+            "{seed}\n\nUse tools if the seed evidence is incomplete. When you have the answer, write FINAL."
         ),
         ..afterray_harness::Opening::default()
     };
@@ -458,7 +453,7 @@ pub(crate) async fn handle_ask(
     };
     let system = format!(
         "{ASK_SYSTEM_PROMPT}\n\nWrite the answer in {language}. Proper nouns — \
-         products, repos, files, commands, people — keep their original spelling.\n\nReply language: {language}\n\n{}\n\n{QWEN35_TOOL_PROTOCOL_SUFFIX}",
+         products, repos, files, commands, people — keep their original spelling.\n\nReply language: {language}\n\n{}",
         crate::tools::tool_catalog_text(now_ms)
     );
     match agent::run_readonly_agent(models, &host, &system, opening).await {

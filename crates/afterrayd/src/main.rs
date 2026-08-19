@@ -618,13 +618,13 @@ fn default_language() -> String {
     "auto".to_owned()
 }
 
-/// Reply language for chat and ask, from the stored UI preference.
+/// Reply language for chat and ask, from the stored **summary** preference.
 pub(crate) fn reply_language(state: &AppState) -> String {
-    let stored = state
+    let (ui, summary) = state
         .languages
         .lock()
-        .map_or_else(|_| default_language(), |langs| langs.0.clone());
-    agent::resolve_language(&stored)
+        .map_or_else(|_| (default_language(), default_language()), |langs| langs.clone());
+    agent::reply_language_from_prefs(&ui, &summary)
 }
 
 const fn default_record_audio() -> bool {

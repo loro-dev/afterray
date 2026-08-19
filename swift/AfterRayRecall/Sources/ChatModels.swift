@@ -244,7 +244,8 @@ public struct ChatMessage: Codable, Equatable, Identifiable, Sendable {
             windowTokens: window,
             round: intValue(object["round"]) ?? 0,
             completionTokens: intValue(object["completion_tokens"]) ?? 0,
-            generationMs: intValue(object["generation_ms"]) ?? 0
+            generationMs: intValue(object["generation_ms"]) ?? 0,
+            elapsedMs: intValue(object["elapsed_ms"]) ?? 0
         )
     }
 
@@ -433,19 +434,23 @@ public struct ChatContextUsage: Equatable, Sendable {
     public var completionTokens: Int
     /// Decode time for this turn, milliseconds. Zero until reported.
     public var generationMs: Int
+    /// Wall time for the whole turn, including tool rounds. Zero until known.
+    public var elapsedMs: Int
 
     public init(
         promptTokens: Int,
         windowTokens: Int,
         round: Int,
         completionTokens: Int = 0,
-        generationMs: Int = 0
+        generationMs: Int = 0,
+        elapsedMs: Int = 0
     ) {
         self.promptTokens = promptTokens
         self.windowTokens = windowTokens
         self.round = round
         self.completionTokens = completionTokens
         self.generationMs = generationMs
+        self.elapsedMs = elapsedMs
     }
 
     /// Model-reported decode rate. Nil until both counts arrive — do not
@@ -680,7 +685,8 @@ public enum ChatStreamEventDecoder {
                     windowTokens: intValue(object["window_tokens"]) ?? 0,
                     round: intValue(object["round"]) ?? 0,
                     completionTokens: intValue(object["completion_tokens"]) ?? 0,
-                    generationMs: intValue(object["generation_ms"]) ?? 0
+                    generationMs: intValue(object["generation_ms"]) ?? 0,
+                    elapsedMs: intValue(object["elapsed_ms"]) ?? 0
                 )
             )
         case "started":
@@ -1376,8 +1382,11 @@ public enum ChatTranscript {
             if message.role == .user {
                 previousUserMs = message.createdAtMs
             }
+            let storedElapsed = message.usage.flatMap { usage in
+                usage.elapsedMs > 0 ? usage.elapsedMs : nil
+            }
             let elapsed = message.role == .assistant
-                ? ChatWorkSummary.elapsedMs(
+                ? storedElapsed ?? ChatWorkSummary.elapsedMs(
                     fromUserMs: previousUserMs,
                     toAssistantMs: message.createdAtMs
                 )
@@ -1426,7 +1435,8 @@ public enum ChatTranscript {
                     progress: progress,
                     reasoning: streamingReasoning,
                     parts: liveParts,
-                    workElapsedMs: progress?.elapsedMs ?? lastWorkElapsedMs,
+                    // Wall time from send, not the current round's clock.
+                    workElapsedMs: lastWorkElapsedMs ?? progress?.elapsedMs,
                     usage: liveUsage
                 )
             )
