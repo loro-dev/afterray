@@ -1,0 +1,3 @@
+NSAppleEventsUsageDescription = "AfterRayはアクティブなブラウザウィンドウがプライベートかどうかを確認し、記録をスキップします。この許可でページのURLは読み取りません。";
+NSMicrophoneUsageDescription = "AfterRayはコンピュータの活動を記録しているあいだ、音声をこのMac上で文字起こしします。";
+NSHumanReadableCopyright = "Copyright © 2026 AfterRay.";

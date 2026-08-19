@@ -91,9 +91,13 @@ public enum RelativeStamp {
     private static let week: Int64 = 7 * day
 
     /// `NOW`, `5M`, `3H`, `2D`, `6W`, `2Y`.
-    public static func short(fromMs: Int64, nowMs: Int64) -> String {
+    public static func short(
+        fromMs: Int64,
+        nowMs: Int64,
+        copy: AfterRayCopy = .english
+    ) -> String {
         let elapsed = max(nowMs - fromMs, 0)
-        if elapsed < minute { return "NOW" }
+        if elapsed < minute { return copy.format.now }
         if elapsed < hour { return "\(elapsed / minute)M" }
         if elapsed < day { return "\(elapsed / hour)H" }
         if elapsed < week { return "\(elapsed / day)D" }

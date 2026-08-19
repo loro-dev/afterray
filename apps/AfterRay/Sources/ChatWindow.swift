@@ -47,7 +47,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
             backing: .buffered,
             defer: false
         )
-        window.title = "AfterRay Chat"
+        window.title = AfterRayLocalization.shared.copy.menu.chatWindow
         let minSize = NSSize(width: 720, height: 480)
         window.minSize = minSize
         window.contentMinSize = minSize
@@ -158,7 +158,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
             return item
         case .chatTitle:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "Conversation title"
+            item.label = AfterRayLocalization.shared.copy.chat.conversationTitle
             item.paletteLabel = item.label
             item.view = NSHostingView(
                 rootView: ChatToolbarTitleView(model: AfterRayServices.shared.chat)
@@ -168,13 +168,14 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
         case .chatNewConversation:
             return toolbarButton(
                 identifier: itemIdentifier,
-                label: "New conversation",
+                label: AfterRayLocalization.shared.copy.chat.newConversation,
                 symbol: "plus",
                 action: #selector(startNewConversation(_:))
             )
         case .chatMore:
+            let copy = AfterRayLocalization.shared.copy
             let item = NSMenuToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "More"
+            item.label = copy.chat.more
             item.paletteLabel = item.label
             item.toolTip = item.label
             item.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: item.label)
@@ -280,7 +281,8 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
     }
 
     private var sidebarToggleLabel: String {
-        sidebarState.isCollapsed ? "Show sidebar" : "Hide sidebar"
+        let copy = AfterRayLocalization.shared.copy
+        return sidebarState.isCollapsed ? copy.chat.showSidebar : copy.chat.hideSidebar
     }
 
     private func toolbarButton(
@@ -302,9 +304,10 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
     }
 
     private func makeMoreMenu() -> NSMenu {
-        let menu = NSMenu(title: "More")
+        let strings = AfterRayLocalization.shared.copy
+        let menu = NSMenu(title: strings.chat.more)
         let copy = NSMenuItem(
-            title: "Copy Entire Conversation as Markdown",
+            title: strings.chat.copyEntire,
             action: #selector(copyConversationMarkdown(_:)),
             keyEquivalent: ""
         )

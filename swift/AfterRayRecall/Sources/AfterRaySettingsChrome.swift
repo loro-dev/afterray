@@ -116,13 +116,15 @@ public struct AfterRayStorageSnapshot: Equatable, Sendable {
         return used > afterrayBytes ? used - afterrayBytes : 0
     }
 
-    public var diskShareText: String {
-        guard volumeTotal > 0 else { return "Disk size is unavailable." }
+    public var diskShareText: String { diskShareText(copy: .english) }
+
+    public func diskShareText(copy: AfterRayCopy) -> String {
+        guard volumeTotal > 0 else { return copy.settings.diskUnavailable }
         let percent = Double(afterrayBytes) / Double(volumeTotal) * 100
         let share = percent < 0.1
-            ? "less than 0.1%"
+            ? copy.settings.lessThanTenth
             : String(format: "%.1f%%", percent)
-        return "AfterRay is \(share) of this \(Self.byteCount(volumeTotal)) disk."
+        return copy.settings.diskShare(share, Self.byteCount(volumeTotal))
     }
 
     public var barSlices: (afterray: CGFloat, other: CGFloat, free: CGFloat) {
@@ -188,13 +190,15 @@ public enum AfterRaySettingsPage: String, CaseIterable, Identifiable, Sendable {
 
     public var id: String { rawValue }
 
-    public var title: String {
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .general: "General"
-        case .models: "AI Models"
-        case .advanced: "Advanced"
-        case .developer: "Developer Options"
-        case .diagnostics: "Diagnostics"
+        case .general: copy.settings.pageGeneral
+        case .models: copy.settings.pageModels
+        case .advanced: copy.settings.pageAdvanced
+        case .developer: copy.settings.pageDeveloper
+        case .diagnostics: copy.settings.pageDiagnostics
         }
     }
 
@@ -338,6 +342,9 @@ public enum AfterRaySettingsStyle: Sendable {
 public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @ObservedObject var model: Model
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
+    @ObservedObject private var localization = AfterRayLocalization.shared
+
+    private var copy: AfterRayCopy { localization.copy }
     let onClose: () -> Void
     @State private var page: AfterRaySettingsPage
     @State private var copied = false
@@ -404,6 +411,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 .strokeBorder(.white.opacity(0.09), lineWidth: 1)
             }
         }
+        .afterRayLocalized()
         .task { await model.refresh() }
         .onChange(of: model.developerOptionsEnabled) { _, enabled in
             if !enabled, page == .developer {
@@ -420,7 +428,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 Rectangle()
                     .fill(SettingsPalette.accent)
                     .frame(width: 16, height: 2)
-                Text("AFTERRAY")
+                Text(copy.settings.brand)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .tracking(1.1)
                     .foregroundStyle(SettingsPalette.accent)
@@ -491,7 +499,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
-            Text(page.title)
+            Text(page.title(copy))
                 .font(.settingsPageTitle)
                 .foregroundStyle(SettingsPalette.label)
             Spacer(minLength: 12)
@@ -501,7 +509,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         .controlSize(.small)
                         .frame(width: 28, height: 28)
                 } else {
-                    SettingsIconButton(symbol: "arrow.clockwise", help: "Refresh") {
+                    SettingsIconButton(symbol: "arrow.clockwise", help: copy.common.refresh) {
                         Task { await model.refresh() }
                     }
                 }
@@ -509,7 +517,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 // one inside the content is the kind of duplicate chrome that
                 // makes a hosted panel read as a dialog stuck in a window.
                 if style == .card {
-                    SettingsIconButton(symbol: "xmark", help: "Close settings", action: onClose)
+                    SettingsIconButton(symbol: "xmark", help: copy.settings.closeSettings, action: onClose)
                 }
             }
         }
@@ -555,18 +563,18 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         // Footnote only when something is wrong with the shortcut. What a
         // global shortcut is for needs no caption.
         SettingsSection(
-            title: "Opening AfterRay",
-            footnote: hotKeys.failure ?? hotKeys.hotKey.systemConflictNote
+            title: copy.settings.openingAfterRay,
+            footnote: hotKeys.failure ?? hotKeys.hotKey.systemConflictNote(copy)
         ) {
             SettingsRow(
-                title: "Global shortcut",
+                title: copy.settings.globalShortcut,
                 subtitle: hotKeys.isRecording
-                    ? "Listening — press the keys you want, or esc to keep the current one."
-                    : "Click the keys to record a new combination."
+                    ? copy.settings.listeningShortcut
+                    : copy.settings.clickToRecord
             ) {
                 HStack(spacing: 8) {
                     if !hotKeys.isDefault, !hotKeys.isRecording {
-                        Button("Reset") { hotKeys.restoreDefault() }
+                        Button(copy.common.reset) { hotKeys.restoreDefault() }
                             .buttonStyle(SettingsButtonStyle())
                     }
                     RecallHotKeyField(store: hotKeys, size: .compact)
@@ -574,10 +582,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
-        SettingsSection(title: "Capture") {
+        SettingsSection(title: copy.settings.capture) {
             SettingsRow(
-                title: "Record audio",
-                subtitle: "System audio and microphone for transcripts. Recordings already in the vault stay."
+                title: copy.settings.recordAudio,
+                subtitle: copy.settings.recordAudioSubtitle
             ) {
                 HStack(spacing: 8) {
                     if model.isUpdatingAudio {
@@ -596,58 +604,58 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
 
         SettingsSection(
-            title: "Summaries",
+            title: copy.settings.summaries,
             // The honest caveat: the control looks retroactive, and is not.
-            footnote: "Summaries already written keep the length they were written at."
+            footnote: copy.settings.summariesFootnote
         ) {
             SettingsRow(
-                title: "Summary length",
-                subtitle: "How much of the day one card on the summary panel covers."
+                title: copy.settings.summaryLength,
+                subtitle: copy.settings.summaryLengthSubtitle
             ) {
                 HStack(spacing: 8) {
                     if model.isUpdatingSummarySlot {
                         ProgressView().controlSize(.mini)
                     }
-                    Picker("Summary length", selection: summarySlotMinutesBinding) {
+                    Picker(copy.settings.summaryLength, selection: summarySlotMinutesBinding) {
                         ForEach(summarySlotMinutesOptions, id: \.self) { minutes in
-                            Text(AppSettings.summaryLengthLabel(minutes)).tag(minutes)
+                            Text(AppSettings.summaryLengthLabel(minutes, copy: copy)).tag(minutes)
                         }
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
                     .frame(width: 118)
                     .disabled(model.isUpdatingSummarySlot)
-                    .accessibilityLabel("Summary length")
+                    .accessibilityLabel(copy.settings.summaryLength)
                 }
             }
         }
 
-        SettingsSection(title: "Language") {
+        SettingsSection(title: copy.settings.language) {
             SettingsRow(
-                title: "Interface",
-                subtitle: "Not applied yet."
+                title: copy.settings.interface,
+                subtitle: copy.settings.interfaceSubtitle
             ) {
                 languageMenu(
-                    title: "Interface language",
+                    title: copy.settings.interfaceLanguage,
                     selection: uiLanguageBinding,
-                    options: languagePickerOptions(selected: model.settings?.uiLanguage)
+                    options: uiLanguagePickerOptions(selected: model.settings?.uiLanguage)
                 )
             }
             SettingsSeparator()
-            SettingsRow(title: "Summaries") {
+            SettingsRow(title: copy.settings.summaries) {
                 languageMenu(
-                    title: "Summary language",
+                    title: copy.settings.summaryLanguage,
                     selection: summaryLanguageBinding,
                     options: languagePickerOptions(selected: model.settings?.summaryLanguage)
                 )
             }
         }
 
-        SettingsSection(title: "Excluded apps") {
+        SettingsSection(title: copy.settings.excludedApps) {
             if model.excludedBundleIds.isEmpty {
                 // Empty state carries the action itself: a lone footer bar under
                 // an empty row leaves a separator floating over dead space.
-                SettingsRow(title: "Nothing excluded") {
+                SettingsRow(title: copy.settings.nothingExcluded) {
                     excludeAppButtons
                 }
             } else {
@@ -660,11 +668,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         iconBundleID: bundleID
                     ) {
                         if model.settings?.protectedBundleIds.contains(bundleID) == true {
-                            Label("Always excluded", systemImage: "lock.fill")
+                            Label(copy.settings.alwaysExcluded, systemImage: "lock.fill")
                                 .font(.settingsRowSubtitle)
                                 .foregroundStyle(SettingsPalette.secondaryLabel)
                         } else {
-                            Button("Include") {
+                            Button(copy.common.include) {
                                 Task { await model.includeBundle(bundleID) }
                             }
                             .buttonStyle(SettingsButtonStyle())
@@ -677,16 +685,16 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
-        SettingsSection(title: "Excluded websites") {
+        SettingsSection(title: copy.settings.excludedWebsites) {
             if model.excludedDomains.isEmpty {
-                SettingsRow(title: "Nothing excluded") {
+                SettingsRow(title: copy.settings.nothingExcluded) {
                     addDomainField
                 }
             } else {
                 ForEach(Array(model.excludedDomains.enumerated()), id: \.element) { index, domain in
                     if index > 0 { SettingsSeparator() }
                     SettingsRow(title: domain, subtitle: nil) {
-                        Button("Include") {
+                        Button(copy.common.include) {
                             Task { await model.includeDomain(domain) }
                         }
                         .buttonStyle(SettingsButtonStyle())
@@ -701,16 +709,16 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         storageSection
 
         SettingsSection(
-            title: "Delete history",
-            footnote: "Deleted moments are removed from this Mac and cannot be recovered."
+            title: copy.settings.deleteHistory,
+            footnote: copy.settings.deleteHistoryFootnote
         ) {
-            SettingsRow(title: "Remove captured moments") {
+            SettingsRow(title: copy.settings.removeCapturedMoments) {
                 HStack(spacing: 7) {
-                    Button("Last hour") { Task { await model.clearHistory(.lastHour) } }
+                    Button(copy.settings.lastHour) { Task { await model.clearHistory(.lastHour) } }
                         .buttonStyle(SettingsButtonStyle())
-                    Button("Today") { Task { await model.clearHistory(.today) } }
+                    Button(copy.settings.today) { Task { await model.clearHistory(.today) } }
                         .buttonStyle(SettingsButtonStyle())
-                    Button("Everything") { Task { await model.clearHistory(.all) } }
+                    Button(copy.settings.everything) { Task { await model.clearHistory(.all) } }
                         .buttonStyle(SettingsButtonStyle(kind: .destructive))
                 }
                 .disabled(model.isClearingHistory)
@@ -722,7 +730,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     /// is open the frontmost app is AfterRay itself, so the shortcut could only
     /// ever name the wrong app.
     private var excludeAppButtons: some View {
-        Button("Choose App…") {
+        Button(copy.settings.chooseApp) {
             Task { await model.excludeChosenApp() }
         }
         .buttonStyle(SettingsButtonStyle())
@@ -734,12 +742,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     /// tell was an input, which is the same as having no way to add a site.
     private var addDomainField: some View {
         HStack(spacing: 7) {
-            TextField("example.com", text: $domainDraft)
+            TextField(copy.settings.domainPlaceholder, text: $domainDraft)
                 .settingsFieldStyle()
                 .frame(width: 150)
                 .focused($domainFieldFocused)
                 .onSubmit { submitDomain() }
-            Button("Exclude", action: submitDomain)
+            Button(copy.common.exclude, action: submitDomain)
                 .buttonStyle(SettingsButtonStyle())
                 // Without this the empty-state row's long subtitle wins the
                 // squeeze and the button reads "Ex…".
@@ -765,13 +773,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var storageSection: some View {
-        SettingsSection(title: "Storage", contentPadding: 16) {
+        SettingsSection(title: copy.settings.storage, contentPadding: 16) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .firstTextBaseline) {
-                    storageStat("AfterRay uses", AfterRayStorageSnapshot.byteCount(model.storage.afterrayBytes))
+                    storageStat(copy.settings.afterRayUses, AfterRayStorageSnapshot.byteCount(model.storage.afterrayBytes))
                     Spacer(minLength: 12)
                     storageStat(
-                        "Free on disk",
+                        copy.settings.freeOnDisk,
                         AfterRayStorageSnapshot.byteCount(model.storage.volumeFree),
                         align: .trailing
                     )
@@ -782,7 +790,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         storageLegend(segment)
                     }
                 }
-                Text(model.storage.diskShareText)
+                Text(model.storage.diskShareText(copy: copy))
                     .font(.settingsCaption)
                     .foregroundStyle(SettingsPalette.tertiaryLabel)
                 Rectangle()
@@ -790,10 +798,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     .frame(height: 1)
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Memory limit")
+                        Text(copy.settings.memoryLimit)
                             .font(.settingsRowTitle)
                             .foregroundStyle(SettingsPalette.label)
-                        Text("Oldest unstarred moments are removed first. Favorites and a small metadata overhead may exceed this limit.")
+                        Text(copy.settings.memoryLimitSubtitle)
                             .font(.settingsRowSubtitle)
                             .foregroundStyle(SettingsPalette.secondaryLabel)
                             .fixedSize(horizontal: false, vertical: true)
@@ -803,7 +811,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Picker("Memory limit", selection: storageLimitBinding) {
+                    Picker(copy.settings.memoryLimit, selection: storageLimitBinding) {
                         ForEach(storageLimitOptions, id: \.self) { bytes in
                             Text(AfterRayStorageSnapshot.byteCount(bytes)).tag(bytes)
                         }
@@ -869,6 +877,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             ?? [LanguageOption.followSystem]
     }
 
+    private func uiLanguagePickerOptions(selected: String?) -> [LanguageOption] {
+        model.settings?.uiLanguagePickerOptions(selected: selected ?? AppSettings.defaultLanguage)
+            ?? AfterRayUILanguage.pickerLanguageOptions
+    }
+
     private func languageMenu(
         title: String,
         selection: Binding<String>,
@@ -880,7 +893,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
             Picker(title, selection: selection) {
                 ForEach(options) { option in
-                    Text(option.menuTitle)
+                    Text(option.menuTitle(copy))
                         .tag(option.code)
                         .accessibilityLabel(option.englishName)
                 }
@@ -899,19 +912,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         [
             StorageSegment(
                 id: "memories",
-                title: "Memories",
+                title: copy.settings.memories,
                 bytes: model.storage.vaultBytes,
                 color: SettingsPalette.accent
             ),
             StorageSegment(
                 id: "models",
-                title: "Models",
+                title: copy.settings.models,
                 bytes: model.storage.modelBytes,
                 color: SettingsPalette.accent.opacity(0.58)
             ),
             StorageSegment(
                 id: "runtime",
-                title: "Runtime",
+                title: copy.settings.runtime,
                 bytes: model.storage.runtimeBytes,
                 color: SettingsPalette.accent.opacity(0.32)
             ),
@@ -933,14 +946,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         downloadQueueSection
 
         SettingsSection(
-            title: "Assistant source",
+            title: copy.settings.assistantSource,
             footnote: providerFootnote,
             contentPadding: 14
         ) {
             VStack(alignment: .leading, spacing: 14) {
-                Picker("Assistant source", selection: llmProviderBinding) {
+                Picker(copy.settings.assistantSource, selection: llmProviderBinding) {
                     ForEach(LlmProvider.allCases) { provider in
-                        Text(provider.title).tag(provider)
+                        Text(provider.title(copy)).tag(provider)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -950,9 +963,9 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
 
-        SettingsSection(title: "Model packs") {
-            SettingsRow(title: "On-device OCR", subtitle: "Apple Vision") {
-                SettingsPill("Built in", tone: .neutral)
+        SettingsSection(title: copy.settings.modelPacks) {
+            SettingsRow(title: copy.settings.onDeviceOcr, subtitle: copy.settings.appleVision) {
+                SettingsPill(copy.settings.builtIn, tone: .neutral)
             }
             if let library = model.library {
                 ForEach(library.packs.filter {
@@ -965,7 +978,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 SettingsSeparator()
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text("Reading the model folder…")
+                    Text(copy.settings.readingModelFolder)
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                     Spacer()
@@ -980,7 +993,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         downloadSourceSection
 
         if !model.recentJobs.isEmpty {
-            SettingsSection(title: "Recent inference") {
+            SettingsSection(title: copy.settings.recentInference) {
                 ForEach(Array(model.recentJobs.enumerated()), id: \.element.id) { index, job in
                     if index > 0 { SettingsSeparator() }
                     SettingsRow(title: jobTitle(job), subtitle: jobSubtitle(job)) {
@@ -993,7 +1006,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var packsFooter: some View {
         SettingsFooterBar {
-            Button(enqueueableCount > 0 ? "Download Missing (\(enqueueableCount))" : "All Packs Installed") {
+            Button(enqueueableCount > 0 ? copy.settings.downloadMissing(enqueueableCount) : copy.settings.allPacksInstalled) {
                 Task { await model.download(packID: nil) }
             }
             .buttonStyle(SettingsButtonStyle(kind: .prominent))
@@ -1012,8 +1025,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         let queue = downloadQueue
         if !queue.isEmpty {
             SettingsSection(
-                title: "Downloads",
-                footnote: "One pack transfers at a time. Pause keeps partial files so it resumes where it stopped; cancel discards them."
+                title: copy.settings.downloads,
+                footnote: copy.settings.downloadsFootnote
             ) {
                 ForEach(Array(queue.enumerated()), id: \.element.id) { index, item in
                     if index > 0 { SettingsSeparator() }
@@ -1022,7 +1035,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 if queue.count > 1 {
                     SettingsSeparator()
                     SettingsFooterBar {
-                        Button("Cancel All") {
+                        Button(copy.settings.cancelAll) {
                             Task { await model.cancelModelDownloads() }
                         }
                         .buttonStyle(SettingsButtonStyle(kind: .destructive))
@@ -1052,7 +1065,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     .foregroundStyle(SettingsPalette.label)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                SettingsPill(item.stageLabel, tone: queueStageTone(item.stage))
+                SettingsPill(item.stageLabel(copy), tone: queueStageTone(item.stage))
                 if let percent = item.percent, item.stage != .waiting, item.stage != .failed {
                     Text("\(percent)%")
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
@@ -1089,24 +1102,24 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     private func downloadQueueControls(_ item: ModelDownloadQueueItem) -> some View {
         HStack(spacing: 8) {
             if item.canRetry {
-                Button("Retry") {
+                Button(copy.common.retry) {
                     Task { await model.download(packID: item.id) }
                 }
                 .buttonStyle(SettingsButtonStyle(kind: .prominent))
             }
             if item.canResume {
-                Button("Resume") {
+                Button(copy.common.resume) {
                     Task { await model.resumeModelDownloads() }
                 }
                 .buttonStyle(SettingsButtonStyle(kind: .prominent))
             }
             if item.canPause {
-                Button("Pause") {
+                Button(copy.common.pause) {
                     Task { await model.pauseModelDownloads() }
                 }
                 .buttonStyle(SettingsButtonStyle())
             }
-            Button(item.canRetry ? "Dismiss" : "Cancel") {
+            Button(item.canRetry ? copy.common.dismiss : copy.common.cancel) {
                 Task { await model.cancelModelDownload(packID: item.id) }
             }
             .buttonStyle(SettingsButtonStyle())
@@ -1116,23 +1129,23 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func queueDetail(_ item: ModelDownloadQueueItem) -> String {
         if item.stage == .failed {
-            return item.error ?? "The download failed."
+            return item.error ?? copy.settings.downloadFailed
         }
         var parts: [String] = []
-        if let size = item.sizeText { parts.append(size) }
+        if let size = item.sizeText(copy) { parts.append(size) }
         switch item.stage {
         case .downloading:
             if let rate = model.downloadRateBytesPerSecond, rate >= 1 {
                 parts.append("\(AfterRayStorageSnapshot.byteCount(UInt64(rate)))/s")
             }
-            if let eta = item.etaText { parts.append(eta) }
+            if let eta = item.etaText(copy) { parts.append(eta) }
         case .verifying:
-            parts.append("Checking each file against its checksum")
+            parts.append(copy.settings.checkingChecksums)
         case .paused:
-            parts.append("Partial files kept")
+            parts.append(copy.settings.partialFilesKept)
         case .waiting:
-            parts.append(item.etaText.map { "starts after the current pack · \($0)" }
-                ?? "starts after the current pack")
+            parts.append(item.etaText(copy).map { copy.settings.startsAfterCurrentEta($0) }
+                ?? copy.settings.startsAfterCurrent)
         case .failed:
             break
         }
@@ -1167,25 +1180,25 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     /// only serve or refuse the download, not alter it.
     private var downloadSourceSection: some View {
         SettingsSection(
-            title: "Download source",
-            footnote: "Packs are verified against checksums pinned inside AfterRay, so a mirror changes where bytes come from — never what installs. Pick the mirror if huggingface.co is slow or unreachable from your network."
+            title: copy.settings.downloadSource,
+            footnote: copy.settings.downloadSourceFootnote
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 SettingsMenuPicker(
                     options: [
-                        .init(id: "", title: "huggingface.co · official"),
-                        .init(id: settingsMirrorEndpoint, title: "hf-mirror.com · mirror"),
-                        .init(id: settingsCustomEndpointTag, title: "Custom endpoint…"),
+                        .init(id: "", title: copy.settings.officialEndpoint),
+                        .init(id: settingsMirrorEndpoint, title: copy.settings.mirrorEndpoint),
+                        .init(id: settingsCustomEndpointTag, title: copy.settings.customEndpoint),
                     ],
                     selection: downloadSourceBinding,
                     disabled: model.isControllingDownload
                 )
                 if downloadSourceBinding.wrappedValue == settingsCustomEndpointTag {
                     HStack(spacing: 10) {
-                        TextField("https://mirror.example.com", text: $customEndpointDraft)
+                        TextField(copy.settings.customEndpointPlaceholder, text: $customEndpointDraft)
                             .settingsFieldStyle()
                             .onSubmit { applyCustomEndpoint() }
-                        Button("Apply") { applyCustomEndpoint() }
+                        Button(copy.settings.apply) { applyCustomEndpoint() }
                             .buttonStyle(SettingsButtonStyle(kind: .prominent))
                             .disabled(
                                 customEndpointDraft
@@ -1247,9 +1260,9 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         case .mlxLocal:
             nil
         case .ollama:
-            "Nothing leaves this Mac."
+            copy.settings.ollamaStaysLocal
         case .openaiCompatible:
-            "Any server that speaks OpenAI chat completions."
+            copy.settings.openaiCompatibleNote
         }
     }
 
@@ -1282,11 +1295,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         let selectedPackID = selectedMlxPackID
         if let pack = model.library?.packs.first(where: { $0.id == selectedPackID }) {
             VStack(alignment: .leading, spacing: 12) {
-                SettingsField(label: "Model") {
+                SettingsField(label: copy.settings.model) {
                     SettingsMenuPicker(
                         options: [
-                            .init(id: qwen35MlxPackID, title: "Recommended · Qwen3.5 4B"),
-                            .init(id: qwen35Mlx9BPackID, title: "Higher quality · Qwen3.5 9B"),
+                            .init(id: qwen35MlxPackID, title: copy.settings.recommendedQwen4B),
+                            .init(id: qwen35Mlx9BPackID, title: copy.settings.higherQualityQwen9B),
                         ],
                         selection: mlxModelBinding,
                         disabled: model.isUpdatingLlm
@@ -1294,7 +1307,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
                 HStack(spacing: 8) {
                     SettingsPill(mlxStateLabel(pack.state), tone: mlxStateTone(pack.state))
-                    Text("mlx-community · Apache 2.0")
+                    Text(copy.settings.mlxLicense)
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                     Spacer(minLength: 8)
@@ -1318,7 +1331,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 // Progress for this pack lives in the queue at the top of the
                 // page; the panel only says that it is on the list.
                 if model.library?.isQueued(packID: pack.id) == true {
-                    Label("In the download queue at the top of this page", systemImage: "arrow.up")
+                    Label(copy.settings.inQueueTop, systemImage: "arrow.up")
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                 }
@@ -1328,16 +1341,16 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         switch pack.state {
                         case .notDownloaded, .failed:
                             Button(pack.state == .failed
-                                ? "Retry Download"
-                                : "Download \(mlxDownloadLabel(for: pack.id))")
+                                ? copy.settings.retryDownload
+                                : copy.settings.downloadSized(mlxDownloadLabel(for: pack.id)))
                             {
                                 Task { await model.download(packID: pack.id) }
                             }
                             .buttonStyle(SettingsButtonStyle(kind: .prominent))
                         case .ready, .inUse:
-                            Button("Show Files") { model.reveal(pack.path) }
+                            Button(copy.settings.showFiles) { model.reveal(pack.path) }
                                 .buttonStyle(SettingsButtonStyle())
-                            Button("Remove…") { confirmingMlxRemoval = true }
+                            Button(copy.settings.removeEllipsis) { confirmingMlxRemoval = true }
                                 .buttonStyle(SettingsButtonStyle())
                                 .disabled(pack.state == .inUse)
                         case .downloading, .verifying, .paused, .incompatible:
@@ -1348,19 +1361,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
             }
             .confirmationDialog(
-                "Remove \(pack.name) from this Mac?",
+                copy.settings.removeFromMac(pack.name),
                 isPresented: $confirmingMlxRemoval,
                 titleVisibility: .visible
             ) {
-                Button("Remove Download", role: .destructive) {
+                Button(copy.settings.removeDownload, role: .destructive) {
                     Task { await model.remove(packID: pack.id) }
                 }
-                Button("Cancel", role: .cancel) {}
+                Button(copy.common.cancel, role: .cancel) {}
             } message: {
-                Text("AfterRay can download the verified snapshot again later.")
+                Text(copy.settings.canRedownload)
             }
         } else {
-            Text("The managed MLX model is unavailable in this daemon build.")
+            Text(copy.settings.mlxUnavailable)
                 .font(.settingsCaption)
                 .foregroundStyle(SettingsPalette.secondaryLabel)
         }
@@ -1390,20 +1403,20 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     /// three underneath them is a paragraph that says nothing new.
     private func mlxDescription(for packID: String) -> String {
         packID == qwen35Mlx9BPackID
-            ? "Check your free unified memory before downloading."
-            : "Experimental on an 8 GB Mac."
+            ? copy.settings.mlx9BNote
+            : copy.settings.mlx4BNote
     }
 
     private func mlxStateLabel(_ state: ModelPackState) -> String {
         switch state {
-        case .notDownloaded: "Not downloaded"
-        case .downloading: "Downloading"
-        case .verifying: "Verifying"
-        case .paused: "Paused"
-        case .ready: "Ready"
-        case .inUse: "Loaded"
-        case .failed: "Failed"
-        case .incompatible: "Incompatible"
+        case .notDownloaded: copy.settings.notDownloaded
+        case .downloading: copy.common.downloading
+        case .verifying: copy.common.verifying
+        case .paused: copy.common.paused
+        case .ready: copy.common.ready
+        case .inUse: copy.common.loaded
+        case .failed: copy.common.failed
+        case .incompatible: copy.settings.incompatible
         }
     }
 
@@ -1432,14 +1445,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 if model.isProbingLlm {
                     ProgressView().controlSize(.mini)
                 }
-                Button("Check Again") {
+                Button(copy.settings.checkAgain) {
                     Task { await model.probeLlm() }
                 }
                 .buttonStyle(SettingsButtonStyle())
                 .disabled(model.isProbingLlm)
             }
 
-            SettingsField(label: "Model") {
+            SettingsField(label: copy.settings.model) {
                 if let models = model.llmProbe?.models, !models.isEmpty {
                     SettingsMenuPicker(
                         options: ollamaPickerModels(models).map {
@@ -1455,7 +1468,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
             }
 
-            SettingsField(label: "Server URL") {
+            SettingsField(label: copy.settings.serverUrl) {
                 TextField(
                     model.llmProbe?.defaultBaseUrl ?? "http://127.0.0.1:11434",
                     text: $model.draftLlmBaseUrl
@@ -1467,7 +1480,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             if ollamaHasUnsavedChanges {
                 HStack {
                     Spacer()
-                    Button("Save Connection") {
+                    Button(copy.settings.saveConnection) {
                         Task { await model.saveLlmConnection() }
                     }
                     .buttonStyle(SettingsButtonStyle(kind: .prominent))
@@ -1485,19 +1498,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var openaiPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SettingsField(label: "Server URL") {
+            SettingsField(label: copy.settings.serverUrl) {
                 TextField("https://dashscope.aliyuncs.com/compatible-mode/v1", text: $model.draftLlmBaseUrl)
                     .settingsFieldStyle()
             }
-            SettingsField(label: "Model") {
+            SettingsField(label: copy.settings.model) {
                 TextField("qwen3.7-max", text: $model.draftLlmModel)
                     .settingsFieldStyle()
             }
-            SettingsField(label: "API key") {
+            SettingsField(label: copy.settings.apiKey) {
                 SecureField(
                     model.settings?.llmApiKeySet == true
-                        ? "Saved — leave blank to keep it"
-                        : "Optional",
+                        ? copy.settings.savedKeepBlank
+                        : copy.settings.optionalKey,
                     text: $model.draftLlmApiKey
                 )
                 .settingsFieldStyle()
@@ -1510,14 +1523,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         Circle()
                             .fill(probe.reachable ? SettingsPalette.positive : SettingsPalette.danger)
                             .frame(width: 6, height: 6)
-                        Text(probe.reachable ? "Endpoint reachable" : (probe.error ?? "Not reachable"))
+                        Text(probe.reachable ? copy.settings.endpointReachable : (probe.error ?? copy.settings.notReachable))
                             .font(.settingsCaption)
                             .foregroundStyle(SettingsPalette.secondaryLabel)
                             .lineLimit(2)
                     }
                 }
                 Spacer(minLength: 8)
-                Button("Save Connection") {
+                Button(copy.settings.saveConnection) {
                     Task { await model.saveLlmConnection() }
                 }
                 .buttonStyle(SettingsButtonStyle(kind: .prominent))
@@ -1527,13 +1540,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var ollamaStatusText: String {
-        if model.isProbingLlm { return "Looking for Ollama…" }
-        guard let probe = model.llmProbe else { return "Ollama has not been probed yet." }
+        if model.isProbingLlm { return copy.settings.lookingForOllama }
+        guard let probe = model.llmProbe else { return copy.settings.ollamaNotProbed }
         if probe.reachable {
             let count = probe.models.count
-            return count == 1 ? "Ollama is running · 1 chat model" : "Ollama is running · \(count) chat models"
+            return count == 1 ? copy.settings.ollamaOneModel : copy.settings.ollamaManyModels(count)
         }
-        return probe.error ?? "Ollama is not reachable on this Mac."
+        return probe.error ?? copy.settings.ollamaUnreachable
     }
 
     private var ollamaModelBinding: Binding<String> {
@@ -1565,16 +1578,16 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         ) {
             HStack(spacing: 8) {
                 if queued {
-                    Label("In the download queue", systemImage: "arrow.up")
+                    Label(copy.settings.inDownloadQueue, systemImage: "arrow.up")
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                 } else {
                     SettingsPill(packStatus(pack), tone: packTone(pack))
                     if pack.present {
-                        Button("Show") { model.reveal(pack.path) }
+                        Button(copy.common.show) { model.reveal(pack.path) }
                             .buttonStyle(SettingsButtonStyle())
                     } else {
-                        Button("Download") {
+                        Button(copy.settings.download) {
                             Task { await model.download(packID: pack.id) }
                         }
                         .buttonStyle(SettingsButtonStyle())
@@ -1596,14 +1609,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private func packStatus(_ pack: ModelPack) -> String {
-        if pack.state == .failed { return "Failed" }
-        if pack.state == .incompatible { return "Incompatible" }
-        if pack.state == .paused { return "Paused" }
-        if pack.state == .verifying { return "Verifying" }
-        if pack.state == .inUse { return "Loaded" }
-        if pack.present { return "Ready" }
-        if pack.bytes > 0 { return "Incomplete" }
-        return pack.required ? "Needed" : "Optional"
+        if pack.state == .failed { return copy.common.failed }
+        if pack.state == .incompatible { return copy.settings.incompatible }
+        if pack.state == .paused { return copy.common.paused }
+        if pack.state == .verifying { return copy.common.verifying }
+        if pack.state == .inUse { return copy.common.loaded }
+        if pack.present { return copy.common.ready }
+        if pack.bytes > 0 { return copy.settings.incomplete }
+        return pack.required ? copy.settings.needed : copy.common.optional
     }
 
     private func packTone(_ pack: ModelPack) -> SettingsTone {
@@ -1615,10 +1628,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func jobTitle(_ job: ModelJob) -> String {
         switch job.capability {
-        case "asr": "Qwen3 ASR"
-        case "ocr": "OCR"
-        case "embedding": "Embeddings"
-        case "llm": "Assistant"
+        case "asr": copy.settings.jobAsr
+        case "ocr": copy.settings.jobOcr
+        case "embedding": copy.settings.jobEmbedding
+        case "llm": copy.settings.jobAssistant
         default: job.capability
         }
     }
@@ -1632,11 +1645,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func jobStateLabel(_ state: String) -> String {
         switch state {
-        case "done": "OK"
-        case "failed": "Failed"
-        case "running": "Running"
-        case "pending": "Queued"
-        case "cancelled": "Cancelled"
+        case "done": copy.settings.jobOk
+        case "failed": copy.common.failed
+        case "running": copy.settings.jobRunning
+        case "pending": copy.settings.jobQueued
+        case "cancelled": copy.settings.jobCancelled
         default: state
         }
     }
@@ -1654,12 +1667,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @ViewBuilder
     private var advancedPage: some View {
         SettingsSection(
-            title: "Local computation",
-            footnote: "AfterRay already backs off on battery, when the machine is busy, and while you are working. The panel is for the times you want to see why — or override it."
+            title: copy.settings.localComputation,
+            footnote: copy.settings.localComputationFootnote
         ) {
             SettingsRow(
-                title: "Show the local computation panel",
-                subtitle: "Adds a menu bar item and an overlay button showing what is running, what is waiting, and controls to pause or start it.",
+                title: copy.settings.showComputePanel,
+                subtitle: copy.settings.showComputePanelSubtitle,
                 subtitleLineLimit: 3
             ) {
                 Toggle("", isOn: Binding(
@@ -1672,8 +1685,8 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
 
         if model.developerOptionsUnlocked {
-            SettingsSection(title: "Developer Options") {
-                SettingsRow(title: "Show developer settings") {
+            SettingsSection(title: copy.settings.developerOptions) {
+                SettingsRow(title: copy.settings.showDeveloperSettings) {
                     Toggle("", isOn: Binding(
                         get: { model.developerOptionsEnabled },
                         set: { model.setDeveloperOptionsEnabled($0) }
@@ -1687,11 +1700,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
         if model.updatesSupported {
             SettingsSection(
-                title: "Updates",
-                footnote: "Updates install the next time you quit, so a recording is never interrupted."
+                title: copy.settings.updates,
+                footnote: copy.settings.updatesFootnote
             ) {
                 SettingsRow(
-                    title: "Check automatically",
+                    title: copy.settings.checkAutomatically,
                     subtitle: model.updateStatus,
                     subtitleLineLimit: 2
                 ) {
@@ -1704,23 +1717,23 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
                 SettingsSeparator()
                 SettingsFooterBar {
-                    Button("Check Now") { model.checkForUpdates() }
+                    Button(copy.settings.checkNow) { model.checkForUpdates() }
                         .buttonStyle(SettingsButtonStyle(kind: .standard))
                 }
             }
         }
 
         SettingsSection(
-            title: "CLI for agents",
-            footnote: "Installs `afterray` to ~/.local/bin. Agents can search and read summaries. Screenshots, OCR, and other original evidence stay off unless you allow them for 30 minutes."
+            title: copy.settings.cliForAgents,
+            footnote: copy.settings.cliForAgentsFootnote
         ) {
             SettingsRow(
-                title: model.cliInstalled ? "afterray is installed" : "afterray CLI",
+                title: model.cliInstalled ? copy.settings.cliInstalled : copy.settings.cliName,
                 subtitle: model.cliStatus,
                 subtitleLineLimit: 3
             ) {
                 SettingsPill(
-                    model.cliInstalled ? "Ready" : "Missing",
+                    model.cliInstalled ? copy.settings.cliReady : copy.settings.cliMissing,
                     tone: model.cliInstalled ? .positive : .warning
                 )
             }
@@ -1728,19 +1741,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 let active = model.settings?.cliEvidenceIsActive(at: context.date) ?? false
                 SettingsRow(
-                    title: "Original evidence",
+                    title: copy.settings.originalEvidence,
                     subtitle: cliEvidenceSubtitle(now: context.date),
                     subtitleLineLimit: 3
                 ) {
                     SettingsPill(
-                        active ? "On" : "Off",
+                        active ? copy.common.on : copy.common.off,
                         tone: active ? .warning : .neutral
                     )
                 }
             }
             SettingsSeparator()
             SettingsFooterBar {
-                Button(model.cliInstalled ? "Reinstall CLI" : "Install CLI") {
+                Button(model.cliInstalled ? copy.settings.reinstallCli : copy.settings.installCli) {
                     Task { await model.installCli() }
                 }
                 .buttonStyle(SettingsButtonStyle(kind: model.cliInstalled ? .standard : .prominent))
@@ -1751,7 +1764,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     let active = model.settings?.cliEvidenceIsActive(at: context.date) ?? false
-                    Button(active ? "Turn off" : "Allow for 30 minutes") {
+                    Button(active ? copy.settings.turnOff : copy.settings.allow30Minutes) {
                         Task { await model.setCliEvidenceAccess(!active) }
                     }
                     .buttonStyle(SettingsButtonStyle(kind: active ? .standard : .prominent))
@@ -1766,21 +1779,21 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
         // The title states the interval and the pill states that it cannot be
         // changed. A footnote and a subtitle saying both again is three of one.
-        SettingsSection(title: "Capture cadence") {
+        SettingsSection(title: copy.settings.captureCadence) {
             SettingsRow(title: captureCadenceTitle) {
-                SettingsPill("Fixed", tone: .neutral)
+                SettingsPill(copy.settings.fixed, tone: .neutral)
             }
         }
 
         SettingsSection(
-            title: "Locations",
-            footnote: "Moving the vault to another disk is not available yet."
+            title: copy.settings.locations,
+            footnote: copy.settings.locationsFootnote
         ) {
-            SettingsPathRow(title: "Vault", path: model.dataDirectoryPath) {
+            SettingsPathRow(title: copy.settings.vault, path: model.dataDirectoryPath) {
                 model.reveal(model.dataDirectoryPath)
             }
             SettingsSeparator()
-            SettingsPathRow(title: "Models", path: model.modelDirectoryPath) {
+            SettingsPathRow(title: copy.settings.models, path: model.modelDirectoryPath) {
                 model.reveal(model.modelDirectoryPath)
             }
         }
@@ -1788,32 +1801,32 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var captureCadenceTitle: String {
         let seconds = model.settings?.captureIntervalSeconds ?? 10
-        return "One still every \(seconds) second\(seconds == 1 ? "" : "s")"
+        return copy.settings.oneStillEvery(seconds)
     }
 
     private func cliEvidenceSubtitle(now: Date) -> String {
         guard let until = model.settings?.cliEvidenceUntilMs,
               model.settings?.cliEvidenceIsActive(at: now) == true
         else {
-            return "Screenshots, OCR, accessibility trees, and T1 cards stay off for CLI agents."
+            return copy.settings.evidenceOff
         }
         let remaining = max(0, until - Int64(now.timeIntervalSince1970 * 1000))
         let minutes = (remaining + 59_999) / 60_000
         if minutes <= 1 {
-            return "CLI agents can read original evidence for less than a minute."
+            return copy.settings.evidenceLessThanMinute
         }
-        return "CLI agents can read original evidence for about \(minutes) minutes."
+        return copy.settings.evidenceMinutes(minutes)
     }
 
     // MARK: Developer
 
     private var developerPage: some View {
         SettingsSection(
-            title: "Onboarding",
-            footnote: "Reopens the first-run flow without changing downloads or other settings."
+            title: copy.settings.onboarding,
+            footnote: copy.settings.onboardingFootnote
         ) {
-            SettingsRow(title: "Replay onboarding") {
-                Button("Replay") { model.replayOnboarding() }
+            SettingsRow(title: copy.settings.replayOnboarding) {
+                Button(copy.settings.replay) { model.replayOnboarding() }
                     .buttonStyle(SettingsButtonStyle(kind: .prominent))
             }
         }
@@ -1824,15 +1837,15 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @ViewBuilder
     private var diagnosticsPage: some View {
         SettingsSection(
-            title: "Logs",
-            footnote: "Attach this file when reporting a bug."
+            title: copy.settings.logs,
+            footnote: copy.settings.logsFootnote
         ) {
-            SettingsPathRow(title: "Log file", path: model.logFilePath, action: nil)
+            SettingsPathRow(title: copy.settings.logFile, path: model.logFilePath, action: nil)
             SettingsSeparator()
             SettingsFooterBar {
-                Button("Reveal Log Folder") { model.revealLogs() }
+                Button(copy.settings.revealLogFolder) { model.revealLogs() }
                     .buttonStyle(SettingsButtonStyle())
-                Button(copied ? "Copied" : "Copy Report") {
+                Button(copied ? copy.common.copied : copy.settings.copyReport) {
                     model.copyDiagnostics()
                     copied = true
                 }
@@ -1881,9 +1894,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func capabilityLabel(_ capability: String) -> String {
         switch capability {
-        case "asr": "Transcription"
-        case "embedding": "Search embeddings"
-        case "llm": "Assistant"
+        case "asr": copy.settings.capabilityAsr
+        case "ocr": copy.settings.capabilityOcr
+        case "embedding": copy.settings.capabilityEmbedding
+        case "llm": copy.settings.capabilityLlm
+        case "summary": copy.settings.capabilitySummary
         default: capability.capitalized
         }
     }
@@ -1992,6 +2007,7 @@ private struct SettingsRow<Trailing: View>: View {
 }
 
 private struct SettingsPathRow: View {
+    @Environment(\.afterRayCopy) private var copy
     let title: String
     let path: String
     var action: (() -> Void)?
@@ -2022,7 +2038,7 @@ private struct SettingsPathRow: View {
             }
             Spacer(minLength: 16)
             if let action {
-                Button("Show") { action() }
+                Button(copy.common.show) { action() }
                     .buttonStyle(SettingsButtonStyle())
             }
         }
@@ -2287,6 +2303,7 @@ private struct SettingsDeveloperUnlockMonitor: NSViewRepresentable {
 }
 
 private struct SettingsSidebarRow: View {
+    @Environment(\.afterRayCopy) private var copy
     let page: AfterRaySettingsPage
     let isSelected: Bool
     let badge: Int
@@ -2300,7 +2317,7 @@ private struct SettingsSidebarRow: View {
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(iconColor)
                     .frame(width: 17)
-                Text(page.title)
+                Text(page.title(copy))
                     .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
                     .foregroundStyle(isSelected ? SettingsPalette.label : SettingsPalette.secondaryLabel)
                 Spacer(minLength: 6)

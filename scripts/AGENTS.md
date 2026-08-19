@@ -4,13 +4,14 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 ## Dev loop
 
+- `check-i18n.sh` — static UI chrome i18n gate (`make check-i18n`); locale lists, empty catalogs, English-default leaks, hardcoded shipped strings. Allowlist: `i18n-allowlist.tsv` (ratchet — shrink only). Contract: `swift/AfterRayRecall/Sources/L10n/AGENTS.md`.
 - `dev.sh` — watch-mode rebuild loop; change fingerprint via `stat` + `shasum` (dev.sh:57). `--ui` watches only Swift UI + mock data and runs the Visual Lab instead of the app. An explicit `AFTERRAY_DATA_DIR` is forwarded through LaunchServices on every relaunch.
-- `run-v0.sh` — builds shim + Rust workspace (release) and the app (debug — mixed configs are deliberate), assembles and signs `.afterray-dev/AfterRay.app`. Dev vault data lives in `.afterray/`, dev bundle/socket in `.afterray-dev/` (both gitignored); `--ephemeral` uses a throwaway vault.
+- `run-v0.sh` — builds shim + Rust workspace (release) and the app (debug — mixed configs are deliberate), assembles and signs `.afterray-dev/AfterRay.app`. Copies every `apps/AfterRay/Resources/*.lproj` into the bundle (keep in lockstep with `build-release.sh` when adding a UI language). Dev vault data lives in `.afterray/`, dev bundle/socket in `.afterray-dev/` (both gitignored); `--ephemeral` uses a throwaway vault.
 - `open-dev.sh` / `stop-dev.sh` — reopen/quit the dev bundle (bundle id `dev.afterray.app`).
 
 ## Release
 
-- `build-release.sh` — full pipeline: version checks, assemble `AfterRay.app` by hand (SwiftPM emits bare binaries), sign, notarize, staple, DMG + zip into `dist/`. Modes: default / `--skip-notarization` / `--local`.
+- `build-release.sh` — full pipeline: version checks, assemble `AfterRay.app` by hand (SwiftPM emits bare binaries, including every UI locale `.lproj`), sign, notarize, staple, DMG + zip into `dist/`. Modes: default / `--skip-notarization` / `--local`.
 - `publish-release.sh` — uploads zip + DMG to R2 bucket `afterray-releases` under `artifacts/`, then updates the `releases.json` index last (publish-release.sh:36-38) so a partial failure leaves installs on the previous release.
 - `tag-release.sh` — after appcast verification, creates and pushes annotated `v<version>` at the exact published `origin/main` commit.
 - `fetch-sparkle-tools.sh` — Sparkle 2.9.5 tools (`sign_update`, `generate_keys`) into `.afterray-dev/sparkle-tools/`, tarball SHA-256 pinned (fetch-sparkle-tools.sh:10-13). Once per machine.
@@ -28,6 +29,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 ## Commands
 
+- `make check` / `make check-i18n` / `make test` — `check-i18n.sh` is part of `check` and `test`
 - `make dev` / `make dev-ui` / `make v0` / `make v0-daemon` / `make open` / `make stop`
 - `make release-preflight` (needs explicit `AFTERRAY_CODESIGN_IDENTITY` + `AFTERRAY_NOTARY_PROFILE`; checks remote release-index collisions before a costly build) / `make release` (runs that preflight) / `make release-local` (needs neither)
 - `make verify-release MANIFEST=dist/AfterRay-<version>-arm64.json` / `make publish-dry-run MANIFEST=…` / `make publish MANIFEST=…` / `make tag-release MANIFEST=…` — production steps always use one explicit manifest; never select an artifact by `dist/` ordering. Tag only after publish and public appcast verification.

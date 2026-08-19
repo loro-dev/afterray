@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ChatLatestButton: View {
+    @Environment(\.afterRayCopy) private var copy
     let action: () -> Void
     @State private var isHovering = false
 
@@ -21,8 +22,8 @@ struct ChatLatestButton: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
-        .help("Go to latest")
-        .accessibilityLabel("Go to latest")
+        .help(copy.chat.goToLatest)
+        .accessibilityLabel(copy.chat.goToLatest)
         .accessibilityIdentifier("chat-jump-to-latest")
     }
 }

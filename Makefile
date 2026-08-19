@@ -1,4 +1,4 @@
-.PHONY: check test test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile settings-lab chat-lab compute-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
+.PHONY: check check-i18n test test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile settings-lab chat-lab compute-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
 
 # `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
 # `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
@@ -6,11 +6,16 @@
 # with four compile errors in it.
 check:
 	cargo check --workspace --all-targets
+	./scripts/check-i18n.sh
+
+check-i18n:
+	./scripts/check-i18n.sh
 
 test:
 	cargo test --workspace
 	swift test
 	swift test --package-path apps/AfterRayCaptureShim
+	./scripts/check-i18n.sh
 
 # A concurrency or I/O test does not fail; it fails sometimes. One green run
 # proves nothing about a test that races, which is how a capture helper that

@@ -4,7 +4,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 ## Key files
 
-- `Sources/AfterRayApp.swift:30` `@main` + app delegate; `RecallOverlayController` (:401, Carbon hot key + status-bar-level panel); `AfterRayMenuBar` (:216); `AfterRayRootView` (:945)
+- `Sources/AfterRayApp.swift:30` `@main` + app delegate; `RecallOverlayController` (:401, Carbon hot key + status-bar-level panel); `AfterRayMenuBar` (:216); `AfterRayRootView` (:945). First launch calls `AfterRayLocalization.shared.bootstrapFromSystem()` before onboarding so chrome follows `AppleLanguages` when `ui_language` is still `auto`. Menus, permissions, CLI status, and overlay chrome must go through `AfterRayCopy` / `AfterRayLocalization.shared` — do not add hardcoded English. Completeness: [swift/AfterRayRecall/Sources/L10n/AGENTS.md](../../swift/AfterRayRecall/Sources/L10n/AGENTS.md).
 - `Sources/DaemonSupervisor.swift:6` — spawns/owns `afterrayd` and helper binaries, resolves socket/data dirs; dev layout detected via `.afterray-dev` parent in `developmentRepoRoot()` (:276)
 - `Sources/HistoryWindow.swift:12` `AfterRayServices` (`static let shared`); `AfterRayStandardWindowPresence` (:39) Dock/Cmd-Tab for pop-outs; `HistoryWindowController` (:57)
 - `Sources/ChatWindow.swift:10` `ChatWindowController` — standalone chat window; stream lives on `AfterRayServices.shared.chat`

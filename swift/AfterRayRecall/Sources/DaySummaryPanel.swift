@@ -30,6 +30,7 @@ private enum DaySummaryMetrics {
 /// days from the daemon. Cross-row drag-select is not a text document —
 /// copy is structured (this slot, this day, all loaded days).
 public struct DaySummaryPanel: View {
+    @Environment(\.afterRayCopy) private var copy
     @State private var expandedSlotStarts: Set<Int64> = []
     @State private var followedSlot: Int64?
     var style: DaySummaryPanelStyle = .overlay
@@ -95,7 +96,7 @@ public struct DaySummaryPanel: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text("Summaries")
+            Text(copy.compute.summaries)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
             Spacer(minLength: 8)
@@ -116,14 +117,14 @@ public struct DaySummaryPanel: View {
                         )
                 }
                 .buttonStyle(RecallGlassPressStyle())
-                .help("Open as a window")
+                .help(copy.recall.openAsWindow)
             }
         }
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, 8)
         .contextMenu {
-            Button("Copy All Loaded Days") {
+            Button(copy.recall.copyAllLoadedDays) {
                 copyToPasteboard(DaySummaryClipboard.historyText(summaries))
             }
         }
@@ -131,10 +132,10 @@ public struct DaySummaryPanel: View {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Nothing recorded yet.")
+            Text(copy.recall.nothingRecorded)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white.opacity(0.74))
-            Text("Your past days will appear here as AfterRay captures them.")
+            Text(copy.recall.pastDaysWillAppear)
                 .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.42))
                 .fixedSize(horizontal: false, vertical: true)
@@ -225,6 +226,8 @@ public struct DaySummaryPanel: View {
 }
 
 private struct DaySummarySection: View {
+    @Environment(\.afterRayCopy) private var copy
+    @Environment(\.afterRayLocale) private var afterRayLocale
     let summary: DaySummary
     let nowMs: Int64
     let highlightedSlotStart: Int64?
@@ -233,7 +236,12 @@ private struct DaySummarySection: View {
     let onToggleDetails: (Int64) -> Void
 
     private var heading: DaySummaryHeading {
-        DaySummaryLayout.dateHeading(dayStartMs: summary.dayStartMs, nowMs: nowMs)
+        DaySummaryLayout.dateHeading(
+            dayStartMs: summary.dayStartMs,
+            nowMs: nowMs,
+            copy: copy,
+            locale: afterRayLocale
+        )
     }
 
     private var visibleSlots: [DaySlotSummary] {
@@ -247,7 +255,7 @@ private struct DaySummarySection: View {
         // moment of overlap.
         Section {
             if visibleSlots.isEmpty {
-                Text("No recordings")
+                Text(copy.recall.noRecordings)
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.38))
                     .padding(.leading, DaySummaryMetrics.textX)
@@ -275,7 +283,7 @@ private struct DaySummarySection: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(red: 0.055, green: 0.05, blue: 0.06).opacity(0.94))
                 .contextMenu {
-                    Button("Copy This Day") {
+                    Button(copy.recall.copyThisDay) {
                         copyToPasteboard(DaySummaryClipboard.dayText(summary))
                     }
                 }
@@ -284,6 +292,7 @@ private struct DaySummarySection: View {
 }
 
 private struct DaySummaryRow: View {
+    @Environment(\.afterRayCopy) private var copy
     let slot: DaySlotSummary
     let isCurrent: Bool
     let isExpanded: Bool
@@ -316,7 +325,7 @@ private struct DaySummaryRow: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Open this slot in the timeline")
+            .help(copy.recall.openThisSlot)
             .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -340,7 +349,7 @@ private struct DaySummaryRow: View {
 
                 if !sections.isEmpty {
                     Button(action: onToggleDetails) {
-                        Text(isExpanded ? "Hide details" : "Full details")
+                        Text(isExpanded ? copy.recall.hideDetails : copy.recall.fullDetails)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.white.opacity(0.48))
                             .underline()
@@ -400,7 +409,7 @@ private struct DaySummaryRow: View {
         }
         .onHover { isHovering = $0 }
         .contextMenu {
-            Button("Copy This Slot") {
+            Button(copy.recall.copyThisSlot) {
                 copyToPasteboard(DaySummaryClipboard.slotText(slot))
             }
         }
@@ -442,6 +451,7 @@ private struct DaySummaryPanelChrome: ViewModifier {
 }
 
 private struct HistorySummaryLoadTrigger: View {
+    @Environment(\.afterRayCopy) private var copy
     let isLoading: Bool
     let onAppear: () -> Void
 
@@ -459,7 +469,7 @@ private struct HistorySummaryLoadTrigger: View {
                     .onAppear(perform: onAppear)
             }
         }
-        .accessibilityLabel(isLoading ? "Loading older summaries" : "Load older summaries")
+        .accessibilityLabel(isLoading ? copy.recall.loadingOlderSummaries : copy.recall.loadOlderSummaries)
     }
 }
 
@@ -467,6 +477,7 @@ private struct HistorySummaryLoadTrigger: View {
 /// icon cannot resolve (uninstalled since capture) collapses to nothing —
 /// an empty placeholder square only says "something failed here".
 private struct SlotAppIconStrip: View {
+    @Environment(\.afterRayCopy) private var copy
     let apps: [DayAppFact]
 
     var body: some View {
@@ -480,7 +491,7 @@ private struct SlotAppIconStrip: View {
                     .foregroundStyle(.white.opacity(0.35))
             }
         }
-        .accessibilityLabel("Apps used: \(apps.map(\.name).joined(separator: ", "))")
+        .accessibilityLabel(copy.recall.appsUsed(apps.map(\.name).joined(separator: ", ")))
     }
 }
 

@@ -113,6 +113,7 @@ public struct RecallKeycap: View {
 
 /// Shows the current shortcut, and records a new one in place.
 public struct RecallHotKeyField: View {
+    @Environment(\.afterRayCopy) private var copy
     @ObservedObject private var store: RecallHotKeyStore
     private let size: RecallKeycap.Size
     private let isHighlighted: Bool
@@ -173,8 +174,8 @@ public struct RecallHotKeyField: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Record a new shortcut")
-        .accessibilityLabel("Shortcut \(store.hotKey.displayString). Activate to record a new one.")
+        .help(copy.hotKey.recordNew)
+        .accessibilityLabel(copy.hotKey.shortcutActivate(store.hotKey.displayString))
     }
 
     private func tone(for segment: String) -> RecallKeycap.Tone {
@@ -186,7 +187,7 @@ public struct RecallHotKeyField: View {
     private var recorder: some View {
         HStack(spacing: size.gap) {
             if liveModifiers.isEmpty {
-                Text("Press the keys you want")
+                Text(copy.hotKey.pressKeys)
                     .font(.system(size: size == .hero ? 14 : 11.5, weight: .medium, design: .rounded))
                     .foregroundStyle(RecallPalette.textTertiary)
             } else {

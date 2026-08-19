@@ -534,11 +534,13 @@ public enum LlmProvider: String, Codable, CaseIterable, Identifiable, Sendable {
 
     public var id: String { rawValue }
 
-    public var title: String {
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .mlxLocal: "AfterRay Local (MLX)"
-        case .ollama: "Ollama"
-        case .openaiCompatible: "OpenAI compatible"
+        case .mlxLocal: copy.settings.providerMlx
+        case .ollama: copy.settings.providerOllama
+        case .openaiCompatible: copy.settings.providerOpenAI
         }
     }
 
@@ -625,9 +627,13 @@ public struct LanguageOption: Codable, Equatable, Identifiable, Sendable {
         code.compare(Self.autoCode, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
     }
 
-    /// Menu label: `auto` is always 「跟随系统」, everything else uses the native name.
+    /// Menu label: `auto` follows the UI language; everything else uses the native name.
     public var menuTitle: String {
-        isAuto ? "跟随系统" : nativeName
+        menuTitle(.english)
+    }
+
+    public func menuTitle(_ copy: AfterRayCopy) -> String {
+        isAuto ? copy.common.followSystem : nativeName
     }
 }
 
@@ -768,12 +774,15 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Whole hours read as hours. "60 minutes" sitting in a menu beside
     /// "30 minutes" makes the reader do arithmetic to spot the option they
     /// came for.
-    public static func summaryLengthLabel(_ minutes: UInt32) -> String {
+    public static func summaryLengthLabel(
+        _ minutes: UInt32,
+        copy: AfterRayCopy = .english
+    ) -> String {
         guard minutes >= 60, minutes % 60 == 0 else {
-            return "\(minutes) minutes"
+            return copy.format.minutes(minutes)
         }
         let hours = minutes / 60
-        return hours == 1 ? "1 hour" : "\(hours) hours"
+        return hours == 1 ? copy.format.oneHour : copy.format.hours(hours)
     }
 
     /// Rows for the summary-length picker, always including the length in
@@ -793,6 +802,20 @@ public struct AppSettings: Codable, Equatable, Sendable {
         var options = languageOptions.isEmpty ? [LanguageOption.followSystem] : languageOptions
         if !selected.isEmpty, !options.contains(where: { $0.code == selected }) {
             options.append(LanguageOption(code: selected, nativeName: selected, englishName: selected))
+        }
+        return options
+    }
+
+    /// Interface picker: only languages we have chrome for, plus a leftover
+    /// stored code so an older explicit choice still reads true.
+    public func uiLanguagePickerOptions(selected: String) -> [LanguageOption] {
+        var options = AfterRayUILanguage.pickerLanguageOptions
+        if !selected.isEmpty, !options.contains(where: { $0.code == selected }) {
+            if let existing = languageOptions.first(where: { $0.code == selected }) {
+                options.append(existing)
+            } else {
+                options.append(LanguageOption(code: selected, nativeName: selected, englishName: selected))
+            }
         }
         return options
     }

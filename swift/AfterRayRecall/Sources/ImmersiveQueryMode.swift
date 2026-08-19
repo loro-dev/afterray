@@ -5,10 +5,12 @@ public enum ImmersiveQueryMode: String, CaseIterable, Equatable, Sendable {
     case search
     case ask
 
-    public var title: String {
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .search: "Search"
-        case .ask: "Ask"
+        case .search: copy.recall.search
+        case .ask: copy.recall.ask
         }
     }
 
@@ -22,17 +24,21 @@ public enum ImmersiveQueryMode: String, CaseIterable, Equatable, Sendable {
     /// The placeholder carries the Tab affordance — it is the only place the
     /// shortcut is discoverable, since the mode chip shows where you are, not
     /// how to leave.
-    public var placeholder: String {
+    public var placeholder: String { placeholder(.english) }
+
+    public func placeholder(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .search: "Search your day — Tab to ask"
-        case .ask: "Ask about your day — Tab to search"
+        case .search: copy.recall.searchPlaceholder
+        case .ask: copy.recall.askPlaceholder
         }
     }
 
-    public var toggleHelp: String {
+    public var toggleHelp: String { toggleHelp(.english) }
+
+    public func toggleHelp(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .search: "Switch to asking"
-        case .ask: "Switch to search"
+        case .search: copy.recall.switchToAsking
+        case .ask: copy.recall.switchToSearch
         }
     }
 

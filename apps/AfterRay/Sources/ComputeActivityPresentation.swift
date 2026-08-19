@@ -46,7 +46,7 @@ final class ComputeActivityWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Local Computation"
+        window.title = AfterRayLocalization.shared.copy.compute.windowTitle
         window.minSize = NSSize(width: 380, height: 420)
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true

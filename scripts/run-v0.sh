@@ -153,6 +153,11 @@ mkdir -p \
 cp "$repo_root/apps/AfterRay/Resources/Info.plist" "$app_bundle/Contents/Info.plist"
 cp "$repo_root/apps/AfterRay/Resources/AppIcon.icns" \
   "$app_bundle/Contents/Resources/AppIcon.icns"
+for loc in en zh-Hans zh-Hant ja ko es de fr; do
+  mkdir -p "$app_bundle/Contents/Resources/${loc}.lproj"
+  cp "$repo_root/apps/AfterRay/Resources/${loc}.lproj/InfoPlist.strings" \
+    "$app_bundle/Contents/Resources/${loc}.lproj/InfoPlist.strings"
+done
 cp "$repo_root/LICENSES/Qwen3.5-4B-MLX-4bit-NOTICE.txt" \
   "$app_bundle/Contents/Resources/Qwen3.5-4B-MLX-4bit-NOTICE.txt"
 cp "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"
