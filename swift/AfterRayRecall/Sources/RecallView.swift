@@ -2248,7 +2248,7 @@ private struct TranscriptCaption: View {
     private var playHelp: String {
         if isBuffering { return "Cancel audio" }
         if isPlaying { return "Pause audio" }
-        return "Play audio from this moment"
+        return "Play audio"
     }
 
     var body: some View {
@@ -2271,6 +2271,7 @@ private struct TranscriptCaption: View {
                         .background(RecallPalette.ray.opacity(0.92), in: Circle())
                     }
                     .buttonStyle(RecallPressButtonStyle())
+                    .focusable(false)
                     .help(playHelp)
                 }
                 Text(transcript)
@@ -2420,6 +2421,7 @@ private struct RecallDetailsMenu: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(RecallCapsuleButtonStyle())
+                    .focusable(false)
                     .disabled(onToggleAudio == nil)
                     .padding(.top, 8)
                 }
@@ -2477,7 +2479,7 @@ private struct RecallDetailsMenu: View {
     private func detailsAudioTitle(isThis: Bool) -> String {
         if isThis && isAudioBuffering { return "Cancel audio" }
         if isThis && isAudioPlaying { return "Pause audio" }
-        return "Play from this moment"
+        return "Play audio"
     }
 
     private func detailsAudioSymbol(isThis: Bool) -> String {
