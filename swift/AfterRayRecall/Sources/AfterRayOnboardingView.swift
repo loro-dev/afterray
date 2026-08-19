@@ -96,7 +96,7 @@ public final class AfterRayOnboardingModel: ObservableObject {
     @Published public private(set) var pressedPracticeSegments: Set<String> = []
     @Published public private(set) var highlightedPracticeSegments: Set<String> = []
     @Published public private(set) var stage: AfterRayOnboardingStage = .hotKey
-    @Published public private(set) var cliStatus = "Not installed yet."
+    @Published public private(set) var cliStatus = AfterRayCopy.english.onboarding.notInstalledYet
     @Published public private(set) var cliInstalled = false
     @Published public private(set) var isInstallingCli = false
     @Published public var cliMessage: String?
@@ -300,9 +300,10 @@ public final class AfterRayOnboardingModel: ObservableObject {
         do {
             try await cliActions.install()
             refreshCli()
+            let copy = AfterRayLocalization.shared.copy
             cliMessage = cliInstalled
-                ? "CLI is ready for other agents."
-                : "Installed. Add ~/.local/bin to your PATH if needed."
+                ? copy.onboarding.cliReady
+                : copy.onboarding.cliInstalledNeedPath
         } catch {
             cliMessage = error.localizedDescription
         }
@@ -390,7 +391,7 @@ public final class AfterRayOnboardingModel: ObservableObject {
             isDownloadingModels = false
             downloadingPackID = nil
             if next.packs.filter(\.required).allSatisfy(\.present) {
-                modelMessage = "Required models are ready."
+                modelMessage = AfterRayLocalization.shared.copy.onboarding.requiredModelsReady
             }
             return
         }
@@ -429,25 +430,32 @@ public final class AfterRayOnboardingModel: ObservableObject {
 
 /// Greets by hour rather than by name — AfterRay never asks who you are.
 public enum AfterRayGreeting {
-    public static func text(hour: Int) -> String {
+    public static func text(hour: Int, copy: AfterRayCopy = .english) -> String {
         switch hour {
-        case 5 ..< 12: "Good morning."
-        case 12 ..< 17: "Good afternoon."
-        case 17 ..< 22: "Good evening."
-        default: "Still up?"
+        case 5 ..< 12: copy.format.goodMorning
+        case 12 ..< 17: copy.format.goodAfternoon
+        case 17 ..< 22: copy.format.goodEvening
+        default: copy.format.stillUp
         }
     }
 
-    public static func now(_ date: Date = Date(), calendar: Calendar = .current) -> String {
-        text(hour: calendar.component(.hour, from: date))
+    public static func now(
+        _ date: Date = Date(),
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
+    ) -> String {
+        text(hour: calendar.component(.hour, from: date), copy: copy)
     }
 }
 
 public struct AfterRayOnboardingView: View {
     @ObservedObject private var model: AfterRayOnboardingModel
     @ObservedObject private var hotKeys: RecallHotKeyStore
+    @ObservedObject private var localization = AfterRayLocalization.shared
 
-    private let greeting: String
+    private var copy: AfterRayCopy { localization.copy }
+
+    private let greetingOverride: String?
     private let onFinish: () -> Void
 
     @State private var hasAppeared = false
@@ -456,13 +464,17 @@ public struct AfterRayOnboardingView: View {
 
     public init(
         model: AfterRayOnboardingModel,
-        greeting: String = AfterRayGreeting.now(),
+        greeting: String? = nil,
         onFinish: @escaping () -> Void
     ) {
         self.model = model
         hotKeys = model.hotKeys
-        self.greeting = greeting
+        self.greetingOverride = greeting
         self.onFinish = onFinish
+    }
+
+    private var greeting: String {
+        greetingOverride ?? AfterRayGreeting.now(copy: copy)
     }
 
     public var body: some View {
@@ -490,6 +502,7 @@ public struct AfterRayOnboardingView: View {
         .animation(.easeOut(duration: 0.22), value: model.stage)
         .task { hasAppeared = true }
         .task(id: model.didPractice) { await advanceAfterPractice() }
+        .afterRayLocalized()
     }
 
     // MARK: Pieces
@@ -522,23 +535,19 @@ public struct AfterRayOnboardingView: View {
 
     private var headlineTitle: String {
         switch model.stage {
-        case .hotKey:
-            return "Open AfterRay."
-        case .privacy:
-            return "Choose what to skip."
-        case .cli:
-            return "Connect your agents."
-        case .models:
-            return "Set up local models."
+        case .hotKey: copy.onboarding.headlineHotKey
+        case .privacy: copy.onboarding.headlinePrivacy
+        case .cli: copy.onboarding.headlineCli
+        case .models: copy.onboarding.headlineModels
         }
     }
 
     private var eyebrowTitle: String {
         switch model.stage {
-        case .hotKey: "LOCAL ONLY / AFTERRAY"
-        case .privacy: "LOCAL ONLY / PRIVACY"
-        case .cli: "LOCAL ONLY / CLI"
-        case .models: "LOCAL ONLY / MODELS"
+        case .hotKey: copy.onboarding.eyebrowHotKey
+        case .privacy: copy.onboarding.eyebrowPrivacy
+        case .cli: copy.onboarding.eyebrowCli
+        case .models: copy.onboarding.eyebrowModels
         }
     }
 
@@ -601,8 +610,8 @@ public struct AfterRayOnboardingView: View {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(alignment: .top, spacing: 14) {
                     OnboardingExclusionColumn(
-                        title: "Apps",
-                        empty: "None",
+                        title: copy.onboarding.apps,
+                        empty: copy.onboarding.none,
                         entries: privacy.excludedApps().map {
                             OnboardingExclusionEntry(
                                 id: $0,
@@ -617,7 +626,7 @@ public struct AfterRayOnboardingView: View {
                             Button {
                                 Task { await model.addPrivacyApp() }
                             } label: {
-                                Label("Add app", systemImage: "plus")
+                                Label(copy.onboarding.addApp, systemImage: "plus")
                                     .font(.system(size: 12, weight: .medium, design: .rounded))
                             }
                             .buttonStyle(OnboardingQuietButtonStyle())
@@ -626,8 +635,8 @@ public struct AfterRayOnboardingView: View {
                     )
 
                     OnboardingExclusionColumn(
-                        title: "Websites",
-                        empty: "None",
+                        title: copy.onboarding.websites,
+                        empty: copy.onboarding.none,
                         entries: privacy.excludedDomains().map {
                             OnboardingExclusionEntry(id: $0, label: $0)
                         },
@@ -637,11 +646,11 @@ public struct AfterRayOnboardingView: View {
                                 Image(systemName: "globe")
                                     .font(.system(size: 12))
                                     .foregroundStyle(RecallPalette.textSecondary)
-                                TextField("example.com", text: $domainDraft)
+                                TextField(copy.onboarding.domainPlaceholder, text: $domainDraft)
                                     .textFieldStyle(.plain)
                                     .font(.system(size: 12, design: .rounded))
                                     .onSubmit { submitDomain() }
-                                Button("Save") { submitDomain() }
+                                Button(copy.common.save) { submitDomain() }
                                     .buttonStyle(OnboardingQuietButtonStyle())
                                     .disabled(
                                         model.isUpdatingPrivacy
@@ -655,7 +664,7 @@ public struct AfterRayOnboardingView: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 174, maxHeight: 174)
 
-                Text(model.privacyMessage ?? "Installed password managers are skipped automatically.")
+                Text(model.privacyMessage ?? copy.onboarding.passwordManagersSkipped)
                     .font(.system(size: 10.5, weight: .medium, design: .rounded))
                     .foregroundStyle(model.privacyMessage == nil ? RecallPalette.textSecondary : RecallPalette.ray)
                     .lineLimit(1)
@@ -675,10 +684,10 @@ public struct AfterRayOnboardingView: View {
 
     private var privacyFooter: some View {
         HStack(spacing: 10) {
-            Button("Back") { model.goBack() }
+            Button(copy.common.back) { model.goBack() }
                 .buttonStyle(OnboardingQuietButtonStyle())
             Spacer(minLength: 8)
-            Button("Continue") { model.advanceFromPrivacy() }
+            Button(copy.common.continueLabel) { model.advanceFromPrivacy() }
                 .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
                 .keyboardShortcut(.defaultAction)
         }
@@ -686,9 +695,7 @@ public struct AfterRayOnboardingView: View {
 
     private var cliStage: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(
-                "Install the CLI for trusted agents. It can search your vault, change settings, and delete history."
-            )
+            Text(copy.onboarding.cliBody)
             .font(.system(size: 13, weight: .medium, design: .rounded))
             .foregroundStyle(RecallPalette.textSecondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -697,7 +704,7 @@ public struct AfterRayOnboardingView: View {
                 HStack(spacing: 8) {
                     Image(systemName: model.cliInstalled ? "checkmark.circle.fill" : "terminal")
                         .foregroundStyle(model.cliInstalled ? .white.opacity(0.9) : RecallPalette.ray)
-                    Text(model.cliInstalled ? "Installed" : "Not on PATH yet")
+                    Text(model.cliInstalled ? copy.common.installed : copy.onboarding.notOnPath)
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                         .foregroundStyle(RecallPalette.textPrimary)
                     Spacer(minLength: 8)
@@ -736,7 +743,7 @@ public struct AfterRayOnboardingView: View {
 
     private var modelsStage: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Transcription and search use two local model packs. Manage them later in Settings.")
+            Text(copy.onboarding.modelsBody)
                 .font(.system(size: 13, weight: .medium, design: .rounded))
                 .foregroundStyle(RecallPalette.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -744,7 +751,7 @@ public struct AfterRayOnboardingView: View {
             if model.isLoadingModels, model.modelLibrary == nil {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("Checking models…")
+                    Text(copy.onboarding.checkingModels)
                 }
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(RecallPalette.textTertiary)
@@ -761,7 +768,9 @@ public struct AfterRayOnboardingView: View {
             if model.isDownloadingModels, let download = model.modelLibrary?.download {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
-                        Text(download.state == .verifying ? "Verifying \(modelPackName(download.packId))…" : "Downloading \(modelPackName(download.packId))…")
+                        Text(download.state == .verifying
+                            ? copy.onboarding.verifyingPack(modelPackName(download.packId))
+                            : copy.onboarding.downloadingPack(modelPackName(download.packId)))
                             .font(.system(size: 11, weight: .medium, design: .rounded))
                             .foregroundStyle(RecallPalette.textSecondary)
                             .lineLimit(1)
@@ -786,9 +795,9 @@ public struct AfterRayOnboardingView: View {
 
     private var modelStageNote: String {
         if let message = model.modelMessage { return message }
-        if model.isDownloadingModels { return "Close anytime. Downloads continue in the background." }
-        if model.modelDownloadPaused { return "Paused. Resume here or manage downloads in Settings." }
-        return "Optional local assistant: about 17 GB. Install it later in Settings."
+        if model.isDownloadingModels { return copy.onboarding.closeAnytime }
+        if model.modelDownloadPaused { return copy.onboarding.pausedResume }
+        return copy.onboarding.optionalAssistant
     }
 
     private func modelPackRow(_ pack: ModelPack) -> some View {
@@ -818,20 +827,24 @@ public struct AfterRayOnboardingView: View {
     }
 
     private func modelPackSubtitle(_ pack: ModelPack, isCurrent: Bool, isQueued: Bool) -> String {
-        if pack.present { return "Installed" }
-        if isCurrent, model.modelDownloadPaused { return "Paused · \(model.modelDownloadPercent ?? 0)%" }
-        if isCurrent, model.modelLibrary?.download?.state == .verifying { return "Verifying files" }
-        if isCurrent { return "Downloading · \(model.modelDownloadPercent ?? 0)%" }
-        if isQueued { return "Waiting to download" }
-        return "Download · \(modelSize(pack.expectedBytes))"
+        if pack.present { return copy.common.installed }
+        if isCurrent, model.modelDownloadPaused {
+            return copy.onboarding.pausedPercent(model.modelDownloadPercent ?? 0)
+        }
+        if isCurrent, model.modelLibrary?.download?.state == .verifying {
+            return copy.onboarding.verifyingFiles
+        }
+        if isCurrent { return copy.onboarding.downloadingPercent(model.modelDownloadPercent ?? 0) }
+        if isQueued { return copy.onboarding.waitingToDownload }
+        return copy.onboarding.downloadSize(modelSize(pack.expectedBytes))
     }
 
     private func modelPackName(_ packID: String) -> String {
-        model.modelLibrary?.packs.first { $0.id == packID }?.name ?? "model"
+        model.modelLibrary?.packs.first { $0.id == packID }?.name ?? copy.onboarding.modelFallback
     }
 
     private func modelSize(_ bytes: UInt64?) -> String {
-        guard let bytes else { return "size unavailable" }
+        guard let bytes else { return copy.onboarding.sizeUnavailable }
         return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
@@ -841,19 +854,19 @@ public struct AfterRayOnboardingView: View {
             hintLabel(failure, icon: "exclamationmark.circle", tone: RecallPalette.ray)
         } else if hotKeys.isRecording {
             hintLabel(
-                "Anything with ⌘, ⌥ or ⌃ · esc to cancel",
+                copy.onboarding.recordHint,
                 icon: "dot.radiowaves.left.and.right",
                 tone: RecallPalette.textTertiary
             )
         } else if model.didPractice {
             // The lit keys already carry the "yes"; a green tick next to them
             // would be a second, louder signal in a colour AfterRay never uses.
-            hintLabel("That's it. See you soon.", icon: "checkmark.circle.fill", tone: .white.opacity(0.9))
+            hintLabel(copy.onboarding.practiced, icon: "checkmark.circle.fill", tone: .white.opacity(0.9))
                 .transition(.opacity)
         } else if let note = hotKeys.hotKey.systemConflictNote {
             hintLabel(note, icon: "exclamationmark.triangle", tone: Color(red: 0.98, green: 0.74, blue: 0.34))
         } else {
-            hintLabel("Try it — I'll wait.", icon: "hand.point.up.left", tone: RecallPalette.textTertiary)
+            hintLabel(copy.onboarding.tryIt, icon: "hand.point.up.left", tone: RecallPalette.textTertiary)
         }
     }
 
@@ -889,20 +902,20 @@ public struct AfterRayOnboardingView: View {
     private var hotKeyFooter: some View {
         HStack(spacing: 10) {
             if hotKeys.isRecording {
-                Button("Never mind", action: hotKeys.cancelRecording)
+                Button(copy.onboarding.neverMind, action: hotKeys.cancelRecording)
                     .buttonStyle(OnboardingQuietButtonStyle())
             } else {
-                Button("Change shortcut") { model.beginHotKeyRecording() }
+                Button(copy.onboarding.changeShortcut) { model.beginHotKeyRecording() }
                     .buttonStyle(OnboardingQuietButtonStyle())
                 if !hotKeys.isDefault {
-                    Button("Reset", action: hotKeys.restoreDefault)
+                    Button(copy.common.reset, action: hotKeys.restoreDefault)
                         .buttonStyle(OnboardingQuietButtonStyle())
                 }
             }
 
             Spacer(minLength: 8)
 
-            Button(model.didPractice ? "Continue" : "Got it", action: continueFromHotKey)
+            Button(model.didPractice ? copy.common.continueLabel : copy.onboarding.gotIt, action: continueFromHotKey)
                 .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: model.didPractice))
                 .keyboardShortcut(.defaultAction)
         }
@@ -910,19 +923,19 @@ public struct AfterRayOnboardingView: View {
 
     private var cliFooter: some View {
         HStack(spacing: 10) {
-            Button("Back") { model.goBack() }
+            Button(copy.common.back) { model.goBack() }
                 .buttonStyle(OnboardingQuietButtonStyle())
             Spacer(minLength: 8)
-            Button("Skip CLI") { continueFromCli() }
+            Button(copy.onboarding.skipCli) { continueFromCli() }
                 .buttonStyle(OnboardingQuietButtonStyle())
             if !model.cliInstalled {
-                Button(model.isInstallingCli ? "Installing…" : "Install CLI") {
+                Button(model.isInstallingCli ? copy.onboarding.installing : copy.onboarding.installCli) {
                     Task { await model.installCli() }
                 }
                 .buttonStyle(OnboardingQuietButtonStyle())
                 .disabled(model.isInstallingCli)
             }
-            Button("Continue", action: continueFromCli)
+            Button(copy.common.continueLabel, action: continueFromCli)
                 .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: model.cliInstalled))
                 .keyboardShortcut(.defaultAction)
         }
@@ -930,27 +943,27 @@ public struct AfterRayOnboardingView: View {
 
     private var modelsFooter: some View {
         HStack(spacing: 10) {
-            Button("Back") { model.goBack() }
+            Button(copy.common.back) { model.goBack() }
                 .buttonStyle(OnboardingQuietButtonStyle())
             Spacer(minLength: 8)
             if model.isDownloadingModels {
                 if model.hasUnscheduledRequiredModelPacks {
-                    Button("Download models") { Task { await model.downloadRequiredModels() } }
+                    Button(copy.onboarding.downloadModels) { Task { await model.downloadRequiredModels() } }
                         .buttonStyle(OnboardingQuietButtonStyle())
                         .disabled(model.isStartingModelDownload)
                 }
-                Button("Close", action: finish)
+                Button(copy.common.close, action: finish)
                     .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
                     .keyboardShortcut(.defaultAction)
             } else if model.modelLibrary == nil, !model.isLoadingModels {
-                Button("Check again") { Task { await model.refreshModels() } }
+                Button(copy.onboarding.checkAgain) { Task { await model.refreshModels() } }
                     .buttonStyle(OnboardingQuietButtonStyle())
             } else if model.requiredModelsReady {
-                Button("Start using AfterRay", action: finish)
+                Button(copy.onboarding.startUsing, action: finish)
                     .buttonStyle(OnboardingPrimaryButtonStyle(isKeyAction: true))
                     .keyboardShortcut(.defaultAction)
             } else if model.modelLibrary != nil {
-                Button("Skip for now", action: finish)
+                Button(copy.onboarding.skipForNow, action: finish)
                     .buttonStyle(OnboardingQuietButtonStyle())
                 Button(modelDownloadButtonTitle) {
                     Task { await model.downloadRequiredModels() }
@@ -963,9 +976,9 @@ public struct AfterRayOnboardingView: View {
     }
 
     private var modelDownloadButtonTitle: String {
-        if model.isStartingModelDownload { return "Starting…" }
-        if model.modelDownloadPaused { return "Resume download" }
-        return "Download models"
+        if model.isStartingModelDownload { return copy.onboarding.starting }
+        if model.modelDownloadPaused { return copy.onboarding.resumeDownload }
+        return copy.onboarding.downloadModels
     }
 
     private var backdrop: some View {
@@ -1070,6 +1083,7 @@ struct OnboardingExclusionEntry: Identifiable, Equatable {
 /// The action sits above the list because on first run the list is empty, and
 /// a lone control under dead space reads as disabled.
 struct OnboardingExclusionColumn<Accessory: View>: View {
+    @Environment(\.afterRayCopy) private var copy
     let title: String
     let empty: String
     let entries: [OnboardingExclusionEntry]
@@ -1115,7 +1129,7 @@ struct OnboardingExclusionColumn<Accessory: View>: View {
                                             .font(.system(size: 8, weight: .semibold))
                                             .foregroundStyle(RecallPalette.textTertiary)
                                             .frame(width: 18, height: 18)
-                                            .help("Always excluded for privacy")
+                                            .help(copy.onboarding.alwaysExcludedHelp)
                                     } else {
                                         Button {
                                             onRemove(entry.id)
@@ -1126,7 +1140,7 @@ struct OnboardingExclusionColumn<Accessory: View>: View {
                                                 .frame(width: 18, height: 18)
                                         }
                                         .buttonStyle(.plain)
-                                        .help("Stop excluding \(entry.label)")
+                                        .help(copy.onboarding.stopExcluding(entry.label))
                                     }
                                 }
                                 .padding(.horizontal, 10)

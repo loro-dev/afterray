@@ -345,22 +345,28 @@ public enum DaySummaryLayout {
     public static func dateHeading(
         dayStartMs: Int64,
         nowMs: Int64,
-        timeZone: TimeZone = .current
+        timeZone: TimeZone = .current,
+        copy: AfterRayCopy = .english,
+        locale: Locale = Locale(identifier: "en")
     ) -> DaySummaryHeading {
         if dayStartMs == 0 {
-            return DaySummaryHeading(kicker: "TODAY", title: "No day selected", isToday: true)
+            return DaySummaryHeading(
+                kicker: copy.format.todayKicker,
+                title: copy.format.noDaySelected,
+                isToday: true
+            )
         }
         let isToday = localDayKey(ms: dayStartMs, timeZone: timeZone)
             == localDayKey(ms: nowMs, timeZone: timeZone)
         let date = Date(timeIntervalSince1970: TimeInterval(dayStartMs) / 1_000)
         let weekday = date.formatted(
-            Date.FormatStyle().weekday(.abbreviated).locale(Locale(identifier: "en_US_POSIX"))
+            Date.FormatStyle().weekday(.abbreviated).locale(locale)
         )
         let monthDay = date.formatted(
-            Date.FormatStyle().month(.abbreviated).day().locale(Locale(identifier: "en_US_POSIX"))
+            Date.FormatStyle().month(.abbreviated).day().locale(locale)
         )
         if isToday {
-            return DaySummaryHeading(kicker: "TODAY", title: monthDay, isToday: true)
+            return DaySummaryHeading(kicker: copy.format.todayKicker, title: monthDay, isToday: true)
         }
         return DaySummaryHeading(kicker: weekday.uppercased(), title: monthDay, isToday: false)
     }
@@ -380,9 +386,9 @@ public enum DaySummaryLayout {
         return remain == 0 ? "\(hours)h" : "\(hours)h \(remain)m"
     }
 
-    public static func factLine(apps: [DayAppFact]) -> String {
+    public static func factLine(apps: [DayAppFact], copy: AfterRayCopy = .english) -> String {
         let parts = apps.prefix(3).map { "\($0.name) \(formatDuration(ms: $0.ms))" }
-        if parts.isEmpty { return "Quiet — nothing on screen" }
+        if parts.isEmpty { return copy.format.quietNothingOnScreen }
         return parts.joined(separator: " · ")
     }
 
@@ -523,14 +529,14 @@ public enum DaySummaryLayout {
     /// failed" are different situations — one is waiting its turn, the other
     /// needs the model looked at — and a row that was deliberately skipped
     /// should not claim to be pending forever.
-    static func fallbackBadge(state: String) -> String? {
+    static func fallbackBadge(state: String, copy: AfterRayCopy = .english) -> String? {
         switch state {
-        case "failed": "Summary failed"
-        case "skipped_idle": "Idle"
-        case "paused": "Capture paused"
-        case "asleep": "Asleep"
+        case "failed": copy.format.summaryFailed
+        case "skipped_idle": copy.format.idle
+        case "paused": copy.format.capturePaused
+        case "asleep": copy.format.asleep
         case "no_data": nil
-        default: "Not summarised"
+        default: copy.format.notSummarised
         }
     }
 }

@@ -47,7 +47,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
             backing: .buffered,
             defer: false
         )
-        window.title = "AfterRay Chat"
+        window.title = AfterRayLocalization.shared.copy.menu.chatWindow
         let minSize = NSSize(width: 720, height: 480)
         window.minSize = minSize
         window.contentMinSize = minSize
@@ -302,9 +302,10 @@ final class ChatWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate,
     }
 
     private func makeMoreMenu() -> NSMenu {
-        let menu = NSMenu(title: "More")
+        let strings = AfterRayLocalization.shared.copy
+        let menu = NSMenu(title: strings.chat.more)
         let copy = NSMenuItem(
-            title: "Copy Entire Conversation as Markdown",
+            title: strings.chat.copyEntire,
             action: #selector(copyConversationMarkdown(_:)),
             keyEquivalent: ""
         )

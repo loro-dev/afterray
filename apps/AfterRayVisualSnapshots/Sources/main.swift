@@ -23,6 +23,7 @@ enum SnapshotRunner {
         // The overlay only ever runs dark. Without this the offscreen host
         // defaults to Aqua and unstyled labels render black on black.
         application.appearance = NSAppearance(named: .darkAqua)
+        AfterRayLocalization.shared.apply(stored: "en")
 
         let outputDirectory = URL(
             fileURLWithPath: CommandLine.arguments.dropFirst().first

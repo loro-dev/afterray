@@ -12,20 +12,24 @@ public enum ComputeMode: String, Codable, Equatable, Sendable, CaseIterable {
 
     /// One word each. As phrases these were wider than the control that held
     /// them, and the detail line underneath already said the rest.
-    public var title: String {
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .full: "Full"
-        case .essential: "Essential"
-        case .off: "Off"
+        case .full: copy.compute.full
+        case .essential: copy.compute.essential
+        case .off: copy.compute.off
         }
     }
 
     /// What choosing this costs, in the terms the user is deciding in.
-    public var detail: String {
+    public var detail: String { detail(.english) }
+
+    public func detail(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .full: "Everything runs, when the machine can afford it."
-        case .essential: "Screen text and transcripts keep up. No summaries, no compression."
-        case .off: "Nothing runs in the background — new screens are not indexed."
+        case .full: copy.compute.fullDetail
+        case .essential: copy.compute.essentialDetail
+        case .off: copy.compute.offDetail
         }
     }
 }
@@ -53,13 +57,15 @@ public enum ComputeWorkload: String, Codable, Equatable, Sendable {
     case summary
     case archive
 
-    public var title: String {
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .ocr: "Screen text"
-        case .asr: "Transcription"
-        case .embedding: "Search index"
-        case .summary: "Summaries"
-        case .archive: "Archive compression"
+        case .ocr: copy.compute.screenText
+        case .asr: copy.compute.transcription
+        case .embedding: copy.compute.searchIndex
+        case .summary: copy.compute.summaries
+        case .archive: copy.compute.archive
         }
     }
 
@@ -630,16 +636,18 @@ public enum ComputeIndicator: Equatable, Sendable {
     }
 
     /// The tooltip, which is the only text most users will ever read here.
-    public var help: String {
+    public var help: String { help(.english) }
+
+    public func help(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .idle: "Local computation is idle"
+        case .idle: copy.compute.idleHelp
         case let .working(count):
-            count == 1 ? "1 local task running" : "\(count) local tasks running"
+            count == 1 ? copy.compute.oneTaskRunning : copy.compute.tasksRunning(count)
         case let .paused(minutes):
-            if let minutes { "Background computation suspended for \(minutes) more min" }
-            else { "Background computation suspended" }
-        case .off: "Local computation is switched off"
-        case let .waiting(reason): "Waiting — \(reason)"
+            if let minutes { copy.compute.suspendedMinutes(minutes) }
+            else { copy.compute.suspended }
+        case .off: copy.compute.switchedOff
+        case let .waiting(reason): copy.compute.waitingReason(reason)
         }
     }
 

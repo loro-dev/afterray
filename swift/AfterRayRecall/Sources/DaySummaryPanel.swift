@@ -225,6 +225,8 @@ public struct DaySummaryPanel: View {
 }
 
 private struct DaySummarySection: View {
+    @Environment(\.afterRayCopy) private var copy
+    @Environment(\.afterRayLocale) private var afterRayLocale
     let summary: DaySummary
     let nowMs: Int64
     let highlightedSlotStart: Int64?
@@ -233,7 +235,12 @@ private struct DaySummarySection: View {
     let onToggleDetails: (Int64) -> Void
 
     private var heading: DaySummaryHeading {
-        DaySummaryLayout.dateHeading(dayStartMs: summary.dayStartMs, nowMs: nowMs)
+        DaySummaryLayout.dateHeading(
+            dayStartMs: summary.dayStartMs,
+            nowMs: nowMs,
+            copy: copy,
+            locale: afterRayLocale
+        )
     }
 
     private var visibleSlots: [DaySlotSummary] {

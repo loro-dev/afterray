@@ -129,7 +129,8 @@ public enum ChatConversationGrouping {
     public static func days(
         _ conversations: [ChatConversation],
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> [ChatDayGroup] {
         let sorted = conversations.sorted { lhs, rhs in
             if lhs.createdAtMs != rhs.createdAtMs {
@@ -153,7 +154,12 @@ public enum ChatConversationGrouping {
                 groups.append(
                     ChatDayGroup(
                         id: start,
-                        label: ChatTimeLabel.dayHeading(ms: start, now: now, calendar: calendar),
+                        label: ChatTimeLabel.dayHeading(
+                            ms: start,
+                            now: now,
+                            calendar: calendar,
+                            copy: copy
+                        ),
                         conversations: [conversation]
                     )
                 )
@@ -1478,14 +1484,15 @@ public enum ChatTimeLabel {
     public static func dayHeading(
         ms: Int64,
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
-        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
+        if calendar.isDate(date, inSameDayAs: now) { return copy.format.today }
         if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
            calendar.isDate(date, inSameDayAs: yesterday)
         {
-            return "Yesterday"
+            return copy.format.yesterday
         }
         let formatter = DateFormatter()
         formatter.calendar = calendar
@@ -1499,7 +1506,8 @@ public enum ChatTimeLabel {
     public static func listTimestamp(
         ms: Int64,
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
         if calendar.isDate(date, inSameDayAs: now) {
@@ -1508,7 +1516,7 @@ public enum ChatTimeLabel {
         if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
            calendar.isDate(date, inSameDayAs: yesterday)
         {
-            return "Yesterday"
+            return copy.format.yesterday
         }
         let year = calendar.component(.year, from: date)
         let nowYear = calendar.component(.year, from: now)

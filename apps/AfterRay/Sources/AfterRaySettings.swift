@@ -72,7 +72,7 @@ final class AfterRaySettingsController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "AfterRay Settings"
+        window.title = AfterRayLocalization.shared.copy.menu.settingsWindow
         window.minSize = NSSize(width: 820, height: 520)
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true
@@ -199,6 +199,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             recentJobs = Array(loaded.2.suffix(8).reversed())
             applyLlmDrafts(from: loaded.0)
             AfterRayPreferences.recordAudio = loaded.0.recordAudio
+            AfterRayLocalization.shared.apply(stored: loaded.0.uiLanguage)
             storage = AfterRayStorageSnapshot.measure(
                 dataDirectory: URL(fileURLWithPath: loaded.0.dataDir, isDirectory: true),
                 modelDirectory: URL(fileURLWithPath: loaded.0.modelDir, isDirectory: true),
@@ -436,8 +437,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 llmApiKey: nil
             )
             message = enabled
-                ? "Audio recording is on."
-                : "Audio recording is off. Existing recordings stay in your vault."
+                ? AfterRayLocalization.shared.copy.settings.audioOn
+                : AfterRayLocalization.shared.copy.settings.audioOff
         } catch {
             AfterRayPreferences.recordAudio = !enabled
             message = error.localizedDescription
@@ -468,9 +469,10 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 summaryLanguage: summaryLanguage
             )
             if let uiLanguage {
-                message = "Interface language set to \(languageLabel(uiLanguage))."
+                AfterRayLocalization.shared.apply(stored: uiLanguage)
+                message = AfterRayLocalization.shared.copy.settings.interfaceSet(languageLabel(uiLanguage))
             } else if let summaryLanguage {
-                message = "Summary language set to \(languageLabel(summaryLanguage))."
+                message = AfterRayLocalization.shared.copy.settings.summarySet(languageLabel(summaryLanguage))
             }
         } catch {
             message = error.localizedDescription
@@ -478,7 +480,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     private func languageLabel(_ code: String) -> String {
-        settings?.languageOptions.first { $0.code == code }?.menuTitle ?? code
+        let copy = AfterRayLocalization.shared.copy
+        return settings?.languageOptions.first { $0.code == code }?.menuTitle(copy) ?? code
     }
 
     func setStorageLimitBytes(_ bytes: UInt64) async {

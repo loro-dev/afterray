@@ -246,7 +246,8 @@ final class DaemonWireTests: XCTestCase {
 
         let picker = settings.languagePickerOptions(selected: settings.uiLanguage)
         XCTAssertEqual(picker.map(\.code), ["auto"])
-        XCTAssertEqual(picker.first?.menuTitle, "跟随系统")
+        XCTAssertEqual(picker.first?.menuTitle(.english), "Follow system")
+        XCTAssertEqual(picker.first?.menuTitle(.simplifiedChinese), "跟随系统")
         XCTAssertEqual(picker.first?.englishName, "Follow system")
     }
 
@@ -260,7 +261,7 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(settings.languageOptions.count, 3)
         XCTAssertEqual(settings.languageOptions[2].nativeName, "日本語")
         XCTAssertEqual(settings.languageOptions[2].englishName, "Japanese")
-        XCTAssertEqual(settings.languageOptions[0].menuTitle, "跟随系统")
+        XCTAssertEqual(settings.languageOptions[0].menuTitle(.simplifiedChinese), "跟随系统")
         XCTAssertEqual(settings.languageOptions[2].menuTitle, "日本語")
         XCTAssertEqual(
             settings.languagePickerOptions(selected: settings.summaryLanguage).map(\.code),

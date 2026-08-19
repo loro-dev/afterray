@@ -20,6 +20,9 @@ private enum ComputePanelMetrics {
 
 public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     @ObservedObject var model: Model
+    @ObservedObject private var localization = AfterRayLocalization.shared
+
+    private var copy: AfterRayCopy { localization.copy }
     /// Which row's explanation is open. One at a time: two popovers of
     /// conditions side by side would be unreadable.
     @State private var explainedWorkload: ComputeWorkload?
@@ -63,6 +66,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
         .frame(minWidth: 380, minHeight: 420)
         .background(RecallPalette.background)
         .preferredColorScheme(.dark)
+        .afterRayLocalized()
         // Polling is started and stopped by whoever hosts this view, not here.
         // Both hosts are AppKit windows that are ordered out rather than torn
         // down, so `onDisappear` never fires and a view-owned watcher would poll
@@ -74,7 +78,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(model.indicator.help)
+            Text(model.indicator.help(copy))
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(RecallPalette.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -97,7 +101,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                     .font(.system(size: 13))
             }
             .buttonStyle(.borderless)
-            .help("How AfterRay decides when to run local work")
+            .help(copy.compute.howItDecides)
             .popover(isPresented: $explainingModes, arrowEdge: .bottom) {
                 modesPopover
             }
@@ -629,7 +633,7 @@ public struct ComputeActivityButton: View {
     public var body: some View {
         RecallChromeIconButton(
             symbol: indicator.symbol,
-            help: indicator.help,
+            help: indicator.help(AfterRayLocalization.shared.copy),
             tint: indicator.isAccented ? RecallPalette.ray : .white,
             action: action
         )

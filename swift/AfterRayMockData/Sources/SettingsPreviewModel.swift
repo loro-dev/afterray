@@ -168,7 +168,8 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         isUpdatingLanguage = true
         settings = replacing(current, uiLanguage: code)
         isUpdatingLanguage = false
-        message = "Preview interface language updated."
+        AfterRayLocalization.shared.apply(stored: code)
+        message = AfterRayLocalization.shared.copy.settings.interfaceSet(code)
     }
 
     public func setSummaryLanguage(_ code: String) async {

@@ -22,6 +22,8 @@ enum RecallPresentation {
 }
 
 public struct RecallView: View {
+    @Environment(\.afterRayCopy) private var copy
+    @Environment(\.afterRayLocale) private var afterRayLocale
     public let moments: [RecallMoment]
     @Binding public var playheadMs: Int64
     @Binding public var isLive: Bool
@@ -232,6 +234,7 @@ public struct RecallView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .afterRayLocalized()
     }
 
     private var isProcessing: Bool {
@@ -582,7 +585,7 @@ public struct RecallView: View {
             Spacer(minLength: 24)
 
             if isProcessing, !renderedIsLive {
-                Label("Understanding", systemImage: "sparkles")
+                Label(copy.recall.understanding, systemImage: "sparkles")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.86))
                     .padding(.horizontal, 12)
@@ -595,7 +598,7 @@ public struct RecallView: View {
                     if !renderedIsLive {
                         RecallChromeIconButton(
                             symbol: showsDetails ? "sidebar.right" : "info.circle",
-                            help: showsDetails ? "Hide captured context" : "Show captured context",
+                            help: showsDetails ? copy.recall.hideContext : copy.recall.showContext,
                             action: {
                                 if showsDetails {
                                     showsDetails = false
@@ -1429,7 +1432,7 @@ private struct AppUsageTimeline: View {
 
             HStack(spacing: 7) {
                 Image(systemName: "arrow.left.and.right")
-                Text("Drag to zoom · Swipe to travel · Esc to close")
+                Text(copy.recall.dragHint)
             }
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))
@@ -1573,12 +1576,13 @@ private struct OcrHighlightOverlay: View {
 /// search filmstrip: whatever the strip below is showing, this stays the one
 /// place that spells out *when*.
 struct PlayheadTimestamp: View {
+    @Environment(\.afterRayCopy) private var copy
     let date: Date
     let isLive: Bool
 
     var body: some View {
         VStack(spacing: 2) {
-            Text(isLive ? "NOW" : date.formatted(date: .omitted, time: .standard))
+            Text(isLive ? copy.format.now : date.formatted(date: .omitted, time: .standard))
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 // Explicit, not `.primary`: this always sits on dark chrome, and
@@ -1636,7 +1640,7 @@ private struct TimelineRecordingStatusButton: View {
         .recallGlass(in: .capsule)
         .disabled(effectiveState == .stopping || isChanging)
         .help(toggleHelp)
-        .accessibilityLabel("Capture status")
+        .accessibilityLabel(copy.recall.captureStatus)
         .accessibilityValue(statusLabel)
         .accessibilityHint(toggleHelp)
     }
@@ -2297,6 +2301,7 @@ private struct TranscriptCaption: View {
 }
 
 private struct RecallDetailsMenu: View {
+    @Environment(\.afterRayCopy) private var copy
     let moment: RecallMoment
     @Binding var page: RecallDetailsPage
     let isProcessing: Bool
@@ -2477,9 +2482,9 @@ private struct RecallDetailsMenu: View {
     }
 
     private func detailsAudioTitle(isThis: Bool) -> String {
-        if isThis && isAudioBuffering { return "Cancel audio" }
-        if isThis && isAudioPlaying { return "Pause audio" }
-        return "Play audio"
+        if isThis && isAudioBuffering { return copy.recall.cancelAudio }
+        if isThis && isAudioPlaying { return copy.recall.pauseAudio }
+        return copy.recall.playAudio
     }
 
     private func detailsAudioSymbol(isThis: Bool) -> String {
@@ -2490,6 +2495,7 @@ private struct RecallDetailsMenu: View {
 }
 
 private struct RecallDetailsTextPage: View {
+    @Environment(\.afterRayCopy) private var copy
     let title: String
     let text: String?
     let emptyText: String
@@ -2509,8 +2515,8 @@ private struct RecallDetailsTextPage: View {
         VStack(alignment: .leading, spacing: 10) {
             if hasContent {
                 HStack(spacing: 8) {
-                    Button("Copy") { RecallTextActions.copy(displayText) }
-                    Button("Open") { RecallTextActions.open(displayText, name: fileName) }
+                    Button(copy.recall.copy) { RecallTextActions.copy(displayText) }
+                    Button(copy.recall.open) { RecallTextActions.open(displayText, name: fileName) }
                     Spacer()
                 }
                 .buttonStyle(.plain)
@@ -2597,6 +2603,7 @@ private enum RecallTextActions {
 }
 
 private struct EmptyRecallView: View {
+    @Environment(\.afterRayCopy) private var copy
     let isProcessing: Bool
 
     var body: some View {
@@ -2605,14 +2612,14 @@ private struct EmptyRecallView: View {
                 Rectangle()
                     .fill(RecallPalette.ray)
                     .frame(width: 18, height: 2)
-                Text(isProcessing ? "PREPARING FIRST MOMENT" : "CAPTURE IS READY")
+                Text(copy.recall.localOnly)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .tracking(1.1)
                     .foregroundStyle(RecallPalette.ray)
             }
-            Text(isProcessing ? "The first moments are being prepared" : "Your day begins here")
+            Text(isProcessing ? copy.recall.firstMoments : copy.recall.dayBegins)
                 .font(.system(size: 24, weight: .semibold))
-            Text(isProcessing ? "Keep AfterRay running for a moment." : "AfterRay is capturing automatically. Your first screen will appear shortly.")
+            Text(isProcessing ? copy.recall.keepRunning : copy.recall.capturingAutomatically)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420, alignment: .leading)
@@ -2628,6 +2635,7 @@ private struct EmptyRecallView: View {
 }
 
 private struct FailureView: View {
+    @Environment(\.afterRayCopy) private var copy
     let message: String
     let onReload: (() -> Void)?
 
@@ -2636,14 +2644,14 @@ private struct FailureView: View {
             HStack(spacing: 9) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 12, weight: .semibold))
-                Text("LOCAL SERVICE UNAVAILABLE")
+                Text(copy.recall.serviceUnavailable)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .tracking(1.0)
             }
             .foregroundStyle(RecallPalette.ray)
-            Text("Couldn’t open your memory")
+            Text(copy.recall.couldntOpen)
                 .font(.system(size: 24, weight: .semibold))
-            Text("The local AfterRay daemon failed to start.")
+            Text(copy.recall.daemonFailed)
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Text(message)
@@ -2655,7 +2663,7 @@ private struct FailureView: View {
             if let onReload {
                 HStack {
                     Spacer()
-                    Button("Try Again", action: onReload)
+                    Button(copy.recall.tryAgain, action: onReload)
                         .buttonStyle(RecallCapsuleButtonStyle())
                 }
             }

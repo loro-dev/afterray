@@ -1,0 +1,3 @@
+NSAppleEventsUsageDescription = "AfterRay 会检查当前浏览器窗口是否处于无痕模式，以便跳过记录。此权限不会读取页面网址。";
+NSMicrophoneUsageDescription = "AfterRay 在记录电脑活动时于本机转写你的语音。";
+NSHumanReadableCopyright = "Copyright © 2026 AfterRay.";
