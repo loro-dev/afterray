@@ -17,8 +17,6 @@ use crate::tools::ToolHost;
 const CHAT_LIST_LIMIT: usize = 200;
 const TITLE_MAX_CHARS: usize = 24;
 
-use crate::agent::RECALL_SYSTEM_PROMPT as CHAT_SYSTEM_PROMPT;
-
 const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
 struct PendingTurn<'a> {
@@ -40,6 +38,7 @@ pub(crate) async fn handle_send(
     message: &str,
     now_ms: i64,
     model: TurnModel,
+    language: &str,
 ) -> Response {
     let message = message.trim();
     if message.is_empty() {
@@ -77,7 +76,8 @@ pub(crate) async fn handle_send(
         now_ms,
         budget: model.budget,
     };
-    match agent::run_readonly_agent_traced(models, &host, CHAT_SYSTEM_PROMPT, opening).await {
+    let system = agent::render_recall_system(conversation.created_at_ms, language);
+    match agent::run_readonly_agent_traced(models, &host, &system, opening).await {
         Ok(turn) => {
             eprintln!(
                 "chat.usage rounds={} prompt_tokens={} window_tokens={} compactions={}",
@@ -365,13 +365,13 @@ pub(crate) fn title_from_message(message: &str) -> String {
 /// fencing moved into `Opening::render` too: trimming a block that is already
 /// fenced can cut the marker off it.
 ///
-/// There is no seed any more. A clock block sat in front of every turn,
-/// changed on every turn, and so broke the cached prefix every turn — paid for
-/// whether or not the question involved a time. The clock is a tool now. What
-/// remains is one stamped line on the question itself, which costs nothing:
-/// the question is this turn's new content regardless, and without it a model
-/// reading a `get_now` result folded into history three hours ago has no way
-/// to know it has gone stale.
+/// There is no seed any more. A clock in the opening changed every turn
+/// and broke the cached prefix. The conversation-start table lives in the
+/// catalog (`render_recall_system` with `created_at_ms`); the live clock is
+/// the `get_now` tool. What remains here is one stamped line on the question,
+/// which costs nothing: the question is this turn's new content regardless,
+/// and without it a model reading a `get_now` result folded into history
+/// three hours ago has no way to know it has gone stale.
 pub(crate) fn build_opening(history: History, message: &str, now_ms: i64) -> Opening {
     Opening {
         seed: String::new(),
@@ -699,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn empty_message_fails() {
         let (_directory, vault) = test_vault();
-        let response = handle_send(&vault, &queue(Vec::new()), None, "   ", 1, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT)).await;
+        let response = handle_send(&vault, &queue(Vec::new()), None, "   ", 1, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT), "English").await;
         assert!(!response.ok);
     }
 
@@ -713,6 +713,7 @@ mod tests {
             "hello",
             1,
             TurnModel::missing(),
+            "English",
         )
         .await;
         assert!(!response.ok);
@@ -731,6 +732,7 @@ mod tests {
             "一二三四五六七八九十一二三四五六七八九十一二三四五",
             1_000,
             TurnModel::missing(),
+            "English",
         )
         .await;
         assert!(response.ok, "{response:?}");
@@ -787,7 +789,7 @@ print(json.dumps({
 }))
 "#;
         let models = mock_llm(script);
-        let first = handle_send(&vault, &models, None, "first question", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT)).await;
+        let first = handle_send(&vault, &models, None, "first question", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT), "English").await;
         assert!(first.ok, "{first:?}");
         let first: ChatReply = serde_json::from_value(first.data.unwrap()).unwrap();
         assert_eq!(first.answer, "hello");
@@ -799,6 +801,7 @@ print(json.dumps({
             "what did I just ask",
             2_000,
             TurnModel::ready(afterray_harness::ContextBudget::DEFAULT),
+            "English",
         )
         .await;
         assert!(second.ok, "{second:?}");
@@ -826,7 +829,7 @@ print(json.dumps({
 }))
 "#;
         let models = mock_llm(script);
-        let response = handle_send(&vault, &models, None, "what was open", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT)).await;
+        let response = handle_send(&vault, &models, None, "what was open", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT), "English").await;
         assert!(response.ok, "{response:?}");
         let reply: ChatReply = serde_json::from_value(response.data.unwrap()).unwrap();
         assert_eq!(reply.answer, "used the activity list.");

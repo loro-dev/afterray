@@ -610,33 +610,13 @@ fn default_language() -> String {
     "auto".to_owned()
 }
 
-/// Resolves a stored language preference to the English name a model should
-/// be told to write in. `auto` follows the system language, defaulting to
-/// English when the locale is unset or unrecognised.
-/// The explicit setting always wins. `auto` asks macOS for the user's
-/// ordered language list — a GUI-launched daemon has no `LANG`, so the old
-/// environment sniffing silently answered English for everyone.
-fn resolve_summary_language(stored: &str) -> String {
-    if !stored.eq_ignore_ascii_case("auto") {
-        return afterray_protocol::language_display_name(stored);
-    }
-    let tag = afterray_platform_macos::preferred_languages()
-        .into_iter()
-        .next()
-        .unwrap_or_default()
-        .to_lowercase();
-    let code = if tag.starts_with("zh") {
-        if tag.contains("hant") || tag.contains("-tw") || tag.contains("-hk") {
-            "zh-Hant".to_owned()
-        } else {
-            "zh-Hans".to_owned()
-        }
-    } else if let Some(primary) = tag.split('-').next().filter(|part| !part.is_empty()) {
-        primary.to_owned()
-    } else {
-        "en".to_owned()
-    };
-    afterray_protocol::language_display_name(&code)
+/// Reply language for chat and ask, from the stored UI preference.
+pub(crate) fn reply_language(state: &AppState) -> String {
+    let stored = state
+        .languages
+        .lock()
+        .map_or_else(|_| default_language(), |langs| langs.0.clone());
+    agent::resolve_language(&stored)
 }
 
 const fn default_record_audio() -> bool {
@@ -1154,6 +1134,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 to_ms,
                 now_ms(),
                 model,
+                &reply_language(state),
             )
             .await
         }
@@ -1169,6 +1150,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 &message,
                 now_ms(),
                 model,
+                &reply_language(state),
             )
             .await
         }
@@ -4167,7 +4149,7 @@ fn slot_t2_inputs(
         .languages
         .lock()
         .map_or_else(|_| default_language(), |langs| langs.1.clone());
-    let language = resolve_summary_language(&stored);
+    let language = agent::resolve_language(&stored);
     let prev_cards = state
         .store
         .previous_slot_titles(card.slot_start_ms, T2_PREV_CARDS)
