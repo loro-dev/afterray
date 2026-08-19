@@ -382,6 +382,10 @@ fn missing_model_answer(memories: &[Memory], spans: &[ActivitySpan]) -> AskAnswe
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "range, clock and language are independent turn inputs, not one struct"
+)]
 pub(crate) async fn handle_ask(
     store: &std::sync::Arc<Vault>,
     models: &ModelQueue,
@@ -390,6 +394,7 @@ pub(crate) async fn handle_ask(
     to_ms: Option<i64>,
     now_ms: i64,
     model: TurnModel,
+    language: &str,
 ) -> Response {
     let question = question.trim();
     if question.is_empty() {
@@ -451,7 +456,11 @@ pub(crate) async fn handle_ask(
         now_ms,
         budget: model.budget,
     };
-    let system = format!("{ASK_SYSTEM_PROMPT}\n\n{QWEN35_TOOL_PROTOCOL_SUFFIX}");
+    let system = format!(
+        "{ASK_SYSTEM_PROMPT}\n\nWrite the answer in {language}. Proper nouns — \
+         products, repos, files, commands, people — keep their original spelling.\n\nReply language: {language}\n\n{}\n\n{QWEN35_TOOL_PROTOCOL_SUFFIX}",
+        crate::tools::tool_catalog_text(now_ms)
+    );
     match agent::run_readonly_agent(models, &host, &system, opening).await {
         Ok(answer) => Response::success(AskAnswer {
             answer: answer.trim().to_owned(),
@@ -649,6 +658,7 @@ mod tests {
             Some(10),
             5,
             TurnModel::missing(),
+            "English",
         )
         .await;
         assert!(response.ok);
@@ -660,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn empty_question_fails() {
         let (_directory, vault) = test_vault();
-        let response = handle_ask(&vault, &queue(Vec::new()), "   ", None, None, 1, TurnModel::ready(ContextBudget::DEFAULT)).await;
+        let response = handle_ask(&vault, &queue(Vec::new()), "   ", None, None, 1, TurnModel::ready(ContextBudget::DEFAULT), "English").await;
         assert!(!response.ok);
     }
 
@@ -675,6 +685,7 @@ mod tests {
             Some(10),
             5,
             TurnModel::ready(ContextBudget::DEFAULT),
+            "English",
         )
         .await;
         assert!(response.ok);
@@ -730,7 +741,7 @@ print(json.dumps({
         let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
 
         let response =
-            handle_ask(&vault, &models, "design", Some(0), Some(2_000), 1_500, TurnModel::ready(ContextBudget::DEFAULT)).await;
+            handle_ask(&vault, &models, "design", Some(0), Some(2_000), 1_500, TurnModel::ready(ContextBudget::DEFAULT), "English").await;
         assert!(response.ok, "{response:?}");
         let answer: AskAnswer = serde_json::from_value(response.data.unwrap()).unwrap();
         assert!(!answer.model_missing);

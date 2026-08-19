@@ -134,31 +134,18 @@ impl ToolHost {
         Ok(result)
     }
 
-    /// The clock, every period a question is likely to name, what the
-    /// recording covers, and what is on screen now.
+    /// The live clock: the same table the catalog froze at conversation
+    /// start, plus what the recording covers and what is on screen now.
     ///
-    /// This used to be a block prepended to every turn. It is a tool instead
-    /// because it changes every turn: sitting in the prompt it broke the
-    /// cached prefix each time and was paid for whether or not the question
-    /// involved a time. As a tool it costs one round, once, and only when
-    /// asked — so it answers everything at once rather than a window at a time.
+    /// The catalog carries the table from `created_at_ms` so the system
+    /// prefix is byte-identical every turn. This tool is the refresh — a
+    /// later instant, and the vault lines the catalog only shows as shape.
     #[allow(
         clippy::unnecessary_wraps,
         reason = "one arm of a dispatch table whose other arms are fallible"
     )]
     fn get_now(&self) -> Result<String, String> {
-        let mut lines = vec![format!(
-            "Now: {} ({})   now_ms={}",
-            format_local_datetime(self.now_ms),
-            timezone_label(self.now_ms),
-            self.now_ms
-        )];
-        for period in clock_periods(self.now_ms) {
-            lines.push(format!(
-                "{:<11} {:<15} from_ms={}  to_ms={}",
-                period.label, period.dates, period.from_ms, period.to_ms
-            ));
-        }
+        let mut lines = vec![render_clock_table(self.now_ms)];
         lines.push(match self.store().moment_time_bounds() {
             Ok(Some((first, last))) => format!(
                 "Recording covers {} – {}.",
@@ -639,6 +626,25 @@ impl ToolHost {
             format_local_datetime(self.now_ms)
         )
     }
+}
+
+/// The date/`from_ms` table for one instant: Now, seven days, this/last
+/// week, this/last month. Pure in `now_ms`, so a conversation that passes
+/// its `created_at_ms` every turn gets the same bytes back.
+#[must_use]
+pub(crate) fn render_clock_table(now_ms: i64) -> String {
+    let mut lines = vec![format!(
+        "Now: {} ({})   now_ms={now_ms}",
+        format_local_datetime(now_ms),
+        timezone_label(now_ms),
+    )];
+    for period in clock_periods(now_ms) {
+        lines.push(format!(
+            "{:<11} {:<15} from_ms={}  to_ms={}",
+            period.label, period.dates, period.from_ms, period.to_ms
+        ));
+    }
+    lines.join("\n")
 }
 
 /// One row of `get_now`'s table.
@@ -1193,17 +1199,25 @@ fn require_moment_id(args: &Value) -> Result<String, String> {
 
 /// Catalog shown to the LLM in agent prompts.
 ///
-/// Every tool documents all of its arguments and the exact shape of what it
-/// returns. That is longer than a one-line-per-tool list and it is the point:
-/// the previous catalog said what each tool was *for* and left the model to
-/// discover the rest a round at a time. Nothing here describes a caveat that
-/// the tool's own output already states — an empty result explains itself, a
-/// truncated one says where it stopped — because a caveat repeated in two
-/// places is a caveat that will disagree with itself.
+/// The clock table is rendered from `now_ms` — chat passes the
+/// conversation's `created_at_ms` so the system prefix is identical every
+/// turn. Vault-only lines (`Recording covers`, `Right now`, `Today's apps`)
+/// stay examples; a small model that treats a catalog illustration as
+/// today's facts is how 2026-08-15 outlived the day it was written.
 #[must_use]
-#[allow(clippy::too_many_lines, reason = "it is one string literal")]
-pub fn tool_catalog_text() -> &'static str {
-    r#"Tools. Call at most one per reply, then wait for its result.
+pub(crate) fn tool_catalog_text(now_ms: i64) -> String {
+    let clock = indent_lines(&render_clock_table(now_ms), "    ");
+    CATALOG_TEMPLATE.replace("{CLOCK}", &clock)
+}
+
+fn indent_lines(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const CATALOG_TEMPLATE: &str = r#"Tools. Call at most one per reply, then wait for its result.
 
 Timestamps are Unix milliseconds. Every one you use must be copied from a tool
 result — never work one out yourself, you will get the year wrong. Values
@@ -1212,30 +1226,30 @@ written key=value are there to be copied verbatim.
 ────────────────────────────────────────────────────────────────────────
 get_now   {}
 
-  Takes nothing. Ask for it once, first, whenever the question involves a
-  time — everything needed to name any period is in the one reply.
+  Takes nothing. The clock table below is from the start of this
+  conversation. Copy its dates and from_ms/to_ms. It does not move later
+  in the thread — the question is stamped [asked at …], and this tool
+  returns a later instant if you need one.
 
-  Returns:
-    Now: 2026-08-15 01:52 (+08:00)   now_ms=1786729937000
-    today       2026-08-15      from_ms=1786723200000  to_ms=1786809599999
-    yesterday   2026-08-14      from_ms=1786636800000  to_ms=1786723199999
-                2026-08-13      from_ms=…              to_ms=…
-                …five more days, one line each…
-    this week   08-11 – 08-17   from_ms=…              to_ms=…
-    last week   08-04 – 08-10   from_ms=…              to_ms=…
-    this month  08-01 – 08-31   from_ms=…              to_ms=…
-    last month  07-01 – 07-31   from_ms=…              to_ms=…
-    Recording covers 2026-07-02 – 2026-08-15.
-    Right now: 01:52:10  Zed  tools.rs
-    Today's apps: Zed, Chrome, Weixin
+{CLOCK}
 
-  "Right now" is the newest capture and carries its clock time — if that
-  time is not recent, capture was paused and it is the last thing seen,
-  not what is on screen. "Today's apps" is ordered by how much of the day
-  each one took.
+  The same reply also appends three live vault lines. The block below is
+  EXAMPLE SHAPE ONLY — not this computer, not today's facts, not
+  evidence. Do not copy dates or apps from it. Call get_now for the
+  real values.
+
+    example: Recording covers YYYY-MM-DD – YYYY-MM-DD.
+    example: Right now: HH:MM:SS  App  window
+    example: Today's apps: App, App
+
+  In a real get_now result, "Right now" is the newest capture and
+  carries its clock time — if that time is not recent, capture was
+  paused and it is the last thing seen, not what is on screen.
+  "Today's apps" is ordered by how much of the day each one took.
 
   The date column feeds get_day_summary; the from_ms/to_ms columns feed
-  every tool taking a range. Nothing outside "Recording covers" exists.
+  every tool taking a range. Nothing outside a real get_now
+  "Recording covers" line exists.
 
 ────────────────────────────────────────────────────────────────────────
 get_day_summary   {"day":"2026-08-13"}
@@ -1351,17 +1365,7 @@ list_activity   {"from_ms":…,"to_ms":…}
 
 Whatever a tool could not fit, it says so on its last line, with the
 timestamp to resume from. Nothing is dropped in silence.
-
-Reply with exactly one of:
-
-TOOL <name>
-ARGS <json object>
-
-or
-
-FINAL
-<answer text>"#
-}
+"#;
 
 
 #[cfg(test)]
@@ -1588,7 +1592,7 @@ mod catalog_drift {
     /// Nothing callable may be undocumented.
     #[test]
     fn every_dispatched_tool_appears_in_the_catalog() {
-        let catalog = tool_catalog_text();
+        let catalog = tool_catalog_text(0);
         for name in dispatched_names() {
             assert!(
                 catalog.contains(&format!("{name}   ")),
@@ -1602,7 +1606,7 @@ mod catalog_drift {
     #[test]
     fn every_catalogued_tool_is_dispatched() {
         let dispatched = dispatched_names();
-        for named in tools_named_in(tool_catalog_text()) {
+        for named in tools_named_in(&tool_catalog_text(0)) {
             assert!(
                 dispatched.contains(&named),
                 "the catalog names `{named}`, which nothing dispatches"
@@ -1626,7 +1630,7 @@ mod catalog_drift {
         // getting rid of.
         const UNDOCUMENTED_ON_PURPOSE: [&str; 1] = ["day_ms"];
 
-        let catalog = tool_catalog_text();
+        let catalog = tool_catalog_text(0);
         let mut seen: Vec<String> = Vec::new();
         for (index, _) in production().match_indices("args.get(\"") {
             let rest = &production()[index + "args.get(\"".len()..];
@@ -1657,11 +1661,7 @@ mod catalog_drift {
     /// catalog until the number fits.
     #[test]
     fn the_catalog_and_system_prompt_fit_the_budget_they_are_charged_to() {
-        let system = format!(
-            "{}\n\n{}",
-            crate::agent::RECALL_SYSTEM_PROMPT,
-            tool_catalog_text()
-        );
+        let system = crate::agent::render_recall_system(0, "English");
         let tokens = afterray_harness::estimate_tokens(&system);
         let budgeted = afterray_harness::ContextBudget::DEFAULT.system_tokens;
         assert!(
@@ -1698,7 +1698,7 @@ mod catalog_drift {
                 assert!(
                     tools.is_empty(),
                     "{file}'s system prompt names {tools:?}. Move the advice into \
-                     tool_catalog_text() so it cannot fall behind the tool list."
+                     tool_catalog_text so it cannot fall behind the tool list."
                 );
                 assert!(
                     strangers.is_empty(),
@@ -1708,9 +1708,9 @@ mod catalog_drift {
         }
     }
 
-    /// The seed is gone and must stay gone: a clock block in front of every
-    /// turn changes on every turn, which breaks the cached prefix on every
-    /// turn and is paid for whether or not the question involves a time.
+    /// The seed is gone and must stay gone: a clock in the opening changes
+    /// every turn and breaks the cached prefix. The conversation-start table
+    /// lives in the catalog; the live clock is the `get_now` tool.
     #[test]
     fn no_chat_surface_builds_a_clock_into_its_opening() {
         for (file, source) in [
@@ -1725,8 +1725,54 @@ mod catalog_drift {
                 .map_or(source, |(before, _)| before);
             assert!(
                 production.contains("seed: String::new()"),
-                "{file} stopped building an empty seed; the clock belongs in get_now"
+                "{file} stopped building an empty seed; the clock table belongs \
+                 in the conversation-scoped catalog"
             );
+        }
+    }
+
+    /// A concrete "today YYYY-MM-DD" in the catalog is read as the clock.
+    /// The live table is rendered from the instant the caller passes; the
+    /// vault lines stay behind an example fence so they cannot be.
+    #[test]
+    fn the_catalog_clock_follows_the_instant_and_fences_vault_lines() {
+        // 2026-08-19 00:00 +08:00, a different day from the old 2026-08-15
+        // fixture so a leftover hardcoded "today" would fail.
+        const AUG_19: i64 = 1_787_068_800_000;
+        let catalog = super::tool_catalog_text(AUG_19);
+        let clock = super::render_clock_table(AUG_19);
+        assert!(
+            catalog.contains(&clock.lines().next().expect("clock").to_string())
+                || catalog.contains("now_ms=1787068800000"),
+            "the catalog is not the clock for this instant: {catalog}"
+        );
+        assert!(
+            catalog.contains("2026-08-19"),
+            "today is missing from the catalog clock: {catalog}"
+        );
+        let today_line = catalog
+            .lines()
+            .find(|line| line.contains("today") && line.contains("from_ms="))
+            .expect("no today row");
+        assert!(
+            today_line.contains("2026-08-19"),
+            "today is not the render instant: {today_line}"
+        );
+        assert!(
+            catalog.contains("EXAMPLE SHAPE ONLY"),
+            "the vault lines are not fenced as examples: {catalog}"
+        );
+        for line in catalog.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("Right now:")
+                || trimmed.starts_with("Today's apps:")
+                || trimmed.starts_with("Recording covers")
+            {
+                assert!(
+                    trimmed.starts_with("example:"),
+                    "a vault line is presented as fact: {line}"
+                );
+            }
         }
     }
 }

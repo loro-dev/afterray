@@ -32,22 +32,24 @@ impl ContextBudget {
     /// ```text
     ///  16_384  window
     /// - 2_048  generation headroom
-    /// - 1_792  system prompt + tool catalog (measured at ~1_650)
-    /// = 12_544 transcript
-    ///        → 6 rounds × 1_792 per tool result = 10_752, leaving 1_792 for
+    /// - 2_048  system prompt + tool catalog (measured at ~1_883)
+    /// = 12_288 transcript
+    ///        → 6 rounds × 1_755 per tool result = 10_530, leaving 1_758 for
     ///          the task text and the per-round scaffolding
     /// ```
     ///
     /// `system_tokens` is a **measurement**, not a share. It rose from `1_024`
     /// when the catalog began documenting every argument and return shape of
-    /// every tool: a model that has to discover a parameter by trial spends a
-    /// round on it, and a round costs more than the tokens the prose saves.
-    /// `afterrayd::tools` has the test that re-measures it — when that fails,
-    /// move this number rather than shaving the catalog to fit.
+    /// every tool, and again when the catalog started carrying a live clock
+    /// table plus a reply-language line. A model that has to discover a
+    /// parameter by trial spends a round on it, and a round costs more than
+    /// the tokens the prose saves. `afterrayd::tools` has the test that
+    /// re-measures it — when that fails, move this number rather than shaving
+    /// the catalog to fit.
     pub const DEFAULT: Self = Self {
         window_tokens: 16_384,
         reserve_tokens: 2_048,
-        system_tokens: 1_792,
+        system_tokens: 2_048,
         max_rounds: 6,
     };
 
@@ -176,7 +178,7 @@ const _: () = assert!(matches!(
     ContextBudget {
         window_tokens: 16_384,
         reserve_tokens: 2_048,
-        system_tokens: 1_792,
+        system_tokens: 2_048,
         max_rounds: 6,
     }
 ));
@@ -221,10 +223,9 @@ mod tests {
 
     #[test]
     fn a_narrow_window_still_produces_a_usable_cap() {
-        let budget = ContextBudget {
-            window_tokens: 4_096,
-            ..ContextBudget::DEFAULT
-        };
+        // `for_window`, not `DEFAULT` with a smaller window: reserve and
+        // rounds have to shrink with it, or system + reserve eat the transcript.
+        let budget = ContextBudget::for_window(4_096);
         assert!(budget.is_coherent());
         assert!(budget.tool_result_tokens() > 0);
     }
