@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import AfterRayRecall
 
@@ -26,6 +27,20 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertTrue(store.selectLatestMoment())
         XCTAssertEqual(store.playheadMs, 200)
         XCTAssertEqual(store.selectedMoment?.id, "m2")
+    }
+
+    func testUnchangedPlayheadDoesNotPublish() async {
+        let store = RecallStore(daemon: FakeDaemon())
+        await store.loadTimeline()
+
+        var publishes = 0
+        let token = store.objectWillChange.sink { publishes += 1 }
+        XCTAssertTrue(store.selectLatestMoment())
+        store.select(playheadMs: store.playheadMs)
+        XCTAssertEqual(publishes, 0)
+        store.select(playheadMs: 100)
+        XCTAssertEqual(publishes, 1)
+        _ = token
     }
 
     func testConnectionFailureStaysInRecoveringState() async {

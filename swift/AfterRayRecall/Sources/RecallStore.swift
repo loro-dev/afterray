@@ -316,10 +316,19 @@ public final class RecallStore: ObservableObject {
     }
 
     private func applyPlayhead(_ ms: Int64) {
-        playheadMs = moments.isEmpty
+        let next = moments.isEmpty
             ? 0
             : min(max(ms, timelineBounds.startMs), timelineBounds.endMs)
-        selectedIndex = RecallPlayhead.resolveIndex(playheadMs: playheadMs, moments: moments) ?? 0
+        let nextIndex = RecallPlayhead.resolveIndex(playheadMs: next, moments: moments) ?? 0
+        // Opening the overlay calls `selectLatestMoment` even when the
+        // playhead is already there. Writing `@Published playheadMs` would
+        // rebuild the whole recall tree on the same turn as `orderFront`.
+        if next == playheadMs {
+            selectedIndex = nextIndex
+            return
+        }
+        playheadMs = next
+        selectedIndex = nextIndex
     }
 
     private struct PreparedTimeline: Sendable {

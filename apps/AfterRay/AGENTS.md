@@ -4,7 +4,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 ## Key files
 
-- `Sources/AfterRayApp.swift:30` `@main` + app delegate; `RecallOverlayController` (:401, Carbon hot key + status-bar-level panel); `AfterRayMenuBar` (:216); `AfterRayRootView` (:945)
+- `Sources/AfterRayApp.swift:30` `@main` + app delegate; `RecallOverlayController` (Carbon hot key + status-bar-level panel); `AfterRayMenuBar`; `AfterRayRootView`. Overlay placement policy: `OverlayOpenRoute.swift` (`OverlayPanelPlacement`).
 - `Sources/DaemonSupervisor.swift:6` — spawns/owns `afterrayd` and helper binaries, resolves socket/data dirs; dev layout detected via `.afterray-dev` parent in `developmentRepoRoot()` (:276)
 - `Sources/HistoryWindow.swift:12` `AfterRayServices` (`static let shared`); `AfterRayStandardWindowPresence` (:39) Dock/Cmd-Tab for pop-outs; `HistoryWindowController` (:57)
 - `Sources/ChatWindow.swift:10` `ChatWindowController` — standalone chat window; stream lives on `AfterRayServices.shared.chat`
@@ -15,6 +15,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 - The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 14, which must match `afterray-protocol`.
 - On lock/sleep, `.afterRaySystemSessionWillSuspend` clears store/control/chat, closes chat, and clears image/thumbnail/preview caches. Hook every decrypted-content cache into this.
+- Overlay show is Spotlight-class: keep the hosting tree laid out (`orderOut`, not torn down), `present()` only `orderFront`s, `setFrame` only when the mouse screen moved, and post `DidOpen` / `activate` on the next run-loop turn. Do not invalidate SwiftUI on the hotkey turn.
 - The overlay, history window, and chat window must share `AfterRayServices.shared` stores — never construct a private `RecallStore` or `AfterRayChatModel`.
 - `RecallView` alone owns the opaque history backdrop; `AfterRayRootView` stays transparent. An outer backdrop lags a fast flick to NOW and can leave a black screen.
 - Pop-outs retain their `NSWindow`; every `show()` ensures daemon/refresh. Chat uses `sizingOptions = [.minSize]` or resize snaps back.

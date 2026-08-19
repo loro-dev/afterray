@@ -22,7 +22,9 @@ private final class RecallOverlayLayout: ObservableObject {
     @Published private(set) var topSafeAreaInset: CGFloat = 0
 
     func update(for screen: NSScreen) {
-        topSafeAreaInset = screen.safeAreaInsets.top
+        let inset = screen.safeAreaInsets.top
+        guard inset != topSafeAreaInset else { return }
+        topSafeAreaInset = inset
     }
 }
 
@@ -418,10 +420,19 @@ private final class PermissionGuidePanel: NSPanel {
 }
 
 private let recallHotKeyHandler: EventHandlerUPP = { _, _, _ in
-    DispatchQueue.main.async {
-        // While the welcome window is up the press is the lesson, not a command.
-        guard !OnboardingController.shared.handleHotKey() else { return }
-        RecallOverlayController.shared.toggle()
+    // Spotlight-class: if Carbon already delivered on the main thread, show
+    // in this run-loop turn so orderFront commits with the key event.
+    let fire = {
+        MainActor.assumeIsolated {
+            // While the welcome window is up the press is the lesson, not a command.
+            guard !OnboardingController.shared.handleHotKey() else { return }
+            RecallOverlayController.shared.toggle()
+        }
+    }
+    if Thread.isMainThread {
+        fire()
+    } else {
+        DispatchQueue.main.async(execute: fire)
     }
     return noErr
 }
@@ -435,13 +446,16 @@ final class RecallOverlayController: RecallHotKeyBinding {
     private var hotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
     private var resignKeyObserver: NSObjectProtocol?
+    private var screenObserver: NSObjectProtocol?
     private var keyMonitor: Any?
 
     func start() {
         guard panel == nil else { return }
 
+        let screen = targetScreen
+        RecallOverlayLayout.shared.update(for: screen)
         let panel = RecallOverlayPanel(
-            contentRect: .zero,
+            contentRect: screen.frame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -479,10 +493,14 @@ final class RecallOverlayController: RecallHotKeyBinding {
         }
         registerHotKey()
         installKeyMonitor()
+        installScreenObserver()
 
         // Keep the hosting tree alive so capture can bootstrap in the
         // background, but do not order the full-screen panel in until the
-        // user explicitly opens AfterRay.
+        // user explicitly opens AfterRay. The frame is already the current
+        // screen so the first hotkey is orderFront of a laid-out tree, not
+        // the first layout of a zero-rect hosting view.
+        panel.layoutIfNeeded()
         panel.orderOut(nil)
         AfterRayMenuBar.shared.setOverlayVisible(false)
     }
@@ -514,6 +532,10 @@ final class RecallOverlayController: RecallHotKeyBinding {
             NotificationCenter.default.removeObserver(resignKeyObserver)
         }
         resignKeyObserver = nil
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+        }
+        screenObserver = nil
         panel?.orderOut(nil)
         panel = nil
         AfterRayMenuBar.shared.setOverlayVisible(false)
@@ -546,21 +568,46 @@ final class RecallOverlayController: RecallHotKeyBinding {
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
-        let screen = targetScreen
-        RecallOverlayLayout.shared.update(for: screen)
-        panel.setFrame(screen.frame, display: true)
+        // Same-screen show is orderFront of an already-laid-out tree.
+        // setFrame(display: true), activate, DidOpen, and focus all invalidate
+        // or block the window server before the first frame can commit.
+        placeOnTargetScreen()
         panel.alphaValue = 1
-        NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
-        panel.makeFirstResponder(panel)
-        // Publish only after the panel is key. The query bar handles this on
-        // the next main-actor turn, so its text field becomes first responder
-        // instead of losing a race to the panel itself.
-        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: intent)
         AfterRayMenuBar.shared.setOverlayVisible(true)
         OverlayVisibility.shared.set(true)
         setCapturePaused(true)
+        scheduleWorkAfterFirstFrame(intent)
+    }
+
+    /// Moves the hidden (or visible) panel onto the mouse screen without
+    /// forcing a display. No-op when the frame already matches, which is
+    /// the hot path after start() and after a previous show on this screen.
+    private func placeOnTargetScreen() {
+        guard let panel else { return }
+        let screen = targetScreen
+        RecallOverlayLayout.shared.update(for: screen)
+        let frame = screen.frame
+        guard OverlayPanelPlacement.needsMove(from: panel.frame, to: frame) else { return }
+        panel.setFrame(frame, display: false)
+        panel.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    /// Focus, live-route, and app activation run after this turn's
+    /// CATransaction commits so the overlay can paint first.
+    private func scheduleWorkAfterFirstFrame(_ intent: OverlayOpenIntent?) {
+        DispatchQueue.main.async { [intent] in
+            MainActor.assumeIsolated {
+                RecallOverlayController.shared.completePresent(intent: intent)
+            }
+        }
+    }
+
+    fileprivate func completePresent(intent: OverlayOpenIntent?) {
+        guard panel?.isVisible == true else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: intent)
     }
 
     /// While the overlay is up it covers the screen, so anything the daemon
@@ -605,6 +652,21 @@ final class RecallOverlayController: RecallHotKeyBinding {
         return NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
             ?? NSScreen.main
             ?? NSScreen.screens[0]
+    }
+
+    private func installScreenObserver() {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                // Re-place while hidden so the next hotkey stays a warm
+                // orderFront. A visible overlay also follows a reconnect
+                // without setFrame(display: true).
+                RecallOverlayController.shared.placeOnTargetScreen()
+            }
+        }
     }
 
     private func installKeyMonitor() {
@@ -1161,6 +1223,8 @@ private struct AfterRayRootView: View {
                 }
             }
         }
+        // Posted on the turn *after* orderFront so this work cannot hitch
+        // the overlay's first frame (focus, live-route, compute watch).
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { notification in
             audioPlayer.stop()
             if permissions.allGranted, !AfterRaySettingsController.shared.isVisible {

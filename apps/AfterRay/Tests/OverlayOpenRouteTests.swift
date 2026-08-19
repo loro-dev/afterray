@@ -32,6 +32,25 @@ final class OverlayOpenRouteTests: XCTestCase {
     }
 }
 
+final class OverlayPanelPlacementTests: XCTestCase {
+    func testSameFrameIsAWarmOrderFront() {
+        let frame = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        XCTAssertFalse(OverlayPanelPlacement.needsMove(from: frame, to: frame))
+    }
+
+    func testMovingToAnotherScreenRequiresSetFrame() {
+        let laptop = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let external = CGRect(x: 1512, y: 0, width: 2560, height: 1440)
+        XCTAssertTrue(OverlayPanelPlacement.needsMove(from: laptop, to: external))
+    }
+
+    func testArrangementChangeMovesOriginOnly() {
+        let before = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let after = CGRect(x: -1512, y: 0, width: 1512, height: 982)
+        XCTAssertTrue(OverlayPanelPlacement.needsMove(from: before, to: after))
+    }
+}
+
 final class OverlayCloseKeyTests: XCTestCase {
     func testEscapeDismissesWhenOverlayIsKey() {
         XCTAssertTrue(

@@ -1,4 +1,5 @@
 import AfterRayRecall
+import CoreGraphics
 
 /// Why the overlay is being ordered in. Posted as
 /// `afterRayRecallDidOpen`'s object so a citation from the standalone chat
@@ -30,6 +31,15 @@ enum OverlayOpenRoute: Equatable {
 /// Esc / ⌘W while recall is up. The query bar is often first responder, so
 /// SwiftUI's `onExitCommand` is not enough — AppKit must consume the key
 /// before a text field eats it.
+/// Full-screen overlay placement. Spotlight-class show is `orderFront` of an
+/// already-laid-out tree; `setFrame` only runs when the mouse screen actually
+/// changed (multi-display, resolution, arrangement).
+enum OverlayPanelPlacement {
+    static func needsMove(from current: CGRect, to target: CGRect) -> Bool {
+        current.origin != target.origin || current.size != target.size
+    }
+}
+
 enum OverlayCloseKey {
     static let escapeKeyCode: UInt16 = 53
 
