@@ -1,5 +1,5 @@
 /// Every user-facing chrome string AfterRay draws. Adding a field is a
-/// compile error until both shipped locales fill it.
+/// compile error until every shipped locale fills it.
 public struct AfterRayCopy {
     public var common: Common
     public var format: Format
@@ -162,6 +162,7 @@ extension AfterRayCopy {
         public var addTo: (String) -> String
         public var dragInstructions: String
         public var dragIntoSettings: String
+        public var afterGranting: (String) -> String
     }
 
     public struct Settings {
@@ -375,6 +376,16 @@ extension AfterRayCopy {
         public var open: String
         public var heard: String
         public var seen: String
+        public var onScreen: String
+        public var accessibilityTree: String
+        public var settingsHelp: String
+        public var openAsWindow: String
+        public var copyAllLoadedDays: String
+        public var copyThisDay: String
+        public var copyThisSlot: String
+        public var nothingRecorded: String
+        public var pastDaysWillAppear: String
+        public var noRecordings: String
     }
 
     public struct Chat {

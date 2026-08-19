@@ -144,7 +144,8 @@ extension AfterRayCopy {
             turnOnSwitch: "打开 AfterRay 旁边的开关",
             addTo: { "将 AfterRay 添加到\($0)" },
             dragInstructions: "把下面的应用拖进系统设置的列表，然后打开它。",
-            dragIntoSettings: "拖进系统设置"
+            dragIntoSettings: "拖进系统设置",
+            afterGranting: { "授权后，按 \($0) 返回。" }
         ),
         settings: Settings(
             brand: "AFTERRAY",
@@ -355,7 +356,17 @@ extension AfterRayCopy {
             copy: "复制",
             open: "打开",
             heard: "听到",
-            seen: "看到"
+            seen: "看到",
+            onScreen: "屏幕上",
+            accessibilityTree: "辅助功能树",
+            settingsHelp: "设置",
+            openAsWindow: "作为窗口打开",
+            copyAllLoadedDays: "复制已加载的全部日期",
+            copyThisDay: "复制这一天",
+            copyThisSlot: "复制此时段",
+            nothingRecorded: "还没有记录。",
+            pastDaysWillAppear: "AfterRay 捕获后，过去的日子会出现在这里。",
+            noRecordings: "没有记录"
         ),
         chat: Chat(
             loading: "正在加载…",

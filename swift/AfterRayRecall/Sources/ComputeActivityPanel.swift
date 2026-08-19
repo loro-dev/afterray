@@ -112,11 +112,11 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
 
     private var runningSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Running now")
+            sectionTitle(copy.compute.runningNow)
             if status.running.isEmpty {
                 Text(status.totalRemaining > 0
-                    ? "Nothing running. \(status.totalRemaining) waiting."
-                    : "Nothing running.")
+                    ? copy.compute.nothingRunningWaiting(status.totalRemaining)
+                    : copy.compute.nothingRunning)
                     .font(.caption)
                     .foregroundStyle(RecallPalette.textTertiary)
             } else {
@@ -186,16 +186,16 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     private var summaryTimingSection: some View {
         if !status.recentSummaries.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                sectionTitle("Summary timing")
+                sectionTitle(copy.compute.summaryTiming)
                 if let typical = status.summaryTypicalMs {
                     HStack(spacing: 6) {
-                        Text("Usually")
+                        Text(copy.compute.usually)
                             .font(.caption)
                             .foregroundStyle(RecallPalette.textTertiary)
                         Text(ComputeFormat.duration(ms: typical))
                             .font(.system(size: 12, weight: .medium, design: .monospaced))
                             .foregroundStyle(RecallPalette.textPrimary)
-                        Text("per slot, median of \(successfulRunCount) run\(successfulRunCount == 1 ? "" : "s")")
+                        Text(copy.compute.perSlot(successfulRunCount))
                             .font(.caption2)
                             .foregroundStyle(RecallPalette.textTertiary)
                     }
@@ -214,7 +214,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                                 ? RecallPalette.textSecondary
                                 : RecallPalette.textTertiary)
                             .frame(width: 56, alignment: .leading)
-                        Text(run.ok ? "finished" : "gave up")
+                        Text(run.ok ? copy.compute.finished : copy.compute.gaveUp)
                             .font(.caption2)
                             .foregroundStyle(RecallPalette.textTertiary)
                         Spacer(minLength: 6)
@@ -236,7 +236,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     private var workloadSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                sectionTitle("Work types")
+                sectionTitle(copy.compute.workTypes)
                 Spacer(minLength: 4)
                 if status.totalRemaining > 0 {
                     Text("\(status.totalRemaining) items waiting")
@@ -317,7 +317,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                 Button {
                     Task { await model.runNow(gate.workload) }
                 } label: {
-                    Text("Start now")
+                    Text(copy.compute.startNow)
                         .font(.system(size: 11, weight: .medium))
                 }
                 // Bordered, not borderless: as bare text this was the one
@@ -353,8 +353,8 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     /// every five minutes.
     private func runNowHelp(_ gate: ComputeGate) -> String {
         gate.allowed
-            ? "Works through all \(gate.remaining) now instead of a few at a time"
-            : "Runs the \(gate.remaining) remaining now, ignoring the conditions below"
+            ? copy.compute.startAllNow(gate.remaining)
+            : copy.compute.startRemainingNow(gate.remaining)
     }
 
     /// Every condition, with the live reading next to it. The unmet ones are the
@@ -362,11 +362,11 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     /// list reading as a wall of complaints.
     private func conditionsPopover(_ gate: ComputeGate) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("\(gate.workload.title) starts automatically when")
+            Text(copy.compute.startsWhen(gate.workload.title(copy)))
                 .font(.system(size: 12, weight: .semibold))
             let conditions = status.automaticConditions(for: gate.workload)
             if conditions.isEmpty {
-                Text("It has no conditions — it runs as work arrives.")
+                Text(copy.compute.noConditions)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -409,7 +409,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     private var residentSection: some View {
         if !status.residentModels.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                sectionTitle("Loaded models")
+                sectionTitle(copy.compute.loadedModels)
                 // Worth its own section: a resident pack holds gigabytes of
                 // unified memory whether or not it is generating, which
                 // explains more "my Mac got slow" than any percentage.
@@ -451,7 +451,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
 
     private var machineSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("This machine")
+            sectionTitle(copy.compute.thisMachine)
             VStack(alignment: .leading, spacing: 4) {
                 machineRow(
                     "Power",
@@ -589,7 +589,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                 }
             }
             Divider()
-            Text("Chat and anything you are waiting on always runs, whatever is set here.")
+            Text(copy.compute.chatAlwaysRuns)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -1,0 +1,3 @@
+NSAppleEventsUsageDescription = "AfterRay prüft, ob das aktive Browserfenster privat ist, um die Aufnahme zu überspringen. Diese Berechtigung liest die Seiten-URL nicht.";
+NSMicrophoneUsageDescription = "AfterRay transkribiert Ihre Stimme lokal, während die Computeraktivität aufgezeichnet wird.";
+NSHumanReadableCopyright = "Copyright © 2026 AfterRay.";

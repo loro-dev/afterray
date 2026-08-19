@@ -809,16 +809,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Interface picker: only languages we have chrome for, plus a leftover
     /// stored code so an older explicit choice still reads true.
     public func uiLanguagePickerOptions(selected: String) -> [LanguageOption] {
-        let shipped: [LanguageOption] = [
-            .followSystem,
-            LanguageOption(code: "en", nativeName: "English", englishName: "English"),
-            LanguageOption(
-                code: "zh-Hans",
-                nativeName: "简体中文",
-                englishName: "Chinese (Simplified)"
-            ),
-        ]
-        var options = shipped
+        var options = AfterRayUILanguage.pickerLanguageOptions
         if !selected.isEmpty, !options.contains(where: { $0.code == selected }) {
             if let existing = languageOptions.first(where: { $0.code == selected }) {
                 options.append(existing)

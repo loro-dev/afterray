@@ -879,11 +879,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func uiLanguagePickerOptions(selected: String?) -> [LanguageOption] {
         model.settings?.uiLanguagePickerOptions(selected: selected ?? AppSettings.defaultLanguage)
-            ?? [
-                LanguageOption.followSystem,
-                LanguageOption(code: "en", nativeName: "English", englishName: "English"),
-                LanguageOption(code: "zh-Hans", nativeName: "简体中文", englishName: "Chinese (Simplified)"),
-            ]
+            ?? AfterRayUILanguage.pickerLanguageOptions
     }
 
     private func languageMenu(
@@ -1184,25 +1180,25 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     /// only serve or refuse the download, not alter it.
     private var downloadSourceSection: some View {
         SettingsSection(
-            title: "Download source",
-            footnote: "Packs are verified against checksums pinned inside AfterRay, so a mirror changes where bytes come from — never what installs. Pick the mirror if huggingface.co is slow or unreachable from your network."
+            title: copy.settings.downloadSource,
+            footnote: copy.settings.downloadSourceFootnote
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 SettingsMenuPicker(
                     options: [
-                        .init(id: "", title: "huggingface.co · official"),
-                        .init(id: settingsMirrorEndpoint, title: "hf-mirror.com · mirror"),
-                        .init(id: settingsCustomEndpointTag, title: "Custom endpoint…"),
+                        .init(id: "", title: copy.settings.officialEndpoint),
+                        .init(id: settingsMirrorEndpoint, title: copy.settings.mirrorEndpoint),
+                        .init(id: settingsCustomEndpointTag, title: copy.settings.customEndpoint),
                     ],
                     selection: downloadSourceBinding,
                     disabled: model.isControllingDownload
                 )
                 if downloadSourceBinding.wrappedValue == settingsCustomEndpointTag {
                     HStack(spacing: 10) {
-                        TextField("https://mirror.example.com", text: $customEndpointDraft)
+                        TextField(copy.settings.customEndpointPlaceholder, text: $customEndpointDraft)
                             .settingsFieldStyle()
                             .onSubmit { applyCustomEndpoint() }
-                        Button("Apply") { applyCustomEndpoint() }
+                        Button(copy.settings.apply) { applyCustomEndpoint() }
                             .buttonStyle(SettingsButtonStyle(kind: .prominent))
                             .disabled(
                                 customEndpointDraft
@@ -1299,11 +1295,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         let selectedPackID = selectedMlxPackID
         if let pack = model.library?.packs.first(where: { $0.id == selectedPackID }) {
             VStack(alignment: .leading, spacing: 12) {
-                SettingsField(label: "Model") {
+                SettingsField(label: copy.settings.model) {
                     SettingsMenuPicker(
                         options: [
-                            .init(id: qwen35MlxPackID, title: "Recommended · Qwen3.5 4B"),
-                            .init(id: qwen35Mlx9BPackID, title: "Higher quality · Qwen3.5 9B"),
+                            .init(id: qwen35MlxPackID, title: copy.settings.recommendedQwen4B),
+                            .init(id: qwen35Mlx9BPackID, title: copy.settings.higherQualityQwen9B),
                         ],
                         selection: mlxModelBinding,
                         disabled: model.isUpdatingLlm
@@ -1311,7 +1307,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
                 HStack(spacing: 8) {
                     SettingsPill(mlxStateLabel(pack.state), tone: mlxStateTone(pack.state))
-                    Text("mlx-community · Apache 2.0")
+                    Text(copy.settings.mlxLicense)
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                     Spacer(minLength: 8)
@@ -1335,7 +1331,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 // Progress for this pack lives in the queue at the top of the
                 // page; the panel only says that it is on the list.
                 if model.library?.isQueued(packID: pack.id) == true {
-                    Label("In the download queue at the top of this page", systemImage: "arrow.up")
+                    Label(copy.settings.inQueueTop, systemImage: "arrow.up")
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                 }
@@ -1345,16 +1341,16 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         switch pack.state {
                         case .notDownloaded, .failed:
                             Button(pack.state == .failed
-                                ? "Retry Download"
-                                : "Download \(mlxDownloadLabel(for: pack.id))")
+                                ? copy.settings.retryDownload
+                                : copy.settings.downloadSized(mlxDownloadLabel(for: pack.id)))
                             {
                                 Task { await model.download(packID: pack.id) }
                             }
                             .buttonStyle(SettingsButtonStyle(kind: .prominent))
                         case .ready, .inUse:
-                            Button("Show Files") { model.reveal(pack.path) }
+                            Button(copy.settings.showFiles) { model.reveal(pack.path) }
                                 .buttonStyle(SettingsButtonStyle())
-                            Button("Remove…") { confirmingMlxRemoval = true }
+                            Button(copy.settings.removeEllipsis) { confirmingMlxRemoval = true }
                                 .buttonStyle(SettingsButtonStyle())
                                 .disabled(pack.state == .inUse)
                         case .downloading, .verifying, .paused, .incompatible:
@@ -1365,19 +1361,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
             }
             .confirmationDialog(
-                "Remove \(pack.name) from this Mac?",
+                copy.settings.removeFromMac(pack.name),
                 isPresented: $confirmingMlxRemoval,
                 titleVisibility: .visible
             ) {
-                Button("Remove Download", role: .destructive) {
+                Button(copy.settings.removeDownload, role: .destructive) {
                     Task { await model.remove(packID: pack.id) }
                 }
-                Button("Cancel", role: .cancel) {}
+                Button(copy.common.cancel, role: .cancel) {}
             } message: {
-                Text("AfterRay can download the verified snapshot again later.")
+                Text(copy.settings.canRedownload)
             }
         } else {
-            Text("The managed MLX model is unavailable in this daemon build.")
+            Text(copy.settings.mlxUnavailable)
                 .font(.settingsCaption)
                 .foregroundStyle(SettingsPalette.secondaryLabel)
         }
@@ -1407,20 +1403,20 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     /// three underneath them is a paragraph that says nothing new.
     private func mlxDescription(for packID: String) -> String {
         packID == qwen35Mlx9BPackID
-            ? "Check your free unified memory before downloading."
-            : "Experimental on an 8 GB Mac."
+            ? copy.settings.mlx9BNote
+            : copy.settings.mlx4BNote
     }
 
     private func mlxStateLabel(_ state: ModelPackState) -> String {
         switch state {
-        case .notDownloaded: "Not downloaded"
-        case .downloading: "Downloading"
-        case .verifying: "Verifying"
-        case .paused: "Paused"
-        case .ready: "Ready"
-        case .inUse: "Loaded"
-        case .failed: "Failed"
-        case .incompatible: "Incompatible"
+        case .notDownloaded: copy.settings.notDownloaded
+        case .downloading: copy.common.downloading
+        case .verifying: copy.common.verifying
+        case .paused: copy.common.paused
+        case .ready: copy.common.ready
+        case .inUse: copy.common.loaded
+        case .failed: copy.common.failed
+        case .incompatible: copy.settings.incompatible
         }
     }
 
@@ -1449,14 +1445,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 if model.isProbingLlm {
                     ProgressView().controlSize(.mini)
                 }
-                Button("Check Again") {
+                Button(copy.settings.checkAgain) {
                     Task { await model.probeLlm() }
                 }
                 .buttonStyle(SettingsButtonStyle())
                 .disabled(model.isProbingLlm)
             }
 
-            SettingsField(label: "Model") {
+            SettingsField(label: copy.settings.model) {
                 if let models = model.llmProbe?.models, !models.isEmpty {
                     SettingsMenuPicker(
                         options: ollamaPickerModels(models).map {
@@ -1472,7 +1468,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 }
             }
 
-            SettingsField(label: "Server URL") {
+            SettingsField(label: copy.settings.serverUrl) {
                 TextField(
                     model.llmProbe?.defaultBaseUrl ?? "http://127.0.0.1:11434",
                     text: $model.draftLlmBaseUrl
@@ -1484,7 +1480,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             if ollamaHasUnsavedChanges {
                 HStack {
                     Spacer()
-                    Button("Save Connection") {
+                    Button(copy.settings.saveConnection) {
                         Task { await model.saveLlmConnection() }
                     }
                     .buttonStyle(SettingsButtonStyle(kind: .prominent))
@@ -1502,19 +1498,19 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private var openaiPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SettingsField(label: "Server URL") {
+            SettingsField(label: copy.settings.serverUrl) {
                 TextField("https://dashscope.aliyuncs.com/compatible-mode/v1", text: $model.draftLlmBaseUrl)
                     .settingsFieldStyle()
             }
-            SettingsField(label: "Model") {
+            SettingsField(label: copy.settings.model) {
                 TextField("qwen3.7-max", text: $model.draftLlmModel)
                     .settingsFieldStyle()
             }
-            SettingsField(label: "API key") {
+            SettingsField(label: copy.settings.apiKey) {
                 SecureField(
                     model.settings?.llmApiKeySet == true
-                        ? "Saved — leave blank to keep it"
-                        : "Optional",
+                        ? copy.settings.savedKeepBlank
+                        : copy.settings.optionalKey,
                     text: $model.draftLlmApiKey
                 )
                 .settingsFieldStyle()
@@ -1527,14 +1523,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         Circle()
                             .fill(probe.reachable ? SettingsPalette.positive : SettingsPalette.danger)
                             .frame(width: 6, height: 6)
-                        Text(probe.reachable ? "Endpoint reachable" : (probe.error ?? "Not reachable"))
+                        Text(probe.reachable ? copy.settings.endpointReachable : (probe.error ?? copy.settings.notReachable))
                             .font(.settingsCaption)
                             .foregroundStyle(SettingsPalette.secondaryLabel)
                             .lineLimit(2)
                     }
                 }
                 Spacer(minLength: 8)
-                Button("Save Connection") {
+                Button(copy.settings.saveConnection) {
                     Task { await model.saveLlmConnection() }
                 }
                 .buttonStyle(SettingsButtonStyle(kind: .prominent))
@@ -1544,13 +1540,13 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private var ollamaStatusText: String {
-        if model.isProbingLlm { return "Looking for Ollama…" }
-        guard let probe = model.llmProbe else { return "Ollama has not been probed yet." }
+        if model.isProbingLlm { return copy.settings.lookingForOllama }
+        guard let probe = model.llmProbe else { return copy.settings.ollamaNotProbed }
         if probe.reachable {
             let count = probe.models.count
-            return count == 1 ? "Ollama is running · 1 chat model" : "Ollama is running · \(count) chat models"
+            return count == 1 ? copy.settings.ollamaOneModel : copy.settings.ollamaManyModels(count)
         }
-        return probe.error ?? "Ollama is not reachable on this Mac."
+        return probe.error ?? copy.settings.ollamaUnreachable
     }
 
     private var ollamaModelBinding: Binding<String> {
@@ -1582,7 +1578,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         ) {
             HStack(spacing: 8) {
                 if queued {
-                    Label("In the download queue", systemImage: "arrow.up")
+                    Label(copy.settings.inDownloadQueue, systemImage: "arrow.up")
                         .font(.settingsCaption)
                         .foregroundStyle(SettingsPalette.secondaryLabel)
                 } else {
@@ -1591,7 +1587,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         Button(copy.common.show) { model.reveal(pack.path) }
                             .buttonStyle(SettingsButtonStyle())
                     } else {
-                        Button("Download") {
+                        Button(copy.settings.download) {
                             Task { await model.download(packID: pack.id) }
                         }
                         .buttonStyle(SettingsButtonStyle())
@@ -1613,14 +1609,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private func packStatus(_ pack: ModelPack) -> String {
-        if pack.state == .failed { return "Failed" }
-        if pack.state == .incompatible { return "Incompatible" }
-        if pack.state == .paused { return "Paused" }
-        if pack.state == .verifying { return "Verifying" }
-        if pack.state == .inUse { return "Loaded" }
-        if pack.present { return "Ready" }
-        if pack.bytes > 0 { return "Incomplete" }
-        return pack.required ? "Needed" : "Optional"
+        if pack.state == .failed { return copy.common.failed }
+        if pack.state == .incompatible { return copy.settings.incompatible }
+        if pack.state == .paused { return copy.common.paused }
+        if pack.state == .verifying { return copy.common.verifying }
+        if pack.state == .inUse { return copy.common.loaded }
+        if pack.present { return copy.common.ready }
+        if pack.bytes > 0 { return copy.settings.incomplete }
+        return pack.required ? copy.settings.needed : copy.common.optional
     }
 
     private func packTone(_ pack: ModelPack) -> SettingsTone {
@@ -1632,10 +1628,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func jobTitle(_ job: ModelJob) -> String {
         switch job.capability {
-        case "asr": "Qwen3 ASR"
-        case "ocr": "OCR"
-        case "embedding": "Embeddings"
-        case "llm": "Assistant"
+        case "asr": copy.settings.jobAsr
+        case "ocr": copy.settings.jobOcr
+        case "embedding": copy.settings.jobEmbedding
+        case "llm": copy.settings.jobAssistant
         default: job.capability
         }
     }
@@ -1649,11 +1645,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func jobStateLabel(_ state: String) -> String {
         switch state {
-        case "done": "OK"
-        case "failed": "Failed"
-        case "running": "Running"
-        case "pending": "Queued"
-        case "cancelled": "Cancelled"
+        case "done": copy.settings.jobOk
+        case "failed": copy.common.failed
+        case "running": copy.settings.jobRunning
+        case "pending": copy.settings.jobQueued
+        case "cancelled": copy.settings.jobCancelled
         default: state
         }
     }
@@ -1898,9 +1894,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
 
     private func capabilityLabel(_ capability: String) -> String {
         switch capability {
-        case "asr": "Transcription"
-        case "embedding": "Search embeddings"
-        case "llm": "Assistant"
+        case "asr": copy.settings.capabilityAsr
+        case "ocr": copy.settings.capabilityOcr
+        case "embedding": copy.settings.capabilityEmbedding
+        case "llm": copy.settings.capabilityLlm
+        case "summary": copy.settings.capabilitySummary
         default: capability.capitalized
         }
     }

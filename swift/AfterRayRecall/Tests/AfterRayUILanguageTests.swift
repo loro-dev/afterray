@@ -9,21 +9,41 @@ final class AfterRayUILanguageTests: XCTestCase {
         )
         XCTAssertEqual(
             AfterRayUILanguage.resolve(stored: "auto", preferred: ["zh-TW"]),
-            .simplifiedChinese
+            .traditionalChinese
         )
         XCTAssertEqual(
             AfterRayUILanguage.resolve(stored: "", preferred: ["zh-HK", "en"]),
-            .simplifiedChinese
+            .traditionalChinese
         )
     }
 
-    func testAutoFollowsEnglishAndUnknownFallsBack() {
+    func testAutoFollowsShippedLanguagesAndUnknownFallsBack() {
         XCTAssertEqual(
             AfterRayUILanguage.resolve(stored: "auto", preferred: ["en-US"]),
             .english
         )
         XCTAssertEqual(
             AfterRayUILanguage.resolve(stored: "auto", preferred: ["ja-JP"]),
+            .japanese
+        )
+        XCTAssertEqual(
+            AfterRayUILanguage.resolve(stored: "auto", preferred: ["ko-KR"]),
+            .korean
+        )
+        XCTAssertEqual(
+            AfterRayUILanguage.resolve(stored: "auto", preferred: ["es-MX", "en"]),
+            .spanish
+        )
+        XCTAssertEqual(
+            AfterRayUILanguage.resolve(stored: "auto", preferred: ["de-DE"]),
+            .german
+        )
+        XCTAssertEqual(
+            AfterRayUILanguage.resolve(stored: "auto", preferred: ["fr-FR"]),
+            .french
+        )
+        XCTAssertEqual(
+            AfterRayUILanguage.resolve(stored: "auto", preferred: ["it-IT"]),
             .english
         )
         XCTAssertEqual(
@@ -42,7 +62,15 @@ final class AfterRayUILanguageTests: XCTestCase {
             .simplifiedChinese
         )
         XCTAssertEqual(
+            AfterRayUILanguage.resolve(stored: "zh-Hant", preferred: ["en-US"]),
+            .traditionalChinese
+        )
+        XCTAssertEqual(
             AfterRayUILanguage.resolve(stored: "ja", preferred: ["zh-Hans-CN"]),
+            .japanese
+        )
+        XCTAssertEqual(
+            AfterRayUILanguage.resolve(stored: "xx", preferred: ["ja-JP"]),
             .english
         )
     }
@@ -73,6 +101,12 @@ final class AfterRayUILanguageTests: XCTestCase {
             RelativeStamp.short(fromMs: 0, nowMs: 0, copy: copy),
             "现在"
         )
+        XCTAssertEqual(AfterRayCopy.traditionalChinese.settings.interface, "介面")
+        XCTAssertEqual(AfterRayCopy.japanese.common.followSystem.isEmpty, false)
+        XCTAssertEqual(AfterRayCopy.korean.format.now.isEmpty, false)
+        XCTAssertEqual(AfterRayCopy.spanish.format.today.isEmpty, false)
+        XCTAssertEqual(AfterRayCopy.german.menu.settings.isEmpty, false)
+        XCTAssertEqual(AfterRayCopy.french.recall.tryAgain.isEmpty, false)
     }
 
     func testUiLanguagePickerOffersOnlyShippedLanguages() {
@@ -89,11 +123,15 @@ final class AfterRayUILanguageTests: XCTestCase {
         )
         XCTAssertEqual(
             settings.uiLanguagePickerOptions(selected: "auto").map(\.code),
-            ["auto", "en", "zh-Hans"]
+            AfterRayUILanguage.pickerCodes
         )
         XCTAssertEqual(
             settings.uiLanguagePickerOptions(selected: "ja").map(\.code),
-            ["auto", "en", "zh-Hans", "ja"]
+            AfterRayUILanguage.pickerCodes
+        )
+        XCTAssertEqual(
+            settings.uiLanguagePickerOptions(selected: "xx").map(\.code),
+            AfterRayUILanguage.pickerCodes + ["xx"]
         )
         XCTAssertEqual(
             settings.languagePickerOptions(selected: "ja").map(\.code),

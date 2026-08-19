@@ -626,7 +626,7 @@ public struct RecallView: View {
                     if let onOpenSettings {
                         RecallChromeIconButton(
                             symbol: "gearshape",
-                            help: "Settings",
+                            help: copy.recall.settingsHelp,
                             action: onOpenSettings
                         )
                     }
@@ -2322,14 +2322,14 @@ private struct RecallDetailsMenu: View {
                     rootList
                 case .ocr:
                     RecallDetailsTextPage(
-                        title: "On Screen",
+                        title: copy.recall.onScreen,
                         text: moment.ocrText,
                         emptyText: isProcessing ? "OCR is processing…" : "No screen text found",
                         fileName: "afterray-ocr.txt"
                     )
                 case .transcript:
                     RecallDetailsTextPage(
-                        title: "Heard",
+                        title: copy.recall.heard,
                         text: moment.transcriptText,
                         emptyText: isProcessing ? "Transcript is processing…" : "No transcript near this moment",
                         fileName: "afterray-transcript.txt"
@@ -2396,21 +2396,21 @@ private struct RecallDetailsMenu: View {
                 )
                 detailsRow(
                     icon: "text.viewfinder",
-                    title: "On Screen",
+                    title: copy.recall.onScreen,
                     subtitle: preview(moment.ocrText, empty: isProcessing ? "Processing…" : "No screen text")
                 ) {
                     page = .ocr
                 }
                 detailsRow(
                     icon: "waveform",
-                    title: "Heard",
+                    title: copy.recall.heard,
                     subtitle: preview(moment.transcriptText, empty: isProcessing ? "Processing…" : "No transcript")
                 ) {
                     page = .transcript
                 }
                 detailsRow(
                     icon: "point.3.connected.trianglepath.dotted",
-                    title: "Accessibility tree",
+                    title: copy.recall.accessibilityTree,
                     subtitle: moment.accessibilityArtifactId == nil
                         ? "No snapshot for this moment"
                         : "Full AX JSON for this screen"
@@ -2546,7 +2546,7 @@ private struct RecallDetailsAccessibilityPage: View {
 
     var body: some View {
         RecallDetailsTextPage(
-            title: "Accessibility tree",
+            title: copy.recall.accessibilityTree,
             text: snapshotText,
             emptyText: emptyText,
             fileName: "afterray-accessibility.json"

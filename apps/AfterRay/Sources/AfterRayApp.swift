@@ -929,7 +929,7 @@ private struct PermissionSettingsGuide: View {
                 }
             }
 
-            Text("After granting access, press \(hotKeys.hotKey.displayString) to return.")
+            Text(AfterRayLocalization.shared.copy.permissions.afterGranting(hotKeys.hotKey.displayString))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }

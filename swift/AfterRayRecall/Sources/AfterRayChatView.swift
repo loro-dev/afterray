@@ -1147,6 +1147,7 @@ private struct ChatWorkProcessCard<PartView: View>: View {
 /// One thought, in the place it arrived. Live text stays open; a finished
 /// thought folds so the next tool or thought can take the eye.
 private struct ChatReasoningChip: View {
+    @Environment(\.afterRayCopy) private var copy
     let text: String
     let isActive: Bool
     let progress: ChatProgress?
@@ -1193,11 +1194,12 @@ private struct ChatReasoningChip: View {
             }
             return "Thinking"
         }
-        return "Thought it through"
+        return copy.chat.thoughtItThrough
     }
 }
 
 private struct ChatToolChip: View {
+    @Environment(\.afterRayCopy) private var copy
     let tool: ChatToolCall
     @State private var expanded = false
 
@@ -1226,7 +1228,7 @@ private struct ChatToolChip: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(ChatPalette.tertiary)
                 if tool.truncated {
-                    Text("shortened")
+                    Text(copy.chat.shortened)
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundStyle(ChatPalette.coral.opacity(0.9))
                         .padding(.horizontal, 5)

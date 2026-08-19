@@ -144,7 +144,8 @@ extension AfterRayCopy {
             turnOnSwitch: "Turn on the switch beside AfterRay",
             addTo: { "Add AfterRay to \($0)" },
             dragInstructions: "Drag the application below into the list in System Settings, then turn it on.",
-            dragIntoSettings: "Drag into System Settings"
+            dragIntoSettings: "Drag into System Settings",
+            afterGranting: { "After granting access, press \($0) to return." }
         ),
         settings: Settings(
             brand: "AFTERRAY",
@@ -355,7 +356,17 @@ extension AfterRayCopy {
             copy: "Copy",
             open: "Open",
             heard: "Heard",
-            seen: "Seen"
+            seen: "Seen",
+            onScreen: "On Screen",
+            accessibilityTree: "Accessibility tree",
+            settingsHelp: "Settings",
+            openAsWindow: "Open as a window",
+            copyAllLoadedDays: "Copy All Loaded Days",
+            copyThisDay: "Copy This Day",
+            copyThisSlot: "Copy This Slot",
+            nothingRecorded: "Nothing recorded yet.",
+            pastDaysWillAppear: "Your past days will appear here as AfterRay captures them.",
+            noRecordings: "No recordings"
         ),
         chat: Chat(
             loading: "Loading…",
