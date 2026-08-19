@@ -2271,6 +2271,7 @@ private struct TranscriptCaption: View {
                         .background(RecallPalette.ray.opacity(0.92), in: Circle())
                     }
                     .buttonStyle(RecallPressButtonStyle())
+                    .focusable(false)
                     .help(playHelp)
                 }
                 Text(transcript)
@@ -2420,6 +2421,7 @@ private struct RecallDetailsMenu: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(RecallCapsuleButtonStyle())
+                    .focusable(false)
                     .disabled(onToggleAudio == nil)
                     .padding(.top, 8)
                 }
