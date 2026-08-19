@@ -44,9 +44,14 @@ already holds, so `PROTOCOL_VERSION` is untouched.
   item, so ⌘C has nowhere to dispatch from; and making the layer first responder
   would steal the arrow keys and space that drive the playhead. The monitor
   passes events through untouched when the first responder is an `NSText`.
-- **Cursor rects, not a tracking area.** AppKit unions them per view and
-  restores the previous cursor on exit, which is what keeps the I-beam from
-  fighting the chrome drawn above the layer.
+- **I-beam is set only when this view owns the hit test.** Cursor rects still
+  run, but an `NSView` inside SwiftUI's `NSHostingView` often never receives
+  them — the host owns a full-bounds arrow area, and `invalidateCursorRects`
+  is a no-op if `rebuild` ran before the layer had a window. A tracking area
+  calls `NSCursor.iBeam.set()` only when `hitTest` returns the layer (over a
+  glyph box). That is what keeps the I-beam from fighting the chrome stacked
+  above the still: we never force the arrow unless we ourselves showed the
+  I-beam.
 - **CoreText metrics are lazy.** Hover, hit test and I-beam need boxes only;
   `OcrCaretMetrics` runs the first time a line takes part in a selection, so a
   frame nobody selects on never measures a glyph.

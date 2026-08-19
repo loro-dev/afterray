@@ -84,6 +84,10 @@ final class OcrTextSelectionView: NSView {
     private var anchor: OcrTextPosition?
     private var range: OcrTextRange?
     private var eventMonitor: Any?
+    private var trackingArea: NSTrackingArea?
+    /// True only after this view called `NSCursor.iBeam.set()`. Restoring
+    /// blindly would fight the chrome stacked above the still.
+    private var showingIBeam = false
 
     override var isFlipped: Bool { true }
 
@@ -108,7 +112,12 @@ final class OcrTextSelectionView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { teardown() } else { installEventMonitor() }
+        if window == nil {
+            teardown()
+        } else {
+            installEventMonitor()
+            window?.invalidateCursorRects(for: self)
+        }
     }
 
     func teardown() {
@@ -116,6 +125,11 @@ final class OcrTextSelectionView: NSView {
             NSEvent.removeMonitor(eventMonitor)
             self.eventMonitor = nil
         }
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+            self.trackingArea = nil
+        }
+        restoreArrowIfNeeded()
         anchor = nil
         range = nil
         selection?.setSelecting(false)
@@ -152,9 +166,13 @@ final class OcrTextSelectionView: NSView {
         return textLayout.lineIndex(at: local, padding: Self.hitPadding) != nil ? self : nil
     }
 
-    /// Cursor rects rather than a tracking area: AppKit unions them per view
-    /// and restores the previous cursor on exit, which is what keeps the I-beam
-    /// from fighting the chrome buttons drawn above this layer.
+    /// Cursor rects still run where AppKit honours them, but an `NSView`
+    /// hosted inside SwiftUI's `NSHostingView` often never gets them applied:
+    /// the hosting view owns a full-bounds arrow tracking area and `rebuild`
+    /// can run before the layer is in a window, so `invalidateCursorRects`
+    /// is a no-op. Tracking + `cursorUpdate` is what actually shows the
+    /// I-beam. We only set it when this view owns the hit test — otherwise
+    /// the timeline chrome stacked above the still would lose its pointers.
     override func resetCursorRects() {
         super.resetCursorRects()
         for line in textLayout.lines {
@@ -163,6 +181,57 @@ final class OcrTextSelectionView: NSView {
                 cursor: .iBeam
             )
         }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [
+                .mouseEnteredAndExited,
+                .mouseMoved,
+                .cursorUpdate,
+                .activeInKeyWindow,
+                .inVisibleRect,
+            ],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        syncCursor(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        syncCursor(with: event)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        syncCursor(with: event)
+    }
+
+    override func mouseExited(with _: NSEvent) {
+        restoreArrowIfNeeded()
+    }
+
+    private func syncCursor(with event: NSEvent) {
+        let hit = window?.contentView?.hitTest(event.locationInWindow)
+        if hit === self {
+            NSCursor.iBeam.set()
+            showingIBeam = true
+        } else {
+            restoreArrowIfNeeded()
+        }
+    }
+
+    private func restoreArrowIfNeeded() {
+        guard showingIBeam else { return }
+        NSCursor.arrow.set()
+        showingIBeam = false
     }
 
     override func mouseDown(with event: NSEvent) {
