@@ -65,21 +65,32 @@ reliable thing a small model does. The observed failure was a model *computing*
 `1_723_703_599_000` and landing two years out. A table removes the occasion for
 arithmetic; a parser only adds spellings.
 
-## No seed
+## System is rendered once per conversation
 
-There is no clock block in the opening. It changed every turn, so it broke the
-cached prefix every turn, and it was paid for whether or not the question
-involved a time. `build_opening` in both chat surfaces sets
-`seed: String::new()` — a drift test asserts it stays that way.
+The catalog's clock table is not a hardcoded date. Chat calls
+`render_recall_system(conversation.created_at_ms, language)` so every later
+turn of that thread sends the **same system bytes** and the prefix cache
+hits. A new conversation gets a new table. Ask has no thread and renders
+from the request's wall clock.
 
-What replaces it is one stamped line on the question, `[asked at 2026-08-15
-04:30]`. That is free: the question is the turn's new content regardless, so
-nothing cached is invalidated by it. It exists because a `get_now` result
-folded into history three hours ago is otherwise indistinguishable from a fresh
-one.
+The table is Now + seven days + this/last week + this/last month. It does
+**not** include `Right now`, `Today's apps`, or `Recording covers` — those
+change while a thread is open, so the catalog only shows them behind
+`EXAMPLE SHAPE ONLY` / `example:`. The live values come from the `get_now`
+tool.
 
-The cost is one round when a question involves a time. `get_now` answers
-everything at once so it is never more than one.
+There is still no clock in the opening. `build_opening` sets
+`seed: String::new()` — a drift test asserts it stays that way. What the
+question carries is one stamped line, `[asked at …]`. That is free: the
+question is the turn's new content regardless. It is how a model tells a
+catalog table from conversation start apart from a `get_now` result folded
+into history hours ago.
+
+Chat and ask also inject `Reply language: …` from `ui_language` (`auto`
+follows `AppleLanguages`). T2 keeps using `summary_language` in its input
+JSON.
+
+The cost of a later instant is one round: `get_now`.
 
 ## The catalog documents everything
 
@@ -106,7 +117,7 @@ A caveat repeated in two places is a caveat that will disagree with itself.
 ## Budgets
 
 `ContextBudget::system_tokens` is a **measurement** of the system prompt plus
-the catalog, currently ~1 650 against a budgeted 1 792.
+the catalog, currently ~1 883 against a budgeted 2 048.
 `the_catalog_and_system_prompt_fit_the_budget_they_are_charged_to` re-measures
 it. When that fails, move the constant deliberately rather than shaving the
 catalog to fit — and note the knock-on: `MINIMUM_WINDOW_TOKENS` rose to 4 096

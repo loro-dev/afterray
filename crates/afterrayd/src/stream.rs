@@ -17,11 +17,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 
 use crate::agent::AgentError;
 use crate::turn_row::TurnRow;
-use crate::tools::{ToolHost, tool_catalog_text};
+use crate::tools::ToolHost;
 
 const TITLE_CHARS: usize = 24;
-
-use crate::agent::RECALL_SYSTEM_PROMPT as SYSTEM_PROMPT;
 
 const MODEL_MISSING_MESSAGE: &str = "The language model is not configured. Open Settings to connect Ollama, an OpenAI-compatible endpoint, or download the on-device pack.";
 
@@ -39,6 +37,8 @@ pub(crate) struct ChatStreamCtx<'a> {
     /// Fires when the client hangs up. The app's only way to say "stop" is to
     /// shut its socket down, so the caller watches the read half and trips this.
     pub cancel: CancelToken,
+    /// English display name of the reply language, resolved before the turn.
+    pub language: &'a str,
 }
 
 pub(crate) async fn handle_chat_stream(
@@ -52,6 +52,7 @@ pub(crate) async fn handle_chat_stream(
     // actually has. The same number goes out as `num_ctx`, so what the harness
     // budgets for and what the server allocates cannot drift apart.
     let model = crate::ready_model(state).await;
+    let language = crate::reply_language(state);
     let ctx = ChatStreamCtx {
         store: &state.store,
         models: &state.models,
@@ -60,6 +61,7 @@ pub(crate) async fn handle_chat_stream(
         llm_ready: model.present,
         budget: model.budget,
         cancel: cancel.clone(),
+        language: language.as_str(),
     };
     run_chat_stream_registered(
         write,
@@ -182,7 +184,14 @@ where
     let mut peer_present = write_event(write, &started).await.is_ok();
 
     let opening = build_opening(history, message, ctx.now_ms);
-    let mut outcome = run_agent(write, &ctx, opening, &mut row, &mut peer_present).await;
+    let created_at_ms = ctx
+        .store
+        .conversation(&conversation_id)
+        .ok()
+        .flatten()
+        .map_or(ctx.now_ms, |conversation| conversation.created_at_ms);
+    let system = crate::agent::render_recall_system(created_at_ms, ctx.language);
+    let mut outcome = run_agent(write, &ctx, &system, opening, &mut row, &mut peer_present).await;
     row.set_tool_log(if outcome.tool_log.is_empty() {
         None
     } else {
@@ -544,12 +553,12 @@ struct AgentOutcome {
 async fn run_agent<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     ctx: &ChatStreamCtx<'_>,
+    system: &str,
     opening: Opening,
     row: &mut TurnRow<'_>,
     peer_present: &mut bool,
 ) -> AgentOutcome {
     let budget = ctx.budget;
-    let system = format!("{SYSTEM_PROMPT}\n\n{}", tool_catalog_text());
     let host = ToolHost {
         store: afterray_store::SharedReadOnlyVault::new(std::sync::Arc::clone(ctx.store)),
         now_ms: ctx.now_ms,
@@ -577,7 +586,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
             cancel: ctx.cancel.clone(),
             compaction: Some(&strategy),
         },
-        &system,
+        system,
         opening,
     )
     .await;
@@ -654,12 +663,11 @@ fn conversation_title(message: &str) -> String {
 /// loop then trimmed from the head. A long history therefore deleted the
 /// question at the end of it.
 ///
-/// The seed is gone: a clock block in front of every turn broke the cached
-/// prefix on every turn and was paid for whether or not the question involved
-/// a time. `get_now` serves it on request instead. The one stamped line here
-/// is free — the question is this turn's new content anyway — and it is what
-/// tells the model that a `get_now` result folded into history hours ago has
-/// gone stale.
+/// The seed is gone: a clock in the opening broke the cached prefix every
+/// turn. The conversation-start table lives in the catalog; the live clock
+/// is `get_now`. The one stamped line here is free — the question is this
+/// turn's new content anyway — and it is what tells the model that a
+/// `get_now` result folded into history hours ago has gone stale.
 fn build_opening(history: afterray_harness::History, message: &str, now_ms: i64) -> Opening {
     Opening {
         seed: String::new(),
@@ -856,6 +864,7 @@ mod tests {
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "   ").await.unwrap();
@@ -878,6 +887,7 @@ mod tests {
             llm_ready: false,
             budget: ContextBudget::DEFAULT,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "hello").await.unwrap();
@@ -915,6 +925,7 @@ print(json.dumps({
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "我今天下午在干嘛")
@@ -1021,6 +1032,7 @@ print(json.dumps({
             llm_ready: true,
             budget,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "what was I reading")
@@ -1136,6 +1148,7 @@ print(json.dumps({
             llm_ready: true,
             budget,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "what was I reading")
@@ -1270,6 +1283,7 @@ print(json.dumps({{
                     llm_ready: true,
                     budget: ContextBudget::DEFAULT,
                     cancel: CancelToken::new(),
+                    language: "English",
                 },
                 conversation.as_deref(),
                 question,
@@ -1397,6 +1411,7 @@ print(json.dumps({
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
             cancel,
+            language: "English",
         };
         let mut buf = Vec::new();
         tokio::time::timeout(
@@ -1486,6 +1501,7 @@ print(json.dumps({
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, None, "Reply with exactly: OK")
@@ -1627,6 +1643,7 @@ print(json.dumps({
             budget: ContextBudget::DEFAULT,
             // Never fired: a hang-up does not cancel.
             cancel: CancelToken::new(),
+            language: "English",
         };
 
         run_chat_stream(&mut DeadPipe, ctx, None, "what was I reading")
@@ -1698,6 +1715,7 @@ print(json.dumps({
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
             cancel: cancel.clone(),
+            language: "English",
         };
         let mut writer = TripOnFirstOutput {
             seen: Vec::new(),
@@ -1834,6 +1852,7 @@ print(json.dumps({
                         llm_ready: true,
                         budget: ContextBudget::for_window(32_768),
                         cancel: CancelToken::new(),
+                        language: "English",
                     },
                     conversation.as_deref(),
                     question.as_str(),
@@ -2137,6 +2156,7 @@ print(json.dumps({
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, Some("missing"), "hello")
@@ -2180,6 +2200,7 @@ print(json.dumps({
             llm_ready: true,
             budget: ContextBudget::DEFAULT,
             cancel: CancelToken::new(),
+            language: "English",
         };
         let mut buf = Vec::new();
         run_chat_stream(&mut buf, ctx, Some(&conversation), "and then?")
