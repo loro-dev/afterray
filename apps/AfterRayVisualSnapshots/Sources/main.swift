@@ -549,9 +549,8 @@ private var historyPanelScene: [SnapshotScene] {
 }
 
 /// A production-scale mixed history: legacy 30-minute rows before the vault
-/// cutover and 10-minute v2 rows after it. Keeping all seven days in the
-/// document catches rebuild and scrolling regressions even though the snapshot
-/// itself only shows the newest viewport.
+/// cutover and 10-minute v2 rows after it. The snapshot only shows the newest
+/// viewport; the list virtualizes the rest.
 @MainActor
 private var mixedHistoryScene: [SnapshotScene] {
     let playheadMs = RecallScenario.long.moments[12].capturedAtMs

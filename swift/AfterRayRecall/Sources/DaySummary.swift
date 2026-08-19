@@ -365,6 +365,12 @@ public enum DaySummaryLayout {
         return DaySummaryHeading(kicker: weekday.uppercased(), title: monthDay, isToday: false)
     }
 
+    /// Title case for the panel: an all-caps kicker reads as shouting in a
+    /// dense list. `dateHeading` keeps the raw kicker so tests can pin TODAY.
+    public static func headingLabel(_ heading: DaySummaryHeading) -> String {
+        "\(heading.kicker.capitalized) · \(heading.title)"
+    }
+
     public static func formatDuration(ms: Int64) -> String {
         let minutes = max(Int((Double(ms) / 60_000).rounded()), 0)
         if minutes == 0 { return "<1m" }
@@ -449,13 +455,12 @@ public enum DaySummaryLayout {
     ///
     /// Parsed by `StreamingMarkdown` — the same parser the chat uses, so the
     /// two surfaces agree on what a heading and a citation are, and a change to
-    /// one cannot leave the other reading a different document. What the panel
-    /// draws is plain text (it is one AppKit text view, not a stack of SwiftUI
-    /// blocks), so inline markup and citation syntax are resolved to what they
-    /// say: `[label](afterray://moment/id)` renders as `label`, and a
-    /// standalone citation becomes its own line. Loading the frame itself, and
-    /// highlighting an `#el<N>` element inside it, is the chat's job today and
-    /// this panel's later.
+    /// one cannot leave the other reading a different document. The panel
+    /// draws plain text, so inline markup and citation syntax are resolved to
+    /// what they say: `[label](afterray://moment/id)` renders as `label`, and
+    /// a standalone citation becomes its own line. Loading the frame itself,
+    /// and highlighting an `#el<N>` element inside it, is the chat's job today
+    /// and this panel's later.
     static func markdownSections(_ details: String) -> [DaySummaryExpandedSection] {
         var sections: [DaySummaryExpandedSection] = []
         var heading: String?
