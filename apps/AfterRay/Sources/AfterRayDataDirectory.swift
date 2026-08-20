@@ -5,23 +5,24 @@ import Foundation
 enum AfterRayDataDirectory {
     static let folderName = "AfterRay"
 
-    struct Location: Equatable {
+    struct Location: Equatable, Sendable {
         let url: URL
         let volumeRoot: URL
         let volumeUUID: String?
     }
 
-    struct Move: Equatable {
+    struct Move: Equatable, Sendable {
         let source: URL
         let destination: URL
     }
 
-    enum Error: LocalizedError {
+    enum Error: LocalizedError, Sendable {
         case destinationIsCurrent
         case destinationInsideCurrent
         case destinationIsNotEmpty(URL)
         case configuredVolumeUnavailable(URL)
         case configuredVolumeChanged(URL)
+        case rollbackFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -35,6 +36,8 @@ enum AfterRayDataDirectory {
                 "The drive containing your memories is unavailable: \(volume.path)"
             case let .configuredVolumeChanged(volume):
                 "The drive at \(volume.path) is not the drive that stores your memories."
+            case let .rollbackFailed(details):
+                "Could not restore the original memory location: \(details)"
             }
         }
     }
@@ -129,7 +132,7 @@ enum AfterRayDataDirectory {
             }
             return moves
         } catch {
-            rollback(moves, fileManager: fileManager)
+            try rollback(moves, fileManager: fileManager)
             throw error
         }
     }
@@ -152,10 +155,63 @@ enum AfterRayDataDirectory {
         return Move(source: source, destination: destination)
     }
 
-    static func rollback(_ moves: [Move], fileManager: FileManager = .default) {
-        for move in moves.reversed() where fileManager.fileExists(atPath: move.destination.path) {
-            try? fileManager.moveItem(at: move.destination, to: move.source)
+    /// A complete move transaction, including the separately located development
+    /// model/runtime directories. The caller must leave the daemon stopped for
+    /// its entire duration.
+    static func migrate(
+        sourceData: URL,
+        sourceModels: URL,
+        sourceRuntime: URL,
+        destination: URL,
+        socketName: String
+    ) throws -> [Move] {
+        var moves: [Move] = []
+        do {
+            moves += try moveContents(
+                from: sourceData,
+                to: destination,
+                excluding: [socketName]
+            )
+            if !isDescendant(sourceModels, of: sourceData),
+               let move = try moveDirectory(
+                   from: sourceModels,
+                   to: destination.appendingPathComponent("Models", isDirectory: true)
+               ) {
+                moves.append(move)
+            }
+            if !isDescendant(sourceRuntime, of: sourceData),
+               !isDescendant(sourceRuntime, of: sourceModels),
+               let move = try moveDirectory(
+                   from: sourceRuntime,
+                   to: destination.appendingPathComponent("mlx-runtime", isDirectory: true)
+               ) {
+                moves.append(move)
+            }
+            return moves
+        } catch {
+            try rollback(moves)
+            throw error
         }
+    }
+
+    static func rollback(_ moves: [Move], fileManager: FileManager = .default) throws {
+        var failures: [String] = []
+        for move in moves.reversed() where fileManager.fileExists(atPath: move.destination.path) {
+            do {
+                try fileManager.moveItem(at: move.destination, to: move.source)
+            } catch {
+                failures.append("\(move.destination.path): \(error.localizedDescription)")
+            }
+        }
+        if !failures.isEmpty {
+            throw Error.rollbackFailed(failures.joined(separator: "; "))
+        }
+    }
+
+    static func needsManualRecovery(_ error: any Swift.Error) -> Bool {
+        guard let error = error as? Error else { return false }
+        if case .rollbackFailed = error { return true }
+        return false
     }
 
     static func validateConfiguredVolume(

@@ -74,6 +74,50 @@ final class AfterRayDataDirectoryTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: source.appendingPathComponent("afterray.sqlite3").path))
     }
 
+    func testMigrationMovesSeparateDevelopmentModelsAndRuntime() throws {
+        let sourceData = directory.appendingPathComponent("v0-data", isDirectory: true)
+        let sourceModels = directory.appendingPathComponent("models", isDirectory: true)
+        let sourceRuntime = directory.appendingPathComponent("mlx-runtime", isDirectory: true)
+        let destination = directory.appendingPathComponent("external/AfterRay", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceData, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sourceModels, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sourceRuntime, withIntermediateDirectories: true)
+        try Data("vault".utf8).write(to: sourceData.appendingPathComponent("afterray.sqlite3"))
+        try Data("model".utf8).write(to: sourceModels.appendingPathComponent("weight.bin"))
+        try Data("runtime".utf8).write(to: sourceRuntime.appendingPathComponent("cache.bin"))
+
+        let moves = try AfterRayDataDirectory.migrate(
+            sourceData: sourceData,
+            sourceModels: sourceModels,
+            sourceRuntime: sourceRuntime,
+            destination: destination,
+            socketName: "afterray.sock"
+        )
+
+        XCTAssertEqual(moves.count, 3)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appendingPathComponent("afterray.sqlite3").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appendingPathComponent("Models/weight.bin").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appendingPathComponent("mlx-runtime/cache.bin").path))
+    }
+
+    func testRollbackFailureIsReportedForManualRecovery() throws {
+        let source = directory.appendingPathComponent("source", isDirectory: true)
+        let destination = directory.appendingPathComponent("destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let sourceFile = source.appendingPathComponent("afterray.sqlite3")
+        let destinationFile = destination.appendingPathComponent("afterray.sqlite3")
+        try Data("old source".utf8).write(to: sourceFile)
+        try Data("moved vault".utf8).write(to: destinationFile)
+
+        XCTAssertThrowsError(
+            try AfterRayDataDirectory.rollback([.init(source: sourceFile, destination: destinationFile)])
+        ) { error in
+            XCTAssertTrue(AfterRayDataDirectory.needsManualRecovery(error))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destinationFile.path))
+    }
+
     func testValidationRejectsAChildOfTheCurrentVault() throws {
         let source = directory.appendingPathComponent("source", isDirectory: true)
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)

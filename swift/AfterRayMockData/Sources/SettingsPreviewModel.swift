@@ -161,11 +161,11 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         relocationDestinationPath = "/Volumes/External/AfterRay"
     }
 
-    public func confirmMemoryLocation(migrateExistingData: Bool) async {
+    public func confirmMemoryLocation(migrateExistingData: Bool) {
         guard let destination = relocationDestinationPath else { return }
         isRelocatingMemory = true
-        defer { isRelocatingMemory = false }
         relocationDestinationPath = nil
+        isRelocatingMemory = false
         message = migrateExistingData
             ? "Preview would move memories to \(destination)."
             : "Preview would use the empty folder \(destination)."

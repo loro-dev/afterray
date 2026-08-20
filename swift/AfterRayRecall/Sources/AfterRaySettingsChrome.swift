@@ -56,7 +56,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func setRecordAudio(_ enabled: Bool) async
     func setStorageLimitBytes(_ bytes: UInt64) async
     func chooseMemoryLocation()
-    func confirmMemoryLocation(migrateExistingData: Bool) async
+    func confirmMemoryLocation(migrateExistingData: Bool)
     func cancelMemoryLocationChange()
     /// Changes how much wall-clock one summary covers, from now on.
     func setSummarySlotMinutes(_ minutes: UInt32) async
@@ -443,10 +443,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             isPresented: memoryLocationConfirmationPresented
         ) {
             Button(copy.settings.moveExistingMemories) {
-                Task { await model.confirmMemoryLocation(migrateExistingData: true) }
+                model.confirmMemoryLocation(migrateExistingData: true)
             }
             Button(copy.settings.useEmptyMemoryFolder) {
-                Task { await model.confirmMemoryLocation(migrateExistingData: false) }
+                model.confirmMemoryLocation(migrateExistingData: false)
             }
             Button(copy.common.cancel, role: .cancel) {
                 model.cancelMemoryLocationChange()

@@ -1,4 +1,4 @@
 {
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
-  "apps/AfterRay/Sources/DaemonSupervisor.swift::func relocateDataDirectory(to selectedDirectory: URL, migrateExistingData: Bool) async throws {": "sha256:ad7b12f25f3c263b"
+  "apps/AfterRay/Sources/DaemonSupervisor.swift::func relocateDataDirectory(to selectedDirectory: URL, migrateExistingData: Bool) async throws {": "sha256:99fa7ce96fccd780"
 }

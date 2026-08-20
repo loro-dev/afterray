@@ -32,9 +32,15 @@ persisted too: a missing or replaced external drive is an error, never a reason
 to recreate its path on the internal disk.
 
 No migration starts the same stopped/reconfigure/restart sequence but leaves the
-old root intact. A failed move rolls moved entries back and retains the previous
-preference. Explicit `AFTERRAY_DATA_DIR` or `AFTERRAY_MODEL_DIR` overrides are
-developer-controlled and disable the UI migration path.
+old root intact. A relocation fence rejects ordinary keep-alives from the moment
+the App begins waiting for an in-flight start through the byte move; only the
+relocation operation may restart the daemon. The synchronous file work runs off
+the App's main actor. A failed move rolls moved entries back and retains the
+previous preference. If any rollback step fails, the daemon stays stopped rather
+than reopening a possibly incomplete old root; a repaired vault needs an app
+relaunch before capture can resume. Explicit `AFTERRAY_DATA_DIR` or
+`AFTERRAY_MODEL_DIR` overrides are developer-controlled and disable the UI
+migration path.
 
 ## Alternatives considered
 
@@ -62,8 +68,9 @@ location and client discovery do not change.
 **Cost:** a location change pauses capture and needs enough space for the
 filesystem's move operation. Cross-volume moves are not atomic; the App can
 roll back entries it moved before an error, but a storage failure that also
-prevents rollback requires the user to repair the two visible folders. A
-disconnected external drive blocks startup rather than falling back silently.
+prevents rollback keeps capture stopped and requires the user to repair the two
+visible folders. A disconnected external drive blocks startup rather than
+falling back silently.
 
 ## Related
 

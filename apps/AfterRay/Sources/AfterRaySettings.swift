@@ -562,20 +562,25 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         }
     }
 
-    func confirmMemoryLocation(migrateExistingData: Bool) async {
+    /// Consume the destination synchronously, before SwiftUI dismisses the
+    /// confirmation alert and writes `false` through its presentation binding.
+    func confirmMemoryLocation(migrateExistingData: Bool) {
         guard let path = relocationDestinationPath else { return }
+        relocationDestinationPath = nil
         isRelocatingMemory = true
-        defer { isRelocatingMemory = false }
-        do {
-            try await DaemonSupervisor.shared.relocateDataDirectory(
-                to: URL(fileURLWithPath: path, isDirectory: true).deletingLastPathComponent(),
-                migrateExistingData: migrateExistingData
-            )
-            relocationDestinationPath = nil
-            await refresh()
-            message = copy.settings.memoryLocationChanged(dataDirectoryPath)
-        } catch {
-            message = error.localizedDescription
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isRelocatingMemory = false }
+            do {
+                try await DaemonSupervisor.shared.relocateDataDirectory(
+                    to: URL(fileURLWithPath: path, isDirectory: true).deletingLastPathComponent(),
+                    migrateExistingData: migrateExistingData
+                )
+                await self.refresh()
+                self.message = self.copy.settings.memoryLocationChanged(self.dataDirectoryPath)
+            } catch {
+                self.message = error.localizedDescription
+            }
         }
     }
 
