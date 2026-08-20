@@ -286,9 +286,6 @@ public struct TimelineLayout: Equatable, Sendable {
         return low
     }
 
-    /// The runs that intersect `range`, for a view that only draws what the
-    /// viewport can show. A day of captures is tens of thousands of points
-    /// wide; the visible slice is one screen of it.
     /// How far the playhead travels before the mounted window changes.
     public static let mountQuantum: CGFloat = 256
 
@@ -318,6 +315,9 @@ public struct TimelineLayout: Equatable, Sendable {
         return (snapped - widened)...(snapped + widened)
     }
 
+    /// The runs that intersect `range`, for a view that only draws what the
+    /// viewport can show. A day of captures is tens of thousands of points
+    /// wide; the visible slice is one screen of it.
     public func runs(intersecting range: ClosedRange<CGFloat>) -> ArraySlice<AppUsageRun> {
         guard !runs.isEmpty else { return runs[runs.startIndex..<runs.startIndex] }
         let firstIndex = Self.searchIndex(in: runs) { $0.startX <= range.lowerBound }
