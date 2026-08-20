@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import QuartzCore
 import SwiftUI
 
@@ -2050,11 +2051,19 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         private var isScrolling = false
         private var lastEventTime: CFTimeInterval = 0
         private var lastFrameTime: CFTimeInterval = 0
-        /// Opt-in release-build measurement for the stress lab. Normal app
-        /// launches do not allocate samples or print anything.
-        private var frameMetrics = ScrubFrameMetrics(
-            enabled: ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_LOG"] == "1"
-        )
+        /// Opt-in measurement. Normal launches allocate no samples and log
+        /// nothing. Enabled either by the environment (the stress lab, which
+        /// `swift run`s a binary) or by a user default:
+        ///
+        ///     defaults write dev.afterray.app AfterRayUIPerfLog -bool YES
+        ///
+        /// The default exists because the shipped app is launched by
+        /// `open`/launchd, which is the only way it gets its own TCC identity
+        /// — run the binary from a terminal and macOS attributes Screen
+        /// Recording to the *terminal*, so the app lands on the permissions
+        /// wall instead of the timeline. There is no environment to set on
+        /// that path.
+        private var frameMetrics = ScrubFrameMetrics(enabled: ScrubFrameMetrics.isEnabled)
         /// Our own deceleration. System momentum events are swallowed:
         /// macOS restarts momentum on every flick, whereas stacking releases
         /// is exactly the accelerate-by-repeated-swipes feel being asked for.
@@ -2296,6 +2305,14 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
 /// opportunities, while handler time tells us whether our own hot path spent
 /// the 8.33 ms budget.
 private struct ScrubFrameMetrics {
+    static let log = Logger(subsystem: "dev.afterray", category: "ui-perf")
+
+    /// Environment for the lab, user default for the shipped app.
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_LOG"] == "1"
+            || UserDefaults.standard.bool(forKey: "AfterRayUIPerfLog")
+    }
+
     let enabled: Bool
     private var frameIntervals: [CFTimeInterval] = []
     private var handlerDurations: [CFTimeInterval] = []
@@ -2323,8 +2340,7 @@ private struct ScrubFrameMetrics {
         let refreshRate = meanInterval > 0 ? 1 / meanInterval : 0
         let overTwelvePointFiveMs = intervals.lazy.filter { $0 > 0.0125 }.count
         let overSixteenPointSevenMs = intervals.lazy.filter { $0 > 1.0 / 60.0 }.count
-        print(
-            String(
+        let line = String(
                 format: "[afterray-ui-perf] callbacks=%d hz=%.1f interval_p95_ms=%.2f interval_max_ms=%.2f over_12.5ms=%d over_16.7ms=%d handler_p95_ms=%.3f handler_max_ms=%.3f settle_ms=%.3f",
                 handlerDurations.count,
                 refreshRate,
@@ -2336,13 +2352,18 @@ private struct ScrubFrameMetrics {
                 (handlers.last ?? 0) * 1_000,
                 settleDuration * 1_000
             )
-        )
+        print(line)
         // stdout is block-buffered when it is not a terminal, and a profiling
         // run ends by killing the process at a time limit — without this the
         // line is written and then thrown away, which reads as "the harness
         // never fired". It only ever survived because the lab was run by hand
         // in a terminal.
         fflush(stdout)
+        // And stdout goes nowhere at all when launchd started the app, which
+        // is how the real app has to be launched to own its TCC identity.
+        // `log stream --predicate 'subsystem == "dev.afterray"'` works on
+        // every launch path.
+        ScrubFrameMetrics.log.notice("\(line, privacy: .public)")
         frameIntervals.removeAll(keepingCapacity: true)
         handlerDurations.removeAll(keepingCapacity: true)
     }

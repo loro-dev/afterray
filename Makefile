@@ -126,6 +126,24 @@ profile-report:
 # recordings are not comparable — how hard you scrubbed dominates.
 #   make profile-app RUN=ab PROFILE_SECONDS=24s
 #   make profile-ab TRACE_IN=/tmp/afterray-ab-HHMMSS.trace
+# Ground truth for frame pacing: the app's own display-link measurement,
+# not inferred from CPU samples. Prints one line per settled scrub.
+#
+# A user default, not an environment variable, because the app has to be
+# launched by launchd to own its TCC identity — start the binary from a
+# terminal and macOS attributes Screen Recording to the terminal, so you land
+# on the permissions wall. `open --env` reaches the app but its stdout goes
+# nowhere, hence the unified log.
+perf-log-on:
+	defaults write dev.afterray.app AfterRayUIPerfLog -bool YES
+	@echo "on. restart the app (make stop && make dev), scrub, then: make perf-log"
+
+perf-log-off:
+	defaults delete dev.afterray.app AfterRayUIPerfLog 2>/dev/null || true
+
+perf-log:
+	log stream --predicate 'subsystem == "dev.afterray" AND category == "ui-perf"' --style compact
+
 # Frame rate, which is the number that matters. CPU% saturates and cannot tell
 # two configurations apart.
 profile-frames:
