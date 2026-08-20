@@ -26,6 +26,13 @@ enum OverlayOpenRoute: Equatable {
             return .live
         }
     }
+
+    /// After `orderOut`, put the hidden tree on NOW so the next `orderFront`
+    /// is not an opaque history backdrop that we then peel off. Search stays
+    /// parked because reopen restores the selected result.
+    static func shouldParkLiveOnHide(hasSelectedSearch: Bool) -> Bool {
+        resolve(intent: nil, hasSelectedSearch: hasSelectedSearch) == .live
+    }
 }
 
 /// Esc / ⌘W while recall is up. The query bar is often first responder, so

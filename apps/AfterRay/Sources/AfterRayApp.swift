@@ -6,6 +6,7 @@ import SwiftUI
 private extension Notification.Name {
     static let afterRayRecallDidOpen = Notification.Name("dev.afterray.recall-did-open")
     static let afterRayRecallWillHide = Notification.Name("dev.afterray.recall-will-hide")
+    static let afterRayRecallDidHide = Notification.Name("dev.afterray.recall-did-hide")
     static let afterRayRecallToggleAudio = Notification.Name("dev.afterray.recall-toggle-audio")
     static let afterRaySystemSessionWillSuspend = Notification.Name(
         "dev.afterray.system-session-will-suspend"
@@ -397,8 +398,31 @@ private final class AfterRayMenuBar: NSObject {
 /// scrolls over empty timeline chrome fall through to the app behind and
 /// AfterRay never sees them.
 private final class OverlayHostingView<Content: View>: NSHostingView<Content> {
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+        configureTransparency()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configureTransparency()
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         super.hitTest(point) ?? self
+    }
+
+    private func configureTransparency() {
+        wantsLayer = true
+        layer?.isOpaque = false
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 }
 
@@ -460,6 +484,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         let hostingView = OverlayHostingView(rootView: AfterRayRootView())
         hostingView.autoresizingMask = [.width, .height]
         panel.contentView = hostingView
+        panel.appearance = NSAppearance(named: .darkAqua)
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
@@ -566,10 +591,12 @@ final class RecallOverlayController: RecallHotKeyBinding {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
         // Same-screen show is orderFront of an already-laid-out tree.
-        // setFrame(display: true), activate, DidOpen, and focus all invalidate
-        // or block the window server before the first frame can commit.
+        // Activate first so Liquid Glass samples as an active window —
+        // deferring it left 1–2 frames of opaque inactive material.
+        // DidOpen (focus, route) still waits until after this commit.
         placeOnTargetScreen()
         panel.alphaValue = 1
+        NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
         AfterRayMenuBar.shared.setOverlayVisible(true)
@@ -591,8 +618,8 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.contentView?.layoutSubtreeIfNeeded()
     }
 
-    /// Focus, live-route, and app activation run after this turn's
-    /// CATransaction commits so the overlay can paint first.
+    /// Focus and open-route run after this turn's CATransaction commits
+    /// so they cannot rebuild the tree on the first painted frame.
     private func scheduleWorkAfterFirstFrame(_ intent: OverlayOpenIntent?) {
         DispatchQueue.main.async { [intent] in
             MainActor.assumeIsolated {
@@ -603,7 +630,6 @@ final class RecallOverlayController: RecallHotKeyBinding {
 
     fileprivate func completePresent(intent: OverlayOpenIntent?) {
         guard panel?.isVisible == true else { return }
-        NSApp.activate(ignoringOtherApps: true)
         NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: intent)
     }
 
@@ -642,6 +668,10 @@ final class RecallOverlayController: RecallHotKeyBinding {
         OverlayVisibility.shared.set(false)
         setCapturePaused(false)
         application?.activate(options: [])
+        // After the window is off-screen: park the hidden tree in the live
+        // presentation so the next orderFront is not one opaque history
+        // frame followed by glass.
+        NotificationCenter.default.post(name: .afterRayRecallDidHide, object: nil)
     }
 
     private var targetScreen: NSScreen {
@@ -1123,6 +1153,7 @@ private struct AfterRayRootView: View {
             onSelectSearchFrame: selectSearchFrame
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.clear)
         .opacity(permissions.allGranted ? 1 : 0)
         // RecallView alone owns the full-screen history backdrop because it
         // can see transient scrub state. A second backdrop here only sees the
@@ -1250,6 +1281,15 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
             audioPlayer.stop()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidHide)) { _ in
+            // Park only the default reopen. A selected search must survive
+            // hide so the next first frame is still the filmstrip, not NOW.
+            if OverlayOpenRoute.shouldParkLiveOnHide(
+                hasSelectedSearch: control.searchSession?.selectedFrame != nil
+            ) {
+                enterLive()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallToggleAudio)) { _ in
             guard !isLive, let moment = store.selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else { return }
