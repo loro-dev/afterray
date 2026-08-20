@@ -69,15 +69,6 @@ export default function Closer() {
           </div>
         </Reveal>
       </section>
-
-      <footer className="footer">
-        {/* the tagline explains the name, so the two belong together */}
-        <p className="footer-brand">
-          <span className="mono">AfterRay</span>
-          <span className="dim">{t.footer.tagline}</span>
-        </p>
-        <span className="mono dim">{t.footer.rights}</span>
-      </footer>
     </>
   )
 }

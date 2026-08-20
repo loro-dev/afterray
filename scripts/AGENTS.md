@@ -19,6 +19,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 ## Docs gate
 
 - `docs-gate/` — `make docs-sync`, run by `make test`; coverage and limits: [decisions/README.md](../docs/decisions/README.md#what-the-gate-checks).
+- Decision anchors cover Rust, Swift, and site web sources; build output is skipped.
 - **Node ≥22.6 runs TypeScript directly**: no dependencies, `package.json`, or `node_modules`; never put this runtime on a product path.
 - A red anchor hash means a decision was not re-read when its code changed. Re-read it, then `node scripts/docs-gate/main.ts --write` and commit the sidecar diff — the diff is the confirmation. Never hand-edit a sidecar.
 

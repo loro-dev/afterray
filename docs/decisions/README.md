@@ -92,7 +92,7 @@ Both directions, always. A marker with no record is a dangling pointer, and a re
 
 Anchor the **narrowest item that carries the decision** — the function, struct, or const, not the file. Anchor sparingly: a marker is for a choice someone could plausibly undo by accident, not for every function that happens to be mentioned.
 
-Swift and Python use their own comment syntax; the token `@dec:<slug>` is what matters.
+Rust, Swift, and the website's TypeScript/TSX/JavaScript source trees are scanned. Each language uses its own comment syntax; the token `@dec:<slug>` is what matters.
 
 ## Working with these records
 

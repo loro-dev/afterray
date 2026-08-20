@@ -10,7 +10,7 @@ export default function Hero() {
       <div className="hero-ray" aria-hidden="true" />
       <div className="hero-content">
         <p className="hero-eyebrow anim-in">{t.eyebrow}</p>
-        <h1 className={`hero-title${lang === 'zh' ? ' hero-title-oneline' : ''}`}>
+        <h1 className={`hero-title${lang.startsWith('zh') ? ' hero-title-oneline' : ''}`}>
           <span className="anim-in" style={{ animationDelay: '0.1s' }}>
             <Rich parts={t.titleA} />
           </span>

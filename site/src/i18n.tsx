@@ -1,36 +1,46 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useState,
-  type ReactNode,
-} from 'react'
+import { createContext, useContext, type ReactNode } from 'react'
+import { makeExtraCopies } from './extraLocales'
 
-export type Lang = 'en' | 'zh'
+export type Lang = 'en' | 'zh-Hans' | 'zh-Hant' | 'ja' | 'ko' | 'es' | 'de' | 'fr'
 export type Part = string | { em: string }
 
 /** Every locale the switcher offers, labelled in its own language.
- *  Adding one means adding an entry here plus a `copy` block. */
-export const LANGS: { code: Lang; label: string }[] = [
-  { code: 'en', label: 'English' },
-  { code: 'zh', label: '中文' },
+ *  Adding one means LANGS here, copy in extraLocales.ts (or this file for
+ *  en/zh-Hans), SEO in routes.ts, info pages in InfoPage.tsx, and footer
+ *  labels in App.tsx. */
+export const LANGS: {
+  code: Lang
+  label: string
+  htmlLang: string
+  pathPrefix: string
+  ogLocale: string
+}[] = [
+  { code: 'en', label: 'English', htmlLang: 'en', pathPrefix: '', ogLocale: 'en_US' },
+  { code: 'zh-Hans', label: '简体中文', htmlLang: 'zh-Hans', pathPrefix: 'zh', ogLocale: 'zh_CN' },
+  { code: 'zh-Hant', label: '繁體中文', htmlLang: 'zh-Hant', pathPrefix: 'zh-hant', ogLocale: 'zh_TW' },
+  { code: 'ja', label: '日本語', htmlLang: 'ja', pathPrefix: 'ja', ogLocale: 'ja_JP' },
+  { code: 'ko', label: '한국어', htmlLang: 'ko', pathPrefix: 'ko', ogLocale: 'ko_KR' },
+  { code: 'es', label: 'Español', htmlLang: 'es', pathPrefix: 'es', ogLocale: 'es_ES' },
+  { code: 'de', label: 'Deutsch', htmlLang: 'de', pathPrefix: 'de', ogLocale: 'de_DE' },
+  { code: 'fr', label: 'Français', htmlLang: 'fr', pathPrefix: 'fr', ogLocale: 'fr_FR' },
 ]
 
+export function languageDefinition(lang: Lang) {
+  const definition = LANGS.find((candidate) => candidate.code === lang)
+  if (!definition) throw new Error(`missing language definition for ${lang}`)
+  return definition
+}
+
 const en = {
-  meta: {
-    title: 'AfterRay — Remember everything you see and hear on your Mac.',
-    htmlLang: 'en',
-  },
   nav: {
     language: 'Language',
     skip: 'Skip to content',
   },
   hero: {
-    eyebrow: 'Local-first computer history',
-    titleA: ['Remember'] as Part[],
-    titleB: [{ em: 'everything.' }] as Part[],
-    sub: 'AfterRay records your screen and audio all day — so you and your agent can find anything you saw or heard.',
+    eyebrow: 'Private, local-first computer history for Mac',
+    titleA: ["Your Mac's"] as Part[],
+    titleB: ['private, ', { em: 'searchable memory.' }] as Part[],
+    sub: 'AfterRay records your screen and audio on your Mac, so you can replay any moment, search what you saw or heard, and let your agent look it up.',
     ctaPrimary: 'Download for macOS',
     ctaSecondary: 'See what it remembers',
     facts: ['macOS 15+', 'Exclude apps and sites', 'Pause or delete anytime', 'Nothing leaves this Mac'],
@@ -300,20 +310,16 @@ const en = {
 
 export type Copy = typeof en
 
-const zh: Copy = {
-  meta: {
-    title: 'AfterRay — 记住你在 Mac 上看见、听见的一切。',
-    htmlLang: 'zh-CN',
-  },
+const zhHans: Copy = {
   nav: {
     language: '语言',
     skip: '跳到正文',
   },
   hero: {
-    eyebrow: '本地优先的电脑历史',
-    titleA: ['记住'],
-    titleB: [{ em: '一切。' }],
-    sub: 'AfterRay 全天记录你的屏幕和声音——你和你的 agent 都能找回所见所闻。',
+    eyebrow: 'Mac 上私密、本地优先的电脑历史',
+    titleA: ['你的 Mac'],
+    titleB: ['私密、', { em: '可搜索的记忆。' }],
+    sub: 'AfterRay 在 Mac 本地记录屏幕与音频，让你回放任意时刻、搜索看过或听过的内容，也让 agent 查询这些记忆。',
     ctaPrimary: '下载 macOS 版',
     ctaSecondary: '看看它记得什么',
     facts: ['macOS 15+', '可排除 App 和网站', '随时暂停或删除', '不出这台 Mac'],
@@ -553,7 +559,7 @@ const zh: Copy = {
     ],
   },
   specs: {
-    steps: ['Capture', 'OCR / ASR', 'Embedding', 'Encrypted Vault', 'Local LLM', 'Recall'],
+    steps: ['捕捉', 'OCR / ASR', 'Embedding', '加密 Vault', '本机 LLM', '回顾'],
     rows: [
       ['平台', 'macOS 15+ · Apple Silicon（推荐 M3）'],
       ['存储', 'SQLCipher + XChaCha20-Poly1305，密钥存于 Keychain'],
@@ -575,56 +581,18 @@ const zh: Copy = {
   },
 }
 
-export const copy: Record<Lang, Copy> = { en, zh }
+const extraCopies = makeExtraCopies(en)
 
-const LangCtx = createContext<{ lang: Lang; setLang: (l: Lang) => void }>({
-  lang: 'en',
-  setLang: () => {},
-})
-
-const STORAGE_KEY = 'afterray-lang'
-
-function detectLang(): Lang {
-  try {
-    const param = new URLSearchParams(window.location.search).get('lang')
-    if (param === 'en' || param === 'zh') return param
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (saved === 'en' || saved === 'zh') return saved
-  } catch {
-    /* private mode etc. */
-  }
-  return navigator.language?.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+export const copy: Record<Lang, Copy> = {
+  en,
+  'zh-Hans': zhHans,
+  ...extraCopies,
 }
 
-export function LangProvider({ children }: { children: ReactNode }) {
-  // The prerendered HTML is English, so both sides must start there or the
-  // trees disagree on hydration. The reader's language is picked up in an
-  // effect, which never runs on the server.
-  const [lang, setLangState] = useState<Lang>('en')
+const LangCtx = createContext<{ lang: Lang }>({ lang: 'en' })
 
-  useEffect(() => {
-    setLangState(detectLang())
-  }, [])
-
-  useEffect(() => {
-    document.documentElement.lang = copy[lang].meta.htmlLang
-    document.title = copy[lang].meta.title
-  }, [lang])
-
-  // Persist only a deliberate choice. Writing on every change would let the
-  // pre-detection default overwrite a language the reader already picked.
-  const setLang = useCallback((next: Lang) => {
-    setLangState(next)
-    try {
-      localStorage.setItem(STORAGE_KEY, next)
-    } catch {
-      /* private mode etc. */
-    }
-  }, [])
-
-  return (
-    <LangCtx.Provider value={{ lang, setLang }}>{children}</LangCtx.Provider>
-  )
+export function LangProvider({ children, lang }: { children: ReactNode; lang: Lang }) {
+  return <LangCtx.Provider value={{ lang }}>{children}</LangCtx.Provider>
 }
 
 export function useLang() {

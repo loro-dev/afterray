@@ -69,25 +69,90 @@
   </head>
   <body>
     <div class="wrap">
-      <a class="mark" href="/">
+      <a class="mark" href="/" data-home>
         <img src="/logo.png" alt="" width="22" height="22" />
         <span>AfterRay</span>
       </a>
-      <h1 data-en="This one it <em>doesn't</em> remember." data-zh="这一页它<em>不记得</em>。">This one it <em>doesn't</em> remember.</h1>
-      <p data-en="That page isn't here." data-zh="那一页不在这儿。">That page isn't here.</p>
-      <a class="back" href="/" data-en="Back to AfterRay" data-zh="回 AfterRay">Back to AfterRay</a>
+      <h1
+        data-en="This one it <em>doesn't</em> remember."
+        data-zh-hans="这一页它<em>不记得</em>。"
+        data-zh-hant="這一頁它<em>不記得</em>。"
+        data-ja="このページは<em>覚えていません</em>。"
+        data-ko="이 페이지는 <em>기억하지 않습니다</em>."
+        data-es="Esta página <em>no</em> la recuerda."
+        data-de="An diese Seite <em>erinnert es sich nicht</em>."
+        data-fr="Celle-ci, il <em>ne s’en souvient pas</em>."
+      >This one it <em>doesn't</em> remember.</h1>
+      <p
+        data-en="That page isn't here."
+        data-zh-hans="那一页不在这儿。"
+        data-zh-hant="那一頁不在這裡。"
+        data-ja="そのページはありません。"
+        data-ko="해당 페이지가 없습니다."
+        data-es="Esa página no está aquí."
+        data-de="Diese Seite ist nicht hier."
+        data-fr="Cette page n’est pas ici."
+      >That page isn't here.</p>
+      <a
+        class="back"
+        href="/"
+        data-home
+        data-en="Back to AfterRay"
+        data-zh-hans="回 AfterRay"
+        data-zh-hant="回 AfterRay"
+        data-ja="AfterRayに戻る"
+        data-ko="AfterRay로 돌아가기"
+        data-es="Volver a AfterRay"
+        data-de="Zurück zu AfterRay"
+        data-fr="Retour à AfterRay"
+      >Back to AfterRay</a>
       <script>
         (function () {
+          var homes = {
+            en: '/',
+            'zh-Hans': '/zh/',
+            'zh-Hant': '/zh-hant/',
+            ja: '/ja/',
+            ko: '/ko/',
+            es: '/es/',
+            de: '/de/',
+            fr: '/fr/',
+          }
+          var htmlLang = {
+            en: 'en',
+            'zh-Hans': 'zh-Hans',
+            'zh-Hant': 'zh-Hant',
+            ja: 'ja',
+            ko: 'ko',
+            es: 'es',
+            de: 'de',
+            fr: 'fr',
+          }
+          var titles = {
+            en: 'Not found — AfterRay',
+            'zh-Hans': '未找到 — AfterRay',
+            'zh-Hant': '找不到 — AfterRay',
+            ja: '見つかりません — AfterRay',
+            ko: '찾을 수 없음 — AfterRay',
+            es: 'No encontrado — AfterRay',
+            de: 'Nicht gefunden — AfterRay',
+            fr: 'Introuvable — AfterRay',
+          }
           var lang = 'en'
           try {
-            var q = new URLSearchParams(location.search).get('lang')
-            var saved = localStorage.getItem('afterray-lang')
-            lang = q === 'zh' || q === 'en' ? q : saved === 'zh' || saved === 'en' ? saved : (navigator.language || '').toLowerCase().indexOf('zh') === 0 ? 'zh' : 'en'
+            var match = (location.pathname || '').match(/^\/(zh-hant|zh|ja|ko|es|de|fr)(?:\/|$)/)
+            if (match) {
+              lang = match[1] === 'zh' ? 'zh-Hans' : match[1] === 'zh-hant' ? 'zh-Hant' : match[1]
+            }
           } catch (e) {}
-          document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en'
-          document.title = lang === 'zh' ? '未找到 — AfterRay' : 'Not found — AfterRay'
-          document.querySelectorAll('[data-zh]').forEach(function (el) {
-            el.innerHTML = el.getAttribute(lang === 'zh' ? 'data-zh' : 'data-en')
+          var attr = lang.toLowerCase()
+          document.documentElement.lang = htmlLang[lang] || 'en'
+          document.title = titles[lang] || titles.en
+          document.querySelectorAll('[data-en]').forEach(function (el) {
+            el.innerHTML = el.getAttribute('data-' + attr) || el.getAttribute('data-en')
+          })
+          document.querySelectorAll('[data-home]').forEach(function (el) {
+            el.setAttribute('href', homes[lang] || '/')
           })
         })()
       </script>

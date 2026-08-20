@@ -16,8 +16,8 @@ import { repoRoot, listFiles, type Finding } from './util.ts'
 const MARKER = /@dec:([a-z0-9-]+)(?:\s*[—-]+\s*(\S+))?/
 
 /** Source trees a marker may live in. Nothing else is scanned. */
-const SOURCE_DIRS = ['crates', 'apps', 'swift']
-const SOURCE_EXTS = ['.rs', '.swift']
+const SOURCE_DIRS = ['crates', 'apps', 'swift', 'site']
+const SOURCE_EXTS = ['.rs', '.swift', '.ts', '.tsx', '.js', '.mjs']
 
 /** Explains the sidecar to whoever opens it. A valid JSON key, so it survives a round-trip. */
 const SIDECAR_NOTE_KEY = '//'
