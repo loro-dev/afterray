@@ -27,6 +27,17 @@ public actor SummaryExportFileStore {
         return url
     }
 
+    // @dec:summary-inline-markdown-actions — docs/decisions/active/product/2026-08-20-summary-inline-markdown-actions.md
+    public func write(markdown: String) throws -> URL {
+        try ensureDirectory()
+        try cleanupExpired(now: .now)
+        let url = directory.appending(path: "\(UUID().uuidString).md")
+        let contents = markdown.hasSuffix("\n") ? markdown : "\(markdown)\n"
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return url
+    }
+
     public func cleanupExpired(now: Date) throws {
         guard FileManager.default.fileExists(atPath: directory.path) else { return }
         for url in try FileManager.default.contentsOfDirectory(

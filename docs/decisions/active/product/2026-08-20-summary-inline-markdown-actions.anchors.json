@@ -1,0 +1,6 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "swift/AfterRayRecall/Sources/DaySummaryTitleActions.swift::struct DaySummaryTitleActions: View {": "sha256:cf241b646d67016b",
+  "swift/AfterRayRecall/Sources/DaySummaryTitleLayout.swift::struct DaySummaryTitleLayout: Layout {": "sha256:06ba0c85815da05c",
+  "swift/AfterRayRecall/Sources/SummaryExportFileStore.swift::public func write(markdown: String) throws -> URL {": "sha256:763f7ffd7a67b355"
+}

@@ -412,6 +412,8 @@ extension AfterRayCopy {
             copyAllLoadedDays: "Alle geladenen Tage kopieren",
             copyThisDay: "Diesen Tag kopieren",
             copyThisSlot: "Diesen Abschnitt kopieren",
+            copySummary: "Zusammenfassung kopieren",
+            openSummaryAsMarkdown: "Zusammenfassung als Markdown öffnen",
             nothingRecorded: "Noch nichts aufgezeichnet.",
             pastDaysWillAppear: "Vergangene Tage erscheinen hier, sobald AfterRay sie erfasst.",
             noRecordings: "Keine Aufzeichnungen",
