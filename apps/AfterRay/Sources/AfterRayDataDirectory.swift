@@ -38,6 +38,14 @@ enum AfterRayDataDirectory {
         /// Recovery examines both lists because a crash can occur in between.
         var plannedMoves: [Move]
         var completedMoves: [Move]
+
+        var destinationLocation: Location {
+            Location(
+                url: destinationRoot,
+                volumeRoot: destinationVolumeRoot,
+                volumeUUID: destinationVolumeUUID
+            )
+        }
     }
 
     enum StartupRecovery: Equatable, Sendable {
@@ -179,7 +187,7 @@ enum AfterRayDataDirectory {
     /// has proved it can open the selected root.
     static func recoverInterruptedMigration(
         manifestURL: URL,
-        currentDataDirectory: URL,
+        currentDataLocation: Location?,
         fileManager: FileManager = .default
     ) throws -> StartupRecovery {
         guard var manifest = try loadRecoveryManifest(at: manifestURL) else { return .none }
@@ -196,14 +204,14 @@ enum AfterRayDataDirectory {
 
         switch manifest.phase {
         case .preferenceCommitted:
-            guard sameDirectory(currentDataDirectory, manifest.destinationRoot) else {
+            guard currentDataLocation == manifest.destinationLocation else {
                 throw Error.recoveryRequired("preferences do not select the completed destination")
             }
             try requireDestinationComplete(manifest, fileManager: fileManager)
             return .clearAfterDaemonIsReachable
 
         case .moved:
-            if sameDirectory(currentDataDirectory, manifest.destinationRoot) {
+            if currentDataLocation == manifest.destinationLocation {
                 manifest.phase = .preferenceCommitted
                 try saveManifest(manifest, at: manifestURL)
                 try requireDestinationComplete(manifest, fileManager: fileManager)
@@ -222,9 +230,15 @@ enum AfterRayDataDirectory {
         return .none
     }
 
-    static func markPreferenceCommitted(at manifestURL: URL) throws {
+    static func markPreferenceCommitted(
+        at manifestURL: URL,
+        location: Location?
+    ) throws {
         guard var manifest = try loadRecoveryManifest(at: manifestURL) else {
             throw Error.recoveryRequired("migration manifest disappeared before preferences were committed")
+        }
+        guard location == manifest.destinationLocation else {
+            throw Error.recoveryRequired("preferences did not persist the complete destination location")
         }
         manifest.phase = .preferenceCommitted
         try saveManifest(manifest, at: manifestURL)
@@ -344,7 +358,7 @@ enum AfterRayDataDirectory {
                 // before `moveItem` succeeds but before completion is recorded.
                 _ = try recoverInterruptedMigration(
                     manifestURL: recoveryManifestURL!,
-                    currentDataDirectory: sourceData
+                    currentDataLocation: try location(for: sourceData)
                 )
             } else {
                 try rollback(moves)
@@ -560,10 +574,6 @@ enum AfterRayDataDirectory {
             try? fileManager.removeItem(at: temporary)
             throw error
         }
-    }
-
-    private static func sameDirectory(_ lhs: URL, _ rhs: URL) -> Bool {
-        lhs.standardizedFileURL == rhs.standardizedFileURL
     }
 
     private static func isDescendant(_ url: URL, of parent: URL) -> Bool {

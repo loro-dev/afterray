@@ -6,39 +6,83 @@ extension Notification.Name {
     static let afterRayPreferencesDidChange = Notification.Name("dev.afterray.preferences-did-change")
 }
 
+// @dec:vault-location-relocation — docs/decisions/active/architecture/2026-08-20-vault-location-relocation.md
 enum AfterRayPreferences {
     static let recordAudioKey = "dev.afterray.recordAudio"
     static let developerOptionsUnlockedKey = "dev.afterray.developer-options.unlocked"
     static let developerOptionsEnabledKey = "dev.afterray.developer-options.enabled"
     static let computeDashboardKey = "dev.afterray.compute-dashboard.enabled"
+    static let memoryDataLocationKey = "dev.afterray.memory-data-location"
+    /// Legacy components retained only long enough for a one-way read migration.
     static let memoryDataDirectoryKey = "dev.afterray.memory-data-directory"
     static let memoryDataVolumeRootKey = "dev.afterray.memory-data-volume-root"
     static let memoryDataVolumeUUIDKey = "dev.afterray.memory-data-volume-uuid"
 
     static var memoryDataLocation: AfterRayDataDirectory.Location? {
         get {
+            if UserDefaults.standard.object(forKey: memoryDataLocationKey) != nil {
+                // Do not fall back to retired fragments when a canonical value
+                // is corrupt; that could reconstruct a different location.
+                return canonicalMemoryDataLocation
+            }
             guard let path = UserDefaults.standard.string(forKey: memoryDataDirectoryKey),
                   let volumeRoot = UserDefaults.standard.string(forKey: memoryDataVolumeRootKey)
             else {
                 return nil
             }
-            return AfterRayDataDirectory.Location(
+            let legacy = AfterRayDataDirectory.Location(
                 url: URL(fileURLWithPath: path, isDirectory: true),
                 volumeRoot: URL(fileURLWithPath: volumeRoot, isDirectory: true),
                 volumeUUID: UserDefaults.standard.string(forKey: memoryDataVolumeUUIDKey)
             )
+            // Write the complete value first. A crash before removing legacy
+            // keys still reads this single canonical value, never a mix.
+            if storeCanonicalMemoryDataLocation(legacy) {
+                removeLegacyMemoryDataLocation()
+            }
+            return legacy
         }
         set {
             guard let newValue else {
-                UserDefaults.standard.removeObject(forKey: memoryDataDirectoryKey)
-                UserDefaults.standard.removeObject(forKey: memoryDataVolumeRootKey)
-                UserDefaults.standard.removeObject(forKey: memoryDataVolumeUUIDKey)
+                // Preserve the old canonical value until every legacy fragment
+                // is gone, so clearing cannot briefly expose a mixed legacy root.
+                removeLegacyMemoryDataLocation()
+                UserDefaults.standard.removeObject(forKey: memoryDataLocationKey)
                 return
             }
-            UserDefaults.standard.set(newValue.url.path, forKey: memoryDataDirectoryKey)
-            UserDefaults.standard.set(newValue.volumeRoot.path, forKey: memoryDataVolumeRootKey)
-            UserDefaults.standard.set(newValue.volumeUUID, forKey: memoryDataVolumeUUIDKey)
+            if storeCanonicalMemoryDataLocation(newValue) {
+                removeLegacyMemoryDataLocation()
+            }
         }
+    }
+
+    /// `nil` distinguishes an unset or malformed canonical value from a legacy
+    /// value. Callers that require a post-write proof use this rather than the
+    /// compatibility getter above.
+    static var canonicalMemoryDataLocation: AfterRayDataDirectory.Location? {
+        guard let data = UserDefaults.standard.data(forKey: memoryDataLocationKey) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(AfterRayDataDirectory.Location.self, from: data)
+    }
+
+    private static func storeCanonicalMemoryDataLocation(
+        _ location: AfterRayDataDirectory.Location
+    ) -> Bool {
+        // Location contains URLs and optional UUID only, so encoding cannot
+        // fail in practice. Do not fall back to independently written keys.
+        guard let data = try? JSONEncoder().encode(location) else {
+            assertionFailure("could not encode memory data location")
+            return false
+        }
+        UserDefaults.standard.set(data, forKey: memoryDataLocationKey)
+        return true
+    }
+
+    private static func removeLegacyMemoryDataLocation() {
+        UserDefaults.standard.removeObject(forKey: memoryDataDirectoryKey)
+        UserDefaults.standard.removeObject(forKey: memoryDataVolumeRootKey)
+        UserDefaults.standard.removeObject(forKey: memoryDataVolumeUUIDKey)
     }
 
     /// Whether the local-computation dashboard is offered at all.

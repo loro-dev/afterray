@@ -250,6 +250,8 @@ outside both data roots. On the next launch it either proves every recorded item
 is back at the old root and resumes there, or holds capture stopped for manual
 recovery; it never starts a daemon on a split vault. The manifest is removed
 only after the new preference is committed and the new daemon answers `status`.
+The preference stores the data path and volume identity as one encoded value;
+older component keys are migrated on read and are not written again.
 
 ## Environment variables
 

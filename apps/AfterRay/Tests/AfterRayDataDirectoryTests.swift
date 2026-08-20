@@ -163,7 +163,53 @@ final class AfterRayDataDirectoryTests: XCTestCase {
         XCTAssertEqual(
             try AfterRayDataDirectory.recoverInterruptedMigration(
                 manifestURL: manifestURL,
-                currentDataDirectory: source
+                currentDataLocation: try AfterRayDataDirectory.location(for: source)
+            ),
+            .none
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: manifestURL.path))
+    }
+
+    func testMovedManifestRejectsMixedLocationAndRestoresSource() throws {
+        let source = directory.appendingPathComponent("source", isDirectory: true)
+        let destination = directory.appendingPathComponent("external/AfterRay", isDirectory: true)
+        let manifestURL = directory
+            .appendingPathComponent("control", isDirectory: true)
+            .appendingPathComponent("memory-location-recovery.json")
+        let sourceFile = source.appendingPathComponent("afterray.sqlite3")
+        let destinationFile = destination.appendingPathComponent("afterray.sqlite3")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("vault".utf8).write(to: sourceFile)
+
+        let sourceLocation = try AfterRayDataDirectory.location(for: source)
+        let destinationLocation = try AfterRayDataDirectory.location(for: destination)
+        try AfterRayDataDirectory.beginMigration(
+            sourceRoot: source,
+            destinationRoot: destination,
+            sourceLocation: sourceLocation,
+            destinationLocation: destinationLocation,
+            manifestURL: manifestURL
+        )
+        let journal = try AfterRayDataDirectory.RecoveryJournal(manifestURL: manifestURL)
+        try journal.markMoving()
+        let move = AfterRayDataDirectory.Move(source: sourceFile, destination: destinationFile)
+        try journal.recordIntent(move)
+        try FileManager.default.moveItem(at: sourceFile, to: destinationFile)
+        try journal.recordCompletion(move)
+        try journal.markMoved()
+
+        let mixedLocation = AfterRayDataDirectory.Location(
+            url: destinationLocation.url,
+            volumeRoot: directory.appendingPathComponent("stale-volume", isDirectory: true),
+            volumeUUID: "stale-volume-uuid"
+        )
+        XCTAssertEqual(
+            try AfterRayDataDirectory.recoverInterruptedMigration(
+                manifestURL: manifestURL,
+                currentDataLocation: mixedLocation
             ),
             .none
         )

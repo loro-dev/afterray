@@ -107,18 +107,20 @@ final class DaemonSupervisor {
               allowingDataRelocation || !isRelocatingDataDirectory
         else { return false }
         let recoveryManifestURL = Self.relocationRecoveryManifestURL
+        let currentLocation = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil
+            ? AfterRayPreferences.memoryDataLocation
+            : nil
         let startupRecovery: AfterRayDataDirectory.StartupRecovery
         do {
             startupRecovery = try AfterRayDataDirectory.recoverInterruptedMigration(
                 manifestURL: recoveryManifestURL,
-                currentDataDirectory: dataDirectory
+                currentDataLocation: currentLocation
             )
         } catch {
             requiresDataDirectoryRecovery = true
             throw error
         }
-        if configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
-           let location = AfterRayPreferences.memoryDataLocation {
+        if let location = currentLocation {
             try AfterRayDataDirectory.validateConfiguredVolume(
                 volumeRoot: location.volumeRoot,
                 volumeUUID: location.volumeUUID
@@ -431,7 +433,10 @@ final class DaemonSupervisor {
 
             AfterRayPreferences.memoryDataLocation = location
             if migrateExistingData {
-                try AfterRayDataDirectory.markPreferenceCommitted(at: recoveryManifestURL)
+                try AfterRayDataDirectory.markPreferenceCommitted(
+                    at: recoveryManifestURL,
+                    location: AfterRayPreferences.canonicalMemoryDataLocation
+                )
             }
             _ = try await startIfNeeded(allowingDataRelocation: true)
         } catch {

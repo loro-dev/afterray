@@ -5,6 +5,7 @@ Area: privacy
 Anchors:
 - apps/AfterRay/Sources/DaemonSupervisor.swift @dec:vault-location-relocation
 - apps/AfterRay/Sources/AfterRayDataDirectory.swift @dec:vault-location-relocation
+- apps/AfterRay/Sources/AfterRaySettings.swift @dec:vault-location-relocation
 Supersedes: —
 Superseded-by: —
 
@@ -22,6 +23,13 @@ The App owns the **location preference**, while `afterrayd` remains the sole
 owner of vault bytes and keys. The preference is held in UserDefaults rather
 than the vault's `settings.json`, because the App has to choose the data root
 before it can start the daemon that reads that file.
+
+The selected root, volume root, and volume UUID are one Codable UserDefaults
+value. A complete legacy three-key value is read once, atomically rewritten to
+the canonical value, and then removed. New writes publish the canonical value
+before deleting legacy keys; clearing deletes legacy keys before the canonical
+value. A recovery manifest can therefore accept a committed destination only
+when all three persisted fields equal its destination record.
 
 Selecting a folder creates an `AfterRay` data root beneath it. The destination
 must be empty. The App asks whether to move existing data; accepting stops the
