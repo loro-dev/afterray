@@ -382,11 +382,10 @@ button:focus-visible {
 .hero-title > span {
   display: block;
 }
-/* Chinese "记住一切" is one phrase — keep the two title parts on one line */
+/* Keep the Chinese title parts inline when there is room, but let the phrase
+   wrap at narrow widths instead of letting the hero clip it. */
 .hero-title-oneline {
-  display: flex;
-  flex-wrap: nowrap;
-  white-space: nowrap;
+  white-space: normal;
 }
 .hero-title-oneline > span {
   display: inline;
