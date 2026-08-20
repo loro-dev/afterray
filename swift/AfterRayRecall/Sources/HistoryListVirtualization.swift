@@ -217,6 +217,17 @@ enum HistoryListLayout {
     static let horizontalInset: CGFloat = 6
     static let bottomPadding: CGFloat = 8
 
+    /// The part of the item model that changes document geometry.
+    ///
+    /// Row identity and count deliberately survive expand/collapse, so neither
+    /// can tell the scroll view that its mounted window is now stale.
+    static func heightKeys(
+        items: [HistoryListItem],
+        isLoadingMore: Bool
+    ) -> [String] {
+        items.map { $0.heightKey(isLoadingMore: isLoadingMore) }
+    }
+
     static func heights(
         items: [HistoryListItem],
         cache: HistoryRowHeightCache,
@@ -248,6 +259,16 @@ enum HistoryListLayout {
         origins.last ?? 0
     }
 
+    static func clampedOffset(
+        origins: [CGFloat],
+        offset: CGFloat,
+        viewportHeight: CGFloat
+    ) -> CGFloat {
+        let viewport = viewportHeight > 0 ? viewportHeight : defaultViewport
+        let height = contentHeight(origins: origins)
+        return min(max(0, offset), max(0, height - viewport))
+    }
+
     /// Rows intersecting the viewport plus overscan.
     ///
     /// **Total by construction: for a non-empty list this always returns a
@@ -266,8 +287,11 @@ enum HistoryListLayout {
         let count = max(origins.count - 1, 0)
         guard count > 0 else { return 0..<0 }
         let viewport = viewportHeight > 0 ? viewportHeight : defaultViewport
-        let height = contentHeight(origins: origins)
-        let clamped = min(max(0, offset), max(0, height - viewport))
+        let clamped = clampedOffset(
+            origins: origins,
+            offset: offset,
+            viewportHeight: viewport
+        )
         let y0 = clamped - overscan
         let y1 = clamped + viewport + overscan
 

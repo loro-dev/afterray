@@ -88,7 +88,9 @@ struct HistoryListScrollView<Row: View>: View {
             runtime.viewportHeight = metrics.height
             applyWindow()
         }
-        .onChange(of: items.count) { _, _ in applyWindow() }
+        .onChange(of: layoutKeys) { _, _ in
+            applyWindow(reconcilingOffset: true)
+        }
         .onChange(of: followGeneration) { _, _ in follow() }
         .onAppear {
             applyWindow()
@@ -107,6 +109,10 @@ struct HistoryListScrollView<Row: View>: View {
         )
     }
 
+    private var layoutKeys: [String] {
+        HistoryListLayout.heightKeys(items: items, isLoadingMore: isLoadingMore)
+    }
+
     /// `mounted` lags the model by one update after the item list changes, so
     /// clamp it, and derive a window outright when there is not one yet.
     private func renderedRange(origins: [CGFloat]) -> Range<Int> {
@@ -123,8 +129,25 @@ struct HistoryListScrollView<Row: View>: View {
         return lower..<upper
     }
 
-    private func applyWindow() {
+    private func applyWindow(reconcilingOffset: Bool = false) {
         let origins = currentOrigins()
+        if reconcilingOffset {
+            let clamped = HistoryListLayout.clampedOffset(
+                origins: origins,
+                offset: runtime.offset,
+                viewportHeight: runtime.viewportHeight
+            )
+            if abs(clamped - runtime.offset) >= 1 {
+                runtime.offset = clamped
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    scrollPosition.scrollTo(y: clamped)
+                }
+            } else {
+                runtime.offset = clamped
+            }
+        }
         let next = HistoryListLayout.visibleRange(
             origins: origins,
             offset: runtime.offset,
