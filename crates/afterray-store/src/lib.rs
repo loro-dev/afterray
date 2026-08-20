@@ -404,11 +404,6 @@ pub enum StoreError {
     InvalidKey,
     #[error("the existing Vault key is missing from macOS Keychain")]
     MissingVaultKey,
-    #[error(
-        "this vault was written by a newer AfterRay (schema {found}, this build supports {supported}); \
-         downgrade is not supported — update AfterRay to open it"
-    )]
-    VaultTooNew { found: u32, supported: u32 },
     #[error("artifact not found: {0}")]
     ArtifactNotFound(String),
     #[error("key provider: {0}")]
@@ -5237,20 +5232,6 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     // Read before the version is stamped forward. Most steps here are cheap
     // enough to re-run on every open; rebuilding the whole text index is not.
     let from_version = stored_schema_version(connection)?;
-
-    // A vault written by a newer build is refused, not migrated. Every step
-    // below is a forward step, so a newer vault skips all of them and then
-    // falls into the unconditional stamp at the end — which would relabel a
-    // schema-27 database as 26 while leaving its extra tables in place, and the
-    // next 26→27 migration would then run a second time against data that had
-    // already been through it. Downgrade is not supported; failing to open is
-    // the recoverable outcome, silently rewriting the label is not.
-    if from_version > SCHEMA_VERSION {
-        return Err(StoreError::VaultTooNew {
-            found: from_version,
-            supported: SCHEMA_VERSION,
-        });
-    }
     migrate_query_indexes(connection)?;
     migrate_schema_6(connection)?;
     migrate_schema_7(connection)?;
@@ -10702,42 +10683,6 @@ mod tests {
         assert!(
             !serde_json::to_string(&after).unwrap().contains("the merge is green"),
             "nothing anywhere in the rebuilt card still carries the typed text"
-        );
-    }
-
-    /// Auto-update makes "new app, older daemon still holding the socket" a
-    /// routine state rather than a rare one, and switching branches in a
-    /// checkout does the same to `.afterray-dev/`. Every step in `migrate` is a
-    /// forward step, so a newer vault skips them all and reaches the stamp —
-    /// which would relabel it downward while its extra tables stayed, and the
-    /// next real migration would then run twice over the same data.
-    #[test]
-    fn a_vault_from_a_newer_build_is_refused_and_its_label_left_alone() {
-        let (_directory, vault) = test_vault(10);
-        let future = SCHEMA_VERSION + 1;
-        {
-            let connection = vault.connection.lock().unwrap();
-            connection
-                .execute("UPDATE schema_meta SET version = ?1", [future])
-                .unwrap();
-        }
-
-        let connection = vault.connection.lock().unwrap();
-        let error = migrate(&connection).expect_err("a newer vault must not migrate");
-        assert!(
-            matches!(
-                error,
-                StoreError::VaultTooNew {
-                    found,
-                    supported
-                } if found == future && supported == SCHEMA_VERSION
-            ),
-            "expected VaultTooNew, got {error:?}"
-        );
-        assert_eq!(
-            stored_schema_version(&connection).unwrap(),
-            future,
-            "refusing must leave the label alone; rewriting it is the damage"
         );
     }
 
