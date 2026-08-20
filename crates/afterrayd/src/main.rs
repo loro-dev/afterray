@@ -17,8 +17,9 @@ use afterray_models::{
     PersistentMlxAdapter,
     PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID,
     QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig,
-    download_packs_with_cancellation, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
-    qwen35_mlx_manifest, reclaim_abandoned_downloads, remove_pack, spec_by_id, specs_for_download,
+    download_packs_with_cancellation, huggingface_mirror_to_persist, library, model_directory,
+    probe_llm, qwen35_9b_mlx_manifest, qwen35_mlx_manifest, reclaim_abandoned_downloads,
+    remove_pack, spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, InputEventRecord, MacOsCaptureBackend,
@@ -1685,6 +1686,28 @@ fn summary_slot_minutes(state: &AppState) -> u32 {
 
 fn persist_current_settings(state: &AppState) -> std::io::Result<()> {
     save_persisted_settings(&state.data_dir, &persisted_settings(state))
+}
+
+// @dec:hf-mirror-failover — docs/decisions/active/product/2026-08-20-hf-mirror-failover.md
+fn persist_adopted_huggingface_mirror(state: &AppState) {
+    let stored = state
+        .model_download_endpoint
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(mirror) = huggingface_mirror_to_persist(&stored) else {
+        return;
+    };
+    {
+        let mut endpoint = state
+            .model_download_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        endpoint.clone_from(&mirror);
+    }
+    if let Err(error) = persist_current_settings(state) {
+        eprintln!("could not save the download origin after switching to the mirror: {error}");
+    }
 }
 
 /// Disk first, then memory. A failed write must not leave the live window
@@ -4884,6 +4907,7 @@ async fn run_model_downloads(state: Arc<AppState>) {
             },
         )
         .await;
+        persist_adopted_huggingface_mirror(&state);
         *state
             .download_cancellation
             .lock()
