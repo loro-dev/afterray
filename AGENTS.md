@@ -8,6 +8,7 @@ AfterRay is a local-first macOS computer-history app: a Rust daemon (`afterrayd`
 - `make test` — `cargo test --workspace` + `swift test`
 - `make test-repeat N=10 [TEST=name]` — new concurrency/IO tests need ≥5 consecutive green runs before commit; judge a build by its exit code, never a filtered warning count ([why](docs/development.md#tests-and-lint))
 - `cargo clippy --workspace --all-targets -- -D warnings` — lint gate; the workspace denies `unsafe_code`
+- `make profile-scrub` / `make profile-app` — Instruments traces of a timeline scrub, on fixtures or on the running app ([how to read them](context/history-list-scrolling.md))
 - `make v0` / `make v0-daemon` — one-shot signed app / daemon only; dev data lives in gitignored `.afterray/` and `.afterray-dev/`
 
 ## Context index
@@ -20,7 +21,7 @@ Before editing, read every `AGENTS.md` along the path from root to leaf. Every `
 - [scripts/](scripts/AGENTS.md) — dev loop, signing/notarization/Sparkle release, publish; the root `Makefile` is the entry point
 - [site/](site/AGENTS.md) — afterray.com: React+Vite, Cloudflare Pages, R2-backed appcast/download functions
 - [docs/](docs/AGENTS.md) — specs and plans (some plans are historical; code wins)
-- [context/](context/) — navigation articles: [capture-pipeline](context/capture-pipeline.md), [event-capture-v2](context/event-capture-v2.md), [wire-protocol](context/wire-protocol.md), [compute-governance](context/compute-governance.md), [agent-tools](context/agent-tools.md), [acts-join](context/acts-join.md), [ocr-text-selection](context/ocr-text-selection.md); [CONTEXT-GAPS.md](context/CONTEXT-GAPS.md) — gaps backlog
+- [context/](context/) — navigation articles: [capture-pipeline](context/capture-pipeline.md), [event-capture-v2](context/event-capture-v2.md), [wire-protocol](context/wire-protocol.md), [compute-governance](context/compute-governance.md), [agent-tools](context/agent-tools.md), [acts-join](context/acts-join.md), [ocr-text-selection](context/ocr-text-selection.md), [history-list-scrolling](context/history-list-scrolling.md), [usage-analytics](context/usage-analytics.md); [CONTEXT-GAPS.md](context/CONTEXT-GAPS.md) — gaps backlog
 - `skills/afterray/` — the shipped Agent Skill for the read-only CLI surface; keep in sync with `afterray-cli`
 
 ## Working agreements
