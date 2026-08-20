@@ -4,7 +4,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 ## Key files
 
-- `Sources/AfterRayApp.swift:30` `@main` + app delegate; `RecallOverlayController` (Carbon hot key + status-bar-level panel); `AfterRayMenuBar`; `AfterRayRootView`. Overlay placement policy: `OverlayOpenRoute.swift` (`OverlayPanelPlacement`). `AfterRayMainMenu` is the only menu bar: App + **Edit**. Without Edit, ⌘X/⌘C/⌘V/⌘Z never become `cut:`/`copy:`/`paste:`/`undo:` in *any* field — search bar, settings, chat composer.
+- `Sources/AfterRayApp.swift:30` `@main` + app delegate; `RecallOverlayController` (Carbon hot key + status-bar-level panel); `AfterRayMenuBar`; `AfterRayRootView`. Overlay placement policy: `OverlayOpenRoute.swift` (`OverlayPanelPlacement`). `AfterRayMainMenu` is the only menu bar: App + **Edit**. Without Edit, ⌘X/⌘C/⌘V/⌘Z never become `cut:`/`copy:`/`paste:`/`undo:` in *any* field — search bar, settings, chat composer. First launch bootstraps `AfterRayLocalization.shared`; menus, permissions, CLI status, and overlay chrome use `AfterRayCopy`, never hardcoded English ([i18n contract](../../swift/AfterRayRecall/Sources/L10n/AGENTS.md)).
 - `Sources/DaemonSupervisor.swift:6` — spawns/owns `afterrayd` and helper binaries, resolves socket/data dirs; dev layout detected via `.afterray-dev` parent in `developmentRepoRoot()` (:276)
 - `Sources/HistoryWindow.swift:12` `AfterRayServices` (`static let shared`); `AfterRayStandardWindowPresence` (:39) Dock/Cmd-Tab for pop-outs; `HistoryWindowController` (:57)
 - `Sources/ChatWindow.swift:10` `ChatWindowController` — standalone chat window; stream lives on `AfterRayServices.shared.chat`

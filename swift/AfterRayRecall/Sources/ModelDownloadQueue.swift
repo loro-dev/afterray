@@ -60,27 +60,33 @@ public struct ModelDownloadQueueItem: Identifiable, Equatable, Sendable {
     public var canResume: Bool { stage == .paused }
     public var canRetry: Bool { stage == .failed }
 
-    public var stageLabel: String {
+    public var stageLabel: String { stageLabel(.english) }
+
+    public func stageLabel(_ copy: AfterRayCopy) -> String {
         switch stage {
-        case .downloading: "Downloading"
-        case .verifying: "Verifying"
-        case .paused: "Paused"
-        case .waiting: "Waiting"
-        case .failed: "Failed"
+        case .downloading: copy.common.downloading
+        case .verifying: copy.common.verifying
+        case .paused: copy.common.paused
+        case .waiting: copy.common.waiting
+        case .failed: copy.common.failed
         }
     }
 
     /// "1.2 GB of 5.97 GB", or just the total while nothing has landed yet.
-    public var sizeText: String? {
+    public var sizeText: String? { sizeText(.english) }
+
+    public func sizeText(_ copy: AfterRayCopy) -> String? {
         guard let expectedBytes, expectedBytes > 0 else { return nil }
         let total = ModelDownloadQueueItem.byteText(expectedBytes)
         guard stage != .waiting, bytes > 0 else { return total }
-        return "\(ModelDownloadQueueItem.byteText(bytes)) of \(total)"
+        return copy.settings.ofSize(ModelDownloadQueueItem.byteText(bytes), total)
     }
 
-    public var etaText: String? {
+    public var etaText: String? { etaText(.english) }
+
+    public func etaText(_ copy: AfterRayCopy) -> String? {
         guard let etaSeconds, etaSeconds.isFinite, etaSeconds >= 0 else { return nil }
-        return "\(ModelDownloadQueueItem.durationText(etaSeconds)) left"
+        return copy.settings.left(ModelDownloadQueueItem.durationText(etaSeconds, copy: copy))
     }
 
     static func byteText(_ bytes: UInt64) -> String {
@@ -92,16 +98,22 @@ public struct ModelDownloadQueueItem: Identifiable, Equatable, Sendable {
     /// Deliberately coarse: a download ETA that ticks "4 min 58 sec" reads as
     /// precision the estimate does not have.
     static func durationText(_ seconds: Double) -> String {
+        durationText(seconds, copy: .english)
+    }
+
+    static func durationText(_ seconds: Double, copy: AfterRayCopy) -> String {
         let total = Int(seconds.rounded())
-        if total < 10 { return "a few seconds" }
-        if total < 60 { return "\(total) sec" }
+        if total < 10 { return copy.settings.aFewSeconds }
+        if total < 60 { return copy.settings.seconds(total) }
         if total < 3600 {
             let minutes = Int((Double(total) / 60).rounded())
-            return minutes <= 1 ? "about a minute" : "\(minutes) min"
+            return minutes <= 1 ? copy.settings.aboutAMinute : copy.settings.minutesLeft(minutes)
         }
         let hours = total / 3600
         let minutes = (total % 3600) / 60
-        return minutes == 0 ? "\(hours) hr" : "\(hours) hr \(minutes) min"
+        return minutes == 0
+            ? copy.settings.hoursShort(hours)
+            : copy.settings.hoursAndMinutes(hours, minutes)
     }
 }
 

@@ -8,6 +8,7 @@ struct AfterRayVisualLabApp: App {
         WindowGroup("AfterRay Visual Lab") {
             VisualLabView()
                 .frame(minWidth: 1_080, minHeight: 680)
+                .onAppear { AfterRayLocalization.shared.bootstrapFromSystem() }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1_320, height: 820)

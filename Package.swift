@@ -46,7 +46,11 @@ let package = Package(
             dependencies: [
                 .product(name: "MarkdownUI", package: "swift-markdown-ui"),
             ],
-            path: "swift/AfterRayRecall/Sources"
+            path: "swift/AfterRayRecall/Sources",
+            exclude: [
+                "L10n/AGENTS.md",
+                "L10n/CLAUDE.md",
+            ]
         ),
         .target(
             name: "AfterRayMockData",

@@ -107,7 +107,9 @@ public final class AfterRayControlModel: ObservableObject {
             let hits = try await daemon.search(query: query, limit: 60)
             guard sensitiveGeneration == requestGeneration else { return nil }
             searchSession = RecallSearchSession.make(query: query, hits: hits)
-            message = searchSession == nil ? "No moments matched “\(query)”." : nil
+            message = searchSession == nil
+                ? AfterRayLocalization.shared.copy.recall.noMomentsMatched(query)
+                : nil
             return searchSession?.selectedFrame
         } catch {
             guard sensitiveGeneration == requestGeneration else { return nil }

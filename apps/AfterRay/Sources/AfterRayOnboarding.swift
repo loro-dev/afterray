@@ -53,10 +53,12 @@ final class OnboardingController: ObservableObject {
                 message: { exclusions.message }
             ),
             cliActions: AfterRayOnboardingCliActions(
-                status: { AfterRayCliInstall.statusSummary },
+                status: {
+                    AfterRayCliInstall.statusSummary(copy: AfterRayLocalization.shared.copy)
+                },
                 isInstalled: { AfterRayCliInstall.isInstalled },
                 install: {
-                    _ = try AfterRayCliInstall.install()
+                    _ = try AfterRayCliInstall.install(copy: AfterRayLocalization.shared.copy)
                 },
                 pathExportLine: { AfterRayCliInstall.pathExportLine() }
             ),

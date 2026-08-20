@@ -165,9 +165,9 @@ final class HistoryRowHeightCache: @unchecked Sendable {
 /// have been paged into the scroller. Missing or zero hides the caption
 /// rather than guessing from the loaded page.
 enum HistoryDayCount {
-    static func label(totalDays: Int?) -> String {
+    static func label(totalDays: Int?, copy: AfterRayCopy = .english) -> String {
         guard let totalDays, totalDays > 0 else { return "" }
-        return totalDays == 1 ? "1 day" : "\(totalDays) days"
+        return copy.recall.dayCount(totalDays)
     }
 }
 
@@ -176,14 +176,18 @@ enum HistoryListItems {
         summaries: [DaySummary],
         nowMs: Int64,
         expandedSlotStarts: Set<Int64>,
-        hasMore: Bool
+        hasMore: Bool,
+        copy: AfterRayCopy = .english,
+        locale: Locale = Locale(identifier: "en")
     ) -> [HistoryListItem] {
         var items: [HistoryListItem] = []
         items.reserveCapacity(summaries.reduce(0) { $0 + $1.slots.count + 1 } + 1)
         for summary in summaries {
             let heading = DaySummaryLayout.dateHeading(
                 dayStartMs: summary.dayStartMs,
-                nowMs: nowMs
+                nowMs: nowMs,
+                copy: copy,
+                locale: locale
             )
             items.append(
                 .heading(

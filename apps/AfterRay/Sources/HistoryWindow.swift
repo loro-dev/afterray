@@ -86,7 +86,7 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "AfterRay History"
+        window.title = AfterRayLocalization.shared.copy.menu.historyWindow
         window.minSize = NSSize(width: 360, height: 320)
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true

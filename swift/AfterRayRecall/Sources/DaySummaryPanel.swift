@@ -37,6 +37,8 @@ private enum DaySummaryMetrics {
 /// nothing it draws has changed is the difference between a scrub that drops
 /// frames and one that does not.
 public struct DaySummaryPanel: View {
+    @Environment(\.afterRayCopy) private var copy
+    @Environment(\.afterRayLocale) private var afterRayLocale
     var style: DaySummaryPanelStyle = .overlay
     var onPopOut: (() -> Void)? = nil
     let summaries: [DaySummary]
@@ -100,6 +102,8 @@ public struct DaySummaryPanel: View {
     /// hands SwiftUI an `EquatableView`, which a test cannot look inside.
     var content: DaySummaryPanelContent {
         DaySummaryPanelContent(
+            copy: copy,
+            locale: afterRayLocale,
             style: style,
             onPopOut: onPopOut,
             summaries: summaries,
@@ -127,6 +131,11 @@ public struct DaySummaryPanel: View {
 // Internal, not private, so `DaySummaryPanelScrubTests` can assert the
 // equality that the whole optimisation rests on.
 struct DaySummaryPanelContent: View, Equatable {
+    /// Handed down rather than read from the environment, because this view is
+    /// `.equatable()`: the language has to be able to make it unequal, or
+    /// switching it would leave the panel in the old one.
+    let copy: AfterRayCopy
+    let locale: Locale
     @State private var expandedSlotStarts: Set<Int64> = []
     @State private var followedSlot: Int64?
     @State private var followGeneration = 0
@@ -144,7 +153,8 @@ struct DaySummaryPanelContent: View, Equatable {
     let onLoadMore: () -> Void
 
     static func == (lhs: DaySummaryPanelContent, rhs: DaySummaryPanelContent) -> Bool {
-        lhs.highlightedSlotStart == rhs.highlightedSlotStart
+        lhs.locale == rhs.locale
+            && lhs.highlightedSlotStart == rhs.highlightedSlotStart
             && lhs.followPulse == rhs.followPulse
             && lhs.isLoadingMore == rhs.isLoadingMore
             && lhs.hasMore == rhs.hasMore
@@ -157,7 +167,7 @@ struct DaySummaryPanelContent: View, Equatable {
 
 
     private var dayCountLabel: String {
-        HistoryDayCount.label(totalDays: totalDays)
+        HistoryDayCount.label(totalDays: totalDays, copy: copy)
     }
 
     public var body: some View {
@@ -175,7 +185,7 @@ struct DaySummaryPanelContent: View, Equatable {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text("Summaries")
+            Text(copy.compute.summaries)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
             Spacer(minLength: 8)
@@ -196,14 +206,14 @@ struct DaySummaryPanelContent: View, Equatable {
                         )
                 }
                 .buttonStyle(RecallGlassPressStyle())
-                .help("Open as a window")
+                .help(copy.recall.openAsWindow)
             }
         }
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, 8)
         .contextMenu {
-            Button("Copy All Loaded Days") {
+            Button(copy.recall.copyAllLoadedDays) {
                 copyToPasteboard(DaySummaryClipboard.historyText(summaries))
             }
         }
@@ -211,10 +221,10 @@ struct DaySummaryPanelContent: View, Equatable {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Nothing recorded yet.")
+            Text(copy.recall.nothingRecorded)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white.opacity(0.74))
-            Text("Your past days will appear here as AfterRay captures them.")
+            Text(copy.recall.pastDaysWillAppear)
                 .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.42))
                 .fixedSize(horizontal: false, vertical: true)
@@ -228,7 +238,9 @@ struct DaySummaryPanelContent: View, Equatable {
             summaries: summaries,
             nowMs: todayStartMs,
             expandedSlotStarts: expandedSlotStarts,
-            hasMore: hasMore
+            hasMore: hasMore,
+            copy: copy,
+            locale: locale
         )
     }
 
@@ -346,6 +358,7 @@ struct DaySummaryPanelContent: View, Equatable {
 
 
 private struct DaySummaryHeadingRow: View {
+    @Environment(\.afterRayCopy) private var copy
     let dayStartMs: Int64
     let label: String
     let isToday: Bool
@@ -361,12 +374,13 @@ private struct DaySummaryHeadingRow: View {
             .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contextMenu {
-                Button("Copy This Day", action: onCopyDay)
+                Button(copy.recall.copyThisDay, action: onCopyDay)
             }
     }
 }
 
 private struct DaySummaryRow: View, Equatable {
+    @Environment(\.afterRayCopy) private var copy
     let slot: DaySlotSummary
     let isCurrent: Bool
     let isExpanded: Bool
@@ -394,7 +408,7 @@ private struct DaySummaryRow: View, Equatable {
         // `text.primary`, `text.detail` and `text.badge` each re-derived the
         // whole thing, and `sections` re-parsed the card's Markdown — on every
         // body pass, which is every scroll frame and every playhead tick.
-        let text = DaySummaryLayout.rowText(slot: slot)
+        let text = DaySummaryLayout.rowText(slot: slot, copy: copy)
         let hasDetail = DaySummaryLayout.hasExpandableDetail(slot: slot)
 
         // Not a button: the prose is content to read, select and copy. The
@@ -413,7 +427,7 @@ private struct DaySummaryRow: View, Equatable {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Open this slot in the timeline")
+            .help(copy.recall.openThisSlot)
             .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -437,7 +451,7 @@ private struct DaySummaryRow: View, Equatable {
 
                 if hasDetail {
                     Button(action: onToggleDetails) {
-                        Text(isExpanded ? "Hide details" : "Full details")
+                        Text(isExpanded ? copy.recall.hideDetails : copy.recall.fullDetails)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.white.opacity(0.48))
                             .underline()
@@ -469,7 +483,7 @@ private struct DaySummaryRow: View, Equatable {
                     Text(badge)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(
-                            badge == "Summary failed"
+                            badge == copy.format.summaryFailed
                                 ? RecallPalette.ray.opacity(0.85)
                                 : .white.opacity(0.35)
                         )
@@ -499,7 +513,7 @@ private struct DaySummaryRow: View, Equatable {
         }
         .onHover { isHovering = $0 }
         .contextMenu {
-            Button("Copy This Slot") {
+            Button(copy.recall.copyThisSlot) {
                 copyToPasteboard(DaySummaryClipboard.slotText(slot))
             }
         }
@@ -520,9 +534,9 @@ private struct DaySummaryRow: View, Equatable {
         .accessibilityLabel(Text("\(text.time), \(text.primary)"))
         .accessibilityValue(Text(text.detail.joined(separator: ". ")))
         .accessibilityAddTraits(isCurrent ? [.isSelected] : [])
-        .accessibilityAction(named: "Open in timeline", onSelect)
+        .accessibilityAction(named: copy.recall.openThisSlot, onSelect)
         .accessibilityAction(
-            named: isExpanded ? "Hide details" : "Show full details",
+            named: isExpanded ? copy.recall.hideDetails : copy.recall.fullDetails,
             onToggleDetails
         )
     }
@@ -563,6 +577,7 @@ private struct DaySummaryPanelChrome: ViewModifier {
 }
 
 private struct HistorySummaryLoadTrigger: View {
+    @Environment(\.afterRayCopy) private var copy
     let isLoading: Bool
 
     var body: some View {
@@ -577,7 +592,7 @@ private struct HistorySummaryLoadTrigger: View {
                 Color.clear.frame(height: 1)
             }
         }
-        .accessibilityLabel(isLoading ? "Loading older summaries" : "Load older summaries")
+        .accessibilityLabel(isLoading ? copy.recall.loadingOlderSummaries : copy.recall.loadOlderSummaries)
     }
 }
 
@@ -585,6 +600,7 @@ private struct HistorySummaryLoadTrigger: View {
 /// icon cannot resolve (uninstalled since capture) collapses to nothing —
 /// an empty placeholder square only says "something failed here".
 private struct SlotAppIconStrip: View {
+    @Environment(\.afterRayCopy) private var copy
     let apps: [DayAppFact]
 
     var body: some View {
@@ -598,7 +614,7 @@ private struct SlotAppIconStrip: View {
                     .foregroundStyle(.white.opacity(0.35))
             }
         }
-        .accessibilityLabel("Apps used: \(apps.map(\.name).joined(separator: ", "))")
+        .accessibilityLabel(copy.recall.appsUsed(apps.map(\.name).joined(separator: ", ")))
     }
 }
 

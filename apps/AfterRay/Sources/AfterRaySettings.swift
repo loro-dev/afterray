@@ -73,7 +73,7 @@ final class AfterRaySettingsController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "AfterRay Settings"
+        window.title = AfterRayLocalization.shared.copy.menu.settingsWindow
         window.minSize = NSSize(width: 820, height: 520)
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true
@@ -138,7 +138,9 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var draftLlmApiKey = ""
     @Published var isInstallingCli = false
     @Published var isUpdatingCliEvidence = false
-    @Published private(set) var cliStatus = AfterRayCliInstall.statusSummary
+    @Published private(set) var cliStatus = AfterRayCliInstall.statusSummary(
+        copy: AfterRayLocalization.shared.copy
+    )
     @Published private(set) var cliInstalled = AfterRayCliInstall.isInstalled
     @Published private(set) var developerOptionsUnlocked = UserDefaults.standard.bool(
         forKey: AfterRayPreferences.developerOptionsUnlockedKey
@@ -151,6 +153,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     )
     private var modelDownloadMonitor: Task<Void, Never>?
     private var downloadRateSample: (packID: String, bytes: UInt64, at: Date)?
+    private var copy: AfterRayCopy { AfterRayLocalization.shared.copy }
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
     var excludedBundleIds: [String] {
@@ -200,6 +203,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             recentJobs = Array(loaded.2.suffix(8).reversed())
             applyLlmDrafts(from: loaded.0)
             AfterRayPreferences.recordAudio = loaded.0.recordAudio
+            AfterRayLocalization.shared.apply(stored: loaded.0.uiLanguage)
             storage = AfterRayStorageSnapshot.measure(
                 dataDirectory: URL(fileURLWithPath: loaded.0.dataDir, isDirectory: true),
                 modelDirectory: URL(fileURLWithPath: loaded.0.modelDir, isDirectory: true),
@@ -229,8 +233,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 cliEvidenceAccess: enabled
             )
             message = enabled
-                ? "CLI agents can read original evidence for 30 minutes."
-                : "CLI original evidence is off."
+                ? copy.settings.evidenceOnFor30Minutes
+                : copy.settings.evidenceOffToast
         } catch {
             message = error.localizedDescription
         }
@@ -243,17 +247,17 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             refreshCliStatus()
         }
         do {
-            let destination = try AfterRayCliInstall.install()
+            let destination = try AfterRayCliInstall.install(copy: copy)
             message = AfterRayCliInstall.isOnPath
-                ? "Installed afterray at \(destination.path)."
-                : "Installed afterray at \(destination.path). Add ~/.local/bin to your PATH."
+                ? copy.settings.cliInstalledOnPath(destination.path)
+                : copy.settings.cliInstalledNeedPath(destination.path)
         } catch {
             message = error.localizedDescription
         }
     }
 
     private func refreshCliStatus() {
-        cliStatus = AfterRayCliInstall.statusSummary
+        cliStatus = AfterRayCliInstall.statusSummary(copy: copy)
         cliInstalled = AfterRayCliInstall.isInstalled
     }
 
@@ -263,12 +267,12 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
 
     var updateStatus: String {
         if let staged = AfterRayUpdater.shared.stagedVersion {
-            return "Version \(staged) is downloaded and installs when you quit AfterRay."
+            return copy.settings.updateReadyOnQuit(staged)
         }
         let build = AfterRayUpdater.hostDescription
         return AfterRayUpdater.shared.automaticallyChecksForUpdates
-            ? "You are on \(build). AfterRay checks once a day."
-            : "You are on \(build). Automatic checks are off."
+            ? copy.settings.onVersionChecking(build)
+            : copy.settings.onVersionChecksOff(build)
     }
 
     func setAutomaticUpdates(_ enabled: Bool) {
@@ -284,7 +288,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         guard !developerOptionsUnlocked else { return }
         developerOptionsUnlocked = true
         UserDefaults.standard.set(true, forKey: AfterRayPreferences.developerOptionsUnlockedKey)
-        message = "Developer options unlocked."
+        message = copy.settings.developerUnlocked
     }
 
     func setDeveloperOptionsEnabled(_ enabled: Bool) {
@@ -320,7 +324,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
 
     func includeBundle(_ bundleID: String) async {
         guard settings?.protectedBundleIds.contains(bundleID) != true else {
-            message = "Password managers and system credential apps are always excluded."
+            message = copy.settings.passwordManagersAlwaysExcluded
             return
         }
         await saveExclusions(excludedBundleIds.filter { $0 != bundleID }, message: "Included \(bundleID) again.")
@@ -371,15 +375,15 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        panel.prompt = "Exclude"
-        panel.message = "Choose an app AfterRay should never record."
+        panel.prompt = copy.common.exclude
+        panel.message = copy.settings.chooseAppNeverRecord
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard let bundleID = Bundle(url: url)?.bundleIdentifier else {
-            message = "Could not read that app's identifier."
+            message = copy.settings.couldNotReadAppIdentifier
             return
         }
         guard bundleID != "dev.afterray.app" else {
-            message = "AfterRay does not record its own window."
+            message = copy.settings.doesNotRecordOwnWindow
             return
         }
         await excludeBundle(bundleID)
@@ -392,7 +396,9 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             let result = try await UnixSocketDaemonClient(
                 socketPath: DaemonSupervisor.shared.socketPath
             ).clearHistory(scope: scope)
-            message = "Deleted \(result.deleted) moment\(result.deleted == 1 ? "" : "s")."
+            message = result.deleted == 1
+                ? copy.settings.deletedOneMoment
+                : copy.settings.deletedMoments(result.deleted)
         } catch {
             message = error.localizedDescription
         }
@@ -437,8 +443,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 llmApiKey: nil
             )
             message = enabled
-                ? "Audio recording is on."
-                : "Audio recording is off. Existing recordings stay in your vault."
+                ? AfterRayLocalization.shared.copy.settings.audioOn
+                : AfterRayLocalization.shared.copy.settings.audioOff
         } catch {
             AfterRayPreferences.recordAudio = !enabled
             message = error.localizedDescription
@@ -469,9 +475,10 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 summaryLanguage: summaryLanguage
             )
             if let uiLanguage {
-                message = "Interface language set to \(languageLabel(uiLanguage))."
+                AfterRayLocalization.shared.apply(stored: uiLanguage)
+                message = AfterRayLocalization.shared.copy.settings.interfaceSet(languageLabel(uiLanguage))
             } else if let summaryLanguage {
-                message = "Summary language set to \(languageLabel(summaryLanguage))."
+                message = AfterRayLocalization.shared.copy.settings.summarySet(languageLabel(summaryLanguage))
             }
         } catch {
             message = error.localizedDescription
@@ -479,7 +486,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     private func languageLabel(_ code: String) -> String {
-        settings?.languageOptions.first { $0.code == code }?.menuTitle ?? code
+        let copy = AfterRayLocalization.shared.copy
+        return settings?.languageOptions.first { $0.code == code }?.menuTitle(copy) ?? code
     }
 
     func setStorageLimitBytes(_ bytes: UInt64) async {
@@ -500,7 +508,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
                 runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
             )
-            message = "Memory limit set to \(AfterRayStorageSnapshot.byteCount(bytes))."
+            message = copy.settings.memoryLimitSet(AfterRayStorageSnapshot.byteCount(bytes))
         } catch {
             message = error.localizedDescription
         }
@@ -519,7 +527,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 excludedDomains: nil,
                 summarySlotMinutes: minutes
             )
-            message = "New summaries will cover \(AppSettings.summaryLengthLabel(minutes))."
+            message = copy.settings.newSummariesCover(AppSettings.summaryLengthLabel(minutes, copy: copy))
         } catch {
             message = error.localizedDescription
         }
@@ -549,8 +557,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             applyDownloadState(next.download)
             if next.download == nil {
                 message = packID == nil
-                    ? "All model packs are ready."
-                    : "\(displayName(for: packID)) is ready."
+                    ? copy.settings.allPacksInstalled
+                    : copy.settings.packReady(displayName(for: packID))
             } else {
                 AfterRayLog.info("queued \(packID ?? "missing model") download", source: "download")
                 startDownloadMonitor()
@@ -584,7 +592,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         await controlModelDownloads { try await $0.cancelModelDownload(packID: packID) }
         // Cancelling the last item leaves nothing to poll for.
         if library?.download == nil { pauseDownloadMonitoring() }
-        if message == nil { message = "Cancelled the \(name) download." }
+        if message == nil { message = copy.settings.cancelledDownload(name) }
     }
 
     func updateModelDownloadEndpoint(_ endpoint: String) async {
@@ -594,8 +602,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             ).updateModelDownloadEndpoint(endpoint)
             let applied = settings?.modelDownloadEndpoint ?? ""
             message = applied.isEmpty
-                ? "Model downloads use huggingface.co."
-                : "Model downloads use \(applied)."
+                ? copy.settings.downloadsUseOfficial
+                : copy.settings.downloadsUseEndpoint(applied)
         } catch {
             message = error.localizedDescription
         }
@@ -626,7 +634,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             library = try await UnixSocketDaemonClient(
                 socketPath: DaemonSupervisor.shared.socketPath
             ).removeModel(packID: packID)
-            message = "Removed \(displayName(for: packID))."
+            message = copy.settings.removedPack(displayName(for: packID))
             storage = AfterRayStorageSnapshot.measure(
                 dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
                 modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
@@ -688,7 +696,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             )
             draftLlmApiKey = ""
             applyLlmDrafts(from: settings)
-            message = "Assistant connection saved."
+            message = copy.settings.assistantConnectionSaved
             await probeLlm()
         } catch {
             message = error.localizedDescription
@@ -760,11 +768,11 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     private func assistantSourceMessage(_ provider: LlmProvider) -> String {
         switch provider {
         case .mlxLocal:
-            "Ask will use the selected Qwen3.5 MLX model through AfterRay's signed worker."
+            copy.settings.askUsesMlx
         case .ollama:
-            "Ask will use a local Ollama model."
+            copy.settings.askUsesOllama
         case .openaiCompatible:
-            "Ask will use the OpenAI-compatible endpoint you configure."
+            copy.settings.askUsesOpenAI
         }
     }
 
@@ -828,7 +836,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                     library = next
                     applyDownloadState(next.download)
                     if wasActive, next.download == nil {
-                        message = "Model downloads finished."
+                        message = copy.settings.modelDownloadsFinished
                         storage = AfterRayStorageSnapshot.measure(
                             dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
                             modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),

@@ -279,6 +279,11 @@ install -m 0644 "$source_plist" "$app_bundle/Contents/Info.plist"
 "$plist_buddy" -c "Set :CFBundleVersion $build_number" "$app_bundle/Contents/Info.plist"
 install -m 0644 "$repo_root/apps/AfterRay/Resources/AppIcon.icns" \
   "$app_bundle/Contents/Resources/AppIcon.icns"
+for loc in en zh-Hans zh-Hant ja ko es de fr; do
+  mkdir -p "$app_bundle/Contents/Resources/${loc}.lproj"
+  install -m 0644 "$repo_root/apps/AfterRay/Resources/${loc}.lproj/InfoPlist.strings" \
+    "$app_bundle/Contents/Resources/${loc}.lproj/InfoPlist.strings"
+done
 install -m 0644 "$repo_root/LICENSES/Qwen3.5-4B-MLX-4bit-NOTICE.txt" \
   "$app_bundle/Contents/Resources/Qwen3.5-4B-MLX-4bit-NOTICE.txt"
 install -m 0755 "$app_bin" "$app_bundle/Contents/MacOS/AfterRay"

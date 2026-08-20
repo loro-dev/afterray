@@ -129,7 +129,8 @@ public enum ChatConversationGrouping {
     public static func days(
         _ conversations: [ChatConversation],
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> [ChatDayGroup] {
         let sorted = conversations.sorted { lhs, rhs in
             if lhs.createdAtMs != rhs.createdAtMs {
@@ -153,7 +154,12 @@ public enum ChatConversationGrouping {
                 groups.append(
                     ChatDayGroup(
                         id: start,
-                        label: ChatTimeLabel.dayHeading(ms: start, now: now, calendar: calendar),
+                        label: ChatTimeLabel.dayHeading(
+                            ms: start,
+                            now: now,
+                            calendar: calendar,
+                            copy: copy
+                        ),
                         conversations: [conversation]
                     )
                 )
@@ -541,8 +547,10 @@ public struct ChatProgress: Equatable, Sendable {
         self.round = round
     }
 
-    public var title: String {
-        phase == .thinking ? "Thinking" : "Working"
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
+        phase == .thinking ? copy.chat.thinking : copy.chat.working
     }
 
     /// Elapsed time is honest and readable. `reasoningDeltas` is transport
@@ -590,14 +598,18 @@ public struct ChatCompactionNotice: Equatable, Identifiable, Sendable {
     /// The line drawn across the thread. It says what went and that it is
     /// recoverable — a shorter answer with no explanation just reads as the
     /// assistant getting worse.
-    public var summary: String {
-        let noun = droppedResults == 1 ? "lookup" : "lookups"
+    public var summary: String { summary(.english) }
+
+    public func summary(_ copy: AfterRayCopy) -> String {
         // Deliberately short: this is a rule across the thread, and a line that
         // wraps stops reading as a divider and starts reading as a message.
         let counts = tokensBefore > 0
             ? " · \(ChatContextUsage.compact(tokensBefore)) → \(ChatContextUsage.compact(tokensAfter))"
             : ""
-        return "Dropped \(droppedResults) earlier \(noun)\(counts)"
+        let lead = droppedResults == 1
+            ? copy.chat.droppedOneLookup
+            : copy.chat.droppedLookups(droppedResults)
+        return "\(lead)\(counts)"
     }
 }
 
@@ -1065,52 +1077,60 @@ public enum ChatToolLog {
 public enum ChatToolSummary {
     public static func headline(
         _ call: ChatToolCall,
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> String {
         let args = call.args
         switch call.name {
         case "get_slot_card":
             if let at = int64Value(args["at_ms"]) {
-                return "Looked up \(ChatTimeLabel.slotRange(atMs: at, calendar: calendar))"
+                return copy.chat.lookedUpSlot(ChatTimeLabel.slotRange(atMs: at, calendar: calendar))
             }
-            return "Looked up a half-hour card"
+            return copy.chat.lookedUpHalfHour
         case "list_moments":
             if let range = windowLabel(args, calendar: calendar) {
-                return "Browsed moments from \(range)"
+                return copy.chat.browsedMomentsFrom(range)
             }
-            return "Browsed the timeline"
+            return copy.chat.browsedTimeline
         case "get_transcript":
             if let range = windowLabel(args, calendar: calendar) {
-                return "Read the transcript from \(range)"
+                return copy.chat.readTranscriptFrom(range)
             }
-            return "Read a transcript"
+            return copy.chat.readATranscript
         case "list_activity":
             if let range = windowLabel(args, calendar: calendar) {
-                return "Checked activity from \(range)"
+                return copy.chat.checkedActivityFrom(range)
             }
-            return "Checked activity"
+            return copy.chat.checkedActivity
         case "list_memories":
-            return "Read saved memories"
+            return copy.chat.readSavedMemories
         case "search_evidence":
             if let query = args["query"] as? String, !query.isEmpty {
-                return "Searched “\(query)”"
+                return copy.chat.searchedQuery(query)
             }
-            return "Searched the vault"
+            return copy.chat.searchedVault
         case "get_moment":
-            return "Opened a moment"
+            return copy.chat.openedMoment
         case "get_ocr":
-            return "Read on-screen text"
+            return copy.chat.readOnScreenText
         case "get_ax_digest", "get_ax_tree":
-            return "Read the interface tree"
+            return copy.chat.readInterfaceTree
         default:
-            return "Called \(call.name)"
+            return copy.chat.calledTool(call.name)
         }
     }
 
-    public static func collapsed(_ tools: [ChatToolCall], calendar: Calendar = .current) -> String {
-        guard let first = tools.first else { return "Looked something up" }
-        if tools.count == 1 { return headline(first, calendar: calendar) }
-        return "\(headline(first, calendar: calendar)) · \(tools.count - 1) more"
+    public static func collapsed(
+        _ tools: [ChatToolCall],
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
+    ) -> String {
+        guard let first = tools.first else { return copy.chat.lookedSomethingUp }
+        if tools.count == 1 { return headline(first, calendar: calendar, copy: copy) }
+        return copy.chat.headlineAndMore(
+            headline(first, calendar: calendar, copy: copy),
+            tools.count - 1
+        )
     }
 
     private static func windowLabel(_ args: [String: Any], calendar: Calendar) -> String? {
@@ -1488,14 +1508,15 @@ public enum ChatTimeLabel {
     public static func dayHeading(
         ms: Int64,
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
-        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
+        if calendar.isDate(date, inSameDayAs: now) { return copy.format.today }
         if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
            calendar.isDate(date, inSameDayAs: yesterday)
         {
-            return "Yesterday"
+            return copy.format.yesterday
         }
         let formatter = DateFormatter()
         formatter.calendar = calendar
@@ -1509,7 +1530,8 @@ public enum ChatTimeLabel {
     public static func listTimestamp(
         ms: Int64,
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        copy: AfterRayCopy = .english
     ) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
         if calendar.isDate(date, inSameDayAs: now) {
@@ -1518,7 +1540,7 @@ public enum ChatTimeLabel {
         if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
            calendar.isDate(date, inSameDayAs: yesterday)
         {
-            return "Yesterday"
+            return copy.format.yesterday
         }
         let year = calendar.component(.year, from: date)
         let nowYear = calendar.component(.year, from: now)

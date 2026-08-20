@@ -123,7 +123,10 @@ final class ChatHostingViewTests: XCTestCase {
             toolbar.items.first { $0.itemIdentifier == .chatMore } as? NSMenuToolbarItem
         )
         XCTAssertFalse(more.showsIndicator)
-        XCTAssertEqual(more.menu.items.map(\.title), ["Copy Entire Conversation as Markdown"])
+        XCTAssertEqual(
+            more.menu.items.map(\.title),
+            [AfterRayCopy.english.chat.copyEntire]
+        )
         XCTAssertGreaterThanOrEqual(titleView.fittingSize.width, 180)
         XCTAssertGreaterThanOrEqual(titleView.fittingSize.height, 28)
 

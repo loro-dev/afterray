@@ -158,7 +158,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             // is a beat behind.
         } catch {
             conversations = []
-            statusMessage = Self.disconnectedNote(from: error)
+            statusMessage = Self.disconnectedNote(from: error, copy: AfterRayLocalization.shared.copy)
             errorMessage = error.localizedDescription
         }
         await refreshChatModels()
@@ -261,7 +261,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
-            statusMessage = Self.disconnectedNote(from: error)
+            statusMessage = Self.disconnectedNote(from: error, copy: AfterRayLocalization.shared.copy)
         }
     }
 
@@ -389,7 +389,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             statusMessage = nil
         } catch {
             errorMessage = error.localizedDescription
-            statusMessage = Self.disconnectedNote(from: error)
+            statusMessage = Self.disconnectedNote(from: error, copy: AfterRayLocalization.shared.copy)
         }
     }
 
@@ -549,19 +549,19 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
-            statusMessage = Self.disconnectedNote(from: error)
+            statusMessage = Self.disconnectedNote(from: error, copy: AfterRayLocalization.shared.copy)
         }
     }
 
-    static func disconnectedNote(from error: Error) -> String {
+    static func disconnectedNote(from error: Error, copy: AfterRayCopy = .english) -> String {
         if let daemon = error as? DaemonClientError {
             switch daemon {
             case .connection, .rejected, .protocolMismatch:
-                return "Chat is wired, but afterrayd is not serving it yet."
+                return copy.chat.notServingYet
             default:
                 break
             }
         }
-        return "Could not reach the AfterRay daemon."
+        return copy.chat.couldNotReachDaemon
     }
 }

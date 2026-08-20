@@ -38,6 +38,9 @@ enum ChatPalette {
 
 public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     @ObservedObject var model: Model
+    @ObservedObject private var localization = AfterRayLocalization.shared
+
+    private var copy: AfterRayCopy { localization.copy }
     var onClose: () -> Void
     var onOpenMoment: ((String) -> Void)?
     var thumbnailLoader: RecallThumbnailLoader?
@@ -121,6 +124,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
             return .systemAction
         })
+        .afterRayLocalized()
         .task { await model.refresh() }
         .animation(.easeOut(duration: 0.16), value: sidebarState.isCollapsed)
         .onChange(of: model.selectedID) { _, _ in
@@ -158,19 +162,19 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             if model.isLoadingList, model.conversations.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.mini).tint(ChatPalette.accent)
-                    Text("Loading…")
+                    Text(copy.chat.loading)
                         .font(.system(size: 12))
                         .foregroundStyle(ChatPalette.tertiary)
                 }
                 .padding(.horizontal, 6)
             } else if model.conversations.isEmpty {
-                Text("Past chats will show up here.")
+                Text(copy.chat.pastChats)
                     .font(.system(size: 12))
                     .foregroundStyle(ChatPalette.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 6)
             } else if conversationDays.isEmpty {
-                Text("No chats match.")
+                Text(copy.chat.noChatsMatch)
                     .font(.system(size: 12))
                     .foregroundStyle(ChatPalette.tertiary)
                     .padding(.horizontal, 6)
@@ -220,7 +224,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
             ChatIconButton(
                 symbol: "sidebar.left",
-                help: "Hide sidebar",
+                help: copy.chat.hideSidebar,
                 identifier: "chat-sidebar-toggle",
                 action: { sidebarState.isCollapsed = true }
             )
@@ -232,7 +236,8 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     /// Filter then group — each is one pass / one sort, not per row.
     private var conversationDays: [ChatDayGroup] {
         ChatConversationGrouping.days(
-            ChatConversationGrouping.matching(model.conversations, query: conversationQuery)
+            ChatConversationGrouping.matching(model.conversations, query: conversationQuery),
+            copy: copy
         )
     }
 
@@ -241,7 +246,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(ChatPalette.tertiary)
-            TextField("Search chats", text: $conversationQuery)
+            TextField(copy.chat.searchChats, text: $conversationQuery)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .foregroundStyle(ChatPalette.label)
@@ -254,7 +259,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                         .foregroundStyle(ChatPalette.tertiary)
                 }
                 .buttonStyle(.plain)
-                .help("Clear search")
+                .help(copy.chat.clearSearch)
             }
         }
         .padding(.horizontal, 8)
@@ -298,7 +303,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 if sidebarState.isCollapsed {
                     ChatIconButton(
                         symbol: "sidebar.left",
-                        help: "Show sidebar",
+                        help: copy.chat.showSidebar,
                         identifier: "chat-sidebar-toggle",
                         action: { sidebarState.isCollapsed = false }
                     )
@@ -309,13 +314,13 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 Spacer(minLength: 8)
                 ChatIconButton(
                     symbol: "plus",
-                    help: "New conversation",
+                    help: copy.chat.newConversation,
                     identifier: "chat-new-conversation",
                     action: model.startNew
                 )
                 ChatIconButton(
                     symbol: "ellipsis",
-                    help: "More",
+                    help: copy.chat.more,
                     identifier: "chat-more",
                     action: { moreMenuOpen.toggle() }
                 )
@@ -325,7 +330,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 if !fillsAvailableSpace {
                     ChatIconButton(
                         symbol: "xmark",
-                        help: "Close chat",
+                        help: copy.chat.closeChat,
                         identifier: "chat-close",
                         action: onClose
                     )
@@ -493,7 +498,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     }
 
     private var emptyState: some View {
-        Text("Ask anything AfterRay has already seen.")
+        Text(copy.chat.askAnything)
             .font(.system(size: 15, weight: .medium))
             .foregroundStyle(ChatPalette.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -567,7 +572,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .background(ChatPalette.accent, in: Circle())
             }
             .buttonStyle(ChatPressStyle())
-            .help("Stop generating")
+            .help(copy.chat.stopGenerating)
         } else {
             Button(action: model.send) {
                 Image(systemName: "arrow.up")
@@ -581,7 +586,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
             }
             .buttonStyle(ChatPressStyle())
             .disabled(!model.canSend)
-            .help("Send")
+            .help(copy.chat.send)
         }
     }
 
@@ -626,7 +631,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                 }
             )
         }
-        .help("Choose a model")
+        .help(copy.chat.chooseModel)
     }
 
     private var moreMenu: some View {
@@ -639,7 +644,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(conversationCopied ? ChatPalette.accent : ChatPalette.secondary)
                     .frame(width: 14)
-                Text(conversationCopied ? "Copied" : "Copy Entire Conversation as Markdown")
+                Text(conversationCopied ? copy.common.copied : copy.chat.copyEntire)
                     .font(.system(size: 12))
                     .foregroundStyle(ChatPalette.label)
                     .lineLimit(2)
@@ -651,7 +656,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
         }
         .buttonStyle(.plain)
         .disabled(!canCopyConversation)
-        .help("Copy this thread including thinking and tool results")
+        .help(copy.chat.copyThreadHelp)
         .padding(6)
         .frame(minWidth: 280)
         .background(.ultraThinMaterial)
@@ -798,6 +803,7 @@ private struct ChatCompactionRule: View {
 }
 
 private struct ChatConversationRow: View {
+    @Environment(\.afterRayCopy) private var copy
     let conversation: ChatConversation
     let isSelected: Bool
     let onSelect: () -> Void
@@ -825,7 +831,7 @@ private struct ChatConversationRow: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .help("删除该对话")
+                .help(copy.chat.deleteConversation)
                 .onHover { isHoveringTrash = $0 }
                 .opacity(isHovering ? 1 : 0)
                 .allowsHitTesting(isHovering)
@@ -840,7 +846,7 @@ private struct ChatConversationRow: View {
             isHovering = hovering
             if !hovering { isHoveringTrash = false }
         }
-        .help(isHoveringTrash ? "删除该对话" : conversation.title)
+        .help(isHoveringTrash ? copy.chat.deleteConversation : conversation.title)
     }
 
     private var rowFill: Color {
@@ -850,6 +856,7 @@ private struct ChatConversationRow: View {
 }
 
 private struct ChatContextRing: View {
+    @Environment(\.afterRayCopy) private var copy
     let usage: ChatContextUsage
     @State private var isHovering = false
     @State private var showDetails = false
@@ -888,7 +895,7 @@ private struct ChatContextRing: View {
         .onHover { isHovering = $0 }
         .popover(isPresented: $showDetails, arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Context window")
+                Text(copy.chat.contextWindow)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(ChatPalette.tertiary)
                 Text(usage.shortLabel.replacingOccurrences(of: " / ", with: "/"))
@@ -896,16 +903,16 @@ private struct ChatContextRing: View {
                     .monospacedDigit()
                     .foregroundStyle(ChatPalette.label)
                 VStack(alignment: .leading, spacing: 4) {
-                    detailRow("Used", ChatContextUsage.compact(usage.promptTokens))
-                    detailRow("Total", ChatContextUsage.compact(usage.windowTokens))
+                    detailRow(copy.chat.used, ChatContextUsage.compact(usage.promptTokens))
+                    detailRow(copy.chat.total, ChatContextUsage.compact(usage.windowTokens))
                 }
             }
             .padding(12)
             .frame(minWidth: 176, alignment: .leading)
         }
-        .help("Context used: \(usage.shortLabel)")
-        .accessibilityLabel("Context window")
-        .accessibilityValue("\(usage.percentLabel) used, \(usage.shortLabel)")
+        .help(copy.chat.contextUsed(usage.shortLabel))
+        .accessibilityLabel(copy.chat.contextWindow)
+        .accessibilityValue(copy.chat.contextUsedA11y(usage.percentLabel, usage.shortLabel))
         .accessibilityIdentifier("chat-context-ring")
     }
 
@@ -931,6 +938,7 @@ private struct ChatContextRing: View {
 }
 
 private struct ChatBubbleView: View {
+    @Environment(\.afterRayCopy) private var copy
     let bubble: ChatBubble
     let thumbnailLoader: RecallThumbnailLoader?
     let previewLoader: RecallChatPreviewLoader?
@@ -1040,7 +1048,7 @@ private struct ChatBubbleView: View {
                         // What is above is real, just not all of what was
                         // coming. Saying so stops a half answer reading as a
                         // confident short one.
-                        Text("Stopped — this is as far as it got.")
+                        Text(copy.chat.stopped)
                             .font(.system(size: 11))
                             .foregroundStyle(ChatPalette.tertiary)
                     }
@@ -1052,7 +1060,7 @@ private struct ChatBubbleView: View {
                                     .font(.system(size: 10.5, weight: .medium, design: .rounded))
                                     .monospacedDigit()
                                     .foregroundStyle(ChatPalette.tertiary)
-                                    .help("Wall time for this turn, including lookups")
+                                    .help(copy.chat.turnWallTimeHelp)
                                     .accessibilityIdentifier("chat-turn-elapsed-\(bubble.id)")
                             }
                             if let rate = bubble.tokensPerSecond {
@@ -1060,13 +1068,13 @@ private struct ChatBubbleView: View {
                                     .font(.system(size: 10.5, weight: .medium, design: .rounded))
                                     .monospacedDigit()
                                     .foregroundStyle(ChatPalette.tertiary)
-                                    .help("Estimated tokens per second for this turn")
+                                    .help(copy.chat.tokensPerSecondHelp)
                                     .accessibilityIdentifier("chat-tokens-per-second-\(bubble.id)")
                             }
                             if !bubble.isStreaming, !bubble.text.isEmpty {
                                 Button(action: copyOutput) {
                                     Label(
-                                        copied ? "Copied" : "Copy",
+                                        copied ? copy.common.copied : copy.common.copy,
                                         systemImage: copied ? "checkmark" : "doc.on.doc"
                                     )
                                     .font(.system(size: 10.5, weight: .medium))
@@ -1076,7 +1084,7 @@ private struct ChatBubbleView: View {
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .help(copied ? "Agent output copied" : "Copy agent output")
+                                .help(copied ? copy.chat.agentCopied : copy.chat.copyAgentOutput)
                                 .accessibilityIdentifier("chat-copy-output-\(bubble.id)")
                             }
                         }
@@ -1171,6 +1179,7 @@ private struct ChatWorkProcessCard<PartView: View>: View {
 /// One thought, in the place it arrived. Live text stays open; a finished
 /// thought folds so the next tool or thought can take the eye.
 private struct ChatReasoningChip: View {
+    @Environment(\.afterRayCopy) private var copy
     let text: String
     let isActive: Bool
     let progress: ChatProgress?
@@ -1213,15 +1222,16 @@ private struct ChatReasoningChip: View {
     private var label: String {
         if isActive {
             if let progress {
-                return "\(progress.title) · \(progress.detail)"
+                return "\(progress.title(copy)) · \(progress.detail)"
             }
-            return "Thinking"
+            return copy.chat.thinking
         }
-        return "Thought it through"
+        return copy.chat.thoughtItThrough
     }
 }
 
 private struct ChatToolChip: View {
+    @Environment(\.afterRayCopy) private var copy
     let tool: ChatToolCall
     @State private var expanded = false
 
@@ -1246,11 +1256,11 @@ private struct ChatToolChip: View {
             .padding(.top, 6)
         } label: {
             HStack(spacing: 5) {
-                Text(ChatToolSummary.headline(tool))
+                Text(ChatToolSummary.headline(tool, copy: copy))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(ChatPalette.tertiary)
                 if tool.truncated {
-                    Text("shortened")
+                    Text(copy.chat.shortened)
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundStyle(ChatPalette.coral.opacity(0.9))
                         .padding(.horizontal, 5)
@@ -1277,8 +1287,8 @@ private struct ChatToolChip: View {
     /// rather than the budget biting.
     private var resultNote: String {
         guard let chars = tool.resultChars else { return "" }
-        guard tool.truncated else { return "\(chars) characters back" }
-        return "\(chars) characters back · shortened to fit, ~\(tool.droppedTokens) tokens left out"
+        guard tool.truncated else { return copy.chat.charactersBack(chars) }
+        return copy.chat.charactersBackShortened(chars, tool.droppedTokens)
     }
 }
 
@@ -1320,6 +1330,7 @@ private struct ChatLeadingDisclosureStyle: DisclosureGroupStyle {
 /// answers "is it stuck". It is also the only half that survives into a
 /// screenshot or a snapshot test.
 private struct ChatWorkingIndicator: View {
+    @Environment(\.afterRayCopy) private var copy
     let progress: ChatProgress
     @State private var phase = 0.0
 
@@ -1333,7 +1344,7 @@ private struct ChatWorkingIndicator: View {
                         .opacity(opacity(index))
                 }
             }
-            Text(progress.title)
+            Text(progress.title(copy))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(ChatPalette.secondary)
             Text(progress.detail)
