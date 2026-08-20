@@ -161,18 +161,22 @@ final class AfterRayDataDirectoryTests: XCTestCase {
         // This is the deterministic crash point: the item moved, but the
         // process died before it could record completion or run `catch`.
 
-        var restoredLocation: AfterRayDataDirectory.Location?
         XCTAssertEqual(
-            try AfterRayDataDirectory.recoverInterruptedMigration(
+            try AfterRayDataDirectory.prepareInterruptedMigration(
                 manifestURL: manifestURL,
-                currentDataLocation: try AfterRayDataDirectory.location(for: source),
-                restoreSourceLocation: { restoredLocation = $0 }
+                currentDataLocation: try AfterRayDataDirectory.location(for: source)
             ),
-            .none
+            .restoreSourceLocation(try AfterRayDataDirectory.location(for: source))
         )
-        XCTAssertEqual(restoredLocation, try AfterRayDataDirectory.location(for: source))
         XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
+        // The filesystem phase must retain its journal until the main-actor
+        // preference phase has durably selected the restored source.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: manifestURL.path))
+        try AfterRayDataDirectory.completeSourceRecovery(
+            manifestURL: manifestURL,
+            sourceLocation: try AfterRayDataDirectory.location(for: source)
+        )
         XCTAssertFalse(FileManager.default.fileExists(atPath: manifestURL.path))
     }
 
@@ -234,22 +238,24 @@ final class AfterRayDataDirectoryTests: XCTestCase {
         AfterRayPreferences.memoryDataLocation = mixedLocation
 
         XCTAssertEqual(
-            try AfterRayDataDirectory.recoverInterruptedMigration(
+            try AfterRayDataDirectory.prepareInterruptedMigration(
                 manifestURL: manifestURL,
-                currentDataLocation: mixedLocation,
-                restoreSourceLocation: { sourceLocation in
-                    AfterRayPreferences.memoryDataLocation = sourceLocation
-                    guard AfterRayPreferences.canonicalMemoryDataLocation == sourceLocation else {
-                        throw AfterRayDataDirectory.Error.recoveryRequired("test preference write failed")
-                    }
-                }
+                currentDataLocation: mixedLocation
             ),
-            .none
+            .restoreSourceLocation(sourceLocation)
         )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: manifestURL.path))
+        // This is the main-actor phase used by DaemonSupervisor. It must run
+        // after the background rollback and before the journal can be removed.
+        AfterRayPreferences.memoryDataLocation = sourceLocation
         XCTAssertEqual(AfterRayPreferences.canonicalMemoryDataLocation, sourceLocation)
         XCTAssertEqual(DaemonSupervisor.shared.dataDirectory, sourceLocation.url)
         XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
+        try AfterRayDataDirectory.completeSourceRecovery(
+            manifestURL: manifestURL,
+            sourceLocation: sourceLocation
+        )
         XCTAssertFalse(FileManager.default.fileExists(atPath: manifestURL.path))
     }
 
@@ -282,15 +288,16 @@ final class AfterRayDataDirectoryTests: XCTestCase {
         try journal.recordCompletion(move)
         try journal.markMoved()
 
-        XCTAssertThrowsError(
-            try AfterRayDataDirectory.recoverInterruptedMigration(
+        XCTAssertEqual(
+            try AfterRayDataDirectory.prepareInterruptedMigration(
                 manifestURL: manifestURL,
-                currentDataLocation: nil,
-                restoreSourceLocation: { _ in
-                    throw AfterRayDataDirectory.Error.recoveryRequired("injected preference write failure")
-                }
-            )
+                currentDataLocation: nil
+            ),
+            .restoreSourceLocation(sourceLocation)
         )
+        // Simulate a main-actor preference write failure by deliberately not
+        // running the completion phase. The rollback is complete, but the
+        // durable journal remains to force the next launch to retry safely.
         XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: manifestURL.path))

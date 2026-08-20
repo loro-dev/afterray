@@ -62,11 +62,13 @@ inaccessible item fails closed for manual recovery. A fully moved root selected
 by preferences retains the manifest until a newly started daemon responds to
 `status`; only then is the record removed.
 
-When recovery rolls an incomplete move back to the source root, it atomically
-persists the manifest's complete source Location before it removes the manifest
-or permits daemon startup. A failed preference restore retains the manifest and
-keeps capture stopped; startup always reloads the restored canonical value
-instead of using a location cached before recovery.
+Recovery has three ordered phases: the filesystem inspection/rollback and
+manifest reads run off the App main actor; the App then atomically persists and
+reads back the manifest's complete source Location on its main actor; a second
+background step confirms the restored files and removes the manifest. A failed
+preference restore or source-recovery cleanup retains the manifest and keeps
+capture stopped. Startup always reloads the restored canonical value instead of
+using a location cached before recovery.
 
 ## Alternatives considered
 

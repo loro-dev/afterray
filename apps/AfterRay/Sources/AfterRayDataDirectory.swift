@@ -56,8 +56,12 @@ enum AfterRayDataDirectory {
         }
     }
 
-    enum StartupRecovery: Equatable, Sendable {
+    /// The result of the background filesystem phase. The App must persist a
+    /// returned source location on its main actor before it can clear the
+    /// manifest or launch a daemon.
+    enum RecoveryPreparation: Equatable, Sendable {
         case none
+        case restoreSourceLocation(Location)
         /// The new root has every entry and preferences select it. The caller
         /// must clear the manifest only after the new daemon answers status.
         case clearAfterDaemonIsReachable
@@ -189,16 +193,16 @@ enum AfterRayDataDirectory {
         }
     }
 
-    /// Runs before daemon startup. An incomplete move is deterministically
-    /// returned to the source root; any inaccessible or ambiguous path state
-    /// fails closed. A completed move remains journaled until the new daemon
-    /// has proved it can open the selected root.
-    static func recoverInterruptedMigration(
+    // @dec:vault-location-relocation — docs/decisions/active/architecture/2026-08-20-vault-location-relocation.md
+    /// Runs the filesystem half of startup recovery. It may perform a large
+    /// cross-volume rollback, so callers must run it away from the App's main
+    /// actor. It deliberately leaves a rolled-back manifest in place: the App
+    /// must first prove that it atomically persisted `sourceLocation`.
+    static func prepareInterruptedMigration(
         manifestURL: URL,
         currentDataLocation: Location?,
-        restoreSourceLocation: (Location) throws -> Void,
         fileManager: FileManager = .default
-    ) throws -> StartupRecovery {
+    ) throws -> RecoveryPreparation {
         guard var manifest = try loadRecoveryManifest(at: manifestURL) else { return .none }
         try validateConfiguredVolume(
             volumeRoot: manifest.sourceVolumeRoot,
@@ -235,12 +239,32 @@ enum AfterRayDataDirectory {
             try requireSourceRestored(manifest, fileManager: fileManager)
         }
 
-        // The journal remains durable until the caller proves it atomically
-        // restored the complete source Location preference. Otherwise a stale
+        // The journal remains durable until the main-actor preference phase
+        // proves it restored the complete source Location. Otherwise a stale
         // destination path could start a new empty vault after rollback.
-        try restoreSourceLocation(manifest.sourceLocation)
+        return .restoreSourceLocation(manifest.sourceLocation)
+    }
+
+    /// Completes the filesystem half after the caller has atomically persisted
+    /// and read back `sourceLocation`. Keeping this separate makes a crash
+    /// between rollback and preference restore restart-safe: `.rolledBack`
+    /// remains in the manifest and startup retries the preference phase.
+    static func completeSourceRecovery(
+        manifestURL: URL,
+        sourceLocation: Location,
+        fileManager: FileManager = .default
+    ) throws {
+        guard let manifest = try loadRecoveryManifest(at: manifestURL) else {
+            throw Error.recoveryRequired("migration manifest disappeared before source recovery completed")
+        }
+        guard manifest.sourceLocation == sourceLocation else {
+            throw Error.recoveryRequired("source location changed while completing recovery")
+        }
+        guard case .rolledBack = manifest.phase else {
+            throw Error.recoveryRequired("source recovery was not rolled back before clearing its manifest")
+        }
+        try requireSourceRestored(manifest, fileManager: fileManager)
         try clearRecoveryManifest(at: manifestURL, fileManager: fileManager)
-        return .none
     }
 
     static func markPreferenceCommitted(
@@ -366,17 +390,21 @@ enum AfterRayDataDirectory {
             try journal?.markMoved()
             return moves
         } catch {
-            if journal != nil {
+            if journal != nil, let recoveryManifestURL {
                 // Include prewritten intents: a manifest write can succeed just
                 // before `moveItem` succeeds but before completion is recorded.
-                _ = try recoverInterruptedMigration(
-                    manifestURL: recoveryManifestURL!,
-                    currentDataLocation: try location(for: sourceData),
-                    restoreSourceLocation: { restored in
-                        guard restored == (try location(for: sourceData)) else {
-                            throw Error.recoveryRequired("rollback source location changed")
-                        }
-                    }
+                let recovery = try prepareInterruptedMigration(
+                    manifestURL: recoveryManifestURL,
+                    currentDataLocation: try location(for: sourceData)
+                )
+                guard case let .restoreSourceLocation(restored) = recovery,
+                      restored == (try location(for: sourceData))
+                else {
+                    throw Error.recoveryRequired("rollback did not restore the original source location")
+                }
+                try completeSourceRecovery(
+                    manifestURL: recoveryManifestURL,
+                    sourceLocation: restored
                 )
             } else {
                 try rollback(moves)

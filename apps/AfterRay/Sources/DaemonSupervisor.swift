@@ -111,20 +111,32 @@ final class DaemonSupervisor {
         var currentLocation = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil
             ? AfterRayPreferences.memoryDataLocation
             : nil
-        let startupRecovery: AfterRayDataDirectory.StartupRecovery
+        let startupRecovery: AfterRayDataDirectory.RecoveryPreparation
         do {
-            startupRecovery = try AfterRayDataDirectory.recoverInterruptedMigration(
-                manifestURL: recoveryManifestURL,
-                currentDataLocation: currentLocation,
-                restoreSourceLocation: { sourceLocation in
-                    AfterRayPreferences.memoryDataLocation = sourceLocation
-                    guard AfterRayPreferences.canonicalMemoryDataLocation == sourceLocation else {
-                        throw AfterRayDataDirectory.Error.recoveryRequired(
-                            "could not persist the restored source location"
-                        )
-                    }
+            let recoveryCurrentLocation = currentLocation
+            startupRecovery = try await Task.detached(priority: .userInitiated) {
+                try AfterRayDataDirectory.prepareInterruptedMigration(
+                    manifestURL: recoveryManifestURL,
+                    currentDataLocation: recoveryCurrentLocation
+                )
+            }.value
+            if case let .restoreSourceLocation(sourceLocation) = startupRecovery {
+                // This is intentionally the only main-actor portion: publish
+                // and read back the indivisible Location before permitting the
+                // background cleanup to remove its crash-recovery fence.
+                AfterRayPreferences.memoryDataLocation = sourceLocation
+                guard AfterRayPreferences.canonicalMemoryDataLocation == sourceLocation else {
+                    throw AfterRayDataDirectory.Error.recoveryRequired(
+                        "could not persist the restored source location"
+                    )
                 }
-            )
+                try await Task.detached(priority: .userInitiated) {
+                    try AfterRayDataDirectory.completeSourceRecovery(
+                        manifestURL: recoveryManifestURL,
+                        sourceLocation: sourceLocation
+                    )
+                }.value
+            }
         } catch {
             requiresDataDirectoryRecovery = true
             throw error
@@ -142,7 +154,7 @@ final class DaemonSupervisor {
         }
         if let status = await daemonStatus() {
             if Self.hostBuildMatches(status) {
-                clearRecoveryManifestAfterDaemonVerification(
+                await clearRecoveryManifestAfterDaemonVerification(
                     startupRecovery,
                     manifestURL: recoveryManifestURL
                 )
@@ -234,7 +246,7 @@ final class DaemonSupervisor {
                 return false
             }
             if await daemonIsReachable() {
-                clearRecoveryManifestAfterDaemonVerification(
+                await clearRecoveryManifestAfterDaemonVerification(
                     startupRecovery,
                     manifestURL: recoveryManifestURL
                 )
@@ -341,12 +353,14 @@ final class DaemonSupervisor {
     }
 
     private func clearRecoveryManifestAfterDaemonVerification(
-        _ recovery: AfterRayDataDirectory.StartupRecovery,
+        _ recovery: AfterRayDataDirectory.RecoveryPreparation,
         manifestURL: URL
-    ) {
+    ) async {
         guard recovery == .clearAfterDaemonIsReachable else { return }
         do {
-            try AfterRayDataDirectory.clearRecoveryManifest(at: manifestURL)
+            try await Task.detached(priority: .utility) {
+                try AfterRayDataDirectory.clearRecoveryManifest(at: manifestURL)
+            }.value
         } catch {
             // Keeping a verified journal is safe: the next startup will verify
             // the selected root again before attempting to remove it.
