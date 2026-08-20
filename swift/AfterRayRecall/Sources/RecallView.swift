@@ -1400,9 +1400,51 @@ private struct AppUsageTimeline: View {
     @Binding var isZooming: Bool
     let onSelectMs: (Int64) -> Void
     let onViewportWidthChange: (CGFloat) -> Void
+    /// Bumped once after the palette has been warmed, so the track redraws
+    /// with the sampled colours. Rare — not a per-frame signal.
+    @State private var paletteGeneration = 0
+
+    /// Synchronous, from `AppIconPalette`'s cache. Warming that cache is the
+    /// job of `warmPalette`, once per distinct app, not once per segment.
+    private static func segmentColor(_ run: AppUsageRun) -> Color {
+        if run.isIdle { return Color.white.opacity(0.08) }
+        return AppIconPalette.cachedColor(
+            bundleIdentifier: run.bundleIdentifier,
+            fallbackSeed: run.bundleIdentifier ?? run.applicationName
+        )
+    }
+
+    /// Identifies a dataset, so warming runs when the data changes rather than
+    /// when the view is laid out. Zoom re-places runs but cannot change which
+    /// apps are in them.
+    private struct PaletteKey: Equatable {
+        var startMs: Int64
+        var endMs: Int64
+        var runCount: Int
+    }
+
+    private var paletteKey: PaletteKey {
+        PaletteKey(startMs: layout.startMs, endMs: layout.endMs, runCount: layout.runs.count)
+    }
+
+    private func warmPalette() async {
+        var seen = Set<String>()
+        for run in layout.runs where !run.isIdle {
+            guard let bundleIdentifier = run.bundleIdentifier,
+                  seen.insert(bundleIdentifier).inserted
+            else { continue }
+            _ = await AppIconPalette.colorAsync(
+                bundleIdentifier: bundleIdentifier,
+                fallbackSeed: bundleIdentifier
+            )
+            if Task.isCancelled { return }
+        }
+        paletteGeneration &+= 1
+    }
 
     var body: some View {
-        VStack(spacing: 9) {
+        let _ = paletteGeneration
+        return VStack(spacing: 9) {
             GeometryReader { geometry in
                 let width = geometry.size.width
                 let selectedX = layout.playheadX(playheadMs: playheadMs, isLive: isLive)
@@ -1439,6 +1481,7 @@ private struct AppUsageTimeline: View {
         }
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
+        .task(id: paletteKey) { await warmPalette() }
     }
 
     private var selectedDate: Date {
@@ -1474,14 +1517,15 @@ private struct AppUsageTimeline: View {
                     1
                 )
                 let height = run.isIdle ? 7 : tuning.timelineSegmentHeight
-                AppUsageSegmentView(run: run, width: drawnWidth, height: height)
-                    .frame(width: drawnWidth, height: height)
-                    .position(x: run.startX + run.width / 2, y: 28)
-                    .help(
-                        run.isIdle
-                            ? "这段时间没有录制 · \(DurationFormatter.short(milliseconds: run.durationMs))"
-                            : "\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))"
-                    )
+                AppUsageSegmentView(
+                    run: run,
+                    width: drawnWidth,
+                    height: height,
+                    color: Self.segmentColor(run)
+                )
+                .equatable()
+                .frame(width: drawnWidth, height: height)
+                .position(x: run.startX + run.width / 2, y: 28)
             }
 
             ForEach(layout.favorites.filter { visible.contains($0.x) }) { favorite in
@@ -1493,6 +1537,23 @@ private struct AppUsageTimeline: View {
         }
         .frame(width: layout.contentWidth, height: 56)
         .padding(.vertical, 6)
+        // One element, not one per run.
+        //
+        // Every accessibility attachment is rebuilt on every AttributeGraph
+        // update, and each rebuild calls `AccessibilityNode.visibility`, which
+        // walks the node's ancestors. Cost is nodes x depth x frames, and this
+        // `ForEach` is the largest node source in the overlay: a scrub spent
+        // ~4.0s of 15s of main-thread time in there, ~9.9ms of every 24ms
+        // frame. A scrubber is also *better* exposed as one adjustable element
+        // than as several hundred anonymous rectangles.
+        //
+        // This is why the per-run `.help` tooltip is gone: `.help` is an
+        // accessibility modifier, so it was one attachment per visible run per
+        // frame. Bring it back as a single overlay driven by the hovered run,
+        // never as a modifier inside the loop.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Timeline")
+        .accessibilityValue(selectedDate.formatted(date: .abbreviated, time: .shortened))
     }
 
     /// One viewport either side of the playhead, plus a margin so a segment
@@ -1757,22 +1818,27 @@ private struct TimelineZoomStrip: View {
     }
 }
 
-private struct AppUsageSegmentView: View {
+/// A pure value view: no `@State`, no `.task`, and `Equatable`.
+///
+/// It used to hold two `@State`s and a `.task` to resolve its app's colour.
+/// That is three graph nodes per run, plus `DynamicBody` status, on a view the
+/// timeline mounts several hundred of — and the work was redundant, because
+/// `AppIconPalette` is already a cache and the async path exists only to warm
+/// it. Warming is the parent's job now, once per distinct app rather than once
+/// per segment.
+///
+/// Why this matters more than it looks: accessibility and graph traversal walk
+/// every node's ancestors, so the per-frame cost is nodes x depth. Three nodes
+/// saved on one view is ~900 saved across a full track.
+private struct AppUsageSegmentView: View, Equatable {
     let run: AppUsageRun
     let width: CGFloat
     let height: Double
-    @State private var resolvedColor: Color?
-    @State private var resolvedColorBundleIdentifier: String?
+    let color: Color
 
-    private var color: Color {
-        if run.isIdle { return Color.white.opacity(0.08) }
-        let resolved = resolvedColorBundleIdentifier == run.bundleIdentifier
-            ? resolvedColor
-            : nil
-        return resolved ?? AppIconPalette.cachedColor(
-            bundleIdentifier: run.bundleIdentifier,
-            fallbackSeed: run.bundleIdentifier ?? run.applicationName
-        )
+    static func == (lhs: AppUsageSegmentView, rhs: AppUsageSegmentView) -> Bool {
+        lhs.run == rhs.run && lhs.width == rhs.width
+            && lhs.height == rhs.height && lhs.color == rhs.color
     }
 
     private var cornerRadius: CGFloat {
@@ -1816,17 +1882,6 @@ private struct AppUsageSegmentView: View {
         }
         .frame(height: height)
         .contentShape(Rectangle())
-        .task(id: run.bundleIdentifier) {
-            guard !run.isIdle else { return }
-            let bundleIdentifier = run.bundleIdentifier
-            let color = await AppIconPalette.colorAsync(
-                bundleIdentifier: run.bundleIdentifier,
-                fallbackSeed: run.bundleIdentifier ?? run.applicationName
-            )
-            guard !Task.isCancelled else { return }
-            resolvedColor = color
-            resolvedColorBundleIdentifier = bundleIdentifier
-        }
     }
 }
 
@@ -2218,6 +2273,12 @@ private struct ScrubFrameMetrics {
                 settleDuration * 1_000
             )
         )
+        // stdout is block-buffered when it is not a terminal, and a profiling
+        // run ends by killing the process at a time limit — without this the
+        // line is written and then thrown away, which reads as "the harness
+        // never fired". It only ever survived because the lab was run by hand
+        // in a terminal.
+        fflush(stdout)
         frameIntervals.removeAll(keepingCapacity: true)
         handlerDurations.removeAll(keepingCapacity: true)
     }
