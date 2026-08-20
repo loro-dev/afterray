@@ -18,6 +18,8 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var isControllingDownload: Bool { get }
     var isUpdatingAudio: Bool { get }
     var isUpdatingStorageLimit: Bool { get }
+    var isRelocatingMemory: Bool { get }
+    var relocationDestinationPath: String? { get }
     var isUpdatingSummarySlot: Bool { get }
     var isUpdatingLanguage: Bool { get }
     var recordAudio: Bool { get }
@@ -53,6 +55,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
     func setStorageLimitBytes(_ bytes: UInt64) async
+    func chooseMemoryLocation()
+    func confirmMemoryLocation(migrateExistingData: Bool)
+    func cancelMemoryLocationChange()
     /// Changes how much wall-clock one summary covers, from now on.
     func setSummarySlotMinutes(_ minutes: UInt32) async
     func setUiLanguage(_ code: String) async
@@ -433,6 +438,22 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         }
         .afterRayLocalized()
         .task { await model.refresh() }
+        .alert(
+            copy.settings.moveMemoriesTitle,
+            isPresented: memoryLocationConfirmationPresented
+        ) {
+            Button(copy.settings.moveExistingMemories) {
+                model.confirmMemoryLocation(migrateExistingData: true)
+            }
+            Button(copy.settings.useEmptyMemoryFolder) {
+                model.confirmMemoryLocation(migrateExistingData: false)
+            }
+            Button(copy.common.cancel, role: .cancel) {
+                model.cancelMemoryLocationChange()
+            }
+        } message: {
+            Text(copy.settings.moveMemoriesMessage(model.relocationDestinationPath ?? ""))
+        }
         .onChange(of: model.developerOptionsEnabled) { _, enabled in
             if !enabled, page == .developer {
                 page = .advanced
@@ -841,8 +862,38 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     .frame(width: 110)
                     .disabled(model.isUpdatingStorageLimit)
                 }
+                SettingsSeparator()
+                SettingsRow(
+                    title: copy.settings.memoryLocation,
+                    subtitle: copy.settings.memoryLocationSubtitle
+                ) {
+                    HStack(spacing: 8) {
+                        if model.isRelocatingMemory {
+                            ProgressView().controlSize(.mini)
+                        }
+                        Button(copy.settings.changeMemoryLocation, action: model.chooseMemoryLocation)
+                            .buttonStyle(SettingsButtonStyle())
+                            .disabled(model.isRelocatingMemory)
+                    }
+                }
+                Text(model.dataDirectoryPath)
+                    .font(.settingsCaption)
+                    .foregroundStyle(SettingsPalette.tertiaryLabel)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private var memoryLocationConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { model.relocationDestinationPath != nil },
+            set: { isPresented in
+                if !isPresented {
+                    model.cancelMemoryLocationChange()
+                }
+            }
+        )
     }
 
     private var storageLimitOptions: [UInt64] {

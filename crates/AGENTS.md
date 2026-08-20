@@ -28,4 +28,4 @@ Eleven crates (`Cargo.toml` workspace, edition 2024, rust 1.85). The daemon `aft
 - `make check` → `cargo check --workspace`; `make test` → `cargo test --workspace` + `swift test`
 - `cargo clippy --workspace --all-targets -- -D warnings` — lint gate
 - `make build` builds the capture shim first; the daemon finds it at `apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim` or via `AFTERRAY_CAPTURE_SHIM`
-- Useful env vars: `AFTERRAY_DATA_DIR`, `AFTERRAY_SOCKET`, `AFTERRAY_CAPTURE_INTERVAL_SECONDS`, `AFTERRAY_T2_SWEEP_SECONDS` (0 disables), `AFTERRAY_GOP_ARCHIVE` / `AFTERRAY_GOP_KEYINT`, `HF_ENDPOINT` (model-download mirror, e.g. `https://hf-mirror.com`)
+- Useful env vars: `AFTERRAY_DATA_DIR`, `AFTERRAY_SOCKET`, `AFTERRAY_CAPTURE_INTERVAL_SECONDS`, `AFTERRAY_T2_SWEEP_SECONDS` (0 disables), `AFTERRAY_GOP_ARCHIVE` / `AFTERRAY_GOP_KEYINT`, `HF_ENDPOINT` (model-download mirror, e.g. `https://hf-mirror.com`). Official-origin network failures also retry once from hf-mirror.com ([why](../docs/decisions/active/product/2026-08-20-hf-mirror-failover.md)).
