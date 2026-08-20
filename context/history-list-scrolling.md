@@ -171,6 +171,15 @@ a slot start and writes through `@State`. Adding a closure that captures
 something not in `==` would reintroduce stale behaviour silently.
 `DaySummaryPanelScrubTests` pins the frame-stability.
 
+## Which display
+
+This machine has a 60Hz screen and a 120Hz screen, and the budget is 16.7ms on
+one and 8.3ms on the other. The same build measured "locked 60fps, zero dropped
+frames" on the first and 37-80fps on the second, minutes apart. **Always record
+which screen the window was on**; the perf line now reports `display=` and
+derives `budget=` from the display link rather than a constant, so a number is
+never quoted against the wrong target again.
+
 ## Measuring it
 
 Two `make` targets, because the two questions are different.

@@ -2287,7 +2287,13 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 onScroll(delta, pendingIsPrecise, false)
                 frameMetrics.record(
                     frameInterval: frameInterval,
-                    handlerDuration: CACurrentMediaTime() - handlerStart
+                    handlerDuration: CACurrentMediaTime() - handlerStart,
+                    // The budget is the display's, not a constant: this Mac
+                    // has a 60Hz and a 120Hz screen, and the same frame is
+                    // comfortably inside budget on one and misses on the
+                    // other. A hardcoded threshold reads as a regression
+                    // purely from dragging the window across.
+                    nominalInterval: link.targetTimestamp - now
                 )
             }
 
@@ -2325,6 +2331,8 @@ private struct ScrubFrameMetrics {
     }
 
     let enabled: Bool
+    /// The current display's frame duration, sampled from the link.
+    private var nominalInterval: CFTimeInterval = 1.0 / 60.0
     private var frameIntervals: [CFTimeInterval] = []
     private var handlerDurations: [CFTimeInterval] = []
 
@@ -2334,9 +2342,13 @@ private struct ScrubFrameMetrics {
 
     mutating func record(
         frameInterval: CFTimeInterval?,
-        handlerDuration: CFTimeInterval
+        handlerDuration: CFTimeInterval,
+        nominalInterval: CFTimeInterval
     ) {
         guard enabled else { return }
+        if nominalInterval > 0.001, nominalInterval < 0.1 {
+            self.nominalInterval = nominalInterval
+        }
         if let frameInterval { frameIntervals.append(frameInterval) }
         handlerDurations.append(handlerDuration)
     }
@@ -2349,16 +2361,21 @@ private struct ScrubFrameMetrics {
             ? 0
             : intervals.reduce(0, +) / Double(intervals.count)
         let refreshRate = meanInterval > 0 ? 1 / meanInterval : 0
-        let overTwelvePointFiveMs = intervals.lazy.filter { $0 > 0.0125 }.count
-        let overSixteenPointSevenMs = intervals.lazy.filter { $0 > 1.0 / 60.0 }.count
+        // Half a frame of slack: a frame that lands within 1.5x the display's
+        // period is late but not dropped.
+        let budget = nominalInterval
+        let late = intervals.lazy.filter { $0 > budget * 1.5 }.count
+        let dropped = intervals.lazy.filter { $0 > budget * 2 }.count
         let line = String(
-                format: "[afterray-ui-perf] callbacks=%d hz=%.1f interval_p95_ms=%.2f interval_max_ms=%.2f over_12.5ms=%d over_16.7ms=%d handler_p95_ms=%.3f handler_max_ms=%.3f settle_ms=%.3f",
+                format: "[afterray-ui-perf] display=%.0fHz budget=%.1fms callbacks=%d hz=%.1f interval_p95_ms=%.2f interval_max_ms=%.2f late=%d dropped=%d handler_p95_ms=%.3f handler_max_ms=%.3f settle_ms=%.3f",
+                1 / budget,
+                budget * 1_000,
                 handlerDurations.count,
                 refreshRate,
                 percentile(intervals, 0.95) * 1_000,
                 (intervals.last ?? 0) * 1_000,
-                overTwelvePointFiveMs,
-                overSixteenPointSevenMs,
+                late,
+                dropped,
                 percentile(handlers, 0.95) * 1_000,
                 (handlers.last ?? 0) * 1_000,
                 settleDuration * 1_000
