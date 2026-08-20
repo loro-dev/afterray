@@ -8,6 +8,7 @@
 > - 「Schema 10 → 12」→ 现在是 26，`crates/afterray-store/src/lib.rs:97`
 > - §2「48 帧 / 1.5GB 的缓存」→ 实际是全分辨率帧 20 张 / 384 MB（`swift/AfterRayRecall/Sources/RecallView.swift:1166`）、缩略图 240 张 / 96 MB（`swift/AfterRayRecall/Sources/RecallThumbnailCache.swift:26`）。只有数字过时；这一节论证的**两级缓存必须分开**完好无损。
 > - §6「语义召回保留给 chat agent 和 `search_evidence`」→ 这个保留口子已经关掉了：语义检索现在到处都不用，`Vault::semantic_search` 与 `fuse_search_results` 除测试外零调用方（`crates/afterray-store/src/lib.rs:4316`、`:4959`），agent 的 `search_evidence` 也走纯字面的 `search_hits`（`crates/afterrayd/src/main.rs:3177`）。
+> - 搜索胶片条显示时，普通时间轴的缩放拖拽条会隐藏；见 [决策记录](decisions/active/product/2026-08-20-search-filmstrip-hides-timeline-zoom.md)。
 
 搜索原本是召回体验里的二等公民：结果是右上角一列文字摘要，用户要读文字、猜哪条是自己要的、点一下才跳过去；跳过去之后画面上没有任何东西告诉他"命中的字在这里"。底部时间轴按 App 涂色，浏览一天很好用，但和结果集完全脱节。
 

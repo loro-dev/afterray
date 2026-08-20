@@ -660,9 +660,11 @@ public struct RecallView: View {
         }
     }
 
+    // @dec:search-filmstrip-hides-timeline-zoom — docs/decisions/active/product/2026-08-20-search-filmstrip-hides-timeline-zoom.md
     /// One row directly above the timeline: capture state, then the controls,
-    /// then zoom — all left-aligned over the bottom scrim, which is the only
-    /// part of the frame guaranteed to be dark enough to read them against.
+    /// then timeline-only zoom — all left-aligned over the bottom scrim,
+    /// which is the only part of the frame guaranteed to be dark enough
+    /// to read them against.
     /// The playhead clock rides the same row but stays centred on screen.
     private var timelineChromeRow: some View {
         ZStack {
@@ -677,7 +679,9 @@ public struct RecallView: View {
 
                 daySummaryChrome
 
-                TimelineZoomStrip(zoom: $timelineZoom, isDragging: $isZoomingTimeline)
+                if searchSession == nil {
+                    TimelineZoomStrip(zoom: $timelineZoom, isDragging: $isZoomingTimeline)
+                }
 
                 Spacer(minLength: 0)
             }
