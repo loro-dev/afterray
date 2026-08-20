@@ -65,6 +65,70 @@ final class HistoryWindowConvergenceTests: XCTestCase {
         )
     }
 
+    /// Expand/collapse keeps the same row identity and count. The height keys
+    /// are therefore the signal that must invalidate the mounted window.
+    func testExpandCollapseChangesTheLayoutKeys() {
+        let slot = DaySlotSummary(
+            slotStartMs: 0,
+            slotEndMs: DaySummaryLayout.slotDurationMs,
+            state: "done",
+            facts: DaySlotFacts(apps: []),
+            title: "A slot",
+            bullets: ["detail"]
+        )
+        let collapsed = [HistoryListItem.slot(slot, expanded: false)]
+        let expanded = [HistoryListItem.slot(slot, expanded: true)]
+
+        XCTAssertEqual(collapsed.count, expanded.count)
+        XCTAssertEqual(collapsed.map(\.id), expanded.map(\.id))
+        XCTAssertNotEqual(
+            HistoryListLayout.heightKeys(items: collapsed, isLoadingMore: false),
+            HistoryListLayout.heightKeys(items: expanded, isLoadingMore: false)
+        )
+    }
+
+    /// A tall detail card can leave the old offset beyond the shorter document
+    /// after collapse. Keeping that offset produces an empty viewport until
+    /// the next scroll geometry event clamps it.
+    func testCollapseClampsTheOffsetIntoTheShorterDocument() {
+        let expanded = HistoryListLayout.origins(
+            heights: [100, 2_500, 100, 100, 100, 100]
+        )
+        let collapsed = HistoryListLayout.origins(
+            heights: [CGFloat](repeating: 100, count: 6)
+        )
+        let oldOffset: CGFloat = 2_000
+
+        XCTAssertEqual(
+            HistoryListLayout.clampedOffset(
+                origins: expanded,
+                offset: oldOffset,
+                viewportHeight: viewport
+            ),
+            oldOffset
+        )
+
+        let reconciled = HistoryListLayout.clampedOffset(
+            origins: collapsed,
+            offset: oldOffset,
+            viewportHeight: viewport
+        )
+        XCTAssertEqual(
+            reconciled,
+            HistoryListLayout.contentHeight(origins: collapsed) - viewport
+        )
+        let range = HistoryListLayout.visibleRange(
+            origins: collapsed,
+            offset: reconciled,
+            viewportHeight: viewport,
+            overscan: 0
+        )
+        XCTAssertGreaterThanOrEqual(
+            collapsed[range.upperBound] - collapsed[range.lowerBound],
+            viewport
+        )
+    }
+
     // MARK: the spacers
 
     /// Whatever the window, spacers plus mounted rows must equal the document.

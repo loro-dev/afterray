@@ -131,6 +131,12 @@ and `DaySummaryRowBudgetTests`.
 and must survive an expand/collapse toggle; an expanded card is hundreds of
 points taller. Same for the loader, 8pt idle / 36pt busy.
 
+That also means row count and identity cannot invalidate the mounted window on
+expand/collapse. `HistoryListScrollView` observes the ordered height-key list;
+when it changes, it recomputes the window and clamps the writable offset into
+the new document height. Otherwise collapsing a tall card near the bottom can
+leave the viewport beyond the shorter document until the user scrolls again.
+
 ## Scrubbing the timeline
 
 The other way to pay 90x60 is to let a per-frame value into the panel at all.
