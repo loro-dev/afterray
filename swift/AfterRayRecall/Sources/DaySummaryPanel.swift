@@ -505,17 +505,20 @@ private struct DaySummaryRow: View, Equatable {
         }
         // One element per card instead of one per Text, button and icon.
         //
-        // Accessibility attachments are rebuilt on every AttributeGraph
-        // update and each rebuild walks the node's ancestors, so the cost is
-        // nodes x depth x frames — and the panel is drawn inside the same
-        // hosting view as the timeline, which relayouts on every frame of a
-        // scrub. The panel's share of that was ~3.1ms of the ~8.7ms it added
-        // to each frame.
+        // `.ignore`, never `.combine`. Both present the card as a single
+        // element, but `.combine` gets there by visiting every descendant and
+        // merging their properties — measured at +2.9ms per frame here, on
+        // top of the walk it was supposed to remove. `.ignore` does not look
+        // at the children at all, so the label has to be stated, which is
+        // what the rest of this is.
         //
-        // `.combine` drops the descendants' own actions, so both are restated
-        // here; a card read as one item with two actions is better VoiceOver
-        // than eight fragments anyway.
-        .accessibilityElement(children: .combine)
+        // Attachments are rebuilt on every AttributeGraph update, and the
+        // panel shares a hosting view with the timeline, which relayouts on
+        // every frame of a scrub — so anything per-descendant here is paid at
+        // frame rate.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("\(text.time), \(text.primary)"))
+        .accessibilityValue(Text(text.detail.joined(separator: ". ")))
         .accessibilityAddTraits(isCurrent ? [.isSelected] : [])
         .accessibilityAction(named: "Open in timeline", onSelect)
         .accessibilityAction(

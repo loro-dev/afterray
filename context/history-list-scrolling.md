@@ -225,6 +225,16 @@ Measured on the real vault, one recording with the panel toggled halfway
 | panel open | 25 fps | 36 ms | 80 ms |
 | panel closed | 29 fps | 24 ms | 64 ms |
 
+After collapsing accessibility (same machine, same zoom):
+
+| | frames | CPU per frame p50 | p95 |
+|---|---|---|---|
+| panel open | 37 fps | 17 ms | 56 ms |
+| panel closed | 39 fps | 10 ms | 41 ms |
+
+Accessibility no longer appears in the closed-phase hot list at all; what is
+left there is layout (`LayoutEngineBox.sizeThatFits`) and graph traversal.
+
 The budget is 8.3ms at 120Hz. Both are far outside it: **the panel is not the
 problem, it is a 8.7ms surcharge on a frame that was already 24ms.**
 
@@ -257,8 +267,14 @@ nodes x depth x frames. The largest node source was a `.help` tooltip applied
 per visible run inside the timeline's `ForEach` — several hundred attachments,
 every frame. It is gone; the track is one `accessibilityElement(children:
 .ignore)` with a label and a value, which is the right way to expose a scrubber
-anyway. Summary rows are `.combine`d for the same reason, with their two
-actions restated.
+anyway. Summary rows are `.ignore`d for the same reason, with the label stated and
+the two actions restated.
+
+**`.ignore`, never `.combine`.** Both present one element. `.combine` gets
+there by visiting every descendant and merging their properties, which is the
+walk it was supposed to remove plus merge work on top — measured at +2.9ms a
+frame on the rows, the largest single item in what the panel added. `.ignore`
+does not look at the children, which is why it has to be given a label.
 
 If the tooltip comes back it must be a single overlay driven by the hovered
 run, never a modifier inside the loop.
