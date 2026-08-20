@@ -25,8 +25,11 @@ permissions, and errors:
 ```sh
 afterray docs --json
 afterray docs permissions
-afterray docs <command>
+afterray docs <page>
 ```
+
+`afterray docs --json` lists the pages that exist. Not every command has one;
+those carry their guidance in `--help`.
 
 Prefer `--json` on every command except `docs`.
 

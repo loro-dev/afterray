@@ -131,7 +131,8 @@ The split is intentional:
 - **Swift owns the native interface:** recall interaction, rendering, playback,
   and the smallest possible bridge to Apple-only capture APIs.
 - **The UI never opens the database or reads encryption keys.** It requests
-  typed read models and decrypted artifacts from the daemon.
+  typed read models and decrypted artifacts from the daemon
+  ([why](decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md)).
 
 The vault key is created in the macOS Keychain under the service
 `dev.afterray.v0.vault`. Metadata lives in an encrypted SQLCipher database,
@@ -273,15 +274,24 @@ containing the Swift app and all bundled Rust/Swift helpers. See
 [Releasing AfterRay](releasing.md) for certificate setup, commands, artifacts,
 and verification details.
 
-## V0 boundaries
+## Product boundaries
 
-V0 intentionally does not include activity-triggered capture, meeting
-detection, subscriptions, production App Store packaging, multi-device sync,
-the scoped public Context Gateway for third-party Agents, or Windows support.
+The app does not do meeting detection, subscriptions or any payment concept,
+App Store packaging, multi-device sync, or Windows. Third-party agents reach
+the daemon through the read-only CLI and its Agent Skill, not through a scoped
+public Context Gateway: every non-app client gets the same three request
+classes and one global evidence window
+(`crates/afterray-protocol/src/cli_access.rs`).
 
-The next product milestone is focused on the recall experience itself: making
-navigation through hours, days, and eventually months feel immediate and
-visually distinctive.
+Capture is no longer purely a fixed heartbeat. A stored batch of input events
+can pull the next screenshot forward, throttled at `max(10s, the configured
+interval)` — `crates/afterrayd/src/main.rs` `event_capture_is_due`, with
+`fire_capture_tick` as the only door to a screenshot. Screen text, typed runs
+and focused-field values all reach the vault; the one guard is the capture
+shim's secure-field check, at the source.
 
-For the frozen V0 scope and technical decisions, read the
-[V0 implementation plan](afterray-v0-implementation-plan.md).
+For why the code is shaped the way it is, read
+[decisions/](decisions/README.md); for what it currently does, read the
+articles under [context/](../context/). The planning documents in this
+directory are historical and each carries a status block naming what the code
+has since overturned.
