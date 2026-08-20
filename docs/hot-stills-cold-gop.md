@@ -1,5 +1,22 @@
 # 热窗口独立帧 + 冷 rav1e GOP 归档
 
+> **状态（2026-08-20 更新）：历史计划，以代码为准。**
+> 当前行为：过 2h 热窗口的 still 由 `gop_packer` 打成 closed AV1 GOP，**同一次 pass** 里删掉该段全部 still，缩略图在删之前先铸好 —— 见 [context/capture-pipeline.md](../context/capture-pipeline.md)「Cold storage」一节。
+>
+> 已被代码推翻 —— 下文正文保留原始意图，不作改写：
+> - **默认 `keyint = 6`**（Key Decision 2 为此论证了整节） → 默认是 **30**：`DEFAULT_KEYINT`，`crates/afterray-codec/src/lib.rs:37`；`PackPolicy::default`，`crates/afterray-store/src/gop.rs:29`。依据是一次更晚的 live-vault sim（2026-08-14），记在 `crates/afterray-codec/src/lib.rs:6`。文档自己的 env 表（`AFTERRAY_GOP_KEYINT` 默认 `30`）早就与 Key Decision 2 自相矛盾。
+> - **Dual 观察态 + `AFTERRAY_GOP_KEEP_STILLS`** → 树内不存在。GOP 校验通过、`mark_gop_ready` 之后立刻 `drop_unpinned_stills`，`crates/afterrayd/src/gop_packer.rs:201`；该函数删掉本段 **全部** `image_artifact_id`，SQL 里 **没有 `is_favorite` 过滤**，`crates/afterray-store/src/gop.rs:647`。`PackStatus.keep_stills` 是永远 false 的残留线字段：`crates/afterray-protocol/src/lib.rs:1171`，`crates/afterrayd/src/main.rs:5128`。
+> - **「V0：`AFTERRAY_GOP_ARCHIVE=0`」** → 归档默认 **开**：`env_flag("AFTERRAY_GOP_ARCHIVE", true)`，`crates/afterrayd/src/gop_packer.rs:40`。
+> - **`image_artifact_id` 保持 NOT NULL** → 已可空。schema 7 重建表写的是 `image_artifact_id TEXT REFERENCES artifacts(id)`，`crates/afterray-store/src/lib.rs:5497`；协议侧是 `Option<String>`，`crates/afterray-protocol/src/lib.rs:1065`。（复审的「What still holds」第 1 条因此也不再成立。）
+> - **Goal 5 / Key Decision 4「收藏钉住独立 still」** → 收藏整体停用：`Request::FavoriteSet` 直接返回 `"favorites are disabled"`，`crates/afterrayd/src/main.rs:947`。`still_origin = 'gop_extract'` 从未被任何代码写入；`insert_moment` 永远写 `'capture'`，`crates/afterray-store/src/lib.rs:1284`。
+>   **这一条不只是文档漂移，是一个尚未合上的对用户的承诺：** 设置页仍写「Oldest unstarred moments are removed first. Favorites … may exceed this limit.」（`swift/AfterRayRecall/Sources/AfterRaySettingsChrome.swift:816`），官网仍承诺 "favorites never expire"（`site/src/i18n.tsx:284`）/「收藏永不过期」（`site/src/i18n.tsx:561`），而 Swift `toggleFavorite` 发出的 `setFavorite` 必然失败并把乐观翻转回滚（`swift/AfterRayRecall/Sources/RecallStore.swift:291`）。**OPEN：** 要么恢复收藏，要么改掉这两处文案。
+> - **「`bundle_identifier` 变化强制关闭 GOP」** → App 切换 **不** 切段。`fold_pack_runs` 按 `(width, height)` 各开一条 run，只有分辨率不同、或墙钟空档 `> IDLE_GAP_MS`（30s）才关段：`crates/afterray-store/src/gop.rs:132`（说明在 `:120`，`IDLE_GAP_MS` 在 `:10`）。
+> - **`SCHEMA_VERSION` 5→6、`PROTOCOL_VERSION` 2→3** → 现在是 **26**（`crates/afterray-store/src/lib.rs:97`）与 **15**（`crates/afterray-protocol/src/lib.rs:34`，Swift 侧 `swift/AfterRayRecall/Sources/DaemonClient.swift:223`）。
+> - **锁屏语义**：正文「锁屏停捕获、不停 daemon」**成立**，代码站在这一侧 —— `suspendForSystemLock()` 现在只置一个标志位，不再 `stop()` 整个 daemon（`apps/AfterRay/Sources/DaemonSupervisor.swift:231`），锁屏路径是 `pauseCapture(reason:)`（`apps/AfterRay/Sources/AfterRayApp.swift:199`）。复审 Minor 4 指出的那句自相矛盾的结尾（「锁屏停 daemon，packer 一并消失」）在本文修订 4 里已经改掉，只在复审引文中留存。
+> - **PR 9（SVT-AV1）与 GOP compaction 都没有建。** 树内只有 `Rav1eEncoder`（`crates/afterray-codec/src/lib.rs:20`），`gop.rs` / `gop_packer.rs` 里没有任何 compaction 路径。
+> - **由此，§加密 里那条「有意放宽」的适用范围已经不成立。** 放宽「逻辑删除即撤销对应 DEK」时，声明的边界是「≤12 帧 / ≤1 MB 的段」。`keyint = 30` 之后一段最多 30 帧，而 compaction 仍未实现 —— 已删帧的压缩样本滞留在不可变 IVF 里的窗口，比当初据以放宽的那个上界更大。这一点值得直说，不要当成参数微调。
+> - **已落地但两份文档都没写的一条：** pack 时在 JPEG 还解密在手里就先铸缩略图（`crates/afterrayd/src/gop_packer.rs:232`），因为此后 still 被删、而 Rust 侧 **没有** AV1 解码器。读取按 缩略图 → still → GOP 帧 回退：`crates/afterrayd/src/main.rs:5071`。
+
 | 字段 | 值 |
 | --- | --- |
 | 作者 | AfterRay Engineering（草稿） |
@@ -15,13 +32,13 @@
 本设计把存储分成两层，且不改 capture 热路径：
 
 1. **热窗口（最近 2 小时）**：继续用独立 JPEG。拖拽走现有 `RecallJPEGDecoder`。
-2. **冷数据**：后台把已关闭、已 OCR 的 still 打成 **closed-GOP AV1**（PoC 编码器 rav1e，schema 写 `av01`）。**GOP = Group of Pictures**：一段自包含的短视频，先有一张完整关键帧（I / keyframe），后面几张只存相对前一帧的差值（P 帧）。默认 6 张 / 约 1 分钟。k12 实测为 JPEG 的 7.0%，k6 为 9.2%。
+2. **冷数据**：后台把已关闭、已 OCR 的 still 打成 **closed-GOP AV1**（PoC 编码器 rav1e，schema 写 `av01`）。**GOP = Group of Pictures**：一段自包含的短视频，先有一张完整关键帧（I / keyframe），后面几张只存相对前一帧的差值（P 帧）。默认 6 张 / 约 1 分钟。**[已推翻 → `crates/afterray-codec/src/lib.rs:37`，默认 30]** k12 实测为 JPEG 的 7.0%，k6 为 9.2%。
 
-**容量承诺要降级：** PR 0–7 默认 `KEEP_STILLS=1`（Dual：JPEG + GOP 并存）。用户能感到的「1 GiB → ~280 MiB」只在 PR 8 删未收藏 still 之后；达到用户配置的存储预算时，retention 会从最旧的未收藏 Moment 开始回收。Dual 是安全观察态，不是容量态。
+**容量承诺要降级：** PR 0–7 默认 `KEEP_STILLS=1`（Dual：JPEG + GOP 并存）。**[已推翻 → Dual 与该 env 从未存在；`crates/afterrayd/src/gop_packer.rs:201` 在同一次 pack 里就删 still]** 用户能感到的「1 GiB → ~280 MiB」只在 PR 8 删未收藏 still 之后；达到用户配置的存储预算时，retention 会从最旧的未收藏 Moment 开始回收。Dual 是安全观察态，不是容量态。
 
 编码策略、加密、删除、迁移全部归 Rust `afterrayd` / `afterray-store`。Swift Recall 只拿编码后的 still 或 GOP 字节，用 VideoToolbox 解成 NV12。Capture shim 继续薄：`SCScreenshotManager` → JPEG → staging。**rav1e 不进 10s 捕获热路径。**
 
-与 `docs/afterray-v1-spec.md` §9.1 的差异（有意为之）：规格草案写的是小时 / 天级 immutable blob pack + `segment+offset+length+codec+hash`。本设计用 **60s closed GOP**（默认 `keyint=6`）代替大 pack——更短的删除粒度、更短的 settle 预测链、仍是有界独立密文对象。HEVC 仍不作为冷归档主路径。
+与 `docs/afterray-v1-spec.md` §9.1 的差异（有意为之）：规格草案写的是小时 / 天级 immutable blob pack + `segment+offset+length+codec+hash`。本设计用 **60s closed GOP**（默认 `keyint=6`）**[已推翻 → `crates/afterray-store/src/gop.rs:29`，默认 30]** 代替大 pack——更短的删除粒度、更短的 settle 预测链、仍是有界独立密文对象。HEVC 仍不作为冷归档主路径。
 
 ## Background & Motivation
 
@@ -48,8 +65,8 @@ Recall
 关键实现锚点：
 
 - Capture：`apps/AfterRayCaptureShim/Sources/AfterRayCaptureShim/main.swift` 的 `captureScreen`；间隔由 `AFTERRAY_CAPTURE_INTERVAL_SECONDS`（默认 10）在 `crates/afterrayd/src/main.rs` 决定。
-- Vault：`crates/afterray-store/src/lib.rs`，`SCHEMA_VERSION = 5`。`moments.image_artifact_id` **NOT NULL**，一对一指向 `artifacts`。`read_artifact` / `put_artifact` / `delete_artifact_record_and_file` 都按独立对象工作。`cleanup_orphaned_artifact_files` **已经**识别 `.arv1` / `.arv0` / `.*.tmp`。
-- 协议：`crates/afterray-protocol/src/lib.rs`，`PROTOCOL_VERSION = 2`。`Request::ReadArtifact`；`ArtifactPayload::header_line()` 先写 JSON header，再跟 `byte_length` 原始字节。树内 **没有** v1 `bytes_base64` daemon；该形状只残留在 `scripts/bench-recall-pipeline.swift`。当前 `UnixSocketDaemonClient` 已经是 framed v2，且要求 `protocol_version == 2` 精确匹配。**不要重新引入 `bytes_base64`。**
+- Vault：`crates/afterray-store/src/lib.rs`，`SCHEMA_VERSION = 5`。`moments.image_artifact_id` **NOT NULL**，一对一指向 `artifacts`。**[已推翻 → `crates/afterray-store/src/lib.rs:97` 现为 26；`:5497` 该列已可空]** `read_artifact` / `put_artifact` / `delete_artifact_record_and_file` 都按独立对象工作。`cleanup_orphaned_artifact_files` **已经**识别 `.arv1` / `.arv0` / `.*.tmp`。
+- 协议：`crates/afterray-protocol/src/lib.rs`，`PROTOCOL_VERSION = 2`。**[已推翻 → `crates/afterray-protocol/src/lib.rs:34` 现为 15]** `Request::ReadArtifact`；`ArtifactPayload::header_line()` 先写 JSON header，再跟 `byte_length` 原始字节。树内 **没有** v1 `bytes_base64` daemon；该形状只残留在 `scripts/bench-recall-pipeline.swift`。当前 `UnixSocketDaemonClient` 已经是 framed v2，且要求 `protocol_version == 2` 精确匹配。**不要重新引入 `bytes_base64`。**
 - Recall：`RecallYUVDisplay.swift` 的 `RecallJPEGDecoder`；`RecallView.swift` 的 `RecallDecodedImageCache`（48 / 1.5GB，prefetch ±20，6 并发）；`RecallStore.swift` 的 `RecallImageRepository`（128 / 512MB 编码字节）。`RecallMoment.imageArtifactId: String` 非可选。
 - Retention：`VaultConfig.max_storage_bytes`（默认 100 GB，从 `settings.json` 的 `storage_limit_bytes` 读取）。按加密采集 artifact 的字节数计算；超限时优先删除最旧的未收藏 Moment，收藏内容保留。`PRAGMA foreign_keys = ON`。
 - `jobs` 表已建（5 列：`id, capability, source_id, state, attempts, error`）但从未写入；`JobsList` / `JobRetry` 走内存 `afterray-models::ModelQueue`。Packer **不得**复用这张表。
@@ -117,11 +134,11 @@ M3：有 AV1 **解码** 硬件，**没有** AV1 编码硬件。质量 caveat：�
 2. 冷数据以 closed-GOP `av01` 归档；非收藏冷帧存储降到 JPEG 的 ~7–10%。
 3. Capture shim 继续只出 JPEG；编码策略在 Rust。
 4. OCR / 首次理解走 still，不等 rav1e。
-5. Favorites 始终可独立取出高画质 still，不只是 GOP 里的 P 帧。`FavoriteSet` 在独立 still 就绪前不得返回 Ok。
+5. Favorites 始终可独立取出高画质 still，不只是 GOP 里的 P 帧。`FavoriteSet` 在独立 still 就绪前不得返回 Ok。**[已推翻 → 收藏整体停用，`crates/afterrayd/src/main.rs:947`；设置页与官网仍向用户承诺收藏，见顶部状态块]**
 6. 维持现有威胁模型：每对象 AEAD、wrapped DEK、无巨型密文容器。删一条 Moment **立即**从 Timeline / 搜索消失；GOP 像素的物理清除可延迟到整段变空或 compaction（见 Security）。
 7. IPC 只传编码字节（`image/jpeg` 或 `video/x-ivf`）。Swift 用 VideoToolbox 解 NV12。Daemon **断言** GOP handler 绝不返回 NV12 / RGBA。
 8. Schema 写 `av01`，PoC 编码器 rav1e，后续可换 SVT-AV1。
-9. 现有 JPEG Vault 可后台迁移；功能用 flag 关掉时行为与今天一致。`image_artifact_id` 在 Dual / `KEEP_STILLS=1` 期间保持 **NOT NULL**。
+9. 现有 JPEG Vault 可后台迁移；功能用 flag 关掉时行为与今天一致。`image_artifact_id` 在 Dual / `KEEP_STILLS=1` 期间保持 **NOT NULL**。**[已推翻 → 没有 Dual 期；该列已可空，`crates/afterray-store/src/lib.rs:5497`]**
 
 ### Non-Goals
 
@@ -139,15 +156,15 @@ M3：有 AV1 **解码** 硬件，**没有** AV1 编码硬件。质量 caveat：�
 ## Key Decisions
 
 1. **热窗口 = 墙钟 2h 为主、条数地板 360 为辅。** 两者同时满足才允许 pack。
-2. **默认 `keyint = 6`，理由是 settle 预算不是拖拽、也不是 35ms AVImageGen。** 拖拽只用 poster KF（k6 / k12 同档 9–10ms + 5ms setup）。poster 已上屏后解到最后一帧 P：k6 ≈ 10ms（≤ 15ms），k12 ≈ 22ms（超标）。存储差很小（24h 心跳 1.49 vs 1.31 GiB）。可配 12，但默认 6。
+2. **默认 `keyint = 6`，理由是 settle 预算不是拖拽、也不是 35ms AVImageGen。** **[已推翻 → 默认 30：`crates/afterray-codec/src/lib.rs:37`、`crates/afterray-store/src/gop.rs:29`；依据换成了 2026-08-14 的 live-vault sim，`crates/afterray-codec/src/lib.rs:6`]** 拖拽只用 poster KF（k6 / k12 同档 9–10ms + 5ms setup）。poster 已上屏后解到最后一帧 P：k6 ≈ 10ms（≤ 15ms），k12 ≈ 22ms（超标）。存储差很小（24h 心跳 1.49 vs 1.31 GiB）。可配 12，但默认 6。
 3. **`image_artifact_id` 在 Dual 期保持 NOT NULL，它就是 still 指针。** 不加 `still_artifact_id`。GOP 成员关系只活在 `gop_segment_id + gop_index`。可空化在 Dual 观察之后（PR 8），并 **bump `PROTOCOL_VERSION` 到 3**；daemon 与 AfterRay.app 必须原子发布。禁止把 GOP artifact id 塞进 `image_artifact_id`。不把「二次有损是否伤 OCR」当作门闩——首次 OCR 发生在 pack 之前，吃的是原始 JPEG。
-4. **Favorites（收藏）钉住独立 still。** Pack 可以把已收藏帧写进 GOP，但不得删 still。`set_favorite(true)` 在独立 still 存在（原始 JPEG，或从 GOP 抽出的 JPEG）之前不得 Ok。抽出的帧在数据里打 `still_origin=gop_extract`，**UI 不展示「非原始画质」或任何编码代标记。**
+4. **Favorites（收藏）钉住独立 still。** **[已推翻 → 收藏停用（`crates/afterrayd/src/main.rs:947`）；`drop_unpinned_stills` 无 `is_favorite` 过滤，`crates/afterray-store/src/gop.rs:647`]** Pack 可以把已收藏帧写进 GOP，但不得删 still。`set_favorite(true)` 在独立 still 存在（原始 JPEG，或从 GOP 抽出的 JPEG）之前不得 Ok。抽出的帧在数据里打 `still_origin=gop_extract`，**UI 不展示「非原始画质」或任何编码代标记。**
 5. **IPC 传编码 GOP，不传 RGBA。** k6 GOP ≈ 0.6 MB。Swift persistent AV1 reader。拖拽只用 KF/poster，停下再解 P。显示路径拒绝非 `image/jpeg` / `video/x-ivf`，并把 framed 上限降到 8 MiB。
 6. **热 still 继续 JPEG，不换 HEIC。** JPEG VT NV12 4.8–5.2ms；HEIC ImageIO 100ms。
 7. **Schema 记 `codec = av01`，`encoder = rav1e|svt-av1`。** 容器 IVF + SQL 帧索引。
-8. **Pack 是 daemon 后台 job，最低优先级。`AFTERRAY_GOP_KEEP_STILLS` 默认 1。** 让路 capture 与 OCR；AC 时 encode。先 Dual 观察，再允许删未收藏 still。**Encode 前不 claim**；一次 `COMMIT ready`。进程启动时回滚残留 `writing`。锁屏不杀 packer。不把 OCR CER 当删 still 前置。
+8. **Pack 是 daemon 后台 job，最低优先级。`AFTERRAY_GOP_KEEP_STILLS` 默认 1。** **[已推翻 → 该 env 不存在；GOP ready 后立即 `drop_unpinned_stills`，`crates/afterrayd/src/gop_packer.rs:201`]** 让路 capture 与 OCR；AC 时 encode。先 Dual 观察，再允许删未收藏 still。**Encode 前不 claim**；一次 `COMMIT ready`。进程启动时回滚残留 `writing`。锁屏不杀 packer。不把 OCR CER 当删 still 前置。
 9. **锁屏停捕获、不停 daemon。** 菜单栏休眠；时间轴 idle gap + playhead nil + `idle_spans`。ingest 丢弃 `loginwindow`。GOP 切分只剩 App / 分辨率 / NULL 身份 / `Δt > 30s`。
-10. **V0：`AFTERRAY_GOP_ARCHIVE=0`，`AFTERRAY_GOP_KEEP_STILLS=1`。** Schema 6 只做 additive。专用 `gop_pack_jobs` 表，不复用 5 列 `jobs`。
+10. **V0：`AFTERRAY_GOP_ARCHIVE=0`，`AFTERRAY_GOP_KEEP_STILLS=1`。** **[已推翻 → 归档默认开：`crates/afterrayd/src/gop_packer.rs:40`；`KEEP_STILLS` 不存在]** Schema 6 只做 additive。专用 `gop_pack_jobs` 表，不复用 5 列 `jobs`。
 
 ## Proposed Design
 
@@ -248,11 +265,11 @@ Moment **同时**满足以下条件才可进入候选：
 
 ### Closed GOP 切分与装配算法
 
-默认 `keyint = 6`：10s × 6 = **60s 墙钟**。GOP **必须 closed**：下一段第 0 帧是独立 KF。
+默认 `keyint = 6`：10s × 6 = **60s 墙钟**。**[已推翻 → 默认 30，`crates/afterray-store/src/gop.rs:29`]** GOP **必须 closed**：下一段第 0 帧是独立 KF。
 
 强制关闭（即使未到 keyint）：
 
-1. `bundle_identifier` 变化，**包括 `NULL ↔ Some`**。`IS NULL` 的帧只和同样 `IS NULL` 的邻居成组，不与桌面混。
+1. `bundle_identifier` 变化，**包括 `NULL ↔ Some`**。`IS NULL` 的帧只和同样 `IS NULL` 的邻居成组，不与桌面混。**[已推翻 → App 切换不再切段；`fold_pack_runs` 只按 `(width, height)` 分 run，`crates/afterray-store/src/gop.rs:132`]**
 2. `width` / `height` 变化（`insert_moment` 时从 JPEG SOF 写入；本机已有 3456×2234 与 1728×1117）。`width`/`height` 为 NULL 的行 **不进 walker**（见候选条件 4），因此不存在 `NULL` vs `NULL` 成组后无法填 `gop_segments.width NOT NULL` 的问题。
 3. `application_name IS NULL` **且** `bundle_identifier IS NULL`：与上一条的身份键不同则切（身份键定义为 `(bundle_identifier, application_name)`，NULL 是独立键值，不是「沿用上一条」）。
 4. `Δcaptured_at_ms > 30s`（锁屏 / 休眠 / 手动暂停自然产生这种洞）。
@@ -774,7 +791,7 @@ GOP 是 **一个** 有界 artifact（k6 ~0.6 MB，k12 ~0.85 MB），不是历史
 - 复用 `encrypt_artifact` / `decrypt_artifact`。独立随机 DEK，AAD 绑定 `id + content_type`（`video/x-ivf; codec=av01`）。
 - 删收藏 = 删独立 still + 其 DEK，不动 GOP DEK。
 - 删 GOP 内 **最后一条** 存活帧 = 删 GOP artifact + 其 DEK。
-- **新不变量（相对 `docs/vault-encryption-design.md` §5）：** 逻辑删除立即从 Timeline、FTS、Agent 结果中隐藏该 Moment，并删掉 `gop_frames` 行。该帧的压缩样本 **必须留在不可变 IVF 里**，否则后续活着的 P 无法解码。持有 GOP DEK 的人解密 `ReadGopSegment` 仍能看见整段字节——这就是 DEK 延迟。`ReadGopFrame(已删 index)` 与 Timeline / CLI 列表拒绝点名该下标（授权规则，不是抠字节）。物理像素清除推迟到整段变空（retention 第 4–5 步）或 compaction。这是对「逻辑删除即撤销对应 DEK」的 **有意放宽**，范围限于 ≤12 帧 / ≤1 MB 的段。
+- **新不变量（相对 `docs/vault-encryption-design.md` §5）：** 逻辑删除立即从 Timeline、FTS、Agent 结果中隐藏该 Moment，并删掉 `gop_frames` 行。该帧的压缩样本 **必须留在不可变 IVF 里**，否则后续活着的 P 无法解码。持有 GOP DEK 的人解密 `ReadGopSegment` 仍能看见整段字节——这就是 DEK 延迟。`ReadGopFrame(已删 index)` 与 Timeline / CLI 列表拒绝点名该下标（授权规则，不是抠字节）。物理像素清除推迟到整段变空（retention 第 4–5 步）或 compaction。这是对「逻辑删除即撤销对应 DEK」的 **有意放宽**，范围限于 ≤12 帧 / ≤1 MB 的段。**[已推翻 → `keyint = 30`（`crates/afterray-codec/src/lib.rs:37`）后一段最多 30 帧，且 compaction 仍未实现；这条放宽当初据以成立的上界不再成立]**
 - Fast-follow compaction 触发（**本阶段不实现**，单独 PR）：存活帧 < 50%，或收藏删除发生在 GOP 成员上且用户期望尽快清像素。Compaction = 把 live/pinned 帧拷到新 GOP，原子切换 `gop_segments.artifact_id`，删旧 artifact（旧 DEK 消失）。
 
 明文 IVF 只存在于 packer 线程、`ArtifactPayload`（已有 `Drop` + `zeroize`）、Swift 有界 encoded cache。
@@ -867,7 +884,7 @@ Recall：`recall.decode.ms` 分桶 `jpeg_hit|jpeg_miss|av1_kf|av1_p`。
 8. Dual 观察 ≥ 24h（体积、拖拽、崩溃恢复）。不把 OCR CER 当门闩。然后：schema 7 可空化、`PROTOCOL_VERSION=3`、允许 `KEEP_STILLS=0`、后台迁移最旧帧。本机 ~1000 冷帧 / k6 ≈ 167 GOP × 2.8s ≈ **8 分钟** rav1e。
 9. 回滚：`ARCHIVE=0` 停新 pack。`KEEP_STILLS=1` 期间仍是无损回滚（删 GOP artifact，moments 继续 JPEG）。**步骤 8 丢 still 之后没有无损回滚。**
 
-V0 默认：`ARCHIVE=0`，`KEEP_STILLS=1`，不跑 packer。
+V0 默认：`ARCHIVE=0`，`KEEP_STILLS=1`，不跑 packer。**[已推翻 → `AFTERRAY_GOP_ARCHIVE` 默认 true，packer 默认跑：`crates/afterrayd/src/gop_packer.rs:40`]**
 
 ## Open Questions
 

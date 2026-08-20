@@ -29,6 +29,8 @@ baseline 卡片几乎不点名具体对象（每卡 1.1 个标识符——说得
 
 ## 核心结论
 
+> 结论 1 推翻了前一天 [`../t1-t2-2026-08-14/local-model/README.md`](../t1-t2-2026-08-14/local-model/README.md)「直接信任模型输出、不做任何后处理」的判断；代码站在本文这一边（`ground_t2_details`，`crates/afterray-store/src/slot.rs:1114`）。
+
 1. **硬编造：27b 从 5 → 0。** baseline 27b 发明了两个不存在的文件路径
    （`site/src/i18n.tsx`、`afterray-protocol/lib.rs`——目录结构真假参半的
    "合理拼接"）和一个错误版本号（`v0.32.11`）。after 27b 八张卡零硬编造——

@@ -1,5 +1,48 @@
 # Agent Chat 实现计划
 
+> **状态（2026-08-20 更新）：历史计划文档，以代码为准。**
+> 当前行为：工具面与回复协议见 [context/agent-tools.md](../context/agent-tools.md)；
+> 循环、预算与压缩类型在 `crates/afterray-harness`（见
+> [crates/AGENTS.md](../crates/AGENTS.md)）。
+>
+> **本文是一条链的第一环，后两环各自推翻了它的一部分。**
+> 本文（2026-08-14）先把聊天界面做出来；
+> [harness-plan.md](harness-plan.md) 是对这套成品的纠错与重构方案，它推翻了
+> 本文的历史折叠方案与工具清单；
+> [harness-implementation-notes.md](harness-implementation-notes.md) 记录那次
+> 重构最终落成什么样，是三者中最晚的一份。三份都不是当前行为的依据。
+>
+> 已被代码推翻——正文保留当时的意图：
+>
+> - **工具名单。** `list_moments` 已不存在；面从 3 个扩到 14 个再收敛到 8 个，
+>   `crates/afterrayd/src/tools.rs:122`、
+>   [context/agent-tools.md](../context/agent-tools.md)。
+> - **「工具目录改写为『先宽后窄』引导」——在 system prompt 这一层已被测试禁止。**
+>   顺序建议必须写在 catalog 里，system prompt 一个工具名都不许出现，
+>   `crates/afterrayd/src/tools.rs:1694`。
+> - **历史折叠方案（保留首轮 + 最近 N 轮、丢中间）已被删除。** 它让同一段过去
+>   每轮渲染得都不一样，前缀缓存永远命不中；换成只增不改的 `History`，
+>   `crates/afterray-harness/src/history.rs:34`，越界由压缩策略公开处理，
+>   `crates/afterray-harness/src/run.rs:419`。
+> - **CLI 的 `afterray chat send/list/history/stream` 从未实现，现在结构上也不可能。**
+>   chat 被归为 `Privileged`，CLI 客户端一律拒绝，
+>   `crates/afterray-protocol/src/cli_access.rs:64`、`:88`。
+> - **事件集比计划里的大。** 除 `tool_call`/`tool_result`/`token`/`done`/`error`
+>   外，还有 `started`/`reasoning`/`progress`/`usage`/`compaction`，
+>   `crates/afterray-protocol/src/lib.rs:1331`。
+>
+> 仍然成立，值得照做：
+>
+> - **chat 不预取种子。** `build_opening` 的 `seed` 是空串，全靠工具追查，
+>   `crates/afterrayd/src/chat.rs:377`。
+> - **语言选项只在 daemon 定义一份**，Swift 不另写清单，
+>   `crates/afterray-protocol/src/lib.rs:880`。
+> - **库内文本是不可信输入，进 prompt 必须定界。** 见
+>   `crates/afterray-harness/src/fence.rs:14`，用户消息与工具结果同样处理，
+>   `crates/afterrayd/src/chat.rs:282`。
+> - **当日总结面板（任务 E）的要求全部有效**，
+>   `swift/AfterRayRecall/Sources/DaySummaryPanel.swift:33`。
+
 > 状态：进行中，2026-08-14
 > 分支基线：`feat/slot-summaries` @ `8485335`
 > 目标：把现有半成品的 Ask 入口做成完整的 Agent 对话 —— 全库查询、流式输出、
@@ -10,8 +53,8 @@
 | 项 | 位置 |
 |---|---|
 | 对话持久化（schema 11：`conversations` / `conversation_messages`，级联删除，`tool_log` 列） | `crates/afterray-store/src/lib.rs` |
-| 全库查询工具：`list_moments` / `get_transcript` / `get_slot_card` | `crates/afterrayd/src/tools.rs` |
-| 工具目录改写为「先宽后窄」引导 | 同上 |
+| 全库查询工具：`list_moments` / `get_transcript` / `get_slot_card` **[已推翻 → `crates/afterrayd/src/tools.rs:122`，现为 8 个工具，`list_moments` 已删]** | `crates/afterrayd/src/tools.rs` |
+| 工具目录改写为「先宽后窄」引导 **[已推翻（仅限 system prompt 一层）→ `crates/afterrayd/src/tools.rs:1694`]** | 同上 |
 | T1 slot 卡片 + T2 本地模型验证 | `crates/afterray-store/src/slot.rs` |
 | 界面语言 / 总结语言双设置（17 选项） | `crates/afterray-protocol/src/lib.rs` |
 
@@ -36,6 +79,8 @@
 - `ChatSend { conversation_id: Option<String>, message: String }`
   - `None` 时新建会话，标题先用消息前 24 字，后续可由模型改写
   - 把该会话既往消息按 `role: content` 折进 agent 的 user prompt（超长时保留最近 N 轮 + 首轮）
+    **[已推翻 → `crates/afterray-harness/src/history.rs:34`：历史改为只增不改的
+    `Message` 数组，越界交给压缩策略并显式告知，不再重切]**
   - 走 `agent::run_readonly_agent`，system prompt 用新的 `CHAT_SYSTEM_PROMPT`
   - 用户消息与助手回复各落一行；助手行的 `tool_log` 存本轮工具调用的 JSON 数组
 - `agent.rs` 需要一个变体，能把每轮工具调用记录出来（现在只返回最终文本）
@@ -43,6 +88,8 @@
   （当前时间、时区、今天的槽概览），其余靠工具
 
 **验收**：CLI 可完成多轮对话且历史生效 ——
+**[已推翻 → `crates/afterray-protocol/src/cli_access.rs:64`：chat 属 `Privileged`，
+CLI 客户端一律拒绝，下面这些子命令从未实现且不会实现；验收改在 app 内进行]**
 
 ```sh
 afterray chat send "我今天下午在干嘛"
@@ -64,6 +111,10 @@ afterray chat list && afterray chat history <id>
 {"kind":"error","message":"…"}
 ```
 
+**[事件集已扩大 → `crates/afterray-protocol/src/lib.rs:1331`：另有
+`started` / `reasoning` / `progress` / `usage` / `compaction`，`tool_result`
+还带 `truncated` / `dropped`]**
+
 - 参考 `write_artifact_response`（`main.rs`）的分帧写法：先写 JSON 行再写负载，
   streaming 版持续写行直到 `done`
 - **token 级流式**需要 `LlmRouterAdapter` 支持 `stream: true`：
@@ -76,6 +127,8 @@ afterray chat list && afterray chat history <id>
   最终答案一次性到达，UI 照常工作
 
 **验收**：`afterray chat stream "…"` 在终端逐步打印事件，Ollama 下可见 token 增量。
+**[已推翻 → `crates/afterray-protocol/src/cli_access.rs:88`：CLI 拿不到 chat，
+只能在 app 里验]**
 
 ### C. Swift 聊天界面
 

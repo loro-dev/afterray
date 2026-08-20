@@ -1,5 +1,16 @@
 # Qwen3.5-4B 本地 MLX 接入计划
 
+> **状态（2026-08-20 更新）：历史计划，以代码为准。**
+> 当前行为：LLM 只有 MLX 本地（受管 4B / 9B 包）或远程（Ollama / OpenAI-compatible）两条路，GGUF 仅剩 embedding 用 —— 见 [crates/afterray-models/AGENTS.md](../crates/afterray-models/AGENTS.md)。
+>
+> 已被代码推翻 —— 下文正文保留原始意图，不作改写：
+> - **「llama.cpp/GGUF 内置模型继续保留作低内存回退」（正文出现四次：§决策、§实现工作 3.3、§验收标准「兼容性」、§风险第一行）** → GGUF assistant 包已 **退役**，而且有测试禁止它回来：`catalog_no_longer_offers_the_retired_gguf_assistant_pack` 断言目录里没有任何 `capability == "llm"` 的包，`crates/afterray-models/src/catalog.rs:802`。GGUF 只在 embedding 上活着（`NOMIC_EMBED_FILE`，`crates/afterray-models/src/catalog.rs:19`）。旧设置里的 `builtin` / `local` 标签被降级到 MLX 而不是回退到 llama.cpp：`crates/afterray-protocol/src/lib.rs:769`。**所以「低内存回退」这条退路已经不存在** —— 计划里以它为兜底的风险条目（8 GB 档、MLX 上游回归）现在没有兜底。
+> - **「首发只显示为『推荐本地模型』，验收通过后再决定是否替换默认选择」** → `MlxLocal` 已经是 `#[default]`：`crates/afterray-protocol/src/lib.rs:749`。默认已经换了，而换的依据不是本计划写的那场验收。
+> - **Phase 3「受控视觉输入」** → 协议字段在，链路是通的，但功能 **关着**：Rust 适配器两处都写死 `images: Vec::new()`，`crates/afterray-models/src/persistent_mlx.rs:158` 与 `:184`。因此 §验收标准里凡是假设图片输入的项（「无外部依赖」行的「使用图片输入」、「VLM 正确性」行的「文本和单图片请求」）**均未达成**。
+> - **Phase 0 的量测从未发生。** [docs/evals/qwen35-4b-mlx-phase0.md](evals/qwen35-4b-mlx-phase0.md) 自己写着 “real-device run pending”，8/16/24 GB 矩阵是空模板，结尾明说「No throughput, memory, compatibility, or quality claim has been recorded」。Phase 0 的退出条件因此从未被证明满足，Phase 1–2 是在它之上直接落地的。
+> - **计划没有预料到的第二个包已经发货：** `llm_qwen35_9b_mlx4`（`crates/afterray-models/src/catalog.rs:13`，pack spec 在 `:339`）。本计划通篇只规划了单一 4B 包。
+> - **OptiQ 对照从未做。** 树内没有任何 OptiQ 包或基准记录；§Phase 0 写的「否则固定标准版」是靠默认落地的，不是靠证据落地的。
+
 状态：提案，待真实设备验证后实施  
 日期：2026-08-15  
 负责人：AfterRay 本地模型链路
@@ -14,7 +25,7 @@
 - 用 Apple 的 `mlx-swift-lm` / `MLXVLM` 直接运行，做成 App 内签名、常驻的 Swift worker。用户只点下载，
   不安装 Ollama、Unsloth、Python、Node 或模型。
 - 当前 App 的 llama.cpp/GGUF 内置模型继续保留作低内存回退；Ollama 继续是用户自选的外部提供方，
-  不成为内置实现依赖。
+  不成为内置实现依赖。**[已推翻 → GGUF assistant 包已退役，测试禁止其回归：`crates/afterray-models/src/catalog.rs:802`]**
 
 模型许可为 Apache 2.0，消除了 LFM 的商业收入授权门槛；仍须在发行 notices 中包含上游归属和许可证。
 
@@ -105,6 +116,7 @@ worker → daemon  {"v":1,"kind":"cancelled","request_id":"r1"}
 3. 从模型目录的 tokenizer/chat template 生成请求，不能复用 Qwen3/Qwen2.5 模板，也不能手写 image token。
 4. 支持文本流式生成、取消、模型加载时间/峰值内存/token 速率诊断。首版 `images: []`，保留协议字段；
    Phase 3 再把 AfterRay 的截图帧作为受控图片输入接入。
+   **[仍停在首版 → Rust 侧两处都写死 `images: Vec::new()`：`crates/afterray-models/src/persistent_mlx.rs:158`、`:184`；Phase 3 未接通]**
 5. 普通 UI 不显示或持久化模型的控制 token、思考标记或未分类的原始输出；仅显示归一化后的最终回答。
 6. 将 worker、MLX 运行时及动态库纳入 App 资源、codesign 和 notarization；必须在干净 Mac 测试。
 
@@ -113,6 +125,7 @@ worker → daemon  {"v":1,"kind":"cancelled","request_id":"r1"}
 1. 新增 `PersistentMlxAdapter`：持有子进程、stdin 写端、stdout 读取任务、request-id 等待表和重启退避。
 2. 保留 `ProcessAdapter` 原语义，避免影响 OCR 以及它的测试。
 3. 扩展 `LlmProvider` 为 `mlx_local`。`builtin` 仍代表现有 llama.cpp/GGUF；两者状态、日志与设置不混淆。
+   **[已推翻 → `LlmProvider` 只剩 `MlxLocal` / `Ollama` / `OpenaiCompatible`，`builtin`/`local` 被解析降级到 `MlxLocal`：`crates/afterray-protocol/src/lib.rs:769`]**
 4. 在 `LlmRouter` 为 `mlx_local` 增加模型就绪、worker 加载、被取消、进程异常、系统不兼容等可展示状态；
    绝不因为本地失败而暗中发到云端。
 5. 从 App bundle 明确解析签名 worker 路径。开发态与发行态共享解析接口，不能依赖 `PATH`。
@@ -125,6 +138,7 @@ worker → daemon  {"v":1,"kind":"cancelled","request_id":"r1"}
    重试和卸载。
 3. 选中 `mlx_local` 时隐藏 Ollama URL / OpenAI key；加载期间给出明确等待状态和回退到当前内置模型的入口。
 4. 首发只显示为“推荐本地模型”，验收通过后再决定是否替换默认选择。
+   **[已推翻 → `MlxLocal` 已是 `#[default]`：`crates/afterray-protocol/src/lib.rs:749`]**
 
 ## 分阶段与退出条件
 
@@ -135,6 +149,7 @@ worker → daemon  {"v":1,"kind":"cancelled","request_id":"r1"}
 - 验证原生 Swift worker 可签名打包，并量测下载大小、冷加载、稳态 token/s、峰值内存、长上下文、取消。
 - 用同一批 AfterRay T2 样本对比标准 4-bit 与 OptiQ。若要选择 OptiQ，同时证明：不依赖用户 Python、无需
   `optiq serve` 才能跑、质量提升可复现、大小/速度收益足以抵消新依赖；否则固定标准版。
+  **[对照从未做 → 树内没有 OptiQ 包或基准记录；「固定标准版」是默认落地的，不是证据落地的]**
 
 退出条件：标准 4-bit 在 M2 16 GB+ 能由 `MLXVLM` 稳定运行，连续请求不重载模型，且无用户外部安装步骤。
 
@@ -167,7 +182,7 @@ worker → daemon  {"v":1,"kind":"cancelled","request_id":"r1"}
 | 常驻性 | 连续两次请求同一 worker PID 完成；第二次没有完整模型加载事件 |
 | VLM 正确性 | 文本和单图片请求均使用模型原始 chat template/processor；连续 KV-cache 请求通过 #283 对应回归用例 |
 | 安全性 | 工具只能经过 allowlist 和 schema 校验执行；默认不显示/存储控制标记、thinking 或原始隐式推理 |
-| 兼容性 | Built-in llama.cpp、Ollama、OpenAI-compatible 配置和现有测试保持通过 |
+| 兼容性 | Built-in llama.cpp、Ollama、OpenAI-compatible 配置和现有测试保持通过 **[已推翻 → llama.cpp 一档已退役，`crates/afterray-models/src/catalog.rs:802`]** |
 | 发行 | worker 和 MLX 依赖随签名/notarized App 工作；Apache 2.0 notice 可访问 |
 | 质量 | T2 评测输出可解析，人工复核检索、时间范围和工具调用；结论写入 `docs/evals/` |
 
@@ -175,7 +190,7 @@ worker → daemon  {"v":1,"kind":"cancelled","request_id":"r1"}
 
 | 风险 | 处理 |
 | --- | --- |
-| 4B VLM 在低配 M2 的内存超过可接受范围 | Phase 0 建立 8/16/24 GB 矩阵；8 GB 不承诺支持，UI 只向通过档位提供下载，保留 llama.cpp 回退 |
+| 4B VLM 在低配 M2 的内存超过可接受范围 | Phase 0 建立 8/16/24 GB 矩阵；8 GB 不承诺支持，UI 只向通过档位提供下载，保留 llama.cpp 回退 **[已推翻 → 矩阵从未量测（`docs/evals/qwen35-4b-mlx-phase0.md`），llama.cpp 回退已不存在（`crates/afterray-models/src/catalog.rs:802`）；此风险现无缓解]** |
 | MLX Swift 上游回归 | 固定 release、保留真实模型回归；不使用未经验证的 main |
 | VLM cache 回归 | pin 含 #283 的 3.31.4+ 版本并在真实 Qwen3.5-4B 上回归；出现回归时只对该请求退为完整 prefill，不重载模型 |
 | OptiQ 吞吐优势绑定独立运行时 | 不作为发版基础；只有原生可复现的收益才纳入 worker |

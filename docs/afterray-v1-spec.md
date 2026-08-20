@@ -1,6 +1,22 @@
 # AfterRay v1 产品与技术规格草案
 
-> 状态：Deferred product vision；当前实现以 `docs/afterray-v0-implementation-plan.md` 为准，本文件不作为 V0 的任务或验收依据。  
+> **状态（2026-08-20 更新）：Deferred vision（推迟的产品愿景）。代码是唯一权威。**
+> 下面的正文仍然记录着当初的意图，没有改写；被代码推翻的部分逐条列在这里。
+>
+> **注意：愿景推迟了，但 §16 的 EARS 需求 ID 是活的。** 源码按名字引用它们，所以本文件仍然是这些 ID 的定义处 —— 从代码跟着 ID 找过来的人，读到的必须是现在成立的规则。
+>
+> **最重要的一条：`CAP-005` 已作废，而 §16.2 仍在逐字重复它的原始禁令。** 引用点：`crates/afterray-platform-macos/src/lib.rs:186`、`crates/afterray-store/src/lib.rs:125`、`crates/afterray-store/src/acts.rs:656`，以及 [context/event-capture-v2.md](../context/event-capture-v2.md) 与 [context/acts-join.md](../context/acts-join.md)。作废记录在 [docs/event-capture-v2-plan.md](event-capture-v2-plan.md) 的「信任模型变更」一节；详见本文 §16.2 CAP-005 条目上就地补的说明。
+>
+> 其余推翻项：
+> - §1.1 / §1.3 / §8「音频默认 `autoDetectedMeetings`，平时不打开麦克风，`continuous` 不作为首发默认」→ 实际默认就是全程录音且默认开启：`default_record_audio()` 返回 `true`，`crates/afterrayd/src/main.rs:630`。代码里根本不存在「会议」这个概念 —— 没有 `meetingState`、没有会议确认规则、没有会议 App adapter。整个 §8.1 / §8.2 与 `AUD-001`、`AUD-005`、`AUD-006`、`AUD-007`、`AUD-008` 都没有实现对象
+> - §1.2 / §3.2「最低 macOS 26、最低 M3」→ `LSMinimumSystemVersion` 是 `14.0`，`apps/AfterRay/Resources/Info.plist:26`；没有任何芯片代次门槛
+> - §6.2 / §15.1「只有 Download Service 能访问外部网络」→ 远端模型 provider 接受任意 https 主机：`check_origin`，`crates/afterray-models/src/remote.rs:502`（https 一律放行，http 只放行 loopback）。也就是说，一个设置项就能让后台摘要把检索到的历史发到任意外部端点
+> - §2.2 非目标「记录……原始活动事件流」→ `input_events` 表存在（schema 23），`crates/afterray-store/src/lib.rs:5831`；行里还带内容（打字串与焦点控件的 value），`crates/afterray-store/src/lib.rs:125`
+> - §14.3「允许一次、允许 15 分钟或建立持久 scope」→ 实际只有两态：关闭，或开 30 分钟；没有持久授权。`CLI_EVIDENCE_WINDOW_MS`，`crates/afterray-protocol/src/cli_access.rs:13`
+>
+> 未建、且诚实地属于「推迟」而非「推翻」的部分（不逐条展开）：会议检测与会议 App adapter、Free/Paid 档位、保留天数预测、四级缩放 / 星图 / 注意力河流、带 generation counter 的签名 model catalog、MCP、`VisualClock` 与 `VisualPreset.json`、secure-field bounds 的像素遮盖（`AXS-005` 的前半段 —— 不读 secure value —— 由 shim 的 `SecureInputGuard` 实现了，后半段的像素遮盖没有）。
+
+> 前一版状态：Deferred product vision；当前实现以 `docs/afterray-v0-implementation-plan.md` 为准，本文件不作为 V0 的任务或验收依据。  
 > 原状态：Draft 0.2，首发边界已部分冻结  
 > 研究截止：2026-08-12  
 > 目标：macOS Apple Silicon 个人版  
@@ -76,7 +92,7 @@ v1 应让用户在第一次使用的当天完成以下体验：
 - 企业管理、集中策略、远程审计或自部署服务端。
 - 通用桌面自动化、自动点击、自动发消息或自动修改文件。
 - 完整复刻 Hermes、Claude Code 或其他 Agent harness。
-- 记录按键内容、key code、鼠标轨迹、点击内容或原始活动事件流。
+- 记录按键内容、key code、鼠标轨迹、点击内容或原始活动事件流。 **[部分已推翻 → `crates/afterray-store/src/lib.rs:5831`（`input_events` 表）与 `crates/afterray-store/src/lib.rs:125`（行内含打字内容与控件 value）；key code、滚动量、鼠标轨迹仍不落库]**
 - 自动 PII 识别与脱敏。
 - 对 Slack、飞书等 App 做大规模、脆弱的私有协议逆向。
 - 保证每张截图都被 VLM 结构化解析。
@@ -95,7 +111,7 @@ v1 应让用户在第一次使用的当天完成以下体验：
 
 ### 3.2 硬件准入
 
-**已决定**：最低系统为 macOS 26，芯片最低为 M3。磁盘空间不作为“一刀切”的准入条件。
+**已决定**：最低系统为 macOS 26，芯片最低为 M3。磁盘空间不作为“一刀切”的准入条件。 **[已推翻 → `apps/AfterRay/Resources/Info.plist:26`，实际是 macOS 14.0，无芯片代次门槛]**
 
 内存档位仍需实测，当前只作为产品推荐而不是承诺：
 
@@ -383,7 +399,7 @@ Rust 负责：
 
 - Vault/Search Service 是唯一能解密原始记录的组件。
 - Model Runtime 只能接收完成策略裁剪后的输入。
-- Download Service 是唯一允许访问外部网络的组件；Context Gateway 只允许本机 IPC。
+- Download Service 是唯一允许访问外部网络的组件；Context Gateway 只允许本机 IPC。 **[已推翻 → `crates/afterray-models/src/remote.rs:502`，远端 LLM provider 接受任意 https 主机]**
 - Agent Host 无外网、无用户目录和 Vault 文件权限，只能通过受限 IPC 调用只读工具。
 - 外部 Agent 只能通过 Context Gateway 检索，不得连接 SQLite 或 blob 文件。
 
@@ -505,6 +521,8 @@ Any active state
 
 ## 8. 音频与 Transcript
 
+**[整节已推翻 → `crates/afterrayd/src/main.rs:630`：出货默认是 `continuous` 且默认开启。代码里不存在「会议」这个概念 —— 没有 `meetingState`、没有会议确认规则、没有会议 App adapter，§8.1／§8.2 与 `AUD-001`／`AUD-005`／`AUD-006`／`AUD-007`／`AUD-008` 都没有实现对象]**
+
 音频需要把“系统权限”、“自动录制策略”、“会议确认规则”和“原始音频保留”分成四件事。已决定的 v1 默认是 **auto-detected meetings**：平时不录音，确认已进入会议后自动开始。这个策略必须在 onboarding 中被单独解释和同意。
 
 ```text
@@ -514,7 +532,7 @@ audioCapturePolicy = autoDetectedMeetings | manualOnly | continuous
 rawAudioRetention  = 30days | customShorter | none
 ```
 
-`audioCapturePolicy` 决定什么时候自动开始；`rawAudioRetention` 决定原始麦克风和系统音频保留多久。v1 默认 `autoDetectedMeetings + 30days`。`continuous` 不作为首发默认；如果会议检测无法达到发布要求，必须重新做产品决策，而不静默改成全天录音。
+`audioCapturePolicy` 决定什么时候自动开始；`rawAudioRetention` 决定原始麦克风和系统音频保留多久。v1 默认 `autoDetectedMeetings + 30days`。`continuous` 不作为首发默认；如果会议检测无法达到发布要求，必须重新做产品决策，而不静默改成全天录音。 **[已推翻 → `crates/afterrayd/src/main.rs:630`；保留期也不是 30 天，而是按字节，见 `crates/afterray-store/src/lib.rs:4724`]**
 
 ### 8.1 会议确认规则
 
@@ -913,7 +931,7 @@ External Agent → CLI/MCP → scope + approval + audit → Search/Vault
 
 > Claude Code 想检索 2026-08-01 至今天的 OCR 与 Transcript，最多返回 8 个结果，不包含截图和原始音频。
 
-用户可以允许一次、允许 15 分钟或建立持久 scope。查询完成后可在访问记录中看到 client、时间、查询范围、返回 Evidence ID 数量；默认不记录完整查询文本的长期日志，是否保留需单独决定。
+用户可以允许一次、允许 15 分钟或建立持久 scope。 **[已推翻 → `crates/afterray-protocol/src/cli_access.rs:13`：只有「关闭」与「开 30 分钟」两态，没有持久 scope]**查询完成后可在访问记录中看到 client、时间、查询范围、返回 Evidence ID 数量；默认不记录完整查询文本的长期日志，是否保留需单独决定。
 
 ---
 
@@ -929,7 +947,7 @@ External Agent → CLI/MCP → scope + approval + audit → Search/Vault
 - AX secure value 永不读取；能可靠取得 bounds 时按用户选择的保护策略遮盖像素。无法可靠定位时不承诺自动敏感信息屏蔽，并依赖 App/窗口排除。
 - 外部 Agent 默认 text-only + 预览 + scope。
 - 一键删除某一天、某个 App、某次会议和全部 Vault。
-- 所有后台计算默认无外网；只有 Model Download Service 能访问外部网络。Context Gateway 若启用 HTTP，只监听本机并仍视为本地 IPC 边界。
+- 所有后台计算默认无外网；只有 Model Download Service 能访问外部网络。Context Gateway 若启用 HTTP，只监听本机并仍视为本地 IPC 边界。 **[已推翻 → `crates/afterray-models/src/remote.rs:502`]**
 - 无遥测或极小、显式 opt-in 的产品遥测；绝不上传用户内容。
 
 Apple App Review 2.5.14 要求记录屏幕、声音或用户活动时取得明确同意并提供清楚的视觉/听觉指示。菜单栏红色光点和一键暂停是产品核心，不是审核装饰。
@@ -997,6 +1015,17 @@ v1 不承诺防护：
 - **CAP-003**：当活动持续超过 `maxActiveGap` 时，系统应生成 capture candidate，即使尚未出现完整 quiet window。
 - **CAP-004**：当候选帧与上一持久化画面无有效变化时，系统应复用上一 blob，而不是重复写入图片。
 - **CAP-005**：系统不得持久化按键、key code、输入字符、按钮、滚动量、鼠标路径、输入事件时间线或捕获触发原因。
+
+  > **CAP-005 已作废（2026-08-18），下面这条原文不再成立。** 作废理由与范围记录在 [`event-capture-v2-plan.md`](event-capture-v2-plan.md) 的「信任模型变更（2026-08-18 拍板）」一节：全部处理在本地、vault 端到端加密、出境需用户显式批准，原禁令针对的「内容离开信任边界」场景不存在。
+  >
+  > **现在实际持久化的是**：打字串（按 ~2s 停顿合并的 typed run，落在 `input_events.text`）与事件时刻焦点控件的 value（落在 `target_json`）—— `crates/afterray-store/src/lib.rs:125`、`crates/afterray-platform-macos/src/lib.rs:186`、`crates/afterray-store/src/acts.rs:656`。
+  >
+  > **原文中仍然成立的半边**：key code、滚动量、鼠标轨迹、以及「捕获触发原因」都不落库 —— 事件被合并成语义 kind 与计数，不是原始 keystream。
+  >
+  > **唯一保留的护栏**：焦点在 secure text field 时，键流与 value 都不采 —— `apps/AfterRayCaptureShim/Sources/AfterRayCapturePolicy/SecureInputGuard.swift`，join 层再拒读一次（`crates/afterray-store/src/acts.rs:656`）。
+  >
+  > **未履行的义务**：作废方案里，替代原禁令的是「透明披露义务完全在应用自身」（listen-only tap 不在系统「输入监控」面板留痕，见 `docs/event-capture-v2-plan.md:194`）。这项披露**从未实现** —— `apps/AfterRay/Resources/Info.plist` 里没有 `NSInputMonitoringUsageDescription`，onboarding 里没有，官网上也没有。这是一条 OPEN 的未兑现承诺。
+
 - **CAP-006**：若用户开启 Cursor annotation，系统只应保存截图瞬间的单点位置。
 - **CAP-007**：当显示器拓扑变化时，系统应创建新的 topology epoch，并阻止旧坐标映射到新拓扑。
 - **CAP-008**：当锁屏、屏幕睡眠、用户 session 失活或捕获画面 blank/suspended 时，系统应暂停屏幕、音频和 AX 捕获。

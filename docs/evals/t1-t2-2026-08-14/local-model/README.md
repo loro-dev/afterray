@@ -36,6 +36,8 @@ cargo run -p afterrayd --example t2_eval -- \
 
 ## 后处理：已全部移除（2026-08-14）
 
+> 本节的结论一天后被 [`../../t2-cards/REPORT.md`](../../t2-cards/REPORT.md) §核心结论 1 推翻，今天的代码站在后者一边（`ground_t2_details`，`crates/afterray-store/src/slot.rs:1114`）。
+
 早先的 `artifacts` 字段与接地校验都已删除，不做任何模型输出的后处理。
 
 - `artifacts` 原本的理由是「字段排第一可强制模型先接地再表达」，实测证伪 ——

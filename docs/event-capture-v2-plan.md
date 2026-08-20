@@ -1,5 +1,18 @@
 # 事件驱动采集 v2 计划
 
+> **Status (updated 2026-08-20): historical plan. The code is the authority.**
+> Current behavior: [context/event-capture-v2.md](../context/event-capture-v2.md)（tree_text、diff 链、输入词汇表、secure 护栏、截图落点）与 [context/acts-join.md](../context/acts-join.md)（两条事实流如何 join）；保留期是 [「The vault expires by size, never by age」](decisions/active/architecture/2026-08-20-size-driven-retention.md)。
+>
+> Superseded by the code on these points — the body below still states the original intent:
+> - §5「废除 `PROMPT_LINES_BUDGET_CHARS` 固定常量」→ 常量健在，且是时长缩放的基线与下限；模型窗口只作上限，`crates/afterray-store/src/slot.rs:153`
+> - §1「一张截图被其后窗口内的多个 AX 捕获共享（`screenshot_id?`）」→ 全仓无 `screenshot_id`；无截图的 moment 因此不存在，可引性落成按 run 的 `unframed_lines` 计数，`crates/afterray-store/src/slot.rs:404`
+> - §1「节流/抑制计数（shim 已有 `dropped`）进 segment metadata 并最终进卡片」→ shim 报的 `dropped` 止于 daemon 的一行 stderr 日志，不入库、不进 metadata、不进卡片，`crates/afterrayd/src/main.rs:2395`
+> - §6 元素级引用只落了 prompt 半边（`crates/afterray-store/src/slot.rs:2851`）；渲染半边不存在 —— moment id 的字符类不含 `#`，`![…](afterray://moment/<id>#el33)` 匹配不上引用正则，转而被判为「没写完的引用」原样输出，`swift/AfterRayRecall/Sources/StreamingMarkdown.swift:183`
+> - §2/§3 的 `drag` 与 `window_changed`：shim 发这两种 kind（`apps/AfterRayCaptureShim/Sources/AfterRayCaptureShim/main.swift:1923`、`:2071`），acts join 无对应分支，两者落到 `ActKind::Other` 后被 `fold_acts` 丢弃，`crates/afterray-store/src/acts.rs:570`
+> - WS7（语料回归）未建：`scripts/t2-eval.py` 按 v2 卡片的 `threads` / `entities` 形状打分，认不出 v3 正文，`scripts/t2-eval.py:105`
+>
+> 代码侧一处尚未对齐（不是本文的主张）：`captureEdgeSnapshot` 仍以「事件 48h 删、帧长存」论证它绝不触发截图，`apps/AfterRayCaptureShim/Sources/AfterRayCaptureShim/main.swift:2120`。shim 确实不拍（截图是纯拉取式），但那个理由所依赖的 48h 事件寿命已不存在，且事件驱动截图由 daemon 提供（`crates/afterrayd/src/main.rs:1463`）。
+
 > 状态：已批准（2026-08-18 拍板），实施中。
 > 依据：对同类产品 Skysight 的实测逆向 —— 144 个 10 分钟 segment（~24h、1,355+ 事件抽样统计）与 207 份产出文档。每个数字都来自实测，不是设想。
 > 关系：部分取代 [`input-events-and-t1-acts-plan.md`](./input-events-and-t1-acts-plan.md)（R3 边沿快照被 keyframe 策略吸收；acts 的 `typing` 布尔方案被 `text_input.value` 取代）；修订 [`slot-summaries-and-ax-pipeline.md`](./slot-summaries-and-ax-pipeline.md) §7.1 的 CAP-005（见下）。
@@ -33,9 +46,9 @@
 
 - 触发源 = tap 事件（click / submit / shortcut / text_input / drag / 窗口切换 / scroll〔我们保留，它无此项〕）。
 - 无事件时心跳 10s 一拍（深读场景兜底）。
-- **截图独立节流**：事件可触发，≥10s 间隔；一张截图被其后窗口内的多个 AX 捕获共享（`screenshot_id?`）。**无截图的 AX 时刻不可出图级引用，此事实写进 T2 prompt。**
+- **截图独立节流**：事件可触发，≥10s 间隔；一张截图被其后窗口内的多个 AX 捕获共享（`screenshot_id?`）。**无截图的 AX 时刻不可出图级引用，此事实写进 T2 prompt。** **[已推翻 → `crates/afterray-store/src/slot.rs:404`]**
 - 配对不变量方向不变：截图必有 AX；AX 可无截图。
-- 节流/抑制计数（shim 已有 `dropped`）进 segment metadata 并最终进卡片。
+- 节流/抑制计数（shim 已有 `dropped`）进 segment metadata 并最终进卡片。 **[已推翻 → `crates/afterrayd/src/main.rs:2395`]**
 
 ### 2. 事件词汇表 v2
 
@@ -70,13 +83,13 @@
 - `threads/entities/decisions/category/confidence` 全部废除。
 - details 内部按五段骨架给 **prompt 级指导**（非 schema）：叙事结论 → 上文延续（prev-card 的 title+description 直接注入，废除 `get_prev_cards` 工具）→ 标识符词汇表（带定义的 prose 行：`` `session/458abe37` ``: PR #3428 的 head 分支）→ 编年证据段（带时间戳）。
 - 深度跟证据走：无目标小节数；安静时段骨架不变、如实写短（实测范本：登录窗时段 1.7 KB）。
-- 预算：废除 `PROMPT_LINES_BUDGET_CHARS` 固定常量，改由 `resolve_context_budget()`（真实模型窗口 × 机器可负担）推导，保守 2.5 B/token，下限 12k 字符，上限先设 4× 现值的天花板待语料评测放开。`more_chars` 留作如实告知，删除取用邀请与 `get_run_text` 依赖。
+- 预算：废除 `PROMPT_LINES_BUDGET_CHARS` 固定常量 **[已推翻 → `crates/afterray-store/src/slot.rs:153`]**，改由 `resolve_context_budget()`（真实模型窗口 × 机器可负担）推导，保守 2.5 B/token，下限 12k 字符，上限先设 4× 现值的天花板待语料评测放开。`more_chars` 留作如实告知，删除取用邀请与 `get_run_text` 依赖。
 - 工具目录按证据裁剪：无音频的 slot 不出现 `get_transcript`（实测 35b 为此浪费整轮）。
 
 ### 6. 元素级引用
 
 - `afterray://moment/<id>#el<N>`，N 按**该帧**树文本的编号解析（编号跨帧漂移，实测确认）。
-- 渲染：展开高亮节点；有配对截图按节点 rect 裁局部截图；纯 AX 时刻退化为文本节点展示。
+- 渲染：展开高亮节点；有配对截图按节点 rect 裁局部截图；纯 AX 时刻退化为文本节点展示。 **[已推翻 → `swift/AfterRayRecall/Sources/StreamingMarkdown.swift:183`]**
 - 行内 = 可点链接，独立成行 = 渲染帧（复用聊天的既有语义）。
 
 ### 7. OCR 窗口裁剪（此前已批，并入本计划）

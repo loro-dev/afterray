@@ -1,5 +1,14 @@
 # 搜索呈现
 
+> **状态（2026-08-20 更新）：历史计划，以代码为准。** 逐条核对过，这份的设计论证基本都还成立 —— 只有四处数字与范围漂移。
+> 当前行为：索引、折叠与搜索路径见 [crates/afterray-store/AGENTS.md](../crates/afterray-store/AGENTS.md)。
+>
+> 已被代码推翻 —— 下文正文保留的是当初的意图：
+> - 「`PROTOCOL_VERSION` 5 → 6」→ 现在是 15，`crates/afterray-protocol/src/lib.rs:34`
+> - 「Schema 10 → 12」→ 现在是 26，`crates/afterray-store/src/lib.rs:97`
+> - §2「48 帧 / 1.5GB 的缓存」→ 实际是全分辨率帧 20 张 / 384 MB（`swift/AfterRayRecall/Sources/RecallView.swift:1166`）、缩略图 240 张 / 96 MB（`swift/AfterRayRecall/Sources/RecallThumbnailCache.swift:26`）。只有数字过时；这一节论证的**两级缓存必须分开**完好无损。
+> - §6「语义召回保留给 chat agent 和 `search_evidence`」→ 这个保留口子已经关掉了：语义检索现在到处都不用，`Vault::semantic_search` 与 `fuse_search_results` 除测试外零调用方（`crates/afterray-store/src/lib.rs:4316`、`:4959`），agent 的 `search_evidence` 也走纯字面的 `search_hits`（`crates/afterrayd/src/main.rs:3177`）。
+
 搜索原本是召回体验里的二等公民：结果是右上角一列文字摘要，用户要读文字、猜哪条是自己要的、点一下才跳过去；跳过去之后画面上没有任何东西告诉他"命中的字在这里"。底部时间轴按 App 涂色，浏览一天很好用，但和结果集完全脱节。
 
 这次把搜索做成一条完整的动线：
@@ -46,7 +55,7 @@
 
 ### 客户端缓存
 
-`RecallThumbnailCache` 和 `RecallDecodedImageCache` **刻意分开**：一条二十几格的胶片条绝不能把召回视图马上要用的全分辨率帧挤出那个 48 帧 / 1.5GB 的缓存。
+`RecallThumbnailCache` 和 `RecallDecodedImageCache` **刻意分开**：一条二十几格的胶片条绝不能把召回视图马上要用的全分辨率帧挤出那个 48 帧 / 1.5GB 的缓存。 **[数字已过时 → 帧 20 / 384 MB，`swift/AfterRayRecall/Sources/RecallView.swift:1166`；缩略图 240 / 96 MB，`swift/AfterRayRecall/Sources/RecallThumbnailCache.swift:26`。分开这件事仍然成立。]**
 
 ---
 
@@ -107,7 +116,7 @@ OCR bounding box 早就随 `text_evidence.layout_json` 持久化了，`evidence_
 
 ### 修法
 
-**UI 搜索路径只走全文检索。** `Request::Search` 改走 `text_hits`，不再融合语义结果。用户在搜索框里打字，找的是他记得自己看见过的字，期待被指出"那些字在这里"；embedding 空间里的邻居回答不了这个问题——它指向的那一帧根本没有可高亮的像素。语义召回保留给能自己权衡松匹配的调用方：chat agent 和 `search_evidence` 工具，走 `search_hits`。
+**UI 搜索路径只走全文检索。** `Request::Search` 改走 `text_hits`，不再融合语义结果。用户在搜索框里打字，找的是他记得自己看见过的字，期待被指出"那些字在这里"；embedding 空间里的邻居回答不了这个问题——它指向的那一帧根本没有可高亮的像素。语义召回保留给能自己权衡松匹配的调用方：chat agent 和 `search_evidence` 工具，走 `search_hits`。 **[已推翻 → `crates/afterrayd/src/main.rs:3177`：这个口子后来也关了，`search_hits` 现在是纯字面检索；`Vault::semantic_search` / `fuse_search_results` 除测试外零调用方]**
 
 **给语义检索加余弦下限。** `SEMANTIC_MIN_SIMILARITY = 0.72`。低于它的不是匹配，只是"库里最不无关的东西"。查不到就返回空，而不是凑数——这些结果最终会被模型当成引证。
 
@@ -140,9 +149,9 @@ bigram phrase 要求位置连续，所以匹配一个 phrase 等价于匹配一�
 
 ## 破坏性变更
 
-`PROTOCOL_VERSION` 5 → 6。daemon、app、`afterray-cli` 必须一起重建，否则 `DaemonClientError.protocolMismatch`。`scripts/run-v0.sh` 会全量构建。
+`PROTOCOL_VERSION` 5 → 6。daemon、app、`afterray-cli` 必须一起重建，否则 `DaemonClientError.protocolMismatch`。`scripts/run-v0.sh` 会全量构建。 **[版本号已过时 → 现在是 15，`crates/afterray-protocol/src/lib.rs:34`]**
 
-Schema 10 → 12（11 = 窗口标题索引，12 = 缩略图列），两步都是纯增量，不重建表。
+Schema 10 → 12（11 = 窗口标题索引，12 = 缩略图列），两步都是纯增量，不重建表。 **[版本号已过时 → 现在是 26，`crates/afterray-store/src/lib.rs:97`]**
 
 ## 验证
 

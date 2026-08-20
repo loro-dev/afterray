@@ -1,5 +1,12 @@
 # Agent harness threat model
 
+> **Status (updated 2026-08-20): current threat model. The code is the authority where they disagree.**
+> Superseded or unmet on these points — the body below still states the original text:
+> - "The largest capability the tools legitimately hold is `&ModelQueue`, needed for the embedding behind `search_evidence`" → the tools hold no queue at all. `ToolHost` has exactly `store: SharedReadOnlyVault`, `now_ms` and `budget`, and `ModelQueue` does not appear anywhere in the file (`crates/afterrayd/src/tools.rs:66`). `search_evidence` is FTS only: `search_hits` (`crates/afterrayd/src/tools.rs:334`) calls `Vault::search_filtered` and nothing else (`crates/afterrayd/src/main.rs:3177`). **The conclusion below — that `search_evidence` is not an exfiltration path — still holds, and holds more strongly than the stated reason.** What backs it now is three facts, not one: the tools cannot reach the queue; embeddings are switched off entirely and a source-scanning test fails the build if `ModelInput::Embedding`, `semantic_search(` or `insert_embedding(` returns to the daemon (`crates/afterrayd/src/main.rs:6307`); and `LlmRouterAdapter` — the only network-capable adapter — still declares `ModelCapability::Llm` and rejects every non-LLM input at the top of `execute` (`crates/afterray-models/src/remote.rs:238`), asserted by a test that names this document (`crates/afterray-models/src/remote.rs:775`). The narrowing "listed under the remaining work" is therefore already done, by removal rather than by an embedding port.
+> - "Their whole argument vocabulary is `from_ms`, `to_ms`, `at_ms`, `day`, `moment_id`, `query`, `limit`. Two of those are strings" → nine names, four of them strings, and the `search_evidence` analysis rests on this inventory being complete. `app` is a third free string, read by `list_activity` and by the shared search filter (`crates/afterrayd/src/tools.rs:519`, `crates/afterrayd/src/tools.rs:559`); it cannot inject, because `search_filtered` binds it as SQL parameter `?5` (`crates/afterray-store/src/lib.rs:4260`) and `activity_spans_in_app` compares it in Rust with `eq_ignore_ascii_case` (`crates/afterray-store/src/lib.rs:1552`). `day_ms` is a fourth — an integer, accepted by `get_day_summary` and deliberately left out of the catalogue (`crates/afterrayd/src/tools.rs:218`, exempted by name in the documentation test at `crates/afterrayd/src/tools.rs:1639`). The later phrase "those seven argument names" inherits the same error.
+> - "a `CancelToken` checked at three points" → four in `crates/afterray-harness/src/run.rs`: before each round (`:447`), racing the model stream (`:670`), before a tool call (`:698`), racing the tool invocation (`:723`). A fifth cancellation exit is not a check — a model surface that stops its own job returns `ModelError::Cancelled`, converted to `LoopError::Cancelled` at `crates/afterray-harness/src/run.rs:373`.
+> - Re-checked and still literally true: the `jail` source scan covers exactly two regions — `tools.rs` with its test modules stripped, and the `SlotT2Tools` impl carved out of `main.rs` by string split — so a helper defined elsewhere in `main.rs` is invisible to it (`crates/afterrayd/src/tools.rs:1409`).
+
 Everything AfterRay's agent reads is text somebody else wrote — screen
 captures, window titles, transcripts, documents that happened to be open. Some
 of it will eventually contain a sentence engineered to be read as an
@@ -34,6 +41,10 @@ Their whole argument vocabulary is `from_ms`, `to_ms`, `at_ms`, `day`,
 `moment_id`, `query`, `limit`. Two of those are strings: `day` is rejected
 unless it parses as a calendar date, and `query` is discussed below. No path,
 URL, command, glob, or format string.
+**[Changed → nine names, not seven: `app` is a third string
+(`crates/afterrayd/src/tools.rs:519`) and `day_ms` a fourth, undocumented,
+argument (`crates/afterrayd/src/tools.rs:218`). The "no path, URL, command"
+half is unchanged.]**
 
 This list shrank from twelve. `get_moment`, `get_ocr` and `get_ax_digest` were
 folded into `get_moment_context` (one instant, read once instead of three
@@ -57,7 +68,7 @@ from chat.
 | send an embedding query to a remote endpoint | `LlmRouterAdapter` declares `ModelCapability::Llm` and the queue routes by capability; embeddings go to the local worker | **type + routing**, with a test |
 | escape the data fence | tool results are wrapped in `<<<AFTERRAY_DATA kind=tool_result>>>` and the closer is stripped from the body | code + test |
 | loop forever, or fill the window | `ContextBudget` caps rounds and per-result tokens, asserted coherent at compile time | code |
-| keep running after the user stops it | `ChatAbort` fires a `CancelToken` checked at three points, and kills the queue job | code + test |
+| keep running after the user stops it | `ChatAbort` fires a `CancelToken` checked at three points **[Changed → four, `crates/afterray-harness/src/run.rs:447`]**, and kills the queue job | code + test |
 
 Only two entries are structural — the read-only handle, which is a type, and
 the absent HTTP client, which is a dependency fact. Everything marked **review
@@ -67,7 +78,11 @@ capability the tools already hold. Calling it confinement would be wrong; its
 job is to make acquiring those powers impossible to do *silently*.
 
 The largest capability the tools legitimately hold is `&ModelQueue`, needed for
-the embedding behind `search_evidence`. It is narrower than it looks — the
+the embedding behind `search_evidence`.
+**[Changed → `ToolHost` holds `store` / `now_ms` / `budget` and no queue,
+`crates/afterrayd/src/tools.rs:66`; the narrowing this paragraph asks for
+happened by removing the handle. See the status block.]**
+It is narrower than it looks — the
 queue routes by capability and the only network-capable adapter declares itself
 LLM-only — but it is a broader handle than the tools need, and narrowing it to
 an embedding port is listed under the remaining work in
@@ -96,7 +111,8 @@ probabilistic system, and a sufficiently clever payload against a sufficiently
 weak model will get through it. The fence is why injection is unlikely to
 succeed; the read-only tool surface is why it does not matter very much when it
 does. A model that is fully suborned can still only call the eight read tools
-above, with those seven argument names, against the user's own vault.
+above, with those seven argument names **[Changed → nine,
+`crates/afterrayd/src/tools.rs:519` and `:218`]**, against the user's own vault.
 
 **The worst an injection achieves today:** it makes the agent look at
 different evidence than the user asked about, and say something wrong or
@@ -132,6 +148,13 @@ It does not reach the network. `ModelInput::Embedding` is routed by capability,
 `ModelCapability::Llm`, and the queue hands embedding work to the local
 `llama-embedding` worker. There is no setting that points embeddings at a
 remote endpoint. A test asserts the router refuses an embedding job.
+**[Changed → the routing argument is now the second line of defence, not the
+first: `search_evidence` runs FTS only and the tools hold no queue handle to
+route through (`crates/afterrayd/src/tools.rs:334`,
+`crates/afterrayd/src/main.rs:3177`). The router's refusal is still real
+(`crates/afterray-models/src/remote.rs:238`, test at `:775`), and a source scan
+now fails the build if an embedding call reappears in the daemon
+(`crates/afterrayd/src/main.rs:6307`).]**
 
 So the channel does not exist. And even if it did, it would be strictly
 narrower than the prompt itself, which already carries the same screen text to

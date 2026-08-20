@@ -1,6 +1,28 @@
 # AfterRay V0 实现计划
 
-> 状态：Active  
+> **状态（2026-08-20 更新）：历史计划。代码是唯一权威。**
+> 下面的正文仍然记录着当初的意图，没有改写；被代码推翻的部分逐条列在这里。
+>
+> **本文正文自相矛盾，读者无法从中判断 Accessibility Tree 到底是不是需求。** §1 的闭环要求「本地记录……前台 Accessibility Tree」，§2 V0-R001 重复了这条；§3「明确不做」第一行却写着「Accessibility Tree。」；§8「V0 Done」又把它列成完成标准。三处互相冲突，任何一处都不能单独当作需求读。代码给出的答案是：AX 一直在采，而且是主内容通道之一 —— `crates/afterray-platform-macos/src/lib.rs:244`（`ArtifactKind::Accessibility`）。
+>
+> **OPEN：收藏是一条仍然对用户成立的虚假承诺 —— 本文件里最严重的一条。**
+> - `Request::FavoriteSet` 直接失败返回 `"favorites are disabled"`，`crates/afterrayd/src/main.rs:947`
+> - 出货 App 构造 `RecallView` 时根本不接 `onToggleFavorite`，`apps/AfterRay/Sources/AfterRayApp.swift:1063`；这个回调声明在 `swift/AfterRayRecall/Sources/RecallView.swift:32`，只有 Visual Lab 接（`apps/AfterRayVisualLab/Sources/AfterRayVisualLabApp.swift:173`）
+> - 保留策略里的豁免条款还在 —— `WHERE m.is_favorite = 0`，`crates/afterray-store/src/lib.rs:4781` —— 但没有任何一行数据能满足它
+> - 设置页仍然告诉用户「Favorites … may exceed this limit」，`swift/AfterRayRecall/Sources/AfterRaySettingsChrome.swift:816`
+> - 官网仍然承诺 "favorites never expire" / 「收藏永不过期」，`site/src/i18n.tsx:284` 与 `site/src/i18n.tsx:561`
+>
+> 其余推翻项：
+> - V0-R001「V0 使用固定采样策略，不做键鼠活动触发」→ 输入事件现在会把截图拉到前面来，节流下限 `EVENT_CAPTURE_MIN_INTERVAL_MS`，`crates/afterrayd/src/main.rs:1447`；调用点 `crates/afterrayd/src/main.rs:2424`
+> - V0-R003 的按 Moment 数量删除（`maxUnstarredMoments`）→ 改为按字节：`enforce_retention`，`crates/afterray-store/src/lib.rs:4724`，上限默认 100 GB（`DEFAULT_STORAGE_LIMIT_BYTES`，`crates/afterray-protocol/src/lib.rs:14`）。`maxUnstarredMoments` 这个符号在代码里任何地方都不存在。理由见 [docs/decisions/active/architecture/2026-08-20-size-driven-retention.md](decisions/active/architecture/2026-08-20-size-driven-retention.md)
+> - V0-R002 / §5「V0 不实现 blob pack」「V0 不做 pack」→ 冷帧的闭合 GOP AV1 打包已上线，`commit_gop`，`crates/afterray-store/src/gop.rs:386`
+> - §5「schema 只支持 V0……不承诺 migration」→ `migrate` 串了 20 个编号迁移步骤（`crates/afterray-store/src/lib.rs:5126`），`SCHEMA_VERSION = 26`（`crates/afterray-store/src/lib.rs:97`）
+> - §3「明确不做」中实际已经上线的：Accessibility Tree（同上）；Developer ID / Notarization / 自动更新（`scripts/build-release.sh:118` 起的发布链路，Sparkle 配置在 `apps/AfterRay/Resources/Info.plist:37`）；第三方 Agent 集成（`crates/afterray-cli/src/main.rs:15` 的只读 CLI + `skills/afterray/SKILL.md`）；内置 Agent harness（`crates/afterray-harness/`、`crates/afterray-agent/`）；多模型选择（LLM 路由 `crates/afterray-models/src/remote.rs:502`）；Settings UI（`swift/AfterRayRecall/Sources/AfterRaySettingsChrome.swift:816` 所在的设置页）
+> - §4.4 建议 7 个 crate → 实际 11 个（`crates/`：afterray-agent、afterray-cli、afterray-codec、afterray-core、afterray-harness、afterray-infer、afterray-models、afterray-platform-macos、afterray-protocol、afterray-store、afterrayd）
+> - §6 Phase 3 的 `V0-304`「scale/opacity/red glow 过渡」从未落地 —— `RecallView`（`swift/AfterRayRecall/Sources/RecallView.swift:24`）里没有任何红色余辉过渡
+> - §4.5 列出的 CLI 动词（`daemon start`、`record start/stop`、`favorite add/remove`）一个都不存在。真实命令面见 `crates/afterray-cli/src/main.rs:27` 的 `Command`（只读查询与证据读取），且 `--json` 是全局 flag（`crates/afterray-cli/src/main.rs:20`），不是每条命令各自的参数
+
+> 原状态：Active  
 > 目标用户：开发者本人  
 > 目标：先在一台本机上跑通完整闭环，不按可公开发布产品的标准建设  
 > 原则：产品功能最小化，但把可跨平台的后台核心放进 Rust；Swift 只负责 macOS UI 和确实不适合由 Rust 直接调用的系统边界。
@@ -40,7 +62,7 @@ WHEN 三项权限全部可用，AfterRay SHALL 自动在本机开始记录当前
 
 WHEN 开发者点击 Stop Recording，AfterRay SHALL 结束当前 Session，并让已提交内容可以立即回放。
 
-V0 使用固定采样策略，不做键鼠活动触发、会议检测或自适应 throttle。
+V0 使用固定采样策略，不做键鼠活动触发、会议检测或自适应 throttle。 **[已推翻 → `crates/afterrayd/src/main.rs:2424`]**
 
 ### V0-R002：本地保存与恢复
 
@@ -51,6 +73,8 @@ WHEN App 重启，AfterRay SHALL 重新打开已有数据库，并展示之前�
 V0 不实现 blob pack、key rotation、recovery key、复杂 migration 或故障注入框架；但加密边界从第一天属于 Rust Vault，Swift 不直接读写数据库或媒体文件。
 
 ### V0-R003：删除最旧内容
+
+**[整节已推翻 → `crates/afterray-store/src/lib.rs:4724`；`maxUnstarredMoments` 从未存在于代码]**
 
 WHEN 未收藏 Moment 数量超过开发配置中的 `maxUnstarredMoments`，AfterRay SHALL 删除最旧的未收藏 Moment 及其派生数据，直到未收藏数量回到阈值以内。
 
@@ -83,6 +107,8 @@ V0 只做一个水平时间轴，不做 Month/Day/Session 多层缩放。
 
 ### V0-R006：收藏
 
+**[整节已推翻 → `crates/afterrayd/src/main.rs:947`（RPC 直接失败）。但设置页 `swift/AfterRayRecall/Sources/AfterRaySettingsChrome.swift:816` 与官网 `site/src/i18n.tsx:284` 仍在向用户承诺这条 —— 见顶部状态块的 OPEN 项]**
+
 WHEN 用户收藏当前 Moment，AfterRay SHALL 持久化收藏状态。
 
 WHILE Moment 被收藏，自动保留任务 SHALL 跳过该 Moment 及回放它所需的文件。
@@ -93,8 +119,8 @@ WHEN 用户取消收藏，该 Moment SHALL 重新成为可删除内容。
 
 以下内容全部移出 V0，不为它们提前建设抽象：
 
-- Accessibility Tree。
-- 键盘、鼠标活动触发截图。
+- Accessibility Tree。 **[已推翻 → `crates/afterray-platform-macos/src/lib.rs:244`；且与本文 §1、§2 V0-R001、§8 直接冲突]**
+- 键盘、鼠标活动触发截图。 **[已推翻 → `crates/afterrayd/src/main.rs:2424`]**
 - 自动会议检测与会议 App adapters。
 - 自动开始录音；V0 只允许手动 Start/Stop。
 - 正式 onboarding 和一次完成所有权限的流程。
@@ -199,6 +225,8 @@ V0 只拆这些稳定边界，不继续细分 crate。
 ### 4.5 V0 IPC 与 CLI
 
 V0 使用 Unix domain socket 和版本化 request/response。CLI 是第一个完整客户端，Swift UI 使用同一套 API。
+
+下面这份动词表 **[已推翻 → `crates/afterray-cli/src/main.rs:27`]**：`daemon start`、`record start/stop`、`favorite add/remove` 从未实现；真实 CLI 是只读的查询/证据面，`--json` 是全局 flag（`crates/afterray-cli/src/main.rs:20`）。
 
 ```text
 afterray daemon start
@@ -404,8 +432,8 @@ Phase 0
 - OCR、ASR、Embedding、LLM 各有一条真实本地路径成功运行。
 - 可以通过左右拖拽回到 Session 中任意已记录时刻。
 - 可以播放该时刻对应音频，并查看 OCR/Transcript。
-- 可以收藏 Moment，重启后收藏状态仍存在。
-- 未收藏内容达到内部数量阈值后，最旧未收藏内容被删除；收藏内容不计入阈值。
+- 可以收藏 Moment，重启后收藏状态仍存在。 **[已推翻 → `crates/afterrayd/src/main.rs:947`]**
+- 未收藏内容达到内部数量阈值后，最旧未收藏内容被删除；收藏内容不计入阈值。 **[已推翻 → `crates/afterray-store/src/lib.rs:4724`，改为按字节]**
 - Swift UI 关闭时 daemon 可以继续录制和处理；daemon 重启后已有内容仍可回放和搜索。
 - SQLite 与加密 artifact 只由 Rust Vault 访问，Swift UI 和 CLI 不直接碰文件。
 - 完成一次本机自用闭环。
