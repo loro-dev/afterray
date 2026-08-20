@@ -1,0 +1,13 @@
+{
+  "//": "Two texts that must say the same thing. A side is a whole file, or a slice delimited by literal markers so edits above it do not move the boundary.",
+  "pairs": {
+    "readme": [
+      { "file": "README.md" },
+      { "file": "README.zh-CN.md" }
+    ],
+    "site-copy": [
+      { "file": "site/src/i18n.tsx", "from": "const en = {", "to": "export type Copy = typeof en" },
+      { "file": "site/src/i18n.tsx", "from": "const zh: Copy = {", "to": "export const copy" }
+    ]
+  }
+}

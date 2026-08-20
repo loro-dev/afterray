@@ -117,7 +117,9 @@ make docs-sync                          # check
 node scripts/docs-gate/main.ts --write  # re-record anchor hashes
 ```
 
-Three checks, all mechanical: every relative Markdown link and `#fragment` resolves; every record has the header, the lifecycle-matching `Status:`, a closed-set `Area:`, its required sections, and a two-way supersede link; and every `@dec:` marker pairs with a record that lists its file, both ways.
+Six checks, all mechanical: every relative Markdown link and `#fragment` resolves; every `docs/` or `context/` path cited from a source comment exists; no agent-facing document is over its ceiling; every record has the header, the lifecycle-matching `Status:`, a closed-set `Area:`, its required sections, and a two-way supersede link; neither side of a bilingual pair has moved without the other; and every `@dec:` marker pairs with a record that lists its file, both ways.
+
+Two of them keep a lock file. **Bilingual pairs** are hashed, never read — the gate cannot tell whether two languages agree, only whether one side moved without the other. It reports the *pair*, not the side, because re-recording just the side that moved is the exact failure it exists to prevent. **Size ceilings** above the 4000 default are grandfathered debt: the gate blocks growth rather than demanding an immediate split, and the ceilings come down as detail moves into `context/`.
 
 The one worth understanding is the **anchor hash**. Beside each record sits a `<slug>.anchors.json` holding a hash of the code under every marker, as of the last time someone confirmed the record still describes it. Edit that code and the gate goes red — not because the edit is wrong, but because nobody has re-read the decision since. Re-read it, then `--write`; the sidecar diff *is* the confirmation, and it is reviewable.
 

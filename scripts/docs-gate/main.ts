@@ -11,6 +11,9 @@
 // record was looked at when its code changed. The rest stays with review.
 
 import { checkAnchors } from './anchors.ts'
+import { checkBilingual } from './bilingual.ts'
+import { checkBudgets } from './budgets.ts'
+import { checkDocRefs } from './docrefs.ts'
 import { checkLinks } from './links.ts'
 import { checkRecords } from './records.ts'
 import { formatFinding, type Finding } from './util.ts'
@@ -19,7 +22,10 @@ const write = process.argv.includes('--write')
 
 const checks: { name: string; run: () => Finding[] }[] = [
   { name: 'markdown links', run: checkLinks },
+  { name: 'doc refs from source', run: checkDocRefs },
+  { name: 'doc budgets', run: checkBudgets },
   { name: 'decision records', run: checkRecords },
+  { name: 'bilingual pairs', run: () => checkBilingual(write) },
   { name: 'code anchors', run: () => checkAnchors(write) },
 ]
 
