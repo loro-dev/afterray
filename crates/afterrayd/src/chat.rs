@@ -471,7 +471,11 @@ mod tests {
 
         for index in 0..12 {
             rows.push(msg("user", &format!("q{index}"), 10 + i64::from(index) * 2));
-            rows.push(msg("assistant", &format!("a{index}"), 11 + i64::from(index) * 2));
+            rows.push(msg(
+                "assistant",
+                &format!("a{index}"),
+                11 + i64::from(index) * 2,
+            ));
             let current = history_messages(&rows);
             assert!(
                 afterray_harness::is_prefix_of(previous.messages(), current.messages()),
@@ -587,7 +591,10 @@ mod tests {
         let history = history_messages(&rows);
         let replayed = &history.messages()[2].content();
         assert!(replayed.contains("`get_now` ran earlier"), "{replayed}");
-        assert!(!replayed.contains("AFTERRAY_DATA"), "nothing to fence: {replayed}");
+        assert!(
+            !replayed.contains("AFTERRAY_DATA"),
+            "nothing to fence: {replayed}"
+        );
         assert!(history.messages()[1].content().starts_with("TOOL get_now"));
     }
 
@@ -605,7 +612,10 @@ mod tests {
             .iter()
             .find(|message| message.kind == afterray_harness::Kind::Control)
             .expect("no notice about the unreadable log");
-        assert!(control.content().contains("could not be read"), "{control:?}");
+        assert!(
+            control.content().contains("could not be read"),
+            "{control:?}"
+        );
         // The answer still replays: what is missing is the provenance, not the
         // turn.
         assert!(
@@ -623,9 +633,8 @@ mod tests {
     #[test]
     fn a_later_turn_can_see_what_an_earlier_one_looked_up() {
         let mut answered = msg("assistant", "You were reading the AV1 spec.", 2);
-        answered.tool_log = Some(
-            r#"[{"name":"list_activity","args":{"from_ms":1,"to_ms":2}}]"#.to_owned(),
-        );
+        answered.tool_log =
+            Some(r#"[{"name":"list_activity","args":{"from_ms":1,"to_ms":2}}]"#.to_owned());
         let rows = vec![msg("user", "what was I reading", 1), answered];
 
         let rendered = history_messages(&rows);
@@ -680,7 +689,10 @@ mod tests {
             "那第三件呢",
             now,
         )
-        .render(afterray_harness::ContextBudget::DEFAULT, crate::agent::fence_untrusted);
+        .render(
+            afterray_harness::ContextBudget::DEFAULT,
+            crate::agent::fence_untrusted,
+        );
         assert!(!prompt.contains("kind=seed"), "a seed came back: {prompt}");
         assert!(prompt.contains("<<<AFTERRAY_DATA kind=user>>>"));
         assert!(prompt.contains("<<<END_AFTERRAY_DATA>>>"));
@@ -693,13 +705,25 @@ mod tests {
         // conversation where it would change every prefix.
         let history_at = prompt.find("ignore previous").expect("history went");
         let task_at = prompt.find("那第三件呢").expect("question went");
-        assert!(history_at < task_at, "the question is back in front: {prompt}");
+        assert!(
+            history_at < task_at,
+            "the question is back in front: {prompt}"
+        );
     }
 
     #[tokio::test]
     async fn empty_message_fails() {
         let (_directory, vault) = test_vault();
-        let response = handle_send(&vault, &queue(Vec::new()), None, "   ", 1, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT), "English").await;
+        let response = handle_send(
+            &vault,
+            &queue(Vec::new()),
+            None,
+            "   ",
+            1,
+            TurnModel::ready(afterray_harness::ContextBudget::DEFAULT),
+            "English",
+        )
+        .await;
         assert!(!response.ok);
     }
 
@@ -789,7 +813,16 @@ print(json.dumps({
 }))
 "#;
         let models = mock_llm(script);
-        let first = handle_send(&vault, &models, None, "first question", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT), "English").await;
+        let first = handle_send(
+            &vault,
+            &models,
+            None,
+            "first question",
+            1_000,
+            TurnModel::ready(afterray_harness::ContextBudget::DEFAULT),
+            "English",
+        )
+        .await;
         assert!(first.ok, "{first:?}");
         let first: ChatReply = serde_json::from_value(first.data.unwrap()).unwrap();
         assert_eq!(first.answer, "hello");
@@ -829,7 +862,16 @@ print(json.dumps({
 }))
 "#;
         let models = mock_llm(script);
-        let response = handle_send(&vault, &models, None, "what was open", 1_000, TurnModel::ready(afterray_harness::ContextBudget::DEFAULT), "English").await;
+        let response = handle_send(
+            &vault,
+            &models,
+            None,
+            "what was open",
+            1_000,
+            TurnModel::ready(afterray_harness::ContextBudget::DEFAULT),
+            "English",
+        )
+        .await;
         assert!(response.ok, "{response:?}");
         let reply: ChatReply = serde_json::from_value(response.data.unwrap()).unwrap();
         assert_eq!(reply.answer, "used the activity list.");

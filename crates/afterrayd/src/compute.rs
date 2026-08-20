@@ -235,9 +235,8 @@ impl ComputeGovernor {
     /// instruction from the same person, and honouring the pause instead would
     /// leave the panel showing a button that visibly did nothing.
     pub(crate) fn force_now(&self, workload: ComputeWorkload, now_ms: i64) -> i64 {
-        let until = now_ms.saturating_add(
-            i64::try_from(FORCE_WINDOW.as_millis()).unwrap_or(30 * 60 * 1_000),
-        );
+        let until = now_ms
+            .saturating_add(i64::try_from(FORCE_WINDOW.as_millis()).unwrap_or(30 * 60 * 1_000));
         self.paused_until_ms.store(0, Ordering::SeqCst);
         self.forced_until_ms
             .lock()
@@ -282,7 +281,13 @@ impl ComputeGovernor {
     /// Records a finished summary pass. `duration` is wall clock around the
     /// whole pass, queue wait included — that is what the user actually waited
     /// through, and it is the number the estimate has to be built from.
-    pub(crate) fn record_summary(&self, slot_start_ms: i64, finished_at_ms: i64, duration: Duration, ok: bool) {
+    pub(crate) fn record_summary(
+        &self,
+        slot_start_ms: i64,
+        finished_at_ms: i64,
+        duration: Duration,
+        ok: bool,
+    ) {
         let run = ComputeRun {
             slot_start_ms,
             finished_at_ms,
@@ -319,8 +324,6 @@ impl ComputeGovernor {
             .copied()
             .collect()
     }
-
-
 
     pub(crate) fn mode(&self) -> ComputeMode {
         *self
@@ -475,10 +478,12 @@ impl ComputeGovernor {
     /// the work still drains, just five times slower. An override has to reach
     /// this too — ASR has no machine gate, so bypassing the gate alone would
     /// leave "run now" doing nothing but redraw the row.
-    pub(crate) fn asr_sweep_interval(&self, conditions: MachineConditions, now_ms: i64) -> Duration {
-        let forced = self
-            .forced_until_ms(ComputeWorkload::Asr, now_ms)
-            .is_some();
+    pub(crate) fn asr_sweep_interval(
+        &self,
+        conditions: MachineConditions,
+        now_ms: i64,
+    ) -> Duration {
+        let forced = self.forced_until_ms(ComputeWorkload::Asr, now_ms).is_some();
         if conditions.on_ac || forced {
             Duration::from_secs(60)
         } else {
@@ -559,14 +564,17 @@ impl ComputeGovernor {
     /// A suspension is deliberately not an obstacle: `force_now` lifts it. What
     /// remains are the two standing choices no override should quietly
     /// overrule — the off switch, and a workload whose loop never started.
-    pub(crate) fn force_refusal(&self, workload: ComputeWorkload, now_ms: i64) -> Option<GateRefusal> {
-        self.standing_refusal(workload, now_ms)
-            .filter(|refusal| {
-                matches!(
-                    refusal.code,
-                    ComputeGateCode::ModeOff | ComputeGateCode::DisabledByEnv
-                )
-            })
+    pub(crate) fn force_refusal(
+        &self,
+        workload: ComputeWorkload,
+        now_ms: i64,
+    ) -> Option<GateRefusal> {
+        self.standing_refusal(workload, now_ms).filter(|refusal| {
+            matches!(
+                refusal.code,
+                ComputeGateCode::ModeOff | ComputeGateCode::DisabledByEnv
+            )
+        })
     }
 
     /// Whether offering "run now" for `workload` would change anything.
@@ -1042,7 +1050,11 @@ mod tests {
 
         governor.force_now(ComputeWorkload::Summary, now);
         assert!(governor.clear_force(ComputeWorkload::Summary));
-        assert!(governor.forced_until_ms(ComputeWorkload::Summary, now).is_none());
+        assert!(
+            governor
+                .forced_until_ms(ComputeWorkload::Summary, now)
+                .is_none()
+        );
         assert!(
             !governor.clear_force(ComputeWorkload::Summary),
             "clearing nothing reports nothing, so callers do not log a transition"
@@ -1070,7 +1082,11 @@ mod tests {
         let refusal = off
             .force_refusal(ComputeWorkload::Summary, 0)
             .expect("off blocks a forced run");
-        assert!(refusal.reason.contains("switched off"), "{}", refusal.reason);
+        assert!(
+            refusal.reason.contains("switched off"),
+            "{}",
+            refusal.reason
+        );
         assert!(
             governor(ComputeMode::Full)
                 .force_refusal(ComputeWorkload::Summary, 0)
@@ -1125,15 +1141,9 @@ mod tests {
     #[test]
     fn the_reported_thresholds_are_the_ones_the_gate_uses() {
         let thresholds = ComputeGovernor::thresholds();
-        assert!(
-            (thresholds.summary_min_idle_seconds - T2_MIN_IDLE_SECONDS).abs() < f64::EPSILON
-        );
-        assert!(
-            (thresholds.summary_max_load_per_core - T2_MAX_LOAD_PER_CORE).abs() < f64::EPSILON
-        );
-        assert!(
-            (thresholds.summary_min_battery_fraction - T2_MIN_BATTERY).abs() < f64::EPSILON
-        );
+        assert!((thresholds.summary_min_idle_seconds - T2_MIN_IDLE_SECONDS).abs() < f64::EPSILON);
+        assert!((thresholds.summary_max_load_per_core - T2_MAX_LOAD_PER_CORE).abs() < f64::EPSILON);
+        assert!((thresholds.summary_min_battery_fraction - T2_MIN_BATTERY).abs() < f64::EPSILON);
         assert_eq!(thresholds.force_window_seconds, FORCE_WINDOW.as_secs());
     }
 

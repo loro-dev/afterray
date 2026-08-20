@@ -55,13 +55,7 @@ impl<'a> TurnRow<'a> {
         now_ms: i64,
     ) -> Result<Self, String> {
         let id = store
-            .append_message(
-                conversation_id,
-                "assistant",
-                "",
-                None,
-                now_ms,
-            )
+            .append_message(conversation_id, "assistant", "", None, now_ms)
             .map_err(|error| error.to_string())?;
         let row = Self {
             store,
@@ -93,11 +87,7 @@ impl<'a> TurnRow<'a> {
     }
 
     pub(crate) fn push_reasoning(&mut self, round: usize, text: &str) {
-        match self
-            .reasoning
-            .iter_mut()
-            .find(|entry| entry.round == round)
-        {
+        match self.reasoning.iter_mut().find(|entry| entry.round == round) {
             Some(entry) => entry.text.push_str(text),
             None => self.reasoning.push(RoundReasoning {
                 round,
@@ -276,7 +266,9 @@ mod tests {
         let rounds: Vec<RoundReasoning> = serde_json::from_str(reasoning).unwrap();
         assert_eq!(rounds.len(), 3, "every round survives the cap");
         assert!(
-            rounds.iter().all(|entry| entry.text.contains("were cut to fit")),
+            rounds
+                .iter()
+                .all(|entry| entry.text.contains("were cut to fit")),
             "the cut has to be visible"
         );
         assert!(

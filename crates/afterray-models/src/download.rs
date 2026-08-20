@@ -617,8 +617,9 @@ fn verify_one_file(
 ) -> Result<(), DownloadError> {
     ensure_not_cancelled(cancellation)?;
     let file_path = path.join(&expected.path);
-    let metadata = fs::metadata(&file_path)
-        .map_err(|error| DownloadError::message(format!("{} is missing: {error}", expected.path)))?;
+    let metadata = fs::metadata(&file_path).map_err(|error| {
+        DownloadError::message(format!("{} is missing: {error}", expected.path))
+    })?;
     if metadata.len() != expected.bytes {
         return Err(DownloadError::message(format!(
             "{} has {} bytes; expected {}",
@@ -932,7 +933,10 @@ mod tests {
     #[test]
     fn hf_endpoint_override_trims_and_falls_back() {
         assert_eq!(endpoint_or_default(None), "https://huggingface.co");
-        assert_eq!(endpoint_or_default(Some("  ".into())), "https://huggingface.co");
+        assert_eq!(
+            endpoint_or_default(Some("  ".into())),
+            "https://huggingface.co"
+        );
         assert_eq!(
             endpoint_or_default(Some("https://hf-mirror.com/".into())),
             "https://hf-mirror.com"
@@ -954,10 +958,8 @@ mod tests {
 
     #[test]
     fn reclaim_drops_abandoned_staging_but_keeps_listed_and_fresh_ones() {
-        let directory = std::env::temp_dir().join(format!(
-            "afterray-reclaim-test-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("afterray-reclaim-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         let keep_dir = directory.join("QwenKeep.download");
@@ -1051,10 +1053,8 @@ mod tests {
     #[test]
     fn corrupt_snapshot_file_is_binned_so_a_retry_redownloads_it() {
         const GOOD_SHA: &str = "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c";
-        let directory = std::env::temp_dir().join(format!(
-            "afterray-corrupt-bin-test-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("afterray-corrupt-bin-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("good.json"), b"good").unwrap();
@@ -1072,9 +1072,8 @@ mod tests {
             },
         ];
 
-        let error =
-            verify_files_removing_corrupt(&directory, &manifest, &Cancellation::default())
-                .unwrap_err();
+        let error = verify_files_removing_corrupt(&directory, &manifest, &Cancellation::default())
+            .unwrap_err();
         assert!(error.to_string().contains("bad.bin"));
         assert!(directory.join("good.json").is_file(), "good file kept");
         assert!(!directory.join("bad.bin").exists(), "corrupt file binned");

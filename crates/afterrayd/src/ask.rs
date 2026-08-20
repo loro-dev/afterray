@@ -8,9 +8,9 @@ use chrono::Local;
 use std::fmt::Write as _;
 
 use crate::agent;
-use afterray_harness::ContextBudget;
 use crate::search_hits;
 use crate::tools::ToolHost;
+use afterray_harness::ContextBudget;
 
 const CONTEXT_CHAR_CAP: usize = 10_000;
 const SEARCH_HIT_LIMIT: usize = 6;
@@ -82,7 +82,6 @@ pub(crate) fn resolve_ask_range(
     let to = to_ms.unwrap_or(today_end);
     if from <= to { (from, to) } else { (to, from) }
 }
-
 
 fn span_moment_id(span: &ActivitySpan) -> Option<&str> {
     span.moment_ids
@@ -665,7 +664,17 @@ mod tests {
     #[tokio::test]
     async fn empty_question_fails() {
         let (_directory, vault) = test_vault();
-        let response = handle_ask(&vault, &queue(Vec::new()), "   ", None, None, 1, TurnModel::ready(ContextBudget::DEFAULT), "English").await;
+        let response = handle_ask(
+            &vault,
+            &queue(Vec::new()),
+            "   ",
+            None,
+            None,
+            1,
+            TurnModel::ready(ContextBudget::DEFAULT),
+            "English",
+        )
+        .await;
         assert!(!response.ok);
     }
 
@@ -735,8 +744,17 @@ print(json.dumps({
         config.args = vec!["-c".to_owned(), script.to_owned()];
         let models = queue(vec![Arc::new(ProcessAdapter::new(config))]);
 
-        let response =
-            handle_ask(&vault, &models, "design", Some(0), Some(2_000), 1_500, TurnModel::ready(ContextBudget::DEFAULT), "English").await;
+        let response = handle_ask(
+            &vault,
+            &models,
+            "design",
+            Some(0),
+            Some(2_000),
+            1_500,
+            TurnModel::ready(ContextBudget::DEFAULT),
+            "English",
+        )
+        .await;
         assert!(response.ok, "{response:?}");
         let answer: AskAnswer = serde_json::from_value(response.data.unwrap()).unwrap();
         assert!(!answer.model_missing);

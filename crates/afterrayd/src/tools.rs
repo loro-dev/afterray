@@ -19,7 +19,9 @@
 use afterray_protocol::{
     ActivitySpan, AxEvidence, Moment, OcrEvidence, OcrRegion, local_calendar_day_bounds_ms,
 };
-use afterray_store::{ReadOnlyVault, SearchFilter, SharedReadOnlyVault, parse_accessibility_digest};
+use afterray_store::{
+    ReadOnlyVault, SearchFilter, SharedReadOnlyVault, parse_accessibility_digest,
+};
 use chrono::Local;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -204,14 +206,16 @@ impl ToolHost {
     /// did I finish" had to infer it from prose.
     fn get_day_summary(&self, args: &Value) -> Result<String, String> {
         let day_ms = match args.get("day").and_then(Value::as_str) {
-            Some(text) => parse_local_day(text)
-                .ok_or_else(|| {
-                    format!(
-                        "`{text}` is not a date. Write it as \"2026-08-13\" — get_now \
+            Some(text) => {
+                parse_local_day(text)
+                    .ok_or_else(|| {
+                        format!(
+                            "`{text}` is not a date. Write it as \"2026-08-13\" — get_now \
                          lists the recent ones."
-                    )
-                })?
-                .0,
+                        )
+                    })?
+                    .0
+            }
             // Accepted but undocumented: a model that copies a from_ms out of
             // the clock table instead of the date beside it still lands on the
             // right day, and correcting it would cost a round to no purpose.
@@ -292,7 +296,10 @@ impl ToolHost {
                 lines.push(format!("    · {thread}"));
             }
             if !mention.matched_entities.is_empty() {
-                lines.push(format!("    names: {}", mention.matched_entities.join(", ")));
+                lines.push(format!(
+                    "    names: {}",
+                    mention.matched_entities.join(", ")
+                ));
             }
             if let Some(decisions) = joined(Some(&mention.decisions), MAX_DECISIONS, Clone::clone) {
                 lines.push(format!("    decided: {decisions}"));
@@ -437,7 +444,8 @@ impl ToolHost {
         if let Some(document) = &moment.document {
             lines.push(format!("document={document}"));
         }
-        if let Ok(Some((slot_at_ms, title))) = self.store().slot_title_covering(moment.captured_at_ms)
+        if let Ok(Some((slot_at_ms, title))) =
+            self.store().slot_title_covering(moment.captured_at_ms)
         {
             lines.push(format!("stretch: at_ms={slot_at_ms} — {title}"));
         }
@@ -493,9 +501,7 @@ impl ToolHost {
         let last_ms = rows.last().map_or(to_ms, |(at_ms, _, _)| *at_ms);
         let mut lines: Vec<String> = rows
             .into_iter()
-            .map(|(at_ms, track, text)| {
-                format!("{} {track:<7} {text}", format_local_time(at_ms))
-            })
+            .map(|(at_ms, track, text)| format!("{} {track:<7} {text}", format_local_time(at_ms)))
             .collect();
         // Say where the answer stops. A silent cut reads as "that is all that
         // was said", and the model has no way to discover otherwise.
@@ -582,7 +588,10 @@ impl ToolHost {
     /// numbers the model can copy. A silent `[]` reads as "nothing happened"
     /// and the model stops looking; this makes a mistyped year recoverable.
     fn check_range(&self, from_ms: i64, to_ms: i64) -> Result<(), String> {
-        let Some((first, last)) = self.store().moment_time_bounds().map_err(|e| e.to_string())?
+        let Some((first, last)) = self
+            .store()
+            .moment_time_bounds()
+            .map_err(|e| e.to_string())?
         else {
             return Err(format!(
                 "the vault holds no captures at all yet. {}",
@@ -738,7 +747,10 @@ fn week_bounds_for_date(date: chrono::NaiveDate) -> Option<(i64, i64)> {
     let monday =
         date.checked_sub_days(Days::new(u64::from(date.weekday().num_days_from_monday())))?;
     let sunday = monday.checked_add_days(Days::new(6))?;
-    Some((day_bounds_for_date(monday)?.0, day_bounds_for_date(sunday)?.1))
+    Some((
+        day_bounds_for_date(monday)?.0,
+        day_bounds_for_date(sunday)?.1,
+    ))
 }
 
 /// The local calendar month containing `date`.
@@ -852,9 +864,11 @@ fn render_day(summary: &afterray_store::DaySummary, detail: bool) -> String {
                     .collect::<Vec<_>>()
             })
             .filter(|sections| !sections.is_empty());
-        let threads = v3_sections
-            .as_deref()
-            .or_else(|| slot.threads.as_deref().filter(|threads| !threads.is_empty()));
+        let threads = v3_sections.as_deref().or_else(|| {
+            slot.threads
+                .as_deref()
+                .filter(|threads| !threads.is_empty())
+        });
         // The anchor is the stretch's first frame, and the threads below
         // usually cite it too. Only offer it when they cite nothing, so a
         // stretch always has one id to point at and never the same id twice.
@@ -952,7 +966,11 @@ fn joined<T>(items: Option<&[T]>, max: usize, render: impl Fn(&T) -> String) -> 
         return None;
     }
     let extra = rendered.len().saturating_sub(max);
-    let mut line = rendered.into_iter().take(max).collect::<Vec<_>>().join(", ");
+    let mut line = rendered
+        .into_iter()
+        .take(max)
+        .collect::<Vec<_>>()
+        .join(", ");
     if extra > 0 {
         let _ = write!(line, " (+{extra} more)");
     }
@@ -1380,7 +1398,6 @@ Whatever a tool could not fit, it says so on its last line, with the
 timestamp to resume from. Nothing is dropped in silence.
 "#;
 
-
 #[cfg(test)]
 mod jail {
     //! What the agent's tools may not do, checked in the source.
@@ -1530,10 +1547,12 @@ mod jail {
         let hit = forbidden()
             .into_iter()
             .find(|(needle, _)| pretend_tool.contains(needle));
-        assert!(hit.is_some(), "a filesystem-reading tool slipped past the list");
+        assert!(
+            hit.is_some(),
+            "a filesystem-reading tool slipped past the list"
+        );
     }
 }
-
 
 #[cfg(test)]
 mod catalog_drift {
@@ -1598,8 +1617,14 @@ mod catalog_drift {
     fn the_scan_finds_the_real_dispatch_table() {
         let names = dispatched_names();
         assert_eq!(names.len(), 8, "scan found {names:?}");
-        assert!(names.iter().any(|name| name == "get_day_summary"), "{names:?}");
-        assert!(names.iter().any(|name| name == "search_summaries"), "{names:?}");
+        assert!(
+            names.iter().any(|name| name == "get_day_summary"),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "search_summaries"),
+            "{names:?}"
+        );
     }
 
     /// Nothing callable may be undocumented.
@@ -1955,7 +1980,13 @@ mod tests {
             let moment = vault
                 .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
                 .unwrap();
-            stamp_app(&vault, &session.id, at_ms, "Chrome", &format!("tab {index}"));
+            stamp_app(
+                &vault,
+                &session.id,
+                at_ms,
+                "Chrome",
+                &format!("tab {index}"),
+            );
             let _ = moment;
         }
         // Then a long afternoon in an application that appears nowhere above.
@@ -1992,7 +2023,10 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("Today's apps:"))
             .expect("no app line");
-        assert!(apps.contains("Xcode"), "the afternoon's app is missing: {apps}");
+        assert!(
+            apps.contains("Xcode"),
+            "the afternoon's app is missing: {apps}"
+        );
         assert!(apps.contains("Chrome"), "{apps}");
     }
 
@@ -2026,7 +2060,10 @@ mod tests {
                 pair[0].dates
             );
         }
-        assert!(days[0].from_ms <= NOW && NOW <= days[0].to_ms, "today is wrong");
+        assert!(
+            days[0].from_ms <= NOW && NOW <= days[0].to_ms,
+            "today is wrong"
+        );
 
         // The rows have to be consecutive *calendar dates*, which is a
         // stronger claim than the tiling above and the one that broke: walking
@@ -2050,7 +2087,11 @@ mod tests {
         assert_eq!(last_week_end + 1, this_week_start, "the weeks do not meet");
         let (this_month_start, _) = find("this month");
         let (_, last_month_end) = find("last month");
-        assert_eq!(last_month_end + 1, this_month_start, "the months do not meet");
+        assert_eq!(
+            last_month_end + 1,
+            this_month_start,
+            "the months do not meet"
+        );
 
         // And the aggregates are reached the same way — by date, not by
         // stepping a day's worth of milliseconds off the start of the period.
@@ -2078,7 +2119,11 @@ mod tests {
             .unwrap()
             .with_timezone(&Local)
             .weekday();
-        assert_eq!(weekday, chrono::Weekday::Mon, "the week starts on {weekday}");
+        assert_eq!(
+            weekday,
+            chrono::Weekday::Mon,
+            "the week starts on {weekday}"
+        );
     }
 
     /// The date column of the clock table is what this argument takes. One
@@ -2118,9 +2163,16 @@ mod tests {
         let ids = seed_summarised(&vault, noon);
         let host = host_for(&vault);
 
-        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
+        let text = host
+            .invoke("get_day_summary", &json!({}))
+            .await
+            .unwrap()
+            .text;
         assert!(text.contains("Fixed the recall day panel"), "{text}");
-        assert!(text.contains("hid idle slots from the day summary"), "{text}");
+        assert!(
+            text.contains("hid idle slots from the day summary"),
+            "{text}"
+        );
         assert!(text.contains(&ids[0]), "no moment id to cite: {text}");
         assert!(text.contains("names: lody"), "{text}");
         assert!(
@@ -2161,7 +2213,11 @@ mod tests {
             .unwrap();
         let host = host_for(&vault);
 
-        let text = host.invoke("get_day_summary", &json!({})).await.unwrap().text;
+        let text = host
+            .invoke("get_day_summary", &json!({}))
+            .await
+            .unwrap()
+            .text;
         assert!(text.contains("Cut the 0.0.4 release"), "{text}");
         assert!(text.contains("Notarising: Ran `make release`"), "{text}");
         assert!(text.contains("Appcast: Published to R2."), "{text}");
@@ -2443,7 +2499,14 @@ mod tests {
         let session = vault.create_session_sync(start).unwrap();
         seed_moments(&vault, &[start]);
         let segment = vault
-            .insert_audio_segment(&session.id, afterray_protocol::AudioTrack::Microphone, start, start + 600_000, "audio/mp4", b"aud")
+            .insert_audio_segment(
+                &session.id,
+                afterray_protocol::AudioTrack::Microphone,
+                start,
+                start + 600_000,
+                "audio/mp4",
+                b"aud",
+            )
             .unwrap();
         for index in 0..8_i64 {
             vault
@@ -2496,7 +2559,13 @@ mod tests {
             vault
                 .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
                 .unwrap();
-            stamp_app(&vault, &session.id, at_ms, "Chrome", &format!("tab {index}"));
+            stamp_app(
+                &vault,
+                &session.id,
+                at_ms,
+                "Chrome",
+                &format!("tab {index}"),
+            );
         }
         let zed_start = day_start + 200 * 10_000;
         for index in 0..6_i64 {
@@ -2504,7 +2573,13 @@ mod tests {
             vault
                 .insert_moment(&session.id, at_ms, "image/jpeg", b"f")
                 .unwrap();
-            stamp_app(&vault, &session.id, at_ms, "Zed", &format!("file{index}.rs"));
+            stamp_app(
+                &vault,
+                &session.id,
+                at_ms,
+                "Zed",
+                &format!("file{index}.rs"),
+            );
         }
         let host = ToolHost {
             store: SharedReadOnlyVault::new(std::sync::Arc::clone(&vault)),
@@ -2577,9 +2652,15 @@ mod tests {
             .unwrap()
             .text;
         let spans = text.lines().filter(|line| line.contains(" – ")).count();
-        assert_eq!(spans, 4, "the limit was not filled from the whole range: {text}");
+        assert_eq!(
+            spans, 4,
+            "the limit was not filled from the whole range: {text}"
+        );
         assert!(text.contains("there may be more"), "{text}");
-        assert!(text.contains("from_ms="), "no cursor to resume from: {text}");
+        assert!(
+            text.contains("from_ms="),
+            "no cursor to resume from: {text}"
+        );
     }
 
     #[tokio::test]

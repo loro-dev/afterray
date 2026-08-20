@@ -187,8 +187,7 @@ pub async fn probe_context_tokens(config: &LlmRuntimeConfig, afford: usize) -> C
             let origin = config.resolved_base_url();
             if !model.is_empty() && !origin.is_empty() {
                 if let Some(client) = probe_client(&origin) {
-                    probe.architecture =
-                        ollama_architecture_context(&client, &origin, model).await;
+                    probe.architecture = ollama_architecture_context(&client, &origin, model).await;
                     probe.running = ollama_running_context(&client, &origin, model).await;
                 }
             }
@@ -281,7 +280,11 @@ mod tests {
                     format!("{prefix}.embedding_length"): 2_560,
                 }
             });
-            assert_eq!(architecture_context_length(&body), Some(262_144), "{prefix}");
+            assert_eq!(
+                architecture_context_length(&body),
+                Some(262_144),
+                "{prefix}"
+            );
         }
         assert_eq!(architecture_context_length(&json!({})), None);
     }
