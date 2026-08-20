@@ -2,5 +2,6 @@
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
   "crates/afterray-store/src/lib.rs::pub const RAW_EVENT_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;": "sha256:bc9a6d67774957a6",
   "crates/afterray-store/src/lib.rs::pub fn prune_input_events_before(&self, horizon_ms: i64) -> Result<usize, StoreError> {": "sha256:d0b257549eee5fb9",
-  "crates/afterrayd/src/main.rs::async fn expire_raw_input_events(state: &Arc<AppState>, now: i64) {": "sha256:e24c0d762f0c86a2"
+  "crates/afterrayd/src/main.rs::async fn expire_raw_input_events(state: &Arc<AppState>, now: i64) {": "sha256:e24c0d762f0c86a2",
+  "crates/afterrayd/src/main.rs::fn due_slot_windows(slots: &[afterray_store::DaySlot], now: i64) -> Vec<(i64, i64)> {": "sha256:5dfb340d4eaeebee"
 }

@@ -50,6 +50,15 @@ never deleted before it is frozen.
 set independently, so the freeze always reaches every slot whose events are
 still alive.
 
+**A slot whose events are gone is never summarised.** `due_slot_windows` drops
+it, for the sweeper and for the explicit backfill alike. The freeze keeps enough
+for the T1 card to still show where the user was working; it does not keep
+enough to write a T2 card from, and a card written from screen text alone would
+describe the screen while saying nothing about the person in front of it — with
+nothing to distinguish that from a slot where the user genuinely sat still.
+Cards are written once and never revised, so an absent card is the honest
+outcome. Those slots stay `Degraded` and read as "Not summarised" in the UI.
+
 ## Alternatives considered
 
 **Delete on schedule, accept losing unfrozen acts.** Simpler, and it makes 48
@@ -64,6 +73,13 @@ build a backlog.
 **Gate the delete on T2 having summarised the slot.** Rejected: T2 waits for AC
 power, so a laptop that stays unplugged would never expire anything. The freeze
 deliberately runs outside that gate for the same reason.
+
+**Summarise the expired slot anyway, from whatever survives.** Rejected, and
+this is the alternative that looks most reasonable: a card from screen text is
+better than no card. It is not, because the card cannot say which one it is. A
+reader has no way to tell "the user sat still" from "the record of what the
+user did was deleted before anyone read it", and the card is written once and
+never revised. A missing card states the gap; a half-sourced one hides it.
 
 **Freeze the content too, so cards keep their words after expiry.** Rejected —
 it defeats the decision. Frozen content in `acts_json` would outlive the events
@@ -84,6 +100,13 @@ went, which is what the T1/T2 cards actually consume.
 Anyone adding a third should expect to supersede both records rather than add
 another deadline quietly.
 
+**A gap in the record, not a wrong record.** A machine left on battery for more
+than two days produces slots with no T2 card at all. That is the intended
+outcome and the reason the rule exists, but it is a real product cost: the user
+sees "Not summarised" for that stretch and cannot ask for it later, because the
+backfill obeys the same rule. Asking for the summary does not put the evidence
+back.
+
 **48 hours is a ceiling on the raw rows, not on the summary.** The T2 card was
 written by a model that read those rows, and its prose stays in
 `slot_summaries.details` for as long as the slot does. The honest user-facing
@@ -103,3 +126,6 @@ sequence the rebuilt card carries acts, carries no `ActContent`, and contains
 the typed string nowhere in its serialised form.
 `oldest_input_event_ms_judges_a_span_by_its_end` pins the sweep's question
 against the delete's, which must agree or the sweep spins.
+`a_slot_whose_events_have_expired_is_never_summarised` and
+`a_slot_ending_on_the_expiry_cutoff_is_still_summarised` pin the T2 rule and its
+boundary, without a vault — `due_slot_windows` is pure for that reason.

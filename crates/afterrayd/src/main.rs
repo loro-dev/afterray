@@ -3618,15 +3618,29 @@ struct T2Sweep {
     waiting_on_asr: usize,
 }
 
-/// The selection rule on its own, so the three things that make it wrong — the
-/// state filter, the settle window, and the ASR gate that reads the end it
-/// returns — can be tested without a vault.
+// @dec:raw-input-events-expire — docs/decisions/active/product/2026-08-20-raw-input-events-expire.md
+/// The selection rule on its own, so the four things that make it wrong — the
+/// state filter, the settle window, the expiry cutoff, and the ASR gate that
+/// reads the end it returns — can be tested without a vault.
+///
+/// The cutoff is the one that gives up rather than waits. Once a slot's input
+/// events are past `RAW_EVENT_RETENTION_MS` they are gone, and a summary
+/// written from what is left would describe the screen while saying nothing
+/// about the person in front of it — with no way for the reader to tell that
+/// from a slot where the user genuinely sat still. A card that was never
+/// written is honest about being absent; one written from half the evidence is
+/// not, and it is written once and never revised.
+///
+/// This applies to the explicit backfill too, which shares this rule. Asking
+/// for the summary does not put the evidence back.
 fn due_slot_windows(slots: &[afterray_store::DaySlot], now: i64) -> Vec<(i64, i64)> {
+    let evidence_expires_before = now.saturating_sub(afterray_store::RAW_EVENT_RETENTION_MS);
     slots
         .iter()
         // Degraded is precisely "T1 said summarise me, nothing has".
         .filter(|slot| slot.state == SlotSummaryState::Degraded)
         .filter(|slot| slot.slot_end_ms + T2_SETTLE_MS <= now)
+        .filter(|slot| slot.slot_end_ms >= evidence_expires_before)
         .map(|slot| (slot.slot_start_ms, slot.slot_end_ms))
         .collect()
 }
@@ -5813,6 +5827,43 @@ mod tests {
             .into_iter()
             .map(|(slot_start_ms, _)| slot_start_ms)
             .collect()
+    }
+
+    /// The daemon can be off, or on battery, for longer than the events live.
+    /// When it comes back the slot is still `Degraded` and long past settle, so
+    /// every other gate would wave it through — and it would be summarised from
+    /// screen text alone, with nothing to mark the card as having been written
+    /// without the record of what the user did. A missing card says that; a
+    /// half-sourced one does not, and cards are never revised.
+    #[test]
+    fn a_slot_whose_events_have_expired_is_never_summarised() {
+        let base = 1_700_000_000_000;
+        let expired = base
+            - afterray_store::RAW_EVENT_RETENTION_MS
+            - 2 * afterray_store::SLOT_DURATION_MS;
+        let live = base - 10 * afterray_store::SLOT_DURATION_MS;
+        let slots = [
+            day_slot(expired, SlotSummaryState::Degraded),
+            day_slot(live, SlotSummaryState::Degraded),
+        ];
+
+        assert_eq!(
+            due_slot_starts(&slots, base),
+            vec![live],
+            "the expired slot is dropped, the live one is still due"
+        );
+    }
+
+    /// The cutoff keeps the instant itself, matching `prune_input_events_before`.
+    /// A slot ending exactly on it still has its events.
+    #[test]
+    fn a_slot_ending_on_the_expiry_cutoff_is_still_summarised() {
+        let base = 1_700_000_000_000;
+        let cutoff = base - afterray_store::RAW_EVENT_RETENTION_MS;
+        let start = cutoff - afterray_store::SLOT_DURATION_MS;
+        let slots = [day_slot(start, SlotSummaryState::Degraded)];
+
+        assert_eq!(due_slot_starts(&slots, base), vec![start]);
     }
 
     /// Everything except `Degraded` is either already summarised, deliberately
