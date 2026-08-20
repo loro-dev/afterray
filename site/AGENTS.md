@@ -10,12 +10,29 @@ afterray.com: a React 19 + Vite 6 + TypeScript static site on Cloudflare Pages, 
 - `functions/download/[[path]].ts` — serves `artifacts/*` from R2 with immutable caching; `/download/latest` 302-redirects (`no-cache`) to the newest installer.
 - `wrangler.jsonc` — Pages project `afterray`, R2 binding `RELEASES` → bucket `afterray-releases`.
 - `public/_headers` — caching/security headers (see invariants).
+- `scripts/usage.mjs` — reads usage off Cloudflare's edge logs; see [Usage numbers](#usage-numbers).
 
 ## Commands
 
 - `npm run dev` — Vite dev server.
 - `npm run build` — `tsc -b` (typechecks app + functions) + `vite build` + SSR build + prerender.
 - `npm run deploy` / `npm run deploy:preview` — build + `wrangler pages deploy` (`--branch preview`).
+- `npm run usage -- [--days 30] [--json] [--introspect]` — usage report; reads
+  `CLOUDFLARE_API_TOKEN` from the environment or from gitignored `site/.env`.
+
+## Usage numbers
+
+The app ships **no telemetry** and must keep shipping none — `src/i18n.tsx` sells
+"no account, no telemetry, no cloud sync" in both locales. Do not add a device
+id, install id, or stats ping without changing that copy first; it is a product
+promise, not an oversight.
+
+Usage is read from Cloudflare's edge log instead: every install polls
+`/appcast.xml` daily, so `scripts/usage.mjs` counts that path and reads the
+version spread out of Sparkle's User-Agent. Raw counts include a lot of bot
+traffic, the Free plan retains only 8 days, and one download click logs as two
+requests — [context/usage-analytics.md](../context/usage-analytics.md) has the
+full set of traps before you trust or extend a number.
 
 ## Invariants
 
