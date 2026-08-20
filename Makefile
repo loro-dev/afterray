@@ -12,6 +12,16 @@ test: docs-sync
 	swift test
 	swift test --package-path apps/AfterRayCaptureShim
 
+# The one command a change has to pass before it is pushed: docs gate, lint,
+# then the suites. Ordered cheapest-first, so a broken link fails in a second
+# instead of after a Swift build. `make test` is the subset without the lint
+# gate; this is what the PR checklist in AGENTS.md means.
+verify: docs-sync
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo test --workspace
+	swift test
+	swift test --package-path apps/AfterRayCaptureShim
+
 # Links, decision-record shape, and the hash of the code under every `@dec:`
 # marker. Node runs the TypeScript directly — no dependencies, no node_modules.
 # A red anchor hash means the decision was not re-read when its code changed;

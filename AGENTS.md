@@ -5,7 +5,8 @@ AfterRay is a local-first macOS computer-history app: a Rust daemon (`afterrayd`
 ## Build, test, lint
 
 - `make dev` — watch-mode signed dev app; `make dev-ui` — mock-data UI loop, no permissions or real data
-- `make test` — `cargo test --workspace` + `swift test`
+- `make test` — docs gate plus the Rust, Swift library, and capture-shim test suites; omits linting
+- `make verify` — the complete standard gate: docs sync, clippy, Rust tests, Swift library tests, and capture-shim tests; run it before every push or PR.
 - `make test-repeat N=10 [TEST=name]` — new concurrency/IO tests need ≥5 consecutive green runs before commit; judge a build by its exit code, never a filtered warning count ([why](docs/development.md#tests-and-lint))
 - `cargo clippy --workspace --all-targets -- -D warnings` — lint gate; the workspace denies `unsafe_code`
 - `make v0` / `make v0-daemon` — one-shot signed app / daemon only; dev data lives in gitignored `.afterray/` and `.afterray-dev/`
@@ -39,6 +40,7 @@ Before editing, read every `AGENTS.md` along the path from root to leaf. Every `
 
 ### Pull requests
 
+- Before pushing or creating a PR, run `make verify`; also run `make test-repeat N=5 TEST=<name>` for any new concurrency or I/O test.
 - Always label correctness risk: `risk:low`, `risk:middle`, or `risk:high`.
 - Security risk: low needs no label; high must be labeled `security` explicitly.
 - The PR description states the agent's confidence in the change — what was verified and how, what was not.
