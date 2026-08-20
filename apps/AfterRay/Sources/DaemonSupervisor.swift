@@ -10,10 +10,29 @@ final class DaemonSupervisor {
     let defaultDataDirectory: URL
     let defaultModelDirectory: URL
 
-    var dataDirectory: URL { defaultDataDirectory }
-    var modelDirectory: URL { defaultModelDirectory }
+    var dataDirectory: URL {
+        if let overridden = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") {
+            return overridden
+        }
+        return AfterRayPreferences.memoryDataLocation?.url ?? defaultDataDirectory
+    }
+    var modelDirectory: URL {
+        if let overridden = configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") {
+            return overridden
+        }
+        if configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+           AfterRayPreferences.memoryDataLocation != nil {
+            return dataDirectory.appendingPathComponent("Models", isDirectory: true)
+        }
+        return defaultModelDirectory
+    }
     var mlxRuntimeDirectory: URL {
-        defaultModelDirectory
+        if configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") == nil,
+           configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+           AfterRayPreferences.memoryDataLocation != nil {
+            return dataDirectory.appendingPathComponent("mlx-runtime", isDirectory: true)
+        }
+        return defaultModelDirectory
             .deletingLastPathComponent()
             .appendingPathComponent("mlx-runtime", isDirectory: true)
     }
@@ -22,8 +41,28 @@ final class DaemonSupervisor {
     private var process: Process?
     private var processOutput: DaemonOutputBuffer?
     private var recoveryTask: Task<Bool, Error>?
+    /// Fence every ordinary keep-alive while a stopped daemon's data root is
+    /// being moved. The relocation path is the single permitted restart.
+    private var isRelocatingDataDirectory = false
+    /// Set only when a failed rollback leaves the old root potentially split
+    /// across volumes. This process must not restart capture until the user has
+    /// repaired storage and relaunched the app.
+    private var requiresDataDirectoryRecovery = false
     private var isSuspendedForSystemLock = false
     private var isStopped = false
+
+    /// This control record stays beside, never inside, either data root. The
+    /// default vault is `Application Support/AfterRay`; using a sibling keeps
+    /// the journal available while that root is crossing a volume boundary.
+    private static var relocationRecoveryManifestURL: URL {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        return applicationSupport
+            .appendingPathComponent("AfterRayRelocation", isDirectory: true)
+            .appendingPathComponent("memory-location-recovery.json")
+    }
 
     private init() {
         let environment = ProcessInfo.processInfo.environment
@@ -46,23 +85,81 @@ final class DaemonSupervisor {
     }
 
     @discardableResult
-    func startIfNeeded() async throws -> Bool {
-        guard !isStopped else { return false }
+    func startIfNeeded(allowingDataRelocation: Bool = false) async throws -> Bool {
+        guard !isStopped,
+              !requiresDataDirectoryRecovery,
+              allowingDataRelocation || !isRelocatingDataDirectory
+        else { return false }
         if let recoveryTask {
             return try await recoveryTask.value
         }
         let task = Task { @MainActor in
-            try await recoverIfNeeded()
+            try await recoverIfNeeded(allowingDataRelocation: allowingDataRelocation)
         }
         recoveryTask = task
         defer { recoveryTask = nil }
         return try await task.value
     }
 
-    private func recoverIfNeeded() async throws -> Bool {
-        guard !isStopped else { return false }
+    // @dec:vault-location-relocation — docs/decisions/active/architecture/2026-08-20-vault-location-relocation.md
+    private func recoverIfNeeded(allowingDataRelocation: Bool) async throws -> Bool {
+        guard !isStopped,
+              !requiresDataDirectoryRecovery,
+              allowingDataRelocation || !isRelocatingDataDirectory
+        else { return false }
+        let recoveryManifestURL = Self.relocationRecoveryManifestURL
+        var currentLocation = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil
+            ? AfterRayPreferences.memoryDataLocation
+            : nil
+        let startupRecovery: AfterRayDataDirectory.RecoveryPreparation
+        do {
+            let recoveryCurrentLocation = currentLocation
+            startupRecovery = try await Task.detached(priority: .userInitiated) {
+                try AfterRayDataDirectory.prepareInterruptedMigration(
+                    manifestURL: recoveryManifestURL,
+                    currentDataLocation: recoveryCurrentLocation
+                )
+            }.value
+            if case let .restoreSourceLocation(sourceLocation) = startupRecovery {
+                // This is intentionally the only main-actor portion: publish
+                // and read back the indivisible Location before permitting the
+                // background cleanup to remove its crash-recovery fence.
+                AfterRayPreferences.memoryDataLocation = sourceLocation
+                guard AfterRayPreferences.canonicalMemoryDataLocation == sourceLocation else {
+                    throw AfterRayDataDirectory.Error.recoveryRequired(
+                        "could not persist the restored source location"
+                    )
+                }
+                try await Task.detached(priority: .userInitiated) {
+                    try AfterRayDataDirectory.completeSourceRecovery(
+                        manifestURL: recoveryManifestURL,
+                        sourceLocation: sourceLocation
+                    )
+                }.value
+            }
+        } catch {
+            requiresDataDirectoryRecovery = true
+            throw error
+        }
+        // A recovery may have replaced a mixed destination preference. Never
+        // continue with the value captured before that durable restore.
+        currentLocation = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil
+            ? AfterRayPreferences.canonicalMemoryDataLocation
+            : nil
+        if let location = currentLocation {
+            try AfterRayDataDirectory.validateConfiguredVolume(
+                volumeRoot: location.volumeRoot,
+                volumeUUID: location.volumeUUID
+            )
+        }
         if let status = await daemonStatus() {
-            if Self.hostBuildMatches(status) { return false }
+            if Self.hostBuildMatches(status) {
+                await clearRecoveryManifestAfterDaemonVerification(
+                    startupRecovery,
+                    manifestURL: recoveryManifestURL
+                )
+                return false
+            }
             // An update replaced the bundle while the old daemon kept the
             // socket. Reusing it would run this build's UI against the
             // previous build's logic, against the same store, with nothing
@@ -73,7 +170,10 @@ final class DaemonSupervisor {
             )
             await terminateDaemon()
         }
-        guard !isStopped else { return false }
+        guard !isStopped,
+              !requiresDataDirectoryRecovery,
+              allowingDataRelocation || !isRelocatingDataDirectory
+        else { return false }
 
         if let process, process.isRunning {
             process.terminate()
@@ -98,8 +198,7 @@ final class DaemonSupervisor {
         child.executableURL = daemon
         var environment = ProcessInfo.processInfo.environment
         environment["AFTERRAY_SOCKET"] = socketPath
-        environment["AFTERRAY_DATA_DIR"] = environment["AFTERRAY_DATA_DIR"]
-            ?? defaultDataDirectory.path
+        environment["AFTERRAY_DATA_DIR"] = dataDirectory.path
         environment["AFTERRAY_CAPTURE_SHIM"] = try resolveExecutable(
             environmentKey: "AFTERRAY_CAPTURE_SHIM",
             bundledName: "AfterRayCaptureShim",
@@ -120,7 +219,7 @@ final class DaemonSupervisor {
             bundledName: "afterray-mlx-vlm-worker",
             developmentPath: ".build/release/afterray-mlx-vlm-worker"
         ).path
-        environment["AFTERRAY_MODEL_DIR"] = defaultModelDirectory.path
+        environment["AFTERRAY_MODEL_DIR"] = modelDirectory.path
         if let hostBuild = Self.hostBuild {
             environment["AFTERRAY_HOST_BUILD"] = hostBuild
         }
@@ -130,7 +229,8 @@ final class DaemonSupervisor {
         child.standardOutput = output.makePipe()
         child.standardError = output.makePipe()
         try child.run()
-        if isStopped {
+        if isStopped || requiresDataDirectoryRecovery
+            || (!allowingDataRelocation && isRelocatingDataDirectory) {
             child.terminate()
             return false
         }
@@ -138,13 +238,20 @@ final class DaemonSupervisor {
         processOutput = output
 
         for _ in 0..<150 {
-            if isStopped {
+            if isStopped || requiresDataDirectoryRecovery
+                || (!allowingDataRelocation && isRelocatingDataDirectory) {
                 child.terminate()
                 process = nil
                 processOutput = nil
                 return false
             }
-            if await daemonIsReachable() { return true }
+            if await daemonIsReachable() {
+                await clearRecoveryManifestAfterDaemonVerification(
+                    startupRecovery,
+                    manifestURL: recoveryManifestURL
+                )
+                return true
+            }
             if !child.isRunning {
                 process = nil
                 processOutput = nil
@@ -245,6 +352,22 @@ final class DaemonSupervisor {
         try? await UnixSocketDaemonClient(socketPath: socketPath).status()
     }
 
+    private func clearRecoveryManifestAfterDaemonVerification(
+        _ recovery: AfterRayDataDirectory.RecoveryPreparation,
+        manifestURL: URL
+    ) async {
+        guard recovery == .clearAfterDaemonIsReachable else { return }
+        do {
+            try await Task.detached(priority: .utility) {
+                try AfterRayDataDirectory.clearRecoveryManifest(at: manifestURL)
+            }.value
+        } catch {
+            // Keeping a verified journal is safe: the next startup will verify
+            // the selected root again before attempting to remove it.
+            AfterRayLog.error("could not clear memory relocation journal: \(error.localizedDescription)")
+        }
+    }
+
     /// `CFBundleVersion`, which `scripts/build-release.sh` stamps per release.
     /// The marketing version cannot distinguish two builds of one release, and
     /// an update that only fixes the daemon is exactly that case.
@@ -261,9 +384,9 @@ final class DaemonSupervisor {
 
     private func applyModelDefaults(to environment: inout [String: String]) {
         let defaults = [
-            "AFTERRAY_ASR_MODEL": defaultModelDirectory
+            "AFTERRAY_ASR_MODEL": modelDirectory
                 .appendingPathComponent("Qwen3-ASR-1.7B"),
-            "AFTERRAY_EMBEDDING_MODEL": defaultModelDirectory
+            "AFTERRAY_EMBEDDING_MODEL": modelDirectory
                 .appendingPathComponent("nomic-embed-text-v1.5.Q4_K_M.gguf"),
         ]
         for (key, url) in defaults where environment[key] == nil {
@@ -273,10 +396,133 @@ final class DaemonSupervisor {
         }
     }
 
+    /// Stops capture before moving any bytes. The preference changes only after
+    /// every move succeeds. A failed rollback leaves the daemon stopped rather
+    /// than writing an incomplete source vault.
+    // @dec:vault-location-relocation — docs/decisions/active/architecture/2026-08-20-vault-location-relocation.md
+    func relocateDataDirectory(to selectedDirectory: URL, migrateExistingData: Bool) async throws {
+        guard !requiresDataDirectoryRecovery else {
+            throw RuntimeError.dataDirectoryRecoveryRequired
+        }
+        guard configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+              configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") == nil
+        else {
+            throw RuntimeError.dataDirectoryManagedByEnvironment
+        }
+
+        let destination = AfterRayDataDirectory.destination(in: selectedDirectory)
+        let sourceData = dataDirectory
+        let sourceModels = modelDirectory
+        let sourceRuntime = mlxRuntimeDirectory
+        try AfterRayDataDirectory.validateDestination(destination, currentDirectory: sourceData)
+        let location = try AfterRayDataDirectory.location(for: destination)
+        let sourceLocation = try AfterRayDataDirectory.location(for: sourceData)
+        let previousLocation = AfterRayPreferences.memoryDataLocation
+        let socketName = URL(fileURLWithPath: socketPath).lastPathComponent
+        let recoveryManifestURL = Self.relocationRecoveryManifestURL
+        var moves: [AfterRayDataDirectory.Move] = []
+        var migrationFinished = false
+
+        guard !isRelocatingDataDirectory else { return }
+        isRelocatingDataDirectory = true
+        defer { isRelocatingDataDirectory = false }
+
+        // A keep-alive that began immediately before the fence must finish
+        // before we stop the daemon. All new keep-alives return while fenced.
+        if let recoveryTask {
+            _ = try? await recoveryTask.value
+        }
+        await terminateDaemon()
+        do {
+            if migrateExistingData {
+                // This synchronous write is intentionally before the detached
+                // first move; it is the crash/restart fence for cross-volume IO.
+                try AfterRayDataDirectory.beginMigration(
+                    sourceRoot: sourceData,
+                    destinationRoot: destination,
+                    sourceLocation: sourceLocation,
+                    destinationLocation: location,
+                    manifestURL: recoveryManifestURL
+                )
+                // `FileManager.moveItem` may copy tens of gigabytes across a
+                // volume. Keep AppKit and the progress indicator responsive.
+                moves = try await Task.detached(priority: .userInitiated) {
+                    try AfterRayDataDirectory.migrate(
+                        sourceData: sourceData,
+                        sourceModels: sourceModels,
+                        sourceRuntime: sourceRuntime,
+                        destination: destination,
+                        socketName: socketName,
+                        recoveryManifestURL: recoveryManifestURL
+                    )
+                }.value
+                migrationFinished = true
+            }
+
+            AfterRayPreferences.memoryDataLocation = location
+            if migrateExistingData {
+                try AfterRayDataDirectory.markPreferenceCommitted(
+                    at: recoveryManifestURL,
+                    location: AfterRayPreferences.canonicalMemoryDataLocation
+                )
+            }
+            _ = try await startIfNeeded(allowingDataRelocation: true)
+        } catch {
+            AfterRayPreferences.memoryDataLocation = previousLocation
+            var recoveryError: (any Swift.Error)?
+            if migrationFinished {
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try AfterRayDataDirectory.rollback(
+                            moves,
+                            manifestURL: recoveryManifestURL
+                        )
+                    }.value
+                } catch {
+                    recoveryError = error
+                }
+            }
+            if recoveryError == nil, !AfterRayDataDirectory.needsManualRecovery(error) {
+                _ = try? await startIfNeeded(allowingDataRelocation: true)
+            }
+            if let recoveryError {
+                requiresDataDirectoryRecovery = true
+                throw recoveryError
+            }
+            if AfterRayDataDirectory.needsManualRecovery(error) {
+                requiresDataDirectoryRecovery = true
+            }
+            throw error
+        }
+    }
+
+    func relocationDestination(in selectedDirectory: URL) throws -> URL {
+        guard configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+              configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") == nil
+        else {
+            throw RuntimeError.dataDirectoryManagedByEnvironment
+        }
+        let destination = AfterRayDataDirectory.destination(in: selectedDirectory)
+        try AfterRayDataDirectory.validateDestination(destination, currentDirectory: dataDirectory)
+        _ = try AfterRayDataDirectory.location(for: destination)
+        return destination
+    }
+
     private static func developmentRepoRoot() -> URL? {
         let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
         guard bundleParent.lastPathComponent == ".afterray-dev" else { return nil }
         return bundleParent.deletingLastPathComponent()
+    }
+
+    private func configuredEnvironmentDirectory(_ key: String) -> URL? {
+        guard let path = ProcessInfo.processInfo.environment[key], !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    private static func isDescendant(_ url: URL, of parent: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let parentPath = parent.standardizedFileURL.path
+        return path == parentPath || path.hasPrefix(parentPath + "/")
     }
 
     private func resolveExecutable(
@@ -303,6 +549,8 @@ enum RuntimeError: LocalizedError, Equatable {
     case daemonExited(status: Int32, detail: String)
     case daemonTimeout(detail: String)
     case daemonSuspended
+    case dataDirectoryManagedByEnvironment
+    case dataDirectoryRecoveryRequired
 
     var isUserVisibleFailure: Bool {
         if case .daemonSuspended = self { return false }
@@ -322,6 +570,10 @@ enum RuntimeError: LocalizedError, Equatable {
             )
         case .daemonSuspended:
             "afterrayd is paused while this Mac is locked or asleep."
+        case .dataDirectoryManagedByEnvironment:
+            "The memory location is controlled by an environment setting."
+        case .dataDirectoryRecoveryRequired:
+            "Memory storage needs repair after an incomplete move. Repair the folders, then relaunch AfterRay."
         }
     }
 

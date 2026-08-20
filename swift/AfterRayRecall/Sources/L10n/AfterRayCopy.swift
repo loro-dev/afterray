@@ -211,6 +211,14 @@ extension AfterRayCopy {
         public var diskShare: (String, String) -> String
         public var memoryLimit: String
         public var memoryLimitSubtitle: String
+        public var memoryLocation: String
+        public var memoryLocationSubtitle: String
+        public var changeMemoryLocation: String
+        public var moveMemoriesTitle: String
+        public var moveMemoriesMessage: (String) -> String
+        public var moveExistingMemories: String
+        public var useEmptyMemoryFolder: String
+        public var memoryLocationChanged: (String) -> String
         public var assistantSource: String
         public var providerMlx: String
         public var providerOllama: String

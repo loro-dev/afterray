@@ -1056,7 +1056,7 @@ private struct ChatBubbleView: View {
                         HStack(spacing: 8) {
                             Spacer(minLength: 0)
                             if let elapsed = bubble.workElapsedMs, elapsed > 0 {
-                                Text(ChatProgress.formatElapsed(elapsed))
+                                ChatElapsedText(elapsedMs: elapsed, isLive: bubble.isStreaming)
                                     .font(.system(size: 10.5, weight: .medium, design: .rounded))
                                     .monospacedDigit()
                                     .foregroundStyle(ChatPalette.tertiary)
@@ -1332,38 +1332,81 @@ private struct ChatLeadingDisclosureStyle: DisclosureGroupStyle {
 private struct ChatWorkingIndicator: View {
     @Environment(\.afterRayCopy) private var copy
     let progress: ChatProgress
-    @State private var phase = 0.0
 
     var body: some View {
         HStack(spacing: 8) {
-            HStack(spacing: 3) {
-                ForEach(0..<3, id: \.self) { index in
-                    Circle()
-                        .fill(ChatPalette.accent)
-                        .frame(width: 4, height: 4)
-                        .opacity(opacity(index))
-                }
-            }
+            ChatWorkingDots()
             Text(progress.title(copy))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(ChatPalette.secondary)
-            Text(progress.detail)
+            ChatElapsedText(elapsedMs: progress.elapsedMs, isLive: true)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(ChatPalette.tertiary)
                 .monospacedDigit()
         }
-        .onAppear {
-            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
-                phase = 3
+    }
+}
+
+/// A travelling pulse rather than three synchronised blinks: three dots fading
+/// together is hard to tell from a rendering stall. Deriving the phase from a
+/// timeline makes every dot reachable even when the view is recreated.
+private struct ChatWorkingDots: View {
+    private static let dotCount = 3.0
+    private static let cycle: TimeInterval = 1.2
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { timeline in
+            HStack(spacing: 3) {
+                ForEach(0..<Int(Self.dotCount), id: \.self) { index in
+                    Circle()
+                        .fill(ChatPalette.accent)
+                        .frame(width: 4, height: 4)
+                        .opacity(opacity(index, at: timeline.date))
+                }
             }
         }
     }
 
-    /// A travelling pulse rather than three synchronised blinks: three dots
-    /// fading together is hard to tell from a rendering stall.
-    private func opacity(_ index: Int) -> Double {
-        let distance = abs(phase - Double(index))
-        return 0.25 + 0.75 * max(0, 1 - min(distance, 1))
+    private func opacity(_ index: Int, at date: Date) -> Double {
+        let cycleProgress = date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: Self.cycle) / Self.cycle
+        let position = cycleProgress * Self.dotCount
+        let distance = abs(position - Double(index))
+        let circularDistance = min(distance, Self.dotCount - distance)
+        return 0.25 + 0.75 * max(0, 1 - min(circularDistance, 1))
+    }
+}
+
+/// The daemon emits a heartbeat every 400 ms. This view only owns the small
+/// clock inside a live message, so 100 ms interpolation never republishes the
+/// transcript or disturbs its 30 Hz stream presentation limit.
+private struct ChatElapsedText: View {
+    let elapsedMs: Int
+    let isLive: Bool
+    @State private var reportedAt = Date.now
+
+    var body: some View {
+        Group {
+            if isLive {
+                TimelineView(.periodic(from: .now, by: 0.1)) { timeline in
+                    Text(ChatProgress.formatElapsed(displayedElapsed(at: timeline.date)))
+                }
+            } else {
+                Text(ChatProgress.formatElapsed(elapsedMs))
+            }
+        }
+        .onAppear { reportedAt = .now }
+        .onChange(of: elapsedMs) { _, _ in
+            reportedAt = .now
+        }
+    }
+
+    private func displayedElapsed(at now: Date) -> Int {
+        ChatProgress.displayedElapsed(
+            reportedElapsedMs: elapsedMs,
+            reportedAt: reportedAt,
+            now: now
+        )
     }
 }
 
