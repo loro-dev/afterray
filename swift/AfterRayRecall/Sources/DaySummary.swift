@@ -156,17 +156,27 @@ public struct SummaryHistoryPage: Codable, Equatable, Sendable {
     public let days: [DaySummary]
     public let nextBeforeMs: Int64?
     public let hasMore: Bool
+    /// Vault-wide occupied local days. Nil when an older daemon omitted it;
+    /// the header then hides the count rather than guessing from this page.
+    public let totalDays: Int?
 
-    public init(days: [DaySummary], nextBeforeMs: Int64?, hasMore: Bool) {
+    public init(
+        days: [DaySummary],
+        nextBeforeMs: Int64?,
+        hasMore: Bool,
+        totalDays: Int? = nil
+    ) {
         self.days = days
         self.nextBeforeMs = nextBeforeMs
         self.hasMore = hasMore
+        self.totalDays = totalDays
     }
 
     enum CodingKeys: String, CodingKey {
         case days
         case nextBeforeMs = "next_before_ms"
         case hasMore = "has_more"
+        case totalDays = "total_days"
     }
 }
 

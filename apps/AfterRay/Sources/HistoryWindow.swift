@@ -140,6 +140,7 @@ private struct HistoryWindowRoot: View {
             playheadMs: store.playheadMs,
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
             hasMore: store.summaryHistoryHasMore,
+            totalDays: store.summaryHistoryTotalDays,
             isLoadingMore: store.isLoadingSummaryHistory,
             followPulse: 0,
             onSelectSlot: { slot in

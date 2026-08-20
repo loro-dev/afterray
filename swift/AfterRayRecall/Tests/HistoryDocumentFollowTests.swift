@@ -44,59 +44,72 @@ final class HistoryDocumentFollowTests: XCTestCase {
 }
 
 final class HistoryLoadMoreTests: XCTestCase {
-    func testTriggerBelowTheViewportIsNotNear() {
-        XCTAssertFalse(HistoryLoadMore.isNearBottom(triggerMinY: 2_000, viewportHeight: 460))
+    func testOffsetFarFromTheEndIsNotNear() {
+        XCTAssertFalse(
+            HistoryLoadMore.isNearBottom(offset: 0, viewportHeight: 460, contentHeight: 2_000)
+        )
     }
 
-    func testTriggerEnteringTheLeadIsNear() {
-        XCTAssertTrue(HistoryLoadMore.isNearBottom(triggerMinY: 700, viewportHeight: 460))
+    func testOffsetNearTheEndPrefetches() {
+        XCTAssertTrue(
+            HistoryLoadMore.isNearBottom(offset: 1_200, viewportHeight: 460, contentHeight: 2_000)
+        )
     }
 
     func testEmptyViewportNeverLoads() {
-        XCTAssertFalse(HistoryLoadMore.isNearBottom(triggerMinY: 10, viewportHeight: 0))
+        XCTAssertFalse(
+            HistoryLoadMore.isNearBottom(offset: 10, viewportHeight: 0, contentHeight: 400)
+        )
+    }
+
+    func testShortContentFillsTheNextPage() {
+        XCTAssertTrue(
+            HistoryLoadMore.isNearBottom(offset: 0, viewportHeight: 460, contentHeight: 200)
+        )
     }
 }
 
 final class HistoryStickyHeadingTests: XCTestCase {
+    private let today = HistoryListItem.heading(
+        dayStartMs: 2,
+        label: "Today · Aug 19",
+        isToday: true
+    )
+    private let yesterday = HistoryListItem.heading(
+        dayStartMs: 1,
+        label: "Tue · Aug 18",
+        isToday: false
+    )
+
     func testNoChipWhileTheInFlowHeadingIsOnScreen() {
-        let today = DayHeadingAnchor(
-            dayStartMs: 1,
-            label: "Today · Aug 19",
-            isToday: true,
-            minY: 8
+        XCTAssertNil(
+            HistoryStickyHeading.chip(
+                items: [today],
+                origins: [0, 28],
+                offset: 0
+            )
         )
-        XCTAssertNil(HistoryStickyHeading.chip(from: [today]))
     }
 
     func testChipIsTheHeadingThatJustLeftTheTop() {
-        let today = DayHeadingAnchor(
-            dayStartMs: 2,
-            label: "Today · Aug 19",
-            isToday: true,
-            minY: -40
+        XCTAssertEqual(
+            HistoryStickyHeading.chip(
+                items: [today, yesterday],
+                origins: [0, 36, 64],
+                offset: 12
+            )?.label,
+            "Today · Aug 19"
         )
-        let yesterday = DayHeadingAnchor(
-            dayStartMs: 1,
-            label: "Tue · Aug 18",
-            isToday: false,
-            minY: 200
-        )
-        XCTAssertEqual(HistoryStickyHeading.chip(from: [today, yesterday])?.label, "Today · Aug 19")
     }
 
     func testLaterDayReplacesTheChipOnceItScrollsOff() {
-        let today = DayHeadingAnchor(
-            dayStartMs: 2,
-            label: "Today · Aug 19",
-            isToday: true,
-            minY: -400
+        XCTAssertEqual(
+            HistoryStickyHeading.chip(
+                items: [today, yesterday],
+                origins: [0, 36, 64],
+                offset: 40
+            )?.label,
+            "Tue · Aug 18"
         )
-        let yesterday = DayHeadingAnchor(
-            dayStartMs: 1,
-            label: "Tue · Aug 18",
-            isToday: false,
-            minY: -12
-        )
-        XCTAssertEqual(HistoryStickyHeading.chip(from: [today, yesterday])?.label, "Tue · Aug 18")
     }
 }

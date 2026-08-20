@@ -1364,12 +1364,18 @@ pub fn match_slot_mention(
 /// A bounded page for the history-summary panel. Days are ordered newest
 /// first. `next_before_ms` is an exclusive cursor rather than a timestamp to
 /// display, which keeps pagination stable when the user captures new work.
+/// `total_days` is the vault-wide occupied local-day count, not the page
+/// length — the header must not guess from `days.len()`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SummaryHistoryPage {
     pub days: Vec<DaySummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_before_ms: Option<i64>,
     pub has_more: bool,
+    /// Occupied local calendar days in the vault. Optional on the wire so
+    /// an older daemon still decodes; the current vault always fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_days: Option<usize>,
 }
 
 /// Privacy-bounded export for one summary slot. `summary` is the parsed,

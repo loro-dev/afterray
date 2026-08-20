@@ -186,12 +186,14 @@ final class RecallStoreTests: XCTestCase {
                 today.dayStartMs: SummaryHistoryPage(
                     days: [pagedYesterday],
                     nextBeforeMs: pagedYesterday.dayStartMs,
-                    hasMore: true
+                    hasMore: true,
+                    totalDays: 4
                 ),
                 pagedYesterday.dayStartMs: SummaryHistoryPage(
                     days: [older],
                     nextBeforeMs: nil,
-                    hasMore: false
+                    hasMore: false,
+                    totalDays: 4
                 ),
             ]
         )
@@ -200,6 +202,7 @@ final class RecallStoreTests: XCTestCase {
         await store.loadDaySummary(dayMs: today.dayStartMs, force: true)
         XCTAssertEqual(store.summaryHistory, [today, pagedYesterday])
         XCTAssertTrue(store.summaryHistoryHasMore)
+        XCTAssertEqual(store.summaryHistoryTotalDays, 4)
 
         await store.loadDaySummary(dayMs: selectedYesterday.dayStartMs, force: true)
         XCTAssertEqual(store.daySummary, selectedYesterday)

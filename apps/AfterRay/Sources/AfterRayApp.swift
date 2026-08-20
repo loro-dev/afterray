@@ -1102,6 +1102,7 @@ private struct AfterRayRootView: View {
             daySummary: store.daySummary,
             summaryHistory: store.summaryHistory,
             summaryHistoryHasMore: store.summaryHistoryHasMore,
+            summaryHistoryTotalDays: store.summaryHistoryTotalDays,
             isLoadingSummaryHistory: store.isLoadingSummaryHistory,
             onLoadOlderSummaryHistory: {
                 Task { await store.loadOlderSummaryHistory() }

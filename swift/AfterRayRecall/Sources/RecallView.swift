@@ -55,10 +55,10 @@ public struct RecallView: View {
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
     public var daySummary: DaySummary
-    /// Newest first; the history panel mounts loaded days eagerly while the
-    /// store pages older days from the daemon.
+    /// Newest first; the history panel pages older days from the daemon.
     public var summaryHistory: [DaySummary]
     public var summaryHistoryHasMore: Bool
+    public var summaryHistoryTotalDays: Int?
     public var isLoadingSummaryHistory: Bool
     public var onLoadOlderSummaryHistory: (() -> Void)?
     /// Detach the history panel into a standalone window; nil hides the
@@ -131,6 +131,7 @@ public struct RecallView: View {
         daySummary: DaySummary = .empty,
         summaryHistory: [DaySummary] = [],
         summaryHistoryHasMore: Bool = false,
+        summaryHistoryTotalDays: Int? = nil,
         isLoadingSummaryHistory: Bool = false,
         onLoadOlderSummaryHistory: (() -> Void)? = nil,
         onPopOutHistory: (() -> Void)? = nil,
@@ -166,6 +167,7 @@ public struct RecallView: View {
         self.daySummary = daySummary
         self.summaryHistory = summaryHistory
         self.summaryHistoryHasMore = summaryHistoryHasMore
+        self.summaryHistoryTotalDays = summaryHistoryTotalDays
         self.isLoadingSummaryHistory = isLoadingSummaryHistory
         self.onLoadOlderSummaryHistory = onLoadOlderSummaryHistory
         self.onPopOutHistory = onPopOutHistory
@@ -292,6 +294,7 @@ public struct RecallView: View {
                             playheadMs: renderedPlayheadMs,
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
                             hasMore: summaryHistoryHasMore,
+                            totalDays: summaryHistoryTotalDays,
                             isLoadingMore: isLoadingSummaryHistory,
                             followPulse: followPulse,
                             onSelectSlot: { slot in

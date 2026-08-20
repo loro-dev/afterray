@@ -12,6 +12,7 @@ public final class RecallStore: ObservableObject {
     @Published public private(set) var daySummary: DaySummary = .empty
     @Published public private(set) var summaryHistory: [DaySummary] = []
     @Published public private(set) var summaryHistoryHasMore = false
+    @Published public private(set) var summaryHistoryTotalDays: Int?
     @Published public private(set) var isLoadingSummaryHistory = false
 
     private let daemon: any RecallDaemonServing
@@ -223,8 +224,8 @@ public final class RecallStore: ObservableObject {
     }
 
     /// Fetches one small page when the history-summary panel reaches its
-    /// bottom. The list virtualizes rows; this cursor is the only thing that
-    /// walks the vault, so a row never queries the daemon on its own.
+    /// bottom. This cursor is the only thing that walks the vault, so a
+    /// row never queries the daemon on its own.
     public func loadOlderSummaryHistory() async {
         guard summaryHistoryHasMore,
               !isLoadingSummaryHistory,
@@ -247,6 +248,9 @@ public final class RecallStore: ObservableObject {
             summaryHistory.sort { $0.dayStartMs > $1.dayStartMs }
             summaryHistoryCursorMs = page.nextBeforeMs
             summaryHistoryHasMore = page.hasMore && page.nextBeforeMs != nil
+            if let totalDays = page.totalDays {
+                summaryHistoryTotalDays = totalDays
+            }
         } catch {
             guard sensitiveGeneration == sensitiveRequestGeneration,
                   summaryHistoryGeneration == requestGeneration
@@ -308,6 +312,7 @@ public final class RecallStore: ObservableObject {
         daySummary = .empty
         summaryHistory = []
         summaryHistoryHasMore = false
+        summaryHistoryTotalDays = nil
         summaryHistoryCursorMs = nil
         summaryHistoryGeneration &+= 1
         isLoadingSummaryHistory = false

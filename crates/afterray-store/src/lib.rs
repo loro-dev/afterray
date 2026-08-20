@@ -2645,7 +2645,22 @@ impl Vault {
             days,
             next_before_ms: has_more.then_some(cursor),
             has_more,
+            total_days: Some(self.occupied_local_day_count()?),
         })
+    }
+
+    /// Distinct local calendar days that have at least one moment. Matches
+    /// the days `summary_history` will eventually page — one query, not a
+    /// walk of every day summary.
+    fn occupied_local_day_count(&self) -> Result<usize, StoreError> {
+        let connection = self.readers.get();
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(DISTINCT date(captured_at_ms / 1000, 'unixepoch', 'localtime'))
+               FROM moments",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     fn latest_moment_before(&self, before_ms: i64) -> Result<Option<i64>, StoreError> {
@@ -10134,6 +10149,7 @@ mod tests {
         assert_eq!(newest.days[0].day_start_ms, second_day_start);
         assert!(newest.has_more);
         assert_eq!(newest.next_before_ms, Some(second_day_start));
+        assert_eq!(newest.total_days, Some(2));
 
         let older = vault
             .summary_history(newest.next_before_ms, 7, 10_000)
@@ -10142,6 +10158,7 @@ mod tests {
         assert_eq!(older.days[0].day_start_ms, first_day_start);
         assert!(!older.has_more);
         assert_eq!(older.next_before_ms, None);
+        assert_eq!(older.total_days, Some(2));
     }
 
     #[test]
