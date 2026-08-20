@@ -9,7 +9,7 @@ private let qwen35ModelDirectory = ProcessInfo.processInfo.environment[
     "AFTERRAY_QWEN35_MODEL_DIR"
 ]
 
-@Suite("Qwen3.5 VLM worker")
+@Suite("Qwen3.5 VLM worker", .serialized)
 struct Qwen35KvCacheRegressionTests {
     @Test("normalizes hidden reasoning and control tokens")
     func normalizesModelOutput() {
@@ -55,7 +55,7 @@ struct Qwen35KvCacheRegressionTests {
     }
 
     @Test(
-        "real Qwen3.5 VLM KV cache survives images, text, cancellation, and reuse",
+        "real Qwen3.5 VLM handles continuation, cancellation, and windowed long prefill",
         .enabled(
             if: qwen35ModelDirectory?.isEmpty == false,
             "Set AFTERRAY_QWEN35_MODEL_DIR to a verified AfterRay Qwen3.5 4B or 9B snapshot."
@@ -105,6 +105,16 @@ struct Qwen35KvCacheRegressionTests {
             to: "Reply with the word recovered."
         )
         #expect(!normalizeModelOutput(afterCancellation).isEmpty)
+
+        // The old Qwen3.5 prepare path ignored its prefill window. Two prompts
+        // of this size on one warm session formed a single float32 attention
+        // scratch tensor of roughly 16 heads × 20k queries × 40k keys (> 47 GiB).
+        // The pinned runtime must process both in bounded windows.
+        let longPrompt = Array(repeating: "memory", count: 20_000).joined(separator: " ")
+        let firstLong = try await session.respond(to: longPrompt)
+        #expect(!normalizeModelOutput(firstLong).isEmpty)
+        let secondLong = try await session.respond(to: longPrompt)
+        #expect(!normalizeModelOutput(secondLong).isEmpty)
     }
 
     private func solidImage(red: CGFloat, green: CGFloat, blue: CGFloat) -> CIImage {

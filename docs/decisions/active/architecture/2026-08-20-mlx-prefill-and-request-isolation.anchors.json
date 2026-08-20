@@ -1,0 +1,5 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterray-models/src/persistent_mlx.rs::pub async fn shutdown(&self) {": "sha256:6950d9d3f7a43817",
+  "swift/AfterRayMlxVlmWorker/Sources/WorkerCore.swift::let session = ChatSession(": "sha256:88a4c833c76b7fa1"
+}

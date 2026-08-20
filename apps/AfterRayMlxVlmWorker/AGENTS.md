@@ -2,9 +2,9 @@
 
 The persistent MLX VLM worker executable (root `Package.swift` target, product `afterray-mlx-vlm-worker`), launched and supervised by the Rust daemon (`crates/afterray-models`). `Sources/main.swift` here is only a 12-line stdin loop over `MlxWorker`; all logic lives in the shared `AfterRayMlxVlmWorkerCore` target at `swift/AfterRayMlxVlmWorker/Sources/WorkerCore.swift` so tests can import it. Edit the core, not this shell.
 
-## Protocol (line-delimited JSON, v1)
+## Protocol (line-delimited JSON, v2)
 
-- `mlxWorkerProtocolVersion = 1` (`WorkerCore.swift:8`); requests `load`/`generate`/`cancel`, responses `ready`/`delta`/`final`/`cancelled`/`error`, every response echoes `request_id`
+- `mlxWorkerProtocolVersion = 2` (`WorkerCore.swift`); requests `load`/`generate`/`cancel`, responses `ready`/`delta`/`final`/`cancelled`/`error`, every response echoes `request_id`
 - Must stay in sync with the Rust side: `MLX_WORKER_PROTOCOL_VERSION` in `crates/afterray-models/src/persistent_mlx.rs:17`
 - stdout is protocol-only (`ProtocolWriter`, `WorkerCore.swift:65`); logging goes to stderr via `WorkerLog` (:84)
 
@@ -12,9 +12,9 @@ The persistent MLX VLM worker executable (root `Package.swift` target, product `
 
 - Single-flight: one generate at a time (:116); never ack `cancel` until the MLX task has actually stopped (:151, the Qwen3.5 KV-cache regression shape)
 - Generation runs at temperature 0 (:181) with `enable_thinking: false` (:196); strip `<think>`/control tokens via `normalizeModelOutput` (:219)
-- KV-cache session reuse only when system instructions are unchanged and `use_kv_cache` is true (:33)
+- Every `generate` is an independent full prompt and gets a fresh `ChatSession`; only the loaded `ModelContainer` survives across requests. See `docs/decisions/active/architecture/2026-08-20-mlx-prefill-and-request-isolation.md`.
 - `validateLocalSnapshot` (:347) requires the `.afterray-ready.json` marker with a pinned revision (`qwen35_4BRevision`/`qwen35_9BRevision`, :10-11 — keep in sync with `crates/afterray-models/src/catalog.rs`) and `model_type == "qwen3_5"`
-- mlx-swift-lm is pinned `exact: "3.31.4"` in the root `Package.swift:20`
+- mlx-swift-lm is revision-pinned to the Qwen3.5 windowed-prefill fix in the root `Package.swift`; update `mlxRuntimeVersion` together with it
 - SwiftPM emits `mlx.metallib` beside the worker. `scripts/run-v0.sh` and `scripts/build-release.sh` must copy it beside the bundled executable at `Contents/Helpers/mlx.metallib`; MLX searches that colocated path first, and `scripts/verify-release.sh` rejects a release that omits it.
 
 ## Build / test
@@ -25,3 +25,4 @@ The persistent MLX VLM worker executable (root `Package.swift` target, product `
 ## Watch out
 
 - The similarly named `swift/AfterRayMlxVlmWorker` directory is the worker **core library**, not recall UI and not this executable.
+- Do not restore session reuse without adding an explicit conversation identity to the protocol. Matching system instructions do not identify a conversation and caused unbounded cross-summary context growth.

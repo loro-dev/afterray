@@ -496,11 +496,6 @@ fn new_mlx_adapter(
     let mut mlx_config = PersistentMlxConfig::new(worker, model_dir);
     mlx_config.revision = revision.into();
     mlx_config.manifest = manifest;
-    // Cache reuse is the normal path. `=0` remains a narrow recovery switch
-    // for a measured upstream regression; failed cache-prefill attempts retry
-    // once with a fresh session in this same model container.
-    mlx_config.enable_kv_cache =
-        std::env::var("AFTERRAY_MLX_ENABLE_KV_CACHE").map_or(true, |value| value.trim() != "0");
     Arc::new(PersistentMlxAdapter::new(mlx_config))
 }
 

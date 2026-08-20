@@ -17,7 +17,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, mpsc},
 };
 
-pub const MLX_WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const MLX_WORKER_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct PersistentMlxConfig {
@@ -29,8 +29,6 @@ pub struct PersistentMlxConfig {
     pub load_timeout: Duration,
     pub generate_timeout: Duration,
     pub restart_backoff: Duration,
-    /// Enabled by default. Set to false only for a targeted recovery path.
-    pub enable_kv_cache: bool,
 }
 
 impl PersistentMlxConfig {
@@ -45,7 +43,6 @@ impl PersistentMlxConfig {
             load_timeout: Duration::from_secs(180),
             generate_timeout: Duration::from_secs(300),
             restart_backoff: Duration::from_secs(1),
-            enable_kv_cache: true,
         }
     }
 }
@@ -73,6 +70,7 @@ pub struct PersistentMlxAdapter {
     config: PersistentMlxConfig,
     inner: AsyncMutex<Runtime>,
     health: Arc<Mutex<MlxWorkerHealth>>,
+    shutdown_cancellation: Mutex<Cancellation>,
 }
 
 struct Runtime {
@@ -98,6 +96,7 @@ impl PersistentMlxAdapter {
                 next_spawn: None,
             }),
             health: Arc::new(Mutex::new(MlxWorkerHealth::default())),
+            shutdown_cancellation: Mutex::new(Cancellation::default()),
         }
     }
 
@@ -109,16 +108,37 @@ impl PersistentMlxAdapter {
             .clone()
     }
 
+    // @dec:mlx-prefill-and-request-isolation — docs/decisions/active/architecture/2026-08-20-mlx-prefill-and-request-isolation.md
     pub async fn shutdown(&self) {
+        let shutdown_cancellation = self
+            .shutdown_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        shutdown_cancellation.cancel();
         let mut runtime = self.inner.lock().await;
+        self.shutdown_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
         if let Some(mut worker) = runtime.worker.take() {
             let _ = worker.child.kill().await;
             let _ = worker.child.wait().await;
         }
         runtime.next_spawn = None;
         self.set_health(ModelPackState::NotDownloaded, None, None, None);
+        *self
+            .shutdown_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Cancellation::default();
     }
 
+    /// Executes one complete prompt through the resident MLX model process.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol, process, model, timeout, or cancellation error when
+    /// the worker cannot produce a valid final response.
     pub async fn execute_streaming(
         &self,
         job_id: &str,
@@ -137,7 +157,15 @@ impl PersistentMlxAdapter {
                 "MLX adapter received a non-LLM input".into(),
             ));
         };
+        let shutdown_cancellation = self
+            .shutdown_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut runtime = self.inner.lock().await;
+        if shutdown_cancellation.is_cancelled() {
+            return Err(AdapterError::Cancelled);
+        }
         self.ensure_started(&mut runtime).await?;
         let messages: Vec<MlxMessage<'_>> = system
             .iter()
@@ -154,43 +182,20 @@ impl PersistentMlxAdapter {
         let request = MlxRequest::Generate {
             v: MLX_WORKER_PROTOCOL_VERSION,
             request_id: job_id,
-            messages: messages.clone(),
+            messages,
             images: Vec::new(),
             max_tokens: 512,
-            use_kv_cache: self.config.enable_kv_cache,
         };
-        let first = self
+        let result = self
             .run_generate(
                 &mut runtime,
                 request,
                 job_id,
                 token_tx,
-                cancellation.clone(),
+                cancellation,
+                shutdown_cancellation,
             )
             .await;
-        // If reuse itself fails before the user has received a token, retry the
-        // same request with a fresh session in the already-loaded container.
-        // This preserves the persistent worker and avoids duplicate deltas.
-        let result = match first.result {
-            Err(error)
-                if self.config.enable_kv_cache
-                    && !first.emitted_delta
-                    && !matches!(error, AdapterError::Cancelled) =>
-            {
-                let fallback = MlxRequest::Generate {
-                    v: MLX_WORKER_PROTOCOL_VERSION,
-                    request_id: job_id,
-                    messages,
-                    images: Vec::new(),
-                    max_tokens: 512,
-                    use_kv_cache: false,
-                };
-                self.run_generate(&mut runtime, fallback, job_id, None, cancellation)
-                    .await
-                    .result
-            }
-            result => result,
-        };
         if let Err(error) = &result
             && error.retryable()
         {
@@ -324,26 +329,31 @@ impl PersistentMlxAdapter {
         request_id: &str,
         token_tx: Option<mpsc::Sender<LlmDelta>>,
         cancellation: Cancellation,
-    ) -> GenerateAttempt {
+        shutdown_cancellation: Cancellation,
+    ) -> Result<(String, Option<LlmUsage>), AdapterError> {
         let Some(worker) = runtime.worker.as_mut() else {
-            return GenerateAttempt::failed(AdapterError::Process(
+            return Err(AdapterError::Process(
                 "MLX worker disappeared before generation".into(),
             ));
         };
-        if let Err(error) = write_request(&mut worker.stdin, &request).await {
-            return GenerateAttempt::failed(error);
-        }
+        write_request(&mut worker.stdin, &request).await?;
         self.set_health(
             ModelPackState::InUse,
             worker.child.id(),
             self.health().runtime,
             None,
         );
-        let mut emitted_delta = false;
+        let cancelled = async {
+            tokio::select! {
+                () = cancellation.cancelled() => {}
+                () = shutdown_cancellation.cancelled() => {}
+            }
+        };
+        tokio::pin!(cancelled);
         let generation = async {
             loop {
                 tokio::select! {
-                    () = cancellation.cancelled() => {
+                    () = &mut cancelled => {
                         write_request(&mut worker.stdin, &MlxRequest::Cancel {
                             v: MLX_WORKER_PROTOCOL_VERSION,
                             request_id,
@@ -363,7 +373,6 @@ impl PersistentMlxAdapter {
                                 if let Some(text) = response.text.filter(|text| !text.is_empty())
                                     && let Some(tx) = &token_tx
                                 {
-                                    emitted_delta = true;
                                     // The MLX worker already strips reasoning
                                     // in `normalize_model_output`, so whatever
                                     // reaches here is answer text.
@@ -396,10 +405,7 @@ impl PersistentMlxAdapter {
             let pid = worker.child.id();
             self.set_health(ModelPackState::Ready, pid, self.health().runtime, None);
         }
-        GenerateAttempt {
-            result,
-            emitted_delta,
-        }
+        result
     }
 
     async fn fail_worker(&self, runtime: &mut Runtime, error: String) {
@@ -454,7 +460,6 @@ enum MlxRequest<'a> {
         messages: Vec<MlxMessage<'a>>,
         images: Vec<&'a str>,
         max_tokens: u32,
-        use_kv_cache: bool,
     },
     Cancel {
         v: u32,
@@ -466,20 +471,6 @@ enum MlxRequest<'a> {
 struct MlxMessage<'a> {
     role: &'a str,
     content: &'a str,
-}
-
-struct GenerateAttempt {
-    result: Result<(String, Option<LlmUsage>), AdapterError>,
-    emitted_delta: bool,
-}
-
-impl GenerateAttempt {
-    fn failed(error: AdapterError) -> Self {
-        Self {
-            result: Err(error),
-            emitted_delta: false,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -618,14 +609,17 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
     *'"kind":"load"'*)
-      printf '{"v":1,"kind":"ready","request_id":"%s","runtime":"fake@pid-%s"}\n' "$id" "$$"
+      printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake@pid-%s"}\n' "$id" "$$"
+      ;;
+    *'"use_kv_cache"'*)
+      printf '{"v":2,"kind":"error","request_id":"%s","error":"generate protocol must be stateless"}\n' "$id"
       ;;
     *'"kind":"generate"'*)
-      printf '{"v":1,"kind":"delta","request_id":"%s","text":"hello "}\n' "$id"
-      printf '{"v":1,"kind":"final","request_id":"%s","text":"pid=%s"}\n' "$id" "$$"
+      printf '{"v":2,"kind":"delta","request_id":"%s","text":"hello "}\n' "$id"
+      printf '{"v":2,"kind":"final","request_id":"%s","text":"pid=%s"}\n' "$id" "$$"
       ;;
     *'"kind":"cancel"'*)
-      printf '{"v":1,"kind":"cancelled","request_id":"%s"}\n' "$id"
+      printf '{"v":2,"kind":"cancelled","request_id":"%s"}\n' "$id"
       ;;
   esac
 done
@@ -658,38 +652,8 @@ done
         assert_eq!(normalize_model_output("<think>unfinished"), "");
     }
 
-    #[test]
-    fn kv_cache_is_enabled_by_default() {
-        assert!(PersistentMlxConfig::new("worker", "/model").enable_kv_cache);
-    }
-
     #[tokio::test]
-    async fn cache_error_retries_full_prefill_without_reloading_worker() {
-        let script = r#"
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
-  case "$line" in
-    *'"kind":"load"'*) printf '{"v":1,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
-    *'"kind":"generate"'*'"use_kv_cache":true'*) printf '{"v":1,"kind":"error","request_id":"%s","error":"cache prefill failed"}\n' "$id" ;;
-    *'"kind":"generate"'*) printf '{"v":1,"kind":"final","request_id":"%s","text":"fresh prefill"}\n' "$id" ;;
-  esac
-done
-"#;
-        let adapter = test_adapter(script);
-        let output = adapter
-            .execute_streaming("fallback", &prompt("one"), None, Cancellation::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            output,
-            ModelOutput::llm("fresh prefill")
-        );
-        assert!(matches!(adapter.health().state, ModelPackState::Ready));
-        adapter.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn streams_and_reuses_one_worker_pid() {
+    async fn stateless_requests_stream_and_reuse_only_the_worker_process() {
         let adapter = test_adapter(LOOP_WORKER);
         let (tx, mut rx) = mpsc::channel(4);
         let first = adapter
@@ -712,10 +676,10 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"kind":"load"'*) printf '{"v":1,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
-    *'"kind":"cancel"'*) printf '{"v":1,"kind":"cancelled","request_id":"%s"}\n' "$id" ;;
+    *'"kind":"load"'*) printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
+    *'"kind":"cancel"'*) printf '{"v":2,"kind":"cancelled","request_id":"%s"}\n' "$id" ;;
     *'"request_id":"cancel-me"'*) ;;
-    *'"kind":"generate"'*) printf '{"v":1,"kind":"final","request_id":"%s","text":"ok"}\n' "$id" ;;
+    *'"kind":"generate"'*) printf '{"v":2,"kind":"final","request_id":"%s","text":"ok"}\n' "$id" ;;
   esac
 done
 "#;
@@ -745,6 +709,42 @@ done
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_generation_before_waiting_for_the_worker_lock() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"kind":"load"'*) printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
+    *'"kind":"cancel"'*) printf '{"v":2,"kind":"cancelled","request_id":"%s"}\n' "$id" ;;
+    *'"kind":"generate"'*) ;;
+  esac
+done
+"#;
+        let adapter = Arc::new(test_adapter(script));
+        let task_adapter = Arc::clone(&adapter);
+        let task = tokio::spawn(async move {
+            task_adapter
+                .execute_streaming(
+                    "provider-switch",
+                    &prompt("wait"),
+                    None,
+                    Cancellation::default(),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::time::timeout(Duration::from_secs(1), adapter.shutdown())
+            .await
+            .expect("shutdown must cancel the active generation before waiting for its lock");
+        assert!(matches!(task.await.unwrap(), Err(AdapterError::Cancelled)));
+        assert!(matches!(
+            adapter.health().state,
+            ModelPackState::NotDownloaded
+        ));
+    }
+
+    #[tokio::test]
     async fn crash_restarts_after_backoff() {
         let marker =
             std::env::temp_dir().join(format!("afterray-mlx-crash-{}", std::process::id()));
@@ -754,10 +754,10 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"kind":"load"'*) printf '{{"v":1,"kind":"ready","request_id":"%s","runtime":"fake"}}\n' "$id" ;;
+    *'"kind":"load"'*) printf '{{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}}\n' "$id" ;;
     *'"kind":"generate"'*)
       if [ ! -f '{marker}' ]; then /usr/bin/touch '{marker}'; exit 17; fi
-      printf '{{"v":1,"kind":"final","request_id":"%s","text":"recovered"}}\n' "$id"
+      printf '{{"v":2,"kind":"final","request_id":"%s","text":"recovered"}}\n' "$id"
       ;;
   esac
 done

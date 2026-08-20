@@ -21,7 +21,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/ml-explore/mlx-swift-lm",
-            exact: "3.31.4"
+            revision: "65be34c64237c0b5da348169d3a9b59f37453fe2"
         ),
         .package(
             url: "https://github.com/huggingface/swift-huggingface",
