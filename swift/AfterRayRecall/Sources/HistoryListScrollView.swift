@@ -1,16 +1,34 @@
-import AppKit
 import SwiftUI
 
-/// Telegram-style windowed list on AppKit.
+/// A windowed history list: only the rows intersecting the viewport (plus
+/// `HistoryListLayout.overscan`) are mounted, and the rest of the document is
+/// held open by two spacers sized from the height model.
 ///
-/// Telegram-iOS `ListView` cannot ship here (GPL-2, UIKit, AsyncDisplayKit).
-/// This is the same *model* on macOS: the scroll view only provides pan and
-/// a real content size; row views are subviews of a flipped document, and
-/// only the viewport plus `invisibleInset` (~500pt) are mounted. Height is
-/// guessed, then measured; a delta above the fold moves the clip origin so
-/// the document does not jump. Prefetch is "visible index within 5 of the
-/// loaded edge", not an `onAppear` on an unmounted sentinel.
-struct HistoryListScrollView<Row: View>: NSViewRepresentable {
+/// This is the Telegram `ListView` model, which needs three things SwiftUI
+/// only offers from macOS 15. All three are load-bearing:
+///
+/// - `onScrollGeometryChange` — read the offset without routing geometry
+///   through a `PreferenceKey`, which fed every scroll frame back through a
+///   body pass and was half of why the previous attempt oscillated.
+/// - `onGeometryChange` — measure a mounted row the same way.
+/// - `ScrollPosition.scrollTo(y:)` — **write** the offset in points. This is
+///   the compensation: when a measured height replaces an estimate for a row
+///   above the fold, the offset moves by the same delta and the pixels on
+///   screen stay put.
+///
+/// Without that last one the model and the real document drift apart with no
+/// way to reconcile them, the window resolves off the end of the model, and
+/// the viewport goes blank. That is not hypothetical — it shipped. The full
+/// account is in `context/history-list-scrolling.md`; read it before changing
+/// anything here.
+///
+/// Why it converges: a row's height is only ever wrong *before its first
+/// measurement*, and a row is only met for the first time by scrolling toward
+/// it — which puts it below the fold, where a correction needs no
+/// compensation at all. Measured heights never expire, so scrolling back up is
+/// exact. Compensation is the rare case (a jump into unmeasured rows), not the
+/// steady state, which is why writing the offset does not fight momentum.
+struct HistoryListScrollView<Row: View>: View {
     var items: [HistoryListItem]
     var isLoadingMore: Bool
     var hasMore: Bool
@@ -21,278 +39,176 @@ struct HistoryListScrollView<Row: View>: NSViewRepresentable {
     var onStickyChip: (DayHeadingChip?) -> Void
     var row: (HistoryListItem) -> Row
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
+    @State private var runtime = HistoryWindowRuntime()
+    @State private var mounted: Range<Int> = 0..<0
+    @State private var scrollPosition = ScrollPosition()
+    /// Bumped when a measurement changes the height model, to rebuild the
+    /// spacers. The heights themselves live in `runtime`, off `@State`, so a
+    /// measurement that changes nothing costs nothing.
+    @State private var modelRevision = 0
 
-    func makeNSView(context: Context) -> NSScrollView {
-        let coordinator = context.coordinator
-        let scrollView = coordinator.scrollView
-        scrollView.drawsBackground = false
-        scrollView.backgroundColor = .clear
-        scrollView.borderType = .noBorder
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.automaticallyAdjustsContentInsets = false
-        scrollView.contentInsets = NSEdgeInsets()
-        scrollView.scrollerInsets = NSEdgeInsets()
-        scrollView.verticalScrollElasticity = .allowed
-        scrollView.horizontalScrollElasticity = .none
-        let clip = HistoryListClipView()
-        clip.drawsBackground = false
-        clip.postsBoundsChangedNotifications = true
-        scrollView.contentView = clip
-        scrollView.documentView = coordinator.document
-        ScrollFenceRegistry.shared.register(scrollView)
-        coordinator.observeClipView()
-        return scrollView
-    }
+    var body: some View {
+        let _ = modelRevision
+        let origins = currentOrigins()
+        let range = renderedRange(origins: origins)
+        let top = HistoryListLayout.leadingSpacer(rangeStart: range.lowerBound, origins: origins)
+        let bottom = HistoryListLayout.trailingSpacer(rangeEnd: range.upperBound, origins: origins)
+        let lastID = items.last?.id
 
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        let coordinator = context.coordinator
-        scrollView.hasVerticalScroller = showsIndicator
-        coordinator.items = items
-        coordinator.isLoadingMore = isLoadingMore
-        coordinator.hasMore = hasMore
-        coordinator.makeRow = { AnyView(row($0)) }
-        coordinator.onLoadMore = onLoadMore
-        coordinator.onStickyChip = onStickyChip
-        coordinator.reload()
-        if followGeneration != coordinator.appliedFollowGeneration {
-            coordinator.pendingFollowID = followID
-            coordinator.pendingFollowGeneration = followGeneration
-            coordinator.flushFollow()
-        }
-    }
-
-    @MainActor
-    final class Coordinator: NSObject {
-        let scrollView = NSScrollView()
-        let document = HistoryListDocumentView()
-        let cache = HistoryRowHeightCache()
-        var items: [HistoryListItem] = []
-        var isLoadingMore = false
-        var hasMore = false
-        var makeRow: (HistoryListItem) -> AnyView = { _ in AnyView(EmptyView()) }
-        var onLoadMore: () -> Void = {}
-        var onStickyChip: (DayHeadingChip?) -> Void = { _ in }
-        var appliedFollowGeneration = -1
-        var pendingFollowGeneration = -1
-        var pendingFollowID: String?
-        var ignoreScroll = false
-        private var boundsObserver: NSObjectProtocol?
-        private var lastChip: DayHeadingChip?
-        private var lastLoadMoreAt: CFAbsoluteTime = 0
-
-        deinit {
-            if let boundsObserver {
-                NotificationCenter.default.removeObserver(boundsObserver)
-            }
-        }
-
-        func observeClipView() {
-            guard boundsObserver == nil else { return }
-            boundsObserver = NotificationCenter.default.addObserver(
-                forName: NSView.boundsDidChangeNotification,
-                object: scrollView.contentView,
-                queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    guard let self, !self.ignoreScroll else { return }
-                    self.updateVisible(remeasure: false)
-                    self.flushFollow()
+        ScrollView(.vertical, showsIndicators: showsIndicator) {
+            VStack(spacing: 0) {
+                if top > 0 {
+                    Color.clear.frame(height: top)
+                }
+                ForEach(items[range]) { item in
+                    row(item)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                            record(height: height, for: item)
+                        }
+                        .padding(.bottom, item.id == lastID ? 0 : HistoryListLayout.spacing)
+                        .id(item.id)
+                }
+                if bottom > 0 {
+                    Color.clear.frame(height: bottom)
                 }
             }
+            .padding(.horizontal, HistoryListLayout.horizontalInset)
+            .padding(.bottom, HistoryListLayout.bottomPadding)
         }
-
-        func reload() {
-            updateVisible(remeasure: true)
+        .scrollPosition($scrollPosition)
+        .onScrollGeometryChange(for: HistoryViewportMetrics.self) { geometry in
+            HistoryViewportMetrics(
+                offset: HistoryListLayout.offset(visibleMinY: geometry.visibleRect.minY),
+                height: geometry.containerSize.height
+            )
+        } action: { _, metrics in
+            runtime.offset = metrics.offset
+            runtime.viewportHeight = metrics.height
+            applyWindow()
         }
-
-        func flushFollow() {
-            guard pendingFollowGeneration != appliedFollowGeneration else { return }
-            guard scrollView.contentView.bounds.width > 1 else { return }
-            appliedFollowGeneration = pendingFollowGeneration
-            if let pendingFollowID {
-                scrollTo(id: pendingFollowID)
-            }
+        .onChange(of: items.count) { _, _ in applyWindow() }
+        .onChange(of: followGeneration) { _, _ in follow() }
+        .onAppear {
+            applyWindow()
+            follow()
         }
+        .background(ScrollFenceView())
+    }
 
-        var offset: CGFloat {
-            max(0, scrollView.contentView.documentVisibleRect.origin.y)
-        }
-
-        var viewportHeight: CGFloat {
-            scrollView.contentView.bounds.height
-        }
-
-        var rowWidth: CGFloat {
-            max(1, document.bounds.width - HistoryListLayout.horizontalInset * 2)
-        }
-
-        func heights() -> [CGFloat] {
-            HistoryListLayout.heights(
+    private func currentOrigins() -> [CGFloat] {
+        HistoryListLayout.origins(
+            heights: HistoryListLayout.heights(
                 items: items,
-                cache: cache,
+                cache: runtime.cache,
                 isLoadingMore: isLoadingMore
             )
-        }
+        )
+    }
 
-        func originEdges(from rowHeights: [CGFloat]) -> [CGFloat] {
-            HistoryListLayout.origins(heights: rowHeights)
-        }
-
-        func contentHeight(origins: [CGFloat]) -> CGFloat {
-            (origins.last ?? 0) + HistoryListLayout.bottomPadding
-        }
-
-        func scrollTo(id: String) {
-            let heights = heights()
-            let origins = originEdges(from: heights)
-            guard let index = HistoryListLayout.index(of: id, in: items),
-                  index < origins.count
-            else { return }
-            setOffset(origins[index])
-            updateVisible(remeasure: true)
-        }
-
-        func setOffset(_ y: CGFloat) {
-            ignoreScroll = true
-            let maxY = max(0, document.frame.height - viewportHeight)
-            let next = min(max(0, y), maxY)
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: next))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-            ignoreScroll = false
-        }
-
-        func updateVisible(remeasure: Bool) {
-            let width = scrollView.contentView.bounds.width
-            guard width > 1 else { return }
-
-            if items.isEmpty {
-                for host in document.hosts.values { host.removeFromSuperview() }
-                document.hosts.removeAll()
-                document.frame = NSRect(x: 0, y: 0, width: width, height: viewportHeight)
-                return
-            }
-
-            var heights = heights()
-            var origins = originEdges(from: heights)
-            var offset = self.offset
-            let viewport = viewportHeight
-            document.frame = NSRect(
-                x: 0,
-                y: 0,
-                width: width,
-                height: max(contentHeight(origins: origins), viewport)
-            )
-
-            let range = HistoryListLayout.visibleRange(
+    /// `mounted` lags the model by one update after the item list changes, so
+    /// clamp it, and derive a window outright when there is not one yet.
+    private func renderedRange(origins: [CGFloat]) -> Range<Int> {
+        guard !items.isEmpty else { return 0..<0 }
+        let lower = min(max(0, mounted.lowerBound), items.count)
+        let upper = min(max(lower, mounted.upperBound), items.count)
+        guard lower < upper else {
+            return HistoryListLayout.visibleRange(
                 origins: origins,
-                offset: offset,
-                viewportHeight: viewport
+                offset: runtime.offset,
+                viewportHeight: runtime.viewportHeight
             )
-            let visibleIDs = Set(items[range].map(\.id))
+        }
+        return lower..<upper
+    }
 
-            for (id, host) in document.hosts where !visibleIDs.contains(id) {
-                host.removeFromSuperview()
-                document.hosts.removeValue(forKey: id)
-            }
+    private func applyWindow() {
+        let origins = currentOrigins()
+        let next = HistoryListLayout.visibleRange(
+            origins: origins,
+            offset: runtime.offset,
+            viewportHeight: runtime.viewportHeight
+        )
+        if next != mounted { mounted = next }
 
-            var heightChanged = false
-            for index in range {
-                let item = items[index]
-                let host = document.host(for: item.id, row: makeRow(item))
-                if remeasure {
-                    host.rootView = makeRow(item)
-                }
-                let measured = document.measure(host, width: rowWidth)
-                let previous = heights[index]
-                if abs(measured - previous) >= 1 {
-                    offset += HistoryListLayout.offsetDeltaAfterHeightChange(
-                        rowOrigin: origins[index],
-                        viewportOffset: offset,
-                        heightDelta: measured - previous
-                    )
-                    cache.record(id: item.id, measured: measured)
-                    heights[index] = measured
-                    heightChanged = true
-                }
-            }
+        onStickyChip(
+            HistoryStickyHeading.chip(items: items, origins: origins, offset: runtime.offset)
+        )
 
-            if heightChanged {
-                origins = originEdges(from: heights)
-                document.frame = NSRect(
-                    x: 0,
-                    y: 0,
-                    width: width,
-                    height: max(contentHeight(origins: origins), viewport)
-                )
-                setOffset(offset)
-            }
+        guard hasMore, !isLoadingMore else { return }
+        guard HistoryLoadMore.isNearBottom(
+            offset: runtime.offset,
+            viewportHeight: runtime.viewportHeight,
+            contentHeight: HistoryListLayout.contentHeight(origins: origins)
+                + HistoryListLayout.bottomPadding
+        ) else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - runtime.lastLoadMoreAt > 0.25 else { return }
+        runtime.lastLoadMoreAt = now
+        onLoadMore()
+    }
 
-            for index in range {
-                let item = items[index]
-                guard let host = document.hosts[item.id] else { continue }
-                host.rootView = makeRow(item)
-                let height = heights[index]
-                host.frame = NSRect(
-                    x: HistoryListLayout.horizontalInset,
-                    y: origins[index],
-                    width: rowWidth,
-                    height: height
-                )
-            }
+    /// A row just reported its real height. Update the model, and if the row
+    /// is above the fold, move the offset by the same delta so what the user
+    /// is looking at does not shift under them.
+    private func record(height: CGFloat, for item: HistoryListItem) {
+        let key = item.heightKey(isLoadingMore: isLoadingMore)
+        // Cheap check first. `onGeometryChange` fires for every mounted row on
+        // every layout pass, and almost all of them report a height the model
+        // already has; building the origins array before finding that out made
+        // an O(rows) pass the common case instead of the rare one.
+        guard let delta = runtime.cache.record(id: key, measured: height) else { return }
+        // Only now: the row's position under the layout the user is currently
+        // seeing, which is what the delta has to be measured against.
+        let originsBefore = currentOrigins()
 
-            let chip = HistoryStickyHeading.chip(items: items, origins: origins, offset: self.offset)
-            if chip != lastChip {
-                lastChip = chip
-                onStickyChip(chip)
+        if let index = HistoryListLayout.index(of: item.id, in: items),
+           index < originsBefore.count
+        {
+            let shift = HistoryListLayout.offsetDeltaAfterHeightChange(
+                rowOrigin: originsBefore[index],
+                viewportOffset: runtime.offset,
+                heightDelta: delta
+            )
+            if shift != 0 {
+                runtime.offset += shift
+                scrollPosition.scrollTo(y: runtime.offset)
             }
+        }
 
-            let visibleLast = range.isEmpty ? -1 : range.upperBound - 1
-            if hasMore,
-               HistoryListLayout.shouldLoadMore(
-                   visibleLastIndex: visibleLast,
-                   itemCount: items.count,
-                   offset: self.offset,
-                   viewportHeight: viewport,
-                   contentHeight: contentHeight(origins: origins)
-               )
-            {
-                let now = CFAbsoluteTimeGetCurrent()
-                if now - lastLoadMoreAt > 0.2 {
-                    lastLoadMoreAt = now
-                    onLoadMore()
-                }
-            }
+        modelRevision &+= 1
+        applyWindow()
+    }
+
+    /// Scroll to the followed row by model position, not by identity — the
+    /// target is usually not mounted, and `scrollTo(y:)` does not care.
+    private func follow() {
+        guard let followID,
+              let index = HistoryListLayout.index(of: followID, in: items)
+        else { return }
+        if ScrollFenceRegistry.shared.pointerInsideAnyFence() { return }
+        let origins = currentOrigins()
+        guard index < origins.count else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            scrollPosition.scrollTo(y: origins[index])
         }
     }
 }
 
-final class HistoryListDocumentView: NSView {
-    var hosts: [String: NSHostingView<AnyView>] = [:]
-
-    override var isFlipped: Bool { true }
-
-    func host(for id: String, row: AnyView) -> NSHostingView<AnyView> {
-        if let existing = hosts[id] {
-            return existing
-        }
-        let host = NSHostingView(rootView: row)
-        host.sizingOptions = [.intrinsicContentSize]
-        hosts[id] = host
-        addSubview(host)
-        return host
-    }
-
-    func measure(_ host: NSHostingView<AnyView>, width: CGFloat) -> CGFloat {
-        host.frame.size.width = width
-        host.invalidateIntrinsicContentSize()
-        return max(1, ceil(host.fittingSize.height))
-    }
+private struct HistoryViewportMetrics: Equatable {
+    var offset: CGFloat
+    var height: CGFloat
 }
 
-final class HistoryListClipView: NSClipView {
-    override var isFlipped: Bool { true }
+/// Scroll geometry and the height cache, deliberately off `@State`: these
+/// change on every scroll frame and none of them may rebuild the list. Only
+/// `mounted` does that, and only when the window actually moves.
+final class HistoryWindowRuntime {
+    let cache = HistoryRowHeightCache()
+    var offset: CGFloat = 0
+    var viewportHeight: CGFloat = HistoryListLayout.defaultViewport
+    var lastLoadMoreAt: CFAbsoluteTime = 0
 }

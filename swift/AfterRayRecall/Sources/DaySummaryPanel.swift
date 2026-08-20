@@ -25,21 +25,34 @@ private enum DaySummaryMetrics {
     static let iconLimit = 8
 }
 
-/// The history-summary panel is a Telegram-style windowed list:
-/// AppKit `NSScrollView` + flipped document, only the viewport plus
-/// ~500pt of overscan mounted. `LazyVStack` is not used (unmounted
-/// rows contribute no document height). Copy is structured (this
+/// The history-summary panel. The list is windowed (`HistoryListScrollView`);
+/// see `context/history-list-scrolling.md` for what makes that safe and for
+/// the budget every row body has to live inside. Copy is structured (this
 /// slot, this day, all loaded days).
+///
+/// This outer type is a shell whose only job is to collapse the two per-frame
+/// inputs and hand the result to an `Equatable` body. Scrubbing the timeline
+/// rebuilds `RecallView` on every frame, and the panel is a large subtree —
+/// windowed list, glass chrome, a blurred shadow. Skipping it wholesale when
+/// nothing it draws has changed is the difference between a scrub that drops
+/// frames and one that does not.
 public struct DaySummaryPanel: View {
-    @State private var expandedSlotStarts: Set<Int64> = []
-    @State private var followedSlot: Int64?
-    @State private var followGeneration = 0
-    @State private var stickyChip: DayHeadingChip?
     var style: DaySummaryPanelStyle = .overlay
     var onPopOut: (() -> Void)? = nil
     let summaries: [DaySummary]
-    let playheadMs: Int64
-    let nowMs: Int64
+    /// The slot the playhead sits in — resolved once in `init`, not a stored
+    /// `playheadMs`.
+    ///
+    /// Scrubbing the timeline republishes `playheadMs` every frame, but the
+    /// panel only ever asks which slot to highlight, and that changes when the
+    /// playhead crosses a slot boundary — every half hour of recorded time,
+    /// not 60 times a second. Storing the raw playhead made every stored
+    /// property of this view differ on every frame, which rebuilt all ~90 rows
+    /// for a highlight that had not moved. It was also read once *per row*
+    /// (`isCurrent:`), so the O(days x slots) scan ran ~90 times a pass.
+    let highlightedSlotStart: Int64?
+    /// Local midnight, not a live clock — see `DaySummaryLayout.dayStartMs`.
+    let todayStartMs: Int64
     let hasMore: Bool
     let totalDays: Int?
     let isLoadingMore: Bool
@@ -65,8 +78,12 @@ public struct DaySummaryPanel: View {
         self.style = style
         self.onPopOut = onPopOut
         self.summaries = summaries
-        self.playheadMs = playheadMs
-        self.nowMs = nowMs
+        // Both collapse a per-frame value to one that only changes when the
+        // panel would actually look different.
+        self.highlightedSlotStart = summaries.lazy.compactMap {
+            DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots)
+        }.first
+        self.todayStartMs = DaySummaryLayout.dayStartMs(atMs: nowMs)
         self.hasMore = hasMore
         self.totalDays = totalDays
         self.isLoadingMore = isLoadingMore
@@ -75,14 +92,72 @@ public struct DaySummaryPanel: View {
         self.onLoadMore = onLoadMore
     }
 
-    private var dayCountLabel: String {
-        HistoryDayCount.label(totalDays: totalDays)
+    public var body: some View {
+        content.equatable()
     }
 
-    private var highlightedSlotStart: Int64? {
-        summaries.lazy.compactMap {
-            DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots)
-        }.first
+    /// Split out so the equality this relies on is directly testable; `body`
+    /// hands SwiftUI an `EquatableView`, which a test cannot look inside.
+    var content: DaySummaryPanelContent {
+        DaySummaryPanelContent(
+            style: style,
+            onPopOut: onPopOut,
+            summaries: summaries,
+            highlightedSlotStart: highlightedSlotStart,
+            todayStartMs: todayStartMs,
+            hasMore: hasMore,
+            totalDays: totalDays,
+            isLoadingMore: isLoadingMore,
+            followPulse: followPulse,
+            onSelectSlot: onSelectSlot,
+            onLoadMore: onLoadMore
+        )
+    }
+}
+
+/// Everything the panel actually draws, behind one equality check.
+///
+/// `==` compares data only. The closures are new instances on every pass and
+/// would make the panel unequal forever, which is exactly the update this
+/// exists to skip — the same trade `DaySummaryRow` makes, and it bounds
+/// closure staleness the same way: a held closure is at most one *data*
+/// change old, not one frame old, because any change to what the panel draws
+/// refreshes it. Do not add a closure here that captures something absent
+/// from `==`.
+// Internal, not private, so `DaySummaryPanelScrubTests` can assert the
+// equality that the whole optimisation rests on.
+struct DaySummaryPanelContent: View, Equatable {
+    @State private var expandedSlotStarts: Set<Int64> = []
+    @State private var followedSlot: Int64?
+    @State private var followGeneration = 0
+    @State private var stickyChip: DayHeadingChip?
+    let style: DaySummaryPanelStyle
+    let onPopOut: (() -> Void)?
+    let summaries: [DaySummary]
+    let highlightedSlotStart: Int64?
+    let todayStartMs: Int64
+    let hasMore: Bool
+    let totalDays: Int?
+    let isLoadingMore: Bool
+    let followPulse: Int
+    let onSelectSlot: (DaySlotSummary) -> Void
+    let onLoadMore: () -> Void
+
+    static func == (lhs: DaySummaryPanelContent, rhs: DaySummaryPanelContent) -> Bool {
+        lhs.highlightedSlotStart == rhs.highlightedSlotStart
+            && lhs.followPulse == rhs.followPulse
+            && lhs.isLoadingMore == rhs.isLoadingMore
+            && lhs.hasMore == rhs.hasMore
+            && lhs.totalDays == rhs.totalDays
+            && lhs.todayStartMs == rhs.todayStartMs
+            && lhs.style == rhs.style
+            && (lhs.onPopOut == nil) == (rhs.onPopOut == nil)
+            && lhs.summaries == rhs.summaries
+    }
+
+
+    private var dayCountLabel: String {
+        HistoryDayCount.label(totalDays: totalDays)
     }
 
     public var body: some View {
@@ -151,7 +226,7 @@ public struct DaySummaryPanel: View {
     private var listItems: [HistoryListItem] {
         HistoryListItems.build(
             summaries: summaries,
-            nowMs: nowMs,
+            nowMs: todayStartMs,
             expandedSlotStarts: expandedSlotStarts,
             hasMore: hasMore
         )
@@ -248,6 +323,13 @@ public struct DaySummaryPanel: View {
                 }
             )
         case let .slot(slot, expanded):
+            // `.equatable()` is load-bearing, not a micro-optimization. The
+            // list is eager, so without it every enclosing update re-runs all
+            // ~90 row bodies — and the panel is rebuilt by anything upstream
+            // that changes, including closures that are recreated every pass
+            // and so can never compare equal. With it, a pass that moved
+            // nothing but the playhead touches only the two rows whose
+            // `isCurrent` actually flipped.
             DaySummaryRow(
                 slot: slot,
                 isCurrent: slot.slotStartMs == highlightedSlotStart,
@@ -255,11 +337,13 @@ public struct DaySummaryPanel: View {
                 onSelect: { onSelectSlot(slot) },
                 onToggleDetails: { toggleDetails(slotStartMs: slot.slotStartMs) }
             )
+            .equatable()
         case .loadMore:
             HistorySummaryLoadTrigger(isLoading: isLoadingMore)
         }
     }
 }
+
 
 private struct DaySummaryHeadingRow: View {
     let dayStartMs: Int64
@@ -282,7 +366,7 @@ private struct DaySummaryHeadingRow: View {
     }
 }
 
-private struct DaySummaryRow: View {
+private struct DaySummaryRow: View, Equatable {
     let slot: DaySlotSummary
     let isCurrent: Bool
     let isExpanded: Bool
@@ -290,18 +374,32 @@ private struct DaySummaryRow: View {
     let onToggleDetails: () -> Void
     @State private var isHovering = false
 
-    private var text: DaySummaryRowText {
-        DaySummaryLayout.rowText(slot: slot)
-    }
-
-    private var sections: [DaySummaryExpandedSection] {
-        DaySummaryLayout.expandedSections(slot: slot)
+    /// Data only — closures are recreated on every pass and would make every
+    /// row unequal forever, which is exactly the update this is here to skip.
+    ///
+    /// Safe because neither closure outlives its data: `onSelect` captures
+    /// `slot`, which is compared here, and `onToggleDetails` captures only
+    /// `slot.slotStartMs` and writes through `@State`, whose storage SwiftUI
+    /// owns and keeps current regardless of which copy of the struct calls it.
+    /// Hover is `@State` and invalidates the row directly, so it does not need
+    /// to participate.
+    static func == (lhs: DaySummaryRow, rhs: DaySummaryRow) -> Bool {
+        lhs.isCurrent == rhs.isCurrent
+            && lhs.isExpanded == rhs.isExpanded
+            && lhs.slot == rhs.slot
     }
 
     var body: some View {
+        // Bound once. These were computed properties, so `text.time`,
+        // `text.primary`, `text.detail` and `text.badge` each re-derived the
+        // whole thing, and `sections` re-parsed the card's Markdown — on every
+        // body pass, which is every scroll frame and every playhead tick.
+        let text = DaySummaryLayout.rowText(slot: slot)
+        let hasDetail = DaySummaryLayout.hasExpandableDetail(slot: slot)
+
         // Not a button: the prose is content to read, select and copy. The
         // time chip is the deliberate jump onto the timeline.
-        HStack(alignment: .top, spacing: 0) {
+        return HStack(alignment: .top, spacing: 0) {
             Button(action: onSelect) {
                 Text(text.time)
                     .font(.system(size: 11, weight: .medium).monospacedDigit())
@@ -337,7 +435,7 @@ private struct DaySummaryRow: View {
                         .textSelection(.enabled)
                 }
 
-                if !sections.isEmpty {
+                if hasDetail {
                     Button(action: onToggleDetails) {
                         Text(isExpanded ? "Hide details" : "Full details")
                             .font(.system(size: 10, weight: .medium))
@@ -346,7 +444,9 @@ private struct DaySummaryRow: View {
                     }
                     .buttonStyle(.plain)
 
+                    // Parsed only for the card the user actually opened.
                     if isExpanded {
+                        let sections = DaySummaryLayout.expandedSections(slot: slot)
                         ForEach(Array(sections.enumerated()), id: \.offset) { _, section in
                             if let heading = section.heading {
                                 Text(heading)
@@ -403,6 +503,25 @@ private struct DaySummaryRow: View {
                 copyToPasteboard(DaySummaryClipboard.slotText(slot))
             }
         }
+        // One element per card instead of one per Text, button and icon.
+        //
+        // Accessibility attachments are rebuilt on every AttributeGraph
+        // update and each rebuild walks the node's ancestors, so the cost is
+        // nodes x depth x frames — and the panel is drawn inside the same
+        // hosting view as the timeline, which relayouts on every frame of a
+        // scrub. The panel's share of that was ~3.1ms of the ~8.7ms it added
+        // to each frame.
+        //
+        // `.combine` drops the descendants' own actions, so both are restated
+        // here; a card read as one item with two actions is better VoiceOver
+        // than eight fragments anyway.
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isCurrent ? [.isSelected] : [])
+        .accessibilityAction(named: "Open in timeline", onSelect)
+        .accessibilityAction(
+            named: isExpanded ? "Hide details" : "Show full details",
+            onToggleDetails
+        )
     }
 
     private var rowFill: Color {

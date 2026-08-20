@@ -69,6 +69,9 @@ final class HistoryLoadMoreTests: XCTestCase {
     }
 }
 
+/// The chip is computed from the layout model, because the headings it asks
+/// about are above the fold and therefore not mounted. The model is exact up
+/// there: a row already scrolled past has been measured.
 final class HistoryStickyHeadingTests: XCTestCase {
     private let today = HistoryListItem.heading(
         dayStartMs: 2,
@@ -83,11 +86,7 @@ final class HistoryStickyHeadingTests: XCTestCase {
 
     func testNoChipWhileTheInFlowHeadingIsOnScreen() {
         XCTAssertNil(
-            HistoryStickyHeading.chip(
-                items: [today],
-                origins: [0, 28],
-                offset: 0
-            )
+            HistoryStickyHeading.chip(items: [today], origins: [0, 28], offset: 0)
         )
     }
 
