@@ -32,7 +32,32 @@ impl DownloadError {
     fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
     }
+
+    /// Network and mirror-safe content failures. Disk errors and cancellation
+    /// are not: retrying those against another origin cannot help.
+    fn is_retryable_on_mirror(&self) -> bool {
+        match self {
+            Self::Cancelled | Self::Io(_) => false,
+            Self::Http(_) => true,
+            Self::Message(message) => {
+                retryable_http_status_in(message)
+                    || message.contains("SHA-256")
+                    || (message.contains("has ") && message.contains(" bytes; expected "))
+            }
+        }
+    }
 }
+
+/// Official Hugging Face origin. Empty settings and an unset `HF_ENDPOINT`
+/// resolve here.
+pub const OFFICIAL_HUGGINGFACE_ENDPOINT: &str = "https://huggingface.co";
+
+/// Community mirror. SHA-256 pins make it safe; a network failure against the
+/// official origin retries here once and adopts it on success.
+pub const MIRROR_HUGGINGFACE_ENDPOINT: &str = "https://hf-mirror.com";
+
+const HF_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const HF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadProgress {
@@ -677,11 +702,21 @@ async fn list_huggingface_files(
     repository: &str,
     cancellation: &Cancellation,
 ) -> Result<Vec<HfFile>, DownloadError> {
+    with_huggingface_failover(cancellation, |endpoint| {
+        let repository = repository.to_owned();
+        let cancellation = cancellation.clone();
+        async move { list_huggingface_files_from(&endpoint, &repository, &cancellation).await }
+    })
+    .await
+}
+
+async fn list_huggingface_files_from(
+    endpoint: &str,
+    repository: &str,
+    cancellation: &Cancellation,
+) -> Result<Vec<HfFile>, DownloadError> {
     ensure_not_cancelled(cancellation)?;
-    let url = format!(
-        "{}/api/models/{repository}/tree/main?recursive=1",
-        huggingface_endpoint()
-    );
+    let url = format!("{endpoint}/api/models/{repository}/tree/main?recursive=1");
     let request = huggingface_client()?.get(url).send();
     let response = tokio::select! {
         () = cancellation.cancelled() => return Err(DownloadError::Cancelled),
@@ -717,11 +752,57 @@ async fn download_huggingface_file(
     cancellation: &Cancellation,
     mut on_chunk: impl FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadError> {
+    let chain = huggingface_endpoint_chain();
+    for (index, endpoint) in chain.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        match download_huggingface_file_from(
+            endpoint,
+            repository,
+            revision,
+            file,
+            destination,
+            expected_file_bytes,
+            expected_sha256,
+            cancellation,
+            &mut on_chunk,
+        )
+        .await
+        {
+            Ok(()) => {
+                if index > 0 {
+                    adopt_huggingface_endpoint(endpoint);
+                }
+                return Ok(());
+            }
+            Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+            Err(error) if index + 1 < chain.len() && error.is_retryable_on_mirror() => {
+                eprintln!(
+                    "model download: {endpoint} failed ({error}); retrying from {}",
+                    chain[index + 1]
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(DownloadError::message(
+        "model download failed before any origin was contacted",
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_huggingface_file_from(
+    endpoint: &str,
+    repository: &str,
+    revision: &str,
+    file: &str,
+    destination: &Path,
+    expected_file_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
+    cancellation: &Cancellation,
+    mut on_chunk: impl FnMut(u64, Option<u64>),
+) -> Result<(), DownloadError> {
     ensure_not_cancelled(cancellation)?;
-    let url = format!(
-        "{}/{repository}/resolve/{revision}/{file}",
-        huggingface_endpoint()
-    );
+    let url = format!("{endpoint}/{repository}/resolve/{revision}/{file}");
     let partial = partial_path(destination);
     let resume_from = fs::metadata(&partial)
         .map(|metadata| metadata.len())
@@ -820,6 +901,13 @@ fn ensure_not_cancelled(cancellation: &Cancellation) -> Result<(), DownloadError
 /// only mirror control a packaged install actually has.
 static CONFIGURED_ENDPOINT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
+#[cfg(test)]
+static TEST_ENDPOINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+static TEST_OFFICIAL_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_MIRROR_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Points model downloads at a Hugging Face mirror, or back at the official
 /// endpoint with `None`/empty. Content integrity does not depend on the
 /// endpoint: pinned packs are verified against SHA-256 hashes recorded in the
@@ -835,10 +923,9 @@ pub fn set_huggingface_endpoint(endpoint: Option<String>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = cleaned;
 }
 
-/// Base URL for every Hugging Face request: the configured setting, else
-/// `HF_ENDPOINT` — the same variable the official CLI honours — else the
-/// official endpoint.
-fn huggingface_endpoint() -> String {
+/// Live origin model downloads currently resolve against.
+#[must_use]
+pub fn huggingface_endpoint() -> String {
     if let Some(configured) = CONFIGURED_ENDPOINT
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -849,12 +936,122 @@ fn huggingface_endpoint() -> String {
     endpoint_or_default(std::env::var("HF_ENDPOINT").ok())
 }
 
+/// If downloads adopted the community mirror after the official origin failed,
+/// the value Settings should persist. `None` when the live origin is not the
+/// mirror, or when the user already chose a custom endpoint.
+#[must_use]
+pub fn huggingface_mirror_to_persist(stored_endpoint: &str) -> Option<String> {
+    let live = huggingface_endpoint();
+    if live != mirror_huggingface_endpoint() {
+        return None;
+    }
+    let stored = stored_endpoint.trim().trim_end_matches('/');
+    if stored.is_empty() || stored == official_huggingface_endpoint() {
+        Some(live)
+    } else {
+        None
+    }
+}
+
+fn official_huggingface_endpoint() -> String {
+    #[cfg(test)]
+    if let Some(overridden) = TEST_OFFICIAL_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return overridden;
+    }
+    OFFICIAL_HUGGINGFACE_ENDPOINT.to_owned()
+}
+
+fn mirror_huggingface_endpoint() -> String {
+    #[cfg(test)]
+    if let Some(overridden) = TEST_MIRROR_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return overridden;
+    }
+    MIRROR_HUGGINGFACE_ENDPOINT.to_owned()
+}
+
+// @dec:hf-mirror-failover — docs/decisions/active/product/2026-08-20-hf-mirror-failover.md
+fn huggingface_endpoint_chain() -> Vec<String> {
+    let current = huggingface_endpoint();
+    let mirror = mirror_huggingface_endpoint();
+    if current == official_huggingface_endpoint() && current != mirror {
+        vec![current, mirror]
+    } else {
+        vec![current]
+    }
+}
+
+fn adopt_huggingface_endpoint(endpoint: &str) {
+    if huggingface_endpoint() == endpoint {
+        return;
+    }
+    eprintln!("model download: switched origin to {endpoint}");
+    set_huggingface_endpoint(Some(endpoint.to_owned()));
+}
+
+async fn with_huggingface_failover<T, F, Fut>(
+    cancellation: &Cancellation,
+    mut attempt: F,
+) -> Result<T, DownloadError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DownloadError>>,
+{
+    let chain = huggingface_endpoint_chain();
+    for (index, endpoint) in chain.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        match attempt(endpoint.clone()).await {
+            Ok(value) => {
+                if index > 0 {
+                    adopt_huggingface_endpoint(endpoint);
+                }
+                return Ok(value);
+            }
+            Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+            Err(error) if index + 1 < chain.len() && error.is_retryable_on_mirror() => {
+                eprintln!(
+                    "model download: {endpoint} failed ({error}); retrying from {}",
+                    chain[index + 1]
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(DownloadError::message(
+        "model download failed before any origin was contacted",
+    ))
+}
+
 fn endpoint_or_default(configured: Option<String>) -> String {
     let trimmed = configured.as_deref().map_or("", str::trim);
     if trimmed.is_empty() {
-        return "https://huggingface.co".to_owned();
+        return OFFICIAL_HUGGINGFACE_ENDPOINT.to_owned();
     }
     trimmed.trim_end_matches('/').to_owned()
+}
+
+fn retryable_http_status_in(message: &str) -> bool {
+    let Some(index) = message.rfind("HTTP ") else {
+        return false;
+    };
+    let digits: String = message[index + 5..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits
+        .parse::<u16>()
+        .is_ok_and(is_retryable_http_status_code)
+}
+
+const fn is_retryable_http_status_code(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500..=599)
 }
 
 fn huggingface_client() -> Result<reqwest::Client, DownloadError> {
@@ -874,7 +1071,8 @@ fn huggingface_client() -> Result<reqwest::Client, DownloadError> {
         .user_agent("afterray/0.0.1")
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::limited(16))
-        .timeout(Duration::from_secs(60 * 30))
+        .connect_timeout(HF_CONNECT_TIMEOUT)
+        .timeout(HF_REQUEST_TIMEOUT)
         .build()
         .map_err(|error| DownloadError::Http(error.to_string()))
 }
@@ -909,6 +1107,7 @@ fn directory_size(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::sync::Arc;
 
     fn file_pack(path: PathBuf) -> PackSpec {
         PackSpec {
@@ -932,19 +1131,292 @@ mod tests {
     /// paths, so the override must not grow a double slash or lose the default.
     #[test]
     fn hf_endpoint_override_trims_and_falls_back() {
-        assert_eq!(endpoint_or_default(None), "https://huggingface.co");
+        assert_eq!(endpoint_or_default(None), OFFICIAL_HUGGINGFACE_ENDPOINT);
         assert_eq!(
             endpoint_or_default(Some("  ".into())),
-            "https://huggingface.co"
+            OFFICIAL_HUGGINGFACE_ENDPOINT
         );
         assert_eq!(
             endpoint_or_default(Some("https://hf-mirror.com/".into())),
-            "https://hf-mirror.com"
+            MIRROR_HUGGINGFACE_ENDPOINT
         );
         assert_eq!(
             endpoint_or_default(Some(" https://hf-mirror.com ".into())),
-            "https://hf-mirror.com"
+            MIRROR_HUGGINGFACE_ENDPOINT
         );
+    }
+
+    struct EndpointTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EndpointTestGuard {
+        fn drop(&mut self) {
+            reset_test_origins();
+        }
+    }
+
+    fn lock_download_endpoints() -> EndpointTestGuard {
+        let lock = TEST_ENDPOINT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_test_origins();
+        EndpointTestGuard { _lock: lock }
+    }
+
+    fn reset_test_origins() {
+        set_huggingface_endpoint(None);
+        *TEST_OFFICIAL_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *TEST_MIRROR_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn set_test_origins(official: &str, mirror: &str) {
+        let official = official.trim().trim_end_matches('/');
+        let mirror = mirror.trim().trim_end_matches('/');
+        set_huggingface_endpoint(Some(official.to_owned()));
+        *TEST_OFFICIAL_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(official.to_owned());
+        *TEST_MIRROR_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mirror.to_owned());
+    }
+
+    fn closed_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    async fn serve_http(
+        status: u16,
+        body: &'static [u8],
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        serve_http_owned(status, body.to_vec()).await
+    }
+
+    async fn serve_http_owned(
+        status: u16,
+        body: Vec<u8>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut headers = Vec::new();
+                let mut byte = [0_u8; 1];
+                loop {
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        break;
+                    }
+                    headers.push(byte[0]);
+                    if headers.ends_with(b"\r\n\r\n") || headers.len() > 16 * 1024 {
+                        break;
+                    }
+                }
+                let reason = if matches!(status, 200..=299) {
+                    "OK"
+                } else {
+                    "Error"
+                };
+                let header = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[test]
+    fn official_origin_fails_over_to_the_mirror() {
+        let _guard = lock_download_endpoints();
+        assert_eq!(
+            huggingface_endpoint_chain(),
+            [
+                OFFICIAL_HUGGINGFACE_ENDPOINT.to_owned(),
+                MIRROR_HUGGINGFACE_ENDPOINT.to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_or_mirror_origin_does_not_fail_over() {
+        let _guard = lock_download_endpoints();
+        set_huggingface_endpoint(Some("https://mirror.example.com".into()));
+        assert_eq!(
+            huggingface_endpoint_chain(),
+            ["https://mirror.example.com".to_owned()]
+        );
+        set_huggingface_endpoint(Some(MIRROR_HUGGINGFACE_ENDPOINT.into()));
+        assert_eq!(
+            huggingface_endpoint_chain(),
+            [MIRROR_HUGGINGFACE_ENDPOINT.to_owned()]
+        );
+    }
+
+    #[test]
+    fn retryable_errors_are_network_and_content_mismatch() {
+        assert!(DownloadError::Http("connection reset".into()).is_retryable_on_mirror());
+        assert!(DownloadError::message("download failed: HTTP 503").is_retryable_on_mirror());
+        assert!(DownloadError::message("failed SHA-256 verification").is_retryable_on_mirror());
+        assert!(DownloadError::message("file has 3 bytes; expected 4").is_retryable_on_mirror());
+        assert!(!DownloadError::message("download failed: HTTP 404").is_retryable_on_mirror());
+        assert!(!DownloadError::Cancelled.is_retryable_on_mirror());
+        assert!(!DownloadError::Io(std::io::Error::other("disk full")).is_retryable_on_mirror());
+    }
+
+    #[test]
+    fn persist_helper_only_writes_the_mirror_when_stored_is_official() {
+        let _guard = lock_download_endpoints();
+        set_huggingface_endpoint(Some(MIRROR_HUGGINGFACE_ENDPOINT.into()));
+        assert_eq!(
+            huggingface_mirror_to_persist(""),
+            Some(MIRROR_HUGGINGFACE_ENDPOINT.to_owned())
+        );
+        assert_eq!(
+            huggingface_mirror_to_persist(OFFICIAL_HUGGINGFACE_ENDPOINT),
+            Some(MIRROR_HUGGINGFACE_ENDPOINT.to_owned())
+        );
+        assert_eq!(
+            huggingface_mirror_to_persist("https://mirror.example.com"),
+            None
+        );
+        set_huggingface_endpoint(None);
+        assert_eq!(huggingface_mirror_to_persist(""), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_official_origin_downloads_from_the_mirror() {
+        let _guard = lock_download_endpoints();
+        let (mirror, hits) = serve_http(200, b"good").await;
+        set_test_origins(&closed_endpoint(), &mirror);
+        let path = std::env::temp_dir().join(format!(
+            "afterray-failover-refused-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pack = file_pack(path.clone());
+        download_pack(&pack, |_| {}).await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"good");
+        assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(huggingface_endpoint(), mirror);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn official_http_503_downloads_from_the_mirror() {
+        let _guard = lock_download_endpoints();
+        let (official, official_hits) = serve_http(503, b"nope").await;
+        let (mirror, mirror_hits) = serve_http(200, b"good").await;
+        set_test_origins(&official, &mirror);
+        let path = std::env::temp_dir().join(format!(
+            "afterray-failover-503-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pack = file_pack(path.clone());
+        download_pack(&pack, |_| {}).await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"good");
+        assert!(official_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert!(mirror_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(huggingface_endpoint(), mirror);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn official_http_404_does_not_fail_over() {
+        let _guard = lock_download_endpoints();
+        let (official, _) = serve_http(404, b"missing").await;
+        let (mirror, mirror_hits) = serve_http(200, b"good").await;
+        set_test_origins(&official, &mirror);
+        let path = std::env::temp_dir().join(format!(
+            "afterray-failover-404-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pack = file_pack(path.clone());
+        let error = download_pack(&pack, |_| {}).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 404"), "{error}");
+        assert_eq!(mirror_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(huggingface_endpoint(), official.trim_end_matches('/'));
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_origin_does_not_use_the_mirror() {
+        let _guard = lock_download_endpoints();
+        let (mirror, mirror_hits) = serve_http(200, b"good").await;
+        *TEST_MIRROR_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mirror);
+        set_huggingface_endpoint(Some(closed_endpoint()));
+        let path = std::env::temp_dir().join(format!(
+            "afterray-failover-custom-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pack = file_pack(path.clone());
+        let error = download_pack(&pack, |_| {}).await.unwrap_err();
+        assert!(
+            error.to_string().contains("download request failed"),
+            "{error}"
+        );
+        assert_eq!(mirror_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sha256_mismatch_on_official_retries_the_mirror() {
+        let _guard = lock_download_endpoints();
+        let (official, _) = serve_http(200, b"bad!").await;
+        let (mirror, _) = serve_http(200, b"good").await;
+        set_test_origins(&official, &mirror);
+        let path = std::env::temp_dir().join(format!(
+            "afterray-failover-sha-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut pack = file_pack(path.clone());
+        if let PackSource::HuggingFaceFile { sha256, .. } = &mut pack.source {
+            *sha256 =
+                Some("770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c".into());
+        }
+        download_pack(&pack, |_| {}).await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"good");
+        assert_eq!(huggingface_endpoint(), mirror);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

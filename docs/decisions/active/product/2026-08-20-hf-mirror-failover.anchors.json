@@ -1,0 +1,5 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterray-models/src/download.rs::fn huggingface_endpoint_chain() -> Vec<String> {": "sha256:159a2b132843c883",
+  "crates/afterrayd/src/main.rs::fn persist_adopted_huggingface_mirror(state: &AppState) {": "sha256:b321c16b5f177e59"
+}
