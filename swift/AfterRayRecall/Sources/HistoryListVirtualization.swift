@@ -304,6 +304,53 @@ enum HistoryListLayout {
         max(0, visibleMinY)
     }
 
+    /// Keep the highlighted row on screen while the playhead moves over it.
+    ///
+    /// Returns the offset that reveals row `index`, or **nil when it is
+    /// already visible** — which is the whole point. Following by jumping the
+    /// row to the top fires on every slot boundary, and a drag across a day
+    /// crosses ~48 of them: the panel bounces under a finger that is nowhere
+    /// near it, and each jump costs a `ScrollView` re-measure. Revealing only
+    /// what has left the viewport means a scrub inside one screenful of cards
+    /// moves the document not at all.
+    ///
+    /// The scroll is the minimum that works: a row just under the fold rises
+    /// to sit above it, it does not fly to the top.
+    static func offsetToReveal(
+        index: Int,
+        origins: [CGFloat],
+        offset: CGFloat,
+        viewportHeight: CGFloat,
+        margin: CGFloat = 24
+    ) -> CGFloat? {
+        guard index >= 0, index + 1 < origins.count, viewportHeight > 0 else { return nil }
+        let maxOffset = max(0, contentHeight(origins: origins) - viewportHeight)
+        // `origins` folds the gap after a row into the next edge, so a row's
+        // extent here includes its trailing spacing. Revealing 8pt more than
+        // the card is harmless — it shows the gap — and avoids threading the
+        // raw heights through just to subtract it again.
+        let rowTop = origins[index]
+        let rowBottom = origins[index + 1]
+
+        // A row taller than the viewport that already spans it is as visible
+        // as it can get.
+        if rowTop <= offset, rowBottom >= offset + viewportHeight { return nil }
+
+        let inset = min(margin, max(0, (viewportHeight - (rowBottom - rowTop)) / 2))
+        let top = rowTop - inset
+        let bottom = rowBottom + inset
+        if top >= offset, bottom <= offset + viewportHeight { return nil }
+
+        // Align the top when the row is above the fold, and also when it
+        // cannot fit: showing the bottom edge of a card taller than the
+        // viewport hides the title, which is the part worth reading.
+        let alignTop = top < offset || bottom - top > viewportHeight
+        let clamped = min(max(0, alignTop ? top : bottom - viewportHeight), maxOffset)
+        // Below the tolerance the request is noise: a sub-point correction
+        // would still cost a relayout.
+        return abs(clamped - offset) < 1 ? nil : clamped
+    }
+
     /// When a row's measured height replaces its estimate, everything below it
     /// moves by `heightDelta`. If the row sits above the viewport, the pixels
     /// on screen have just been pushed too — so the scroll offset has to move

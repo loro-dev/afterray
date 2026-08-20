@@ -204,3 +204,120 @@ final class HistoryWindowConvergenceTests: XCTestCase {
         XCTAssertLessThan(ms, 5.0, "estimating 91 rows took \(ms)ms — something is parsing")
     }
 }
+
+/// Following the playhead reveals the card only when it is not already on
+/// screen. Getting this wrong is silent in both directions: too eager and the
+/// panel bounces on every slot boundary, too lazy and it stops tracking.
+final class HistoryRevealTests: XCTestCase {
+    private let viewport: CGFloat = 460
+    private let rowHeight: CGFloat = 100
+
+    /// Rows are 100pt with 8pt gaps. `origins` folds each gap into the next
+    /// edge, so row `i`'s extent here is `108i ..< 108(i+1)` — card plus gap.
+    private func origins(count: Int = 40) -> [CGFloat] {
+        HistoryListLayout.origins(heights: [CGFloat](repeating: rowHeight, count: count))
+    }
+
+    private func reveal(_ index: Int, offset: CGFloat) -> CGFloat? {
+        HistoryListLayout.offsetToReveal(
+            index: index,
+            origins: origins(),
+            offset: offset,
+            viewportHeight: viewport
+        )
+    }
+
+    func testARowAlreadyOnScreenDoesNotScroll() {
+        // At offset 0 the viewport covers 0-460, so rows 0-3 are fully inside.
+        for index in 0...3 {
+            XCTAssertNil(reveal(index, offset: 0), "row \(index) is visible and must not scroll")
+        }
+    }
+
+    /// The point of the exercise: crossing several slot boundaries inside one
+    /// screenful must not move the document at all.
+    func testScrubbingAcrossAScreenfulOfCardsNeverScrolls() {
+        var scrolls = 0
+        for index in 0...3 where reveal(index, offset: 0) != nil { scrolls += 1 }
+        XCTAssertEqual(scrolls, 0)
+    }
+
+    func testARowBelowTheFoldRisesJustEnough() {
+        // Row 4 spans 432-540; the viewport ends at 460.
+        let target = reveal(4, offset: 0)
+        XCTAssertNotNil(target)
+        // It comes to rest against the bottom edge, not at the top.
+        XCTAssertEqual(target ?? 0, 540 + 24 - viewport, accuracy: 0.5)
+        XCTAssertLessThan(target ?? .infinity, 432, "a jump to the top would be 432")
+    }
+
+    func testARowAboveTheFoldDropsJustEnough() {
+        // Scrolled to 1000, row 4 (432-532) is above the viewport.
+        let target = reveal(4, offset: 1_000)
+        XCTAssertNotNil(target)
+        XCTAssertEqual(target ?? 0, 432 - 24, accuracy: 0.5)
+    }
+
+    func testItNeverScrollsPastEitherEnd() {
+        let all = origins()
+        let content = HistoryListLayout.contentHeight(origins: all)
+        for index in [0, 1, 20, 38] {
+            for offset in stride(from: CGFloat(0), through: content, by: 97) {
+                guard let target = HistoryListLayout.offsetToReveal(
+                    index: index,
+                    origins: all,
+                    offset: offset,
+                    viewportHeight: viewport
+                ) else { continue }
+                XCTAssertGreaterThanOrEqual(target, 0)
+                XCTAssertLessThanOrEqual(target, max(0, content - viewport) + 0.5)
+            }
+        }
+    }
+
+    /// Whatever it returns, the row must actually be on screen afterwards —
+    /// otherwise the next boundary asks again and the panel judders.
+    func testRevealingAlwaysLandsTheRowOnScreen() {
+        let all = origins()
+        for index in 0..<39 {
+            for offset in stride(from: CGFloat(0), through: 3_500, by: 211) {
+                let target = HistoryListLayout.offsetToReveal(
+                    index: index,
+                    origins: all,
+                    offset: offset,
+                    viewportHeight: viewport
+                ) ?? offset
+                let overlapTop = max(all[index], target)
+                let overlapBottom = min(all[index + 1], target + viewport)
+                XCTAssertGreaterThan(
+                    overlapBottom - overlapTop,
+                    0,
+                    "row \(index) still off screen from offset \(offset)"
+                )
+            }
+        }
+    }
+
+    func testARowTallerThanTheViewportAlignsItsTop() {
+        let tall = HistoryListLayout.origins(heights: [100, 900, 100])
+        let target = HistoryListLayout.offsetToReveal(
+            index: 1,
+            origins: tall,
+            offset: 0,
+            viewportHeight: viewport
+        )
+        XCTAssertEqual(target ?? -1, 108, accuracy: 0.5)
+    }
+
+    func testASubPointCorrectionIsNotWorthARelayout() {
+        let all = origins()
+        // Row 4 resolves to 104; ask from a hair away.
+        let target = HistoryListLayout.offsetToReveal(
+            index: 4,
+            origins: all,
+            offset: 103.7,
+            viewportHeight: viewport
+        )
+        XCTAssertNil(target)
+    }
+}

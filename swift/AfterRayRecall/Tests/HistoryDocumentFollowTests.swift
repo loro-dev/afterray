@@ -1,14 +1,13 @@
 import XCTest
 @testable import AfterRayRecall
 
+/// Following is live again — the panel must track the playhead while it moves,
+/// not wait for the drag to end. The cost that made it wait is handled one
+/// level down by `HistoryListLayout.offsetToReveal`, which answers nil when
+/// the card is already on screen.
 final class HistoryDocumentFollowTests: XCTestCase {
-    /// The document follows on settle, not on every boundary the playhead
-    /// crosses. A drag across a day crosses ~48 of them in a couple of
-    /// seconds, and each one cost a panel rebuild and a `ScrollView`
-    /// re-measure — frames lost to relayout while the main thread was
-    /// otherwise idle.
-    func testSlotChangeAloneDoesNotMoveTheDocument() {
-        XCTAssertFalse(
+    func testSlotChangeFollowsLive() {
+        XCTAssertTrue(
             HistoryDocumentFollow.shouldFollow(
                 previousSlot: 1,
                 currentSlot: 2,
@@ -27,14 +26,7 @@ final class HistoryDocumentFollowTests: XCTestCase {
         )
     }
 
-    func testSettleMovesTheDocument() {
-        XCTAssertTrue(
-            HistoryDocumentFollow.shouldFollow(
-                previousSlot: 1,
-                currentSlot: 2,
-                settleRequested: true
-            )
-        )
+    func testSettleRequestsAFinalCorrectionWithinTheSameSlot() {
         XCTAssertTrue(
             HistoryDocumentFollow.shouldFollow(
                 previousSlot: 2,
@@ -44,8 +36,15 @@ final class HistoryDocumentFollowTests: XCTestCase {
         )
     }
 
-    /// Nothing to scroll to — an idle gap has no card.
-    func testSettleWithNoSlotDoesNothing() {
+    /// An idle gap has no card to reveal, settle or not.
+    func testNoSlotNeverFollows() {
+        XCTAssertFalse(
+            HistoryDocumentFollow.shouldFollow(
+                previousSlot: 2,
+                currentSlot: nil,
+                settleRequested: false
+            )
+        )
         XCTAssertFalse(
             HistoryDocumentFollow.shouldFollow(
                 previousSlot: 2,

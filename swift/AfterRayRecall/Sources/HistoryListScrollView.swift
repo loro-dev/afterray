@@ -183,17 +183,30 @@ struct HistoryListScrollView<Row: View>: View {
 
     /// Scroll to the followed row by model position, not by identity — the
     /// target is usually not mounted, and `scrollTo(y:)` does not care.
+    /// Reveal the followed row, and only if it needs revealing.
+    ///
+    /// Not "scroll it to the top": that fires on every slot boundary the
+    /// playhead crosses, which is ~48 of them in a drag across one day. The
+    /// panel bounced, and every jump cost a `ScrollView` re-measure. Asking
+    /// instead for the minimum scroll that puts the row on screen means a
+    /// scrub within one screenful of cards moves the document not at all,
+    /// while the highlight still tracks live.
     private func follow() {
         guard let followID,
               let index = HistoryListLayout.index(of: followID, in: items)
         else { return }
         if ScrollFenceRegistry.shared.pointerInsideAnyFence() { return }
-        let origins = currentOrigins()
-        guard index < origins.count else { return }
+        guard let target = HistoryListLayout.offsetToReveal(
+            index: index,
+            origins: currentOrigins(),
+            offset: runtime.offset,
+            viewportHeight: runtime.viewportHeight
+        ) else { return }
+        runtime.offset = target
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            scrollPosition.scrollTo(y: origins[index])
+            scrollPosition.scrollTo(y: target)
         }
     }
 }

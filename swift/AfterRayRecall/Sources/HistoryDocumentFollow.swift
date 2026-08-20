@@ -1,27 +1,26 @@
 import Foundation
 
-/// When the history list should jump to the playhead.
+/// When the history list should reveal the playhead's card.
 ///
-/// **Only when the scrub settles.** The highlight itself still moves live —
-/// that is `isCurrent` on the row and costs one row's redraw — but the
-/// document does not chase it.
+/// Live again, on every slot change — but "reveal" now means
+/// `HistoryListLayout.offsetToReveal`, which answers nil when the card is
+/// already on screen. That is where the cost went: following used to jump the
+/// card to the top of the panel on every boundary, and a drag across one day
+/// crosses ~48 of them in a couple of seconds. Each jump rebuilt the panel and
+/// re-measured its `ScrollView`; comparing the slowest seconds of a scrub with
+/// the fastest, those were 10x and 19x higher while the main thread was *less*
+/// busy overall — frames lost to relayout, not to arithmetic.
 ///
-/// Following on every slot change looked cheap: a boundary is half an hour of
-/// recorded time. Dragging across a day crosses ~48 of them in a couple of
-/// seconds, and each one rebuilt the panel and asked its `ScrollView` to
-/// re-measure. Comparing the slowest seconds of a scrub against the fastest in
-/// one recording, `ScrollViewLayoutComputer.sizeThatFits` was 19x higher and
-/// `DaySummaryPanelContent.body` 10x — with the main thread *less* busy
-/// overall, so those were frames lost to relayout, not to arithmetic.
-///
-/// It also read badly: the panel bounced around under a finger that was
-/// nowhere near it.
+/// Gating the *decision* on settle fixed the cost and broke the feature: the
+/// panel stopped tracking until you let go. Gating the *movement* on whether
+/// the card is actually off screen fixes both.
 enum HistoryDocumentFollow {
     static func shouldFollow(
         previousSlot: Int64?,
         currentSlot: Int64?,
         settleRequested: Bool
     ) -> Bool {
-        settleRequested && currentSlot != nil
+        guard currentSlot != nil else { return false }
+        return settleRequested || currentSlot != previousSlot
     }
 }
