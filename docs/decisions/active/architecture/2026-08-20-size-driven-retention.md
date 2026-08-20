@@ -28,7 +28,12 @@ Input events and `edge_snapshots` are swept against the **retention horizon**: t
 
 A vault with no frames has no horizon, and is **not** swept.
 
-The single exception is `SIGNAL_MARKER_RETENTION_MS` (48h, `prune_signal_gaps`): a marker's entire meaning is a deadline, and it is worth nothing once every card covering its stretch is built. It runs before the size sweep and outside its early return, and its failure must not stop the size sweep. Any *other* clock added to this crate contradicts this decision — supersede it rather than adding a second deadline.
+Two streams are exceptions, and both are narrow:
+
+- `SIGNAL_MARKER_RETENTION_MS` (48h, `prune_signal_gaps`): a marker's entire meaning is a deadline, and it is worth nothing once every card covering its stretch is built. It runs before the size sweep and outside its early return, and its failure must not stop the size sweep.
+- Raw `input_events` (48h) — [raw input events expire](../product/2026-08-20-raw-input-events-expire.md). Those rows carry typed text and field values, which is a different kind of content from a screenshot and does not belong under a size-only rule. The shape of the activity is frozen into `slot_summaries.acts_json` before the rows go, so the vault keeps how much was typed and loses what.
+
+Everything else — frames, GOP segments, artifacts, R3 edge trees — expires by size alone. A third clock added to this crate contradicts this decision; supersede both records rather than adding another deadline quietly.
 
 ## Alternatives considered
 
@@ -43,6 +48,8 @@ The single exception is `SIGNAL_MARKER_RETENTION_MS` (48h, `prune_signal_gaps`):
 **Bought:** one answer to "is it still there", derivable from a single number the user controls. A retention question is a disk question, and the recall UI can state the horizon as a fact rather than a policy.
 
 **Cost:** there is no way to say "keep only the last 30 days" — a real request for a screen recorder, and it cannot be granted without superseding this. Under the limit the vault only grows. Edge-tree artifacts on a frameless vault are not reclaimable by retention at all; `delete_history` still reaches them.
+
+**Narrowed once, deliberately.** Keeping typed text under a size-only rule meant a verbatim keystroke log living for months; [raw input events expire](../product/2026-08-20-raw-input-events-expire.md) took that one stream out. The general argument above is unchanged and still governs everything else — which is why that record narrows this one rather than superseding it.
 
 **Load-bearing for privacy:** deletion is the user's tool here, not expiry. `delete_history` must reach every layer — cards, acts, and R3 trees, not just frames — because nothing else will ever remove them. See [crates/afterray-store/AGENTS.md](../../../../crates/afterray-store/AGENTS.md).
 

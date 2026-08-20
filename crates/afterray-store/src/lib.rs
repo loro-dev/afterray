@@ -112,6 +112,26 @@ pub const SCHEMA_VERSION: u32 = 26;
 /// them). This short channel is for markers only.
 pub const SIGNAL_MARKER_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
 
+// @dec:raw-input-events-expire — docs/decisions/active/product/2026-08-20-raw-input-events-expire.md
+/// How long a raw input event survives, whatever the vault's size.
+///
+/// The second clock in this crate, and the reason the size sweep is no longer
+/// the whole story. Since event-capture v2 a row carries what the user typed
+/// and the value of the field they typed into; text that specific should not
+/// sit here for as long as the disk allows, encrypted or not.
+///
+/// What survives the sweep is the *shape* of the activity, never its content.
+/// [`Self::materialize_slot_acts`] freezes counts and labels into
+/// `slot_summaries.acts_json` before anything is deleted, and `acts::ActContent`
+/// is deliberately never frozen. A slot whose events have expired still says
+/// how much was typed and stops saying what.
+///
+/// Order is the whole safety argument: deleting before that freeze would leave
+/// a card that makes no claim about the user at all — correct, but it throws
+/// away acts that could have been kept. `afterrayd`'s sweeper freezes first and
+/// deletes only once the whole expiring window is frozen.
+pub const RAW_EVENT_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
+
 /// One coalesced input observation, as the vault holds it.
 ///
 /// A verbatim mirror of the shim's record (`InputEventRecord` in
@@ -384,6 +404,11 @@ pub enum StoreError {
     InvalidKey,
     #[error("the existing Vault key is missing from macOS Keychain")]
     MissingVaultKey,
+    #[error(
+        "this vault was written by a newer AfterRay (schema {found}, this build supports {supported}); \
+         downgrade is not supported — update AfterRay to open it"
+    )]
+    VaultTooNew { found: u32, supported: u32 },
     #[error("artifact not found: {0}")]
     ArtifactNotFound(String),
     #[error("key provider: {0}")]
@@ -3597,6 +3622,27 @@ impl Vault {
     /// # Errors
     ///
     /// Returns an error when the delete cannot be executed.
+    /// The end of the oldest input-event span still stored, or `None` when the
+    /// table is empty.
+    ///
+    /// The expiry sweep asks this first. On a vault the daemon has been keeping
+    /// up with, the answer is younger than the cutoff and the sweep does
+    /// nothing — which is the normal case and the one worth being cheap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query cannot be executed.
+    pub fn oldest_input_event_ms(&self) -> Result<Option<i64>, StoreError> {
+        let connection = self.readers.get();
+        let oldest: Option<i64> = connection.query_row(
+            "SELECT MIN(MAX(at_ms, COALESCE(end_ms, at_ms))) FROM input_events",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(oldest)
+    }
+
+    // @dec:raw-input-events-expire — docs/decisions/active/product/2026-08-20-raw-input-events-expire.md
     pub fn prune_input_events_before(&self, horizon_ms: i64) -> Result<usize, StoreError> {
         let removed = self.connection.lock().unwrap().execute(
             "DELETE FROM input_events WHERE MAX(at_ms, COALESCE(end_ms, at_ms)) < ?1",
@@ -5191,6 +5237,20 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     // Read before the version is stamped forward. Most steps here are cheap
     // enough to re-run on every open; rebuilding the whole text index is not.
     let from_version = stored_schema_version(connection)?;
+
+    // A vault written by a newer build is refused, not migrated. Every step
+    // below is a forward step, so a newer vault skips all of them and then
+    // falls into the unconditional stamp at the end — which would relabel a
+    // schema-27 database as 26 while leaving its extra tables in place, and the
+    // next 26→27 migration would then run a second time against data that had
+    // already been through it. Downgrade is not supported; failing to open is
+    // the recoverable outcome, silently rewriting the label is not.
+    if from_version > SCHEMA_VERSION {
+        return Err(StoreError::VaultTooNew {
+            found: from_version,
+            supported: SCHEMA_VERSION,
+        });
+    }
     migrate_query_indexes(connection)?;
     migrate_schema_6(connection)?;
     migrate_schema_7(connection)?;
@@ -10581,6 +10641,125 @@ mod tests {
         assert!(after_run.peripheral.is_empty());
         assert_eq!(after_run.lines.len(), 22);
         assert!(after.not_engaged.is_empty());
+    }
+
+    /// The point of expiring raw events: the shape of the activity is kept and
+    /// the words are not. `ActContent` is never frozen, so the sweep is what
+    /// takes it — and a card whose events are gone must still say how much was
+    /// typed, or the expiry would be indistinguishable from "did nothing".
+    #[test]
+    fn expiring_events_keeps_the_acts_and_drops_the_words() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let slot = acts_slot(&vault, &session.id);
+
+        // The fixture's burst carries no text; give this one words to lose.
+        let mut typed = input_event(slot + 60_000 + 7_000, Some(slot + 60_000 + 9_000), "burst");
+        typed.count = Some(11);
+        typed.bundle_identifier = Some("com.electron.lark".to_owned());
+        typed.text = Some("the merge is green".to_owned());
+        typed.target_json = Some(
+            r#"{"role":"AXTextArea","label":"Message",
+                "frame":{"x":300,"y":900,"width":400,"height":40}}"#
+                .to_owned(),
+        );
+        vault.insert_input_events(&[typed]).unwrap();
+        vault.flush_card_cache();
+
+        let live = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        let live_content = live.timeline.iter().find_map(|entry| match entry {
+            slot::TimelineEntry::Run(run) => run.content.clone(),
+            slot::TimelineEntry::Gap(_) => None,
+        });
+        assert!(
+            live_content.is_some_and(|content| content
+                .typed
+                .iter()
+                .any(|line| line.contains("the merge is green"))),
+            "while the events live, the card can say what was written"
+        );
+
+        assert!(vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap());
+        vault.flush_card_cache();
+        vault
+            .prune_input_events_before(slot + SLOT_DURATION_MS)
+            .unwrap();
+
+        let after = vault.slot_card(slot + 60_000, 10_000).unwrap();
+        let run = after
+            .timeline
+            .iter()
+            .find_map(|entry| match entry {
+                slot::TimelineEntry::Run(run) => Some(run),
+                slot::TimelineEntry::Gap(_) => None,
+            })
+            .expect("a run");
+        assert!(run.acts.is_some(), "the frozen shape survives the sweep");
+        assert!(
+            run.content.is_none(),
+            "the words do not: ActContent is never frozen"
+        );
+        assert!(
+            !serde_json::to_string(&after).unwrap().contains("the merge is green"),
+            "nothing anywhere in the rebuilt card still carries the typed text"
+        );
+    }
+
+    /// Auto-update makes "new app, older daemon still holding the socket" a
+    /// routine state rather than a rare one, and switching branches in a
+    /// checkout does the same to `.afterray-dev/`. Every step in `migrate` is a
+    /// forward step, so a newer vault skips them all and reaches the stamp —
+    /// which would relabel it downward while its extra tables stayed, and the
+    /// next real migration would then run twice over the same data.
+    #[test]
+    fn a_vault_from_a_newer_build_is_refused_and_its_label_left_alone() {
+        let (_directory, vault) = test_vault(10);
+        let future = SCHEMA_VERSION + 1;
+        {
+            let connection = vault.connection.lock().unwrap();
+            connection
+                .execute("UPDATE schema_meta SET version = ?1", [future])
+                .unwrap();
+        }
+
+        let connection = vault.connection.lock().unwrap();
+        let error = migrate(&connection).expect_err("a newer vault must not migrate");
+        assert!(
+            matches!(
+                error,
+                StoreError::VaultTooNew {
+                    found,
+                    supported
+                } if found == future && supported == SCHEMA_VERSION
+            ),
+            "expected VaultTooNew, got {error:?}"
+        );
+        assert_eq!(
+            stored_schema_version(&connection).unwrap(),
+            future,
+            "refusing must leave the label alone; rewriting it is the damage"
+        );
+    }
+
+    /// Matches `prune_input_events_before`, which also judges a span by its end.
+    /// A sweep that asked a different question than the delete would either
+    /// spin forever or delete a slot it had not frozen.
+    #[test]
+    fn oldest_input_event_ms_judges_a_span_by_its_end() {
+        let (_directory, vault) = test_vault(10);
+        assert_eq!(vault.oldest_input_event_ms().unwrap(), None);
+
+        let base = slot_start_for(1_786_698_000_000) + 60_000;
+        let mut straddling = input_event(base, Some(base + 30_000), "burst");
+        straddling.count = Some(3);
+        let later = input_event(base + 10_000, None, "click");
+        vault.insert_input_events(&[straddling, later]).unwrap();
+
+        assert_eq!(
+            vault.oldest_input_event_ms().unwrap(),
+            Some(base + 10_000),
+            "the burst starts first but ends last, so the click is the oldest"
+        );
     }
 
     /// The sweeper revisits every slot every five minutes forever.

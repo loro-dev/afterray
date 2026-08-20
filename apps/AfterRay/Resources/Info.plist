@@ -32,6 +32,8 @@
     <string>AfterRay checks whether the active browser window is private so it can skip recording it. This permission does not read the page URL.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>AfterRay transcribes your voice locally while recording your computer activity.</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>AfterRay records what you type so it can tell what you were working on, not just what was on screen. Text stays on this Mac, secure fields and password managers are never read, and the raw record of your keystrokes is deleted after 48 hours.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 AfterRay.</string>
     <key>SUFeedURL</key>

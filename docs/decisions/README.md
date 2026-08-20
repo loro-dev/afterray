@@ -106,6 +106,8 @@ Each hit is a decision that governs that code. Read it — the bug may be the de
 
 **Changing a requirement.** Write a new record whose `Supersedes:` points at the old one, move the old file into `superseded/`, add its `Superseded-by:` back-link, and move the anchors. The pair of files *is* the visible record of the change; do not edit the old record into the new decision.
 
+**Narrowing one, which is not the same thing.** When a new decision takes one case out from under an older one whose general argument still holds, the old record stays `active/` and keeps its anchors. Use `Supersedes: —` and say in the opening line which record is narrowed and how; the older record gains a line in its `## Consequences` pointing back. Moving a still-governing record into `superseded/` is worse than leaving the change unrecorded — it retires an argument the code is still following. The test is whether the old record would be wrong if you deleted the new one: wrong means supersede, merely over-broad means narrow.
+
 **After a serious bug.** Write a postmortem and link it from the `## Consequences` of every decision it implicates, so the failure is visible from the decision that allowed it rather than only from the incident file.
 
 ## What the gate checks

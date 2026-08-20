@@ -813,7 +813,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                         Text("Memory limit")
                             .font(.settingsRowTitle)
                             .foregroundStyle(SettingsPalette.label)
-                        Text("Oldest unstarred moments are removed first. Favorites and a small metadata overhead may exceed this limit.")
+                        Text("Oldest moments are removed first. A small metadata overhead may exceed this limit. What you typed is deleted after 48 hours regardless of this budget.")
                             .font(.settingsRowSubtitle)
                             .foregroundStyle(SettingsPalette.secondaryLabel)
                             .fixedSize(horizontal: false, vertical: true)

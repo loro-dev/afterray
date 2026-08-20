@@ -3872,10 +3872,13 @@ async fn fail_claimed_audio(
 
 /// How far back the freeze looks for slots whose acts are not yet frozen.
 ///
-/// Comfortably inside the 48-hour event retention: the work only exists while
-/// the events do, and a longer window would just re-check slots whose events
-/// are already gone.
-const ACTS_FREEZE_LOOKBACK_MS: i64 = 36 * 60 * 60 * 1000;
+/// Derived from the event lifetime, never a constant of its own: the freeze has
+/// to reach every slot whose events are still alive, and one hour of slack
+/// covers a slot straddling the cutoff. A fixed window shorter than the
+/// lifetime leaves slots that can never be frozen and whose acts are therefore
+/// lost when the events go — which is what a hardcoded 36 hours did once the
+/// events stopped expiring on their own 48-hour clock.
+const ACTS_FREEZE_LOOKBACK_MS: i64 = afterray_store::RAW_EVENT_RETENTION_MS + 60 * 60 * 1000;
 
 /// Ceiling per tick. One freeze rebuilds a card (per-frame AX decryption), so
 /// the backlog drains over several ticks rather than stalling one.
@@ -3887,7 +3890,6 @@ const ACTS_FREEZE_PER_TICK: usize = 4;
 /// "Sealed" is the same settle window T2 uses: a slot still gaining OCR is
 /// still gaining runs, and acts are attributed to runs.
 async fn freeze_slot_acts(state: &Arc<AppState>, now: i64) {
-    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
     let from = now.saturating_sub(ACTS_FREEZE_LOOKBACK_MS);
     let due = match run_store(state, move |s| s.store.slots_missing_acts(from, now)).await {
         Ok(due) => due,
@@ -3896,9 +3898,19 @@ async fn freeze_slot_acts(state: &Arc<AppState>, now: i64) {
             return;
         }
     };
+    freeze_slots(state, due, now, ACTS_FREEZE_PER_TICK).await;
+}
+
+/// Freezes the acts of `slots`, up to `budget` of them.
+///
+/// Shared by the periodic freeze and the expiry sweep, so both obey the same
+/// settle rule and the same per-tick ceiling. Returns how many slots were newly
+/// frozen — the expiry sweep needs that to know whether it may delete yet.
+async fn freeze_slots(state: &Arc<AppState>, slots: Vec<i64>, now: i64, budget: usize) -> usize {
+    let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
     let mut frozen = 0_usize;
-    for slot_start_ms in due {
-        if frozen >= ACTS_FREEZE_PER_TICK {
+    for slot_start_ms in slots {
+        if frozen >= budget {
             break;
         }
         let bounds = match run_store(state, move |s| {
@@ -3929,6 +3941,61 @@ async fn freeze_slot_acts(state: &Arc<AppState>, now: i64) {
                 eprintln!("slot.acts freeze: slot={slot_start_ms} failed: {error}");
             }
         }
+    }
+    frozen
+}
+
+// @dec:raw-input-events-expire — docs/decisions/active/product/2026-08-20-raw-input-events-expire.md
+/// Deletes raw input events past `RAW_EVENT_RETENTION_MS` — but only once the
+/// acts of every slot they cover are frozen.
+///
+/// The order is the entire safety argument. A card built from no events makes
+/// no claim about the user at all, which is the right failure: it does not read
+/// an absence of events as "the user did nothing". But it also cannot say how
+/// much was typed or clicked, and that much is worth keeping. So the freeze
+/// runs first, and a window that is not fully frozen is left for a later tick
+/// rather than deleted early. The delay is bounded by the freeze ceiling and
+/// only ever appears after the daemon has been down long enough to build a
+/// backlog; the alternative — deleting on schedule and losing acts nobody can
+/// reconstruct — is not recoverable.
+///
+/// What the freeze keeps is counts and labels. `acts::ActContent` — the typed
+/// text and the field values — is deliberately never frozen, so this sweep is
+/// what makes it go.
+async fn expire_raw_input_events(state: &Arc<AppState>, now: i64) {
+    let cutoff = now.saturating_sub(afterray_store::RAW_EVENT_RETENTION_MS);
+    let oldest = match run_store(state, |s| s.store.oldest_input_event_ms()).await {
+        Ok(Some(oldest)) => oldest,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("input events expiry: reading the oldest event failed: {error}");
+            return;
+        }
+    };
+    if oldest >= cutoff {
+        return;
+    }
+
+    let pending = match run_store(state, move |s| s.store.slots_missing_acts(oldest, cutoff)).await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!("input events expiry: listing unfrozen slots failed: {error}");
+            return;
+        }
+    };
+    if !pending.is_empty() {
+        let frozen = freeze_slots(state, pending, now, ACTS_FREEZE_PER_TICK).await;
+        eprintln!(
+            "input events expiry: froze {frozen} slot(s) before deleting; deferring the delete"
+        );
+        return;
+    }
+
+    match run_store(state, move |s| s.store.prune_input_events_before(cutoff)).await {
+        Ok(0) => {}
+        Ok(removed) => eprintln!("input events expiry: deleted {removed} row(s) older than {cutoff}"),
+        Err(error) => eprintln!("input events expiry: delete failed: {error}"),
     }
 }
 
@@ -3971,13 +4038,17 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
             // exactly the laptops that stay unplugged.
             freeze_slot_acts(&state, now_ms()).await;
 
-            // All that is left of the 48h channel: the runtime markers. The
-            // observations and the R3 trees are content now and expire with the
-            // rest of the vault's content, oldest-first, inside
-            // `enforce_retention`. A marker's deadline is still wall-clock, so
-            // it cannot hang off capture (which stops when the user pauses) or
-            // off the T2 gate (which waits for power) — this tick runs while
-            // the daemon is up, whether or not anything is being recorded.
+            // Then delete what the freeze has made safe to lose. This must run
+            // after the freeze in the same tick and never before it: the freeze
+            // is what turns an expiring event into a kept act.
+            expire_raw_input_events(&state, now_ms()).await;
+
+            // The runtime markers, on their own shorter deadline. The R3 trees
+            // are content and expire with the rest of it, oldest-first, inside
+            // `enforce_retention`. A marker's deadline is wall-clock, so it
+            // cannot hang off capture (which stops when the user pauses) or off
+            // the T2 gate (which waits for power) — this tick runs while the
+            // daemon is up, whether or not anything is being recorded.
             if let Err(error) = run_store(&state, |s| s.store.prune_signal_gaps(now_ms())).await {
                 eprintln!("signal marker retention failed: {error}");
             }
