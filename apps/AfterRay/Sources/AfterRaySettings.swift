@@ -147,6 +147,9 @@ final class AfterRaySettingsController: NSObject, NSWindowDelegate {
             defer: false
         )
         window.title = AfterRayLocalization.shared.copy.menu.settingsWindow
+        // The Settings content already names the active page. Keep a semantic
+        // window title for macOS while avoiding a duplicate visual brand line.
+        window.titleVisibility = .hidden
         window.minSize = NSSize(width: 820, height: 520)
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true

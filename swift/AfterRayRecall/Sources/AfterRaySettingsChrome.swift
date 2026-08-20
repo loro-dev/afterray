@@ -301,6 +301,9 @@ private enum SettingsMetrics {
     static let controlRadius: CGFloat = 6
     static let rowInset: CGFloat = 14
     static let rowMinHeight: CGFloat = 46
+    /// All value controls share this trailing column. Their widths may differ,
+    /// but their right edges must form one optical alignment line.
+    static let trailingControlWidth: CGFloat = 176
 }
 
 private enum SettingsPalette {
@@ -464,19 +467,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     // MARK: Sidebar
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 9) {
-                Rectangle()
-                    .fill(SettingsPalette.accent)
-                    .frame(width: 16, height: 2)
-                Text(copy.settings.brand)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .tracking(1.1)
-                    .foregroundStyle(SettingsPalette.accent)
-            }
-            .padding(.horizontal, 10)
-            .padding(.top, 6)
-
+        VStack(alignment: .leading, spacing: 0) {
             VStack(spacing: 2) {
                 ForEach(AfterRaySettingsPage.visiblePages(
                     developerOptionsEnabled: model.developerOptionsEnabled
@@ -544,22 +535,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                 .font(.settingsPageTitle)
                 .foregroundStyle(SettingsPalette.label)
             Spacer(minLength: 12)
-            HStack(spacing: 6) {
-                if model.isRefreshing {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 28, height: 28)
-                } else {
-                    SettingsIconButton(symbol: "arrow.clockwise", help: copy.common.refresh) {
-                        Task { await model.refresh() }
-                    }
-                }
-                // A window already has a close button in its titlebar; a second
-                // one inside the content is the kind of duplicate chrome that
-                // makes a hosted panel read as a dialog stuck in a window.
-                if style == .card {
-                    SettingsIconButton(symbol: "xmark", help: copy.settings.closeSettings, action: onClose)
-                }
+            // A window already has a close button in its titlebar; a second
+            // one inside the content is the kind of duplicate chrome that
+            // makes a hosted panel read as a dialog stuck in a window.
+            if style == .card {
+                SettingsIconButton(symbol: "xmark", help: copy.settings.closeSettings, action: onClose)
             }
         }
         .padding(.horizontal, SettingsMetrics.gutter)
@@ -657,15 +637,17 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     if model.isUpdatingSummarySlot {
                         ProgressView().controlSize(.mini)
                     }
-                    Picker(copy.settings.summaryLength, selection: summarySlotMinutesBinding) {
-                        ForEach(summarySlotMinutesOptions, id: \.self) { minutes in
-                            Text(AppSettings.summaryLengthLabel(minutes, copy: copy)).tag(minutes)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 118)
-                    .disabled(model.isUpdatingSummarySlot)
+                    SettingsMenuPicker(
+                        options: summarySlotMinutesOptions.map { minutes in
+                            .init(
+                                id: minutes,
+                                title: AppSettings.summaryLengthLabel(minutes, copy: copy)
+                            )
+                        },
+                        selection: summarySlotMinutesBinding,
+                        disabled: model.isUpdatingSummarySlot
+                    )
+                    .frame(width: SettingsMetrics.trailingControlWidth)
                     .accessibilityLabel(copy.settings.summaryLength)
                 }
             }
@@ -962,17 +944,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             if model.isUpdatingLanguage {
                 ProgressView().controlSize(.mini)
             }
-            Picker(title, selection: selection) {
-                ForEach(options) { option in
-                    Text(option.menuTitle(copy))
-                        .tag(option.code)
-                        .accessibilityLabel(option.englishName)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(minWidth: 132, maxWidth: 176)
-            .disabled(model.isUpdatingLanguage)
+            SettingsMenuPicker(
+                options: options.map {
+                    .init(id: $0.code, title: $0.menuTitle(copy))
+                },
+                selection: selection,
+                disabled: model.isUpdatingLanguage
+            )
+            .frame(width: SettingsMetrics.trailingControlWidth)
             .accessibilityLabel(title)
         }
     }
@@ -1022,14 +1001,14 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             contentPadding: 14
         ) {
             VStack(alignment: .leading, spacing: 14) {
-                Picker(copy.settings.assistantSource, selection: llmProviderBinding) {
-                    ForEach(LlmProvider.allCases) { provider in
-                        Text(provider.title(copy)).tag(provider)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .disabled(model.isUpdatingLlm)
+                SettingsSegmentedPicker(
+                    options: LlmProvider.allCases.map {
+                        .init(id: $0, title: $0.title(copy))
+                    },
+                    selection: llmProviderBinding,
+                    disabled: model.isUpdatingLlm
+                )
+                .accessibilityLabel(copy.settings.assistantSource)
                 llmProviderPanel
             }
         }
@@ -1838,7 +1817,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     Button(active ? copy.settings.turnOff : copy.settings.allow30Minutes) {
                         Task { await model.setCliEvidenceAccess(!active) }
                     }
-                    .buttonStyle(SettingsButtonStyle(kind: active ? .standard : .prominent))
+                    .buttonStyle(SettingsButtonStyle())
                     .disabled(model.isUpdatingCliEvidence)
                     if model.isUpdatingCliEvidence {
                         ProgressView()
@@ -2068,8 +2047,13 @@ private struct SettingsRow<Trailing: View>: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Spacer(minLength: 16)
+            // The description is the flexible side of a settings row. Keeping
+            // the value at its ideal size makes every trailing control share
+            // the card's right alignment edge, even when a subtitle is long.
+            .frame(maxWidth: .infinity, alignment: .leading)
             trailing
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
         }
         .padding(.horizontal, SettingsMetrics.rowInset)
         .padding(.vertical, 11)
@@ -2164,14 +2148,14 @@ private struct SettingsField<Content: View>: View {
 /// SwiftUI's stock menu picker draws its own chrome and, given a wide field,
 /// parks itself in the middle of it — so the model row sat centred above a
 /// full-width server field and read as a different kind of control.
-private struct SettingsMenuPicker: View {
+private struct SettingsMenuPicker<Value: Hashable>: View {
     struct Option: Identifiable {
-        let id: String
+        let id: Value
         let title: String
     }
 
     let options: [Option]
-    @Binding var selection: String
+    @Binding var selection: Value
     var disabled = false
 
     @State private var isHovering = false
@@ -2220,7 +2204,60 @@ private struct SettingsMenuPicker: View {
     }
 
     private var selectedTitle: String {
-        options.first { $0.id == selection }?.title ?? selection
+        options.first { $0.id == selection }?.title ?? String(describing: selection)
+    }
+}
+
+/// A full-width segmented control whose visible surface follows its frame.
+/// SwiftUI's native macOS segmented picker keeps an intrinsic bezel width even
+/// inside an infinite frame, so its background stops short of the card edges.
+private struct SettingsSegmentedPicker<Value: Hashable>: View {
+    struct Option: Identifiable {
+        let id: Value
+        let title: String
+    }
+
+    let options: [Option]
+    @Binding var selection: Value
+    var disabled = false
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options) { option in
+                let isSelected = option.id == selection
+                Button {
+                    selection = option.id
+                } label: {
+                    Text(option.title)
+                        .font(.settingsControl)
+                        .foregroundStyle(
+                            isSelected ? SettingsPalette.label : SettingsPalette.secondaryLabel
+                        )
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, minHeight: 26)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
+                .background(
+                    isSelected ? SettingsPalette.controlHover : Color.clear,
+                    in: RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius - 1)
+                )
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .frame(maxWidth: .infinity)
+        .background(
+            SettingsPalette.controlFill,
+            in: RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: SettingsMetrics.controlRadius)
+                .strokeBorder(SettingsPalette.controlStroke, lineWidth: 1)
+        }
+        .opacity(disabled ? 0.42 : 1)
+        .disabled(disabled)
     }
 }
 
