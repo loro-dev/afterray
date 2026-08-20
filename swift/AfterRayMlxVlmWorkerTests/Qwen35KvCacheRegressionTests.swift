@@ -1,5 +1,6 @@
 import CoreImage
 import Foundation
+import MLX
 import MLXLMCommon
 import Testing
 
@@ -115,6 +116,14 @@ struct Qwen35KvCacheRegressionTests {
         #expect(!normalizeModelOutput(firstLong).isEmpty)
         let secondLong = try await session.respond(to: longPrompt)
         #expect(!normalizeModelOutput(secondLong).isEmpty)
+        // An old unwindowed runtime can still return on a 64 GB machine after
+        // allocating its roughly 47 GiB scratch tensor. Bound the MLX peak so
+        // that surviving the allocation cannot make this regression pass.
+        let maximumPeakBytes = 16 * 1_024 * 1_024 * 1_024
+        #expect(
+            Memory.peakMemory < maximumPeakBytes,
+            "long prefill exceeded the 16 GiB MLX peak-memory budget"
+        )
     }
 
     private func solidImage(red: CGFloat, green: CGFloat, blue: CGFloat) -> CIImage {

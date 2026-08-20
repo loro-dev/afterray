@@ -27,10 +27,11 @@ The worker keeps the loaded `ModelContainer` resident, but creates a fresh
 it has no cross-request cache flag, cache result, or implicit conversation
 identity.
 
-Shutting down an MLX adapter first cancels its active generation, then waits
-for the protocol cancellation acknowledgement and terminates the child. A
-provider or managed-pack switch therefore does not wait for the old summary to
-finish before the setting can take effect.
+Shutting down an MLX adapter first requests cooperative cancellation. The
+child-process handle is independent of the mutex that serializes worker I/O;
+if cancellation does not release that mutex within a short grace period,
+AfterRay kills the child directly. A provider or managed-pack switch is
+therefore bounded by the shutdown grace period, not the generation timeout.
 
 AfterRay pins `mlx-swift-lm` to upstream revision
 `65be34c64237c0b5da348169d3a9b59f37453fe2`, which implements windowed prefill
@@ -55,6 +56,10 @@ quadratic temporary allocation. Windowed prefill fixes the allocation shape.
 **Wait for the active request before shutting down the old provider.** This
 keeps an obsolete summary running after the user has selected another provider
 and can block the settings request for the full generation timeout.
+
+**Keep the child handle behind the generation I/O mutex.** This makes orderly
+protocol teardown simple, but prevents shutdown from killing a process stuck
+inside a Metal operation while generation owns that mutex.
 
 ## Consequences
 

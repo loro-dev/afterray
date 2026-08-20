@@ -18,6 +18,8 @@ use tokio::{
 };
 
 pub const MLX_WORKER_PROTOCOL_VERSION: u32 = 2;
+const SHUTDOWN_CANCEL_GRACE: Duration = Duration::from_millis(250);
+const SHUTDOWN_KILL_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct PersistentMlxConfig {
@@ -69,6 +71,7 @@ impl Default for MlxWorkerHealth {
 pub struct PersistentMlxAdapter {
     config: PersistentMlxConfig,
     inner: AsyncMutex<Runtime>,
+    child: Mutex<Option<Child>>,
     health: Arc<Mutex<MlxWorkerHealth>>,
     shutdown_cancellation: Mutex<Cancellation>,
 }
@@ -80,9 +83,15 @@ struct Runtime {
 }
 
 struct WorkerProcess {
-    child: Child,
+    pid: Option<u32>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+enum ChildState {
+    Running,
+    Exited(String),
+    Missing,
 }
 
 impl PersistentMlxAdapter {
@@ -95,6 +104,7 @@ impl PersistentMlxAdapter {
                 generation: 0,
                 next_spawn: None,
             }),
+            child: Mutex::new(None),
             health: Arc::new(Mutex::new(MlxWorkerHealth::default())),
             shutdown_cancellation: Mutex::new(Cancellation::default()),
         }
@@ -116,17 +126,31 @@ impl PersistentMlxAdapter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         shutdown_cancellation.cancel();
-        let mut runtime = self.inner.lock().await;
-        self.shutdown_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancel();
-        if let Some(mut worker) = runtime.worker.take() {
-            let _ = worker.child.kill().await;
-            let _ = worker.child.wait().await;
+        let runtime = tokio::time::timeout(SHUTDOWN_CANCEL_GRACE, self.inner.lock()).await;
+        let runtime = if let Ok(runtime) = runtime {
+            Some(runtime)
+        } else {
+            // Generation owns `inner` while it performs protocol I/O. MLX can
+            // stay inside one Metal prefill call and never observe cooperative
+            // cancellation, so the kill handle cannot live behind this lock.
+            self.start_kill_child();
+            tokio::time::timeout(SHUTDOWN_KILL_WAIT, self.inner.lock())
+                .await
+                .ok()
+        };
+        if let Some(mut runtime) = runtime {
+            runtime.worker = None;
+            runtime.next_spawn = None;
+            self.stop_child().await;
+            self.set_health(ModelPackState::NotDownloaded, None, None, None);
+        } else {
+            self.set_health(
+                ModelPackState::Failed,
+                None,
+                None,
+                Some("MLX worker did not stop after SIGKILL".into()),
+            );
         }
-        runtime.next_spawn = None;
-        self.set_health(ModelPackState::NotDownloaded, None, None, None);
         *self
             .shutdown_cancellation
             .lock()
@@ -208,21 +232,26 @@ impl PersistentMlxAdapter {
     }
 
     async fn ensure_started(&self, runtime: &mut Runtime) -> Result<(), AdapterError> {
-        if let Some(worker) = runtime.worker.as_mut() {
-            match worker.child.try_wait() {
-                Ok(None) => return Ok(()),
-                Ok(Some(status)) => {
+        if runtime.worker.is_some() {
+            match self.child_state() {
+                Ok(ChildState::Running) => return Ok(()),
+                Ok(ChildState::Exited(status)) => {
+                    runtime.worker = None;
+                    self.set_health(ModelPackState::Failed, None, None, Some(status));
+                }
+                Ok(ChildState::Missing) => {
                     runtime.worker = None;
                     self.set_health(
                         ModelPackState::Failed,
                         None,
                         None,
-                        Some(format!("MLX worker exited with {status}")),
+                        Some("MLX worker process handle is missing".into()),
                     );
                 }
                 Err(error) => {
                     runtime.worker = None;
-                    return Err(AdapterError::Io(error));
+                    self.stop_child().await;
+                    return Err(error);
                 }
             }
         }
@@ -258,33 +287,49 @@ impl PersistentMlxAdapter {
             .stdout
             .take()
             .ok_or_else(|| AdapterError::Process("MLX worker stdout was not piped".into()))?;
+        let pid = child.id();
+        *self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
         runtime.generation = runtime.generation.saturating_add(1);
         let request_id = format!("startup-{}", runtime.generation);
         let mut worker = WorkerProcess {
-            child,
+            pid,
             stdin,
             stdout: BufReader::new(stdout),
         };
-        write_request(
-            &mut worker.stdin,
-            &MlxRequest::Load {
-                v: MLX_WORKER_PROTOCOL_VERSION,
-                request_id: &request_id,
-                model_dir: &self.config.model_dir.display().to_string(),
-            },
-        )
-        .await?;
-        let response = tokio::time::timeout(self.config.load_timeout, read_response(&mut worker))
-            .await
-            .map_err(|_| AdapterError::Timeout {
-                seconds: self.config.load_timeout.as_secs(),
-            })??;
-        validate_response(&response, &request_id)?;
-        if response.kind != "ready" {
-            return Err(response_error(&response, "MLX worker did not become ready"));
+        let loaded = async {
+            write_request(
+                &mut worker.stdin,
+                &MlxRequest::Load {
+                    v: MLX_WORKER_PROTOCOL_VERSION,
+                    request_id: &request_id,
+                    model_dir: &self.config.model_dir.display().to_string(),
+                },
+            )
+            .await?;
+            let response =
+                tokio::time::timeout(self.config.load_timeout, read_response(&mut worker))
+                    .await
+                    .map_err(|_| AdapterError::Timeout {
+                        seconds: self.config.load_timeout.as_secs(),
+                    })??;
+            validate_response(&response, &request_id)?;
+            if response.kind != "ready" {
+                return Err(response_error(&response, "MLX worker did not become ready"));
+            }
+            Ok(response.runtime)
         }
-        let pid = worker.child.id();
-        self.set_health(ModelPackState::Ready, pid, response.runtime.clone(), None);
+        .await;
+        let runtime_name = match loaded {
+            Ok(runtime_name) => runtime_name,
+            Err(error) => {
+                self.stop_child().await;
+                return Err(error);
+            }
+        };
+        self.set_health(ModelPackState::Ready, pid, runtime_name, None);
         runtime.next_spawn = None;
         runtime.worker = Some(worker);
         Ok(())
@@ -339,7 +384,7 @@ impl PersistentMlxAdapter {
         write_request(&mut worker.stdin, &request).await?;
         self.set_health(
             ModelPackState::InUse,
-            worker.child.id(),
+            worker.pid,
             self.health().runtime,
             None,
         );
@@ -402,19 +447,63 @@ impl PersistentMlxAdapter {
             }),
         };
         if result.is_ok() {
-            let pid = worker.child.id();
-            self.set_health(ModelPackState::Ready, pid, self.health().runtime, None);
+            self.set_health(
+                ModelPackState::Ready,
+                worker.pid,
+                self.health().runtime,
+                None,
+            );
         }
         result
     }
 
     async fn fail_worker(&self, runtime: &mut Runtime, error: String) {
-        if let Some(mut worker) = runtime.worker.take() {
-            let _ = worker.child.kill().await;
-            let _ = worker.child.wait().await;
-        }
+        runtime.worker = None;
+        self.stop_child().await;
         runtime.next_spawn = Some(Instant::now() + self.config.restart_backoff);
         self.set_health(ModelPackState::Failed, None, None, Some(error));
+    }
+
+    fn child_state(&self) -> Result<ChildState, AdapterError> {
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(process) = child.as_mut() else {
+            return Ok(ChildState::Missing);
+        };
+        match process.try_wait() {
+            Ok(None) => Ok(ChildState::Running),
+            Ok(Some(status)) => {
+                *child = None;
+                Ok(ChildState::Exited(format!(
+                    "MLX worker exited with {status}"
+                )))
+            }
+            Err(error) => Err(AdapterError::Io(error)),
+        }
+    }
+
+    fn start_kill_child(&self) {
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+
+    async fn stop_child(&self) {
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut child) = child {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
     }
 
     fn set_health(
@@ -530,11 +619,7 @@ async fn read_response(worker: &mut WorkerProcess) -> Result<MlxResponse, Adapte
     let mut line = String::new();
     let read = worker.stdout.read_line(&mut line).await?;
     if read == 0 {
-        let status = worker.child.try_wait().ok().flatten();
-        return Err(AdapterError::Process(format!(
-            "MLX worker closed stdout{}",
-            status.map_or_else(String::new, |status| format!(" ({status})"))
-        )));
+        return Err(AdapterError::Process("MLX worker closed stdout".into()));
     }
     serde_json::from_str(line.trim_end()).map_err(|error| {
         AdapterError::InvalidOutput(format!(
@@ -709,13 +794,13 @@ done
     }
 
     #[tokio::test]
-    async fn shutdown_cancels_generation_before_waiting_for_the_worker_lock() {
+    async fn shutdown_force_kills_generation_that_never_acknowledges_cancel() {
         let script = r#"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
     *'"kind":"load"'*) printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
-    *'"kind":"cancel"'*) printf '{"v":2,"kind":"cancelled","request_id":"%s"}\n' "$id" ;;
+    *'"kind":"cancel"'*) ;;
     *'"kind":"generate"'*) ;;
   esac
 done
@@ -736,8 +821,8 @@ done
 
         tokio::time::timeout(Duration::from_secs(1), adapter.shutdown())
             .await
-            .expect("shutdown must cancel the active generation before waiting for its lock");
-        assert!(matches!(task.await.unwrap(), Err(AdapterError::Cancelled)));
+            .expect("shutdown must kill a worker stuck before its cancellation acknowledgement");
+        assert!(task.await.unwrap().is_err());
         assert!(matches!(
             adapter.health().state,
             ModelPackState::NotDownloaded
