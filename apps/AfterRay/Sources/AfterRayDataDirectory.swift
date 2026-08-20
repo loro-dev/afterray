@@ -46,6 +46,14 @@ enum AfterRayDataDirectory {
                 volumeUUID: destinationVolumeUUID
             )
         }
+
+        var sourceLocation: Location {
+            Location(
+                url: sourceRoot,
+                volumeRoot: sourceVolumeRoot,
+                volumeUUID: sourceVolumeUUID
+            )
+        }
     }
 
     enum StartupRecovery: Equatable, Sendable {
@@ -188,6 +196,7 @@ enum AfterRayDataDirectory {
     static func recoverInterruptedMigration(
         manifestURL: URL,
         currentDataLocation: Location?,
+        restoreSourceLocation: (Location) throws -> Void,
         fileManager: FileManager = .default
     ) throws -> StartupRecovery {
         guard var manifest = try loadRecoveryManifest(at: manifestURL) else { return .none }
@@ -226,6 +235,10 @@ enum AfterRayDataDirectory {
             try requireSourceRestored(manifest, fileManager: fileManager)
         }
 
+        // The journal remains durable until the caller proves it atomically
+        // restored the complete source Location preference. Otherwise a stale
+        // destination path could start a new empty vault after rollback.
+        try restoreSourceLocation(manifest.sourceLocation)
         try clearRecoveryManifest(at: manifestURL, fileManager: fileManager)
         return .none
     }
@@ -358,7 +371,12 @@ enum AfterRayDataDirectory {
                 // before `moveItem` succeeds but before completion is recorded.
                 _ = try recoverInterruptedMigration(
                     manifestURL: recoveryManifestURL!,
-                    currentDataLocation: try location(for: sourceData)
+                    currentDataLocation: try location(for: sourceData),
+                    restoreSourceLocation: { restored in
+                        guard restored == (try location(for: sourceData)) else {
+                            throw Error.recoveryRequired("rollback source location changed")
+                        }
+                    }
                 )
             } else {
                 try rollback(moves)

@@ -62,6 +62,12 @@ inaccessible item fails closed for manual recovery. A fully moved root selected
 by preferences retains the manifest until a newly started daemon responds to
 `status`; only then is the record removed.
 
+When recovery rolls an incomplete move back to the source root, it atomically
+persists the manifest's complete source Location before it removes the manifest
+or permits daemon startup. A failed preference restore retains the manifest and
+keeps capture stopped; startup always reloads the restored canonical value
+instead of using a location cached before recovery.
+
 ## Alternatives considered
 
 **Store the selected path in `settings.json`.** Rejected because that file is

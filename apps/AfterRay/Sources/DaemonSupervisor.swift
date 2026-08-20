@@ -101,25 +101,39 @@ final class DaemonSupervisor {
         return try await task.value
     }
 
+    // @dec:vault-location-relocation — docs/decisions/active/architecture/2026-08-20-vault-location-relocation.md
     private func recoverIfNeeded(allowingDataRelocation: Bool) async throws -> Bool {
         guard !isStopped,
               !requiresDataDirectoryRecovery,
               allowingDataRelocation || !isRelocatingDataDirectory
         else { return false }
         let recoveryManifestURL = Self.relocationRecoveryManifestURL
-        let currentLocation = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil
+        var currentLocation = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil
             ? AfterRayPreferences.memoryDataLocation
             : nil
         let startupRecovery: AfterRayDataDirectory.StartupRecovery
         do {
             startupRecovery = try AfterRayDataDirectory.recoverInterruptedMigration(
                 manifestURL: recoveryManifestURL,
-                currentDataLocation: currentLocation
+                currentDataLocation: currentLocation,
+                restoreSourceLocation: { sourceLocation in
+                    AfterRayPreferences.memoryDataLocation = sourceLocation
+                    guard AfterRayPreferences.canonicalMemoryDataLocation == sourceLocation else {
+                        throw AfterRayDataDirectory.Error.recoveryRequired(
+                            "could not persist the restored source location"
+                        )
+                    }
+                }
             )
         } catch {
             requiresDataDirectoryRecovery = true
             throw error
         }
+        // A recovery may have replaced a mixed destination preference. Never
+        // continue with the value captured before that durable restore.
+        currentLocation = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil
+            ? AfterRayPreferences.canonicalMemoryDataLocation
+            : nil
         if let location = currentLocation {
             try AfterRayDataDirectory.validateConfiguredVolume(
                 volumeRoot: location.volumeRoot,

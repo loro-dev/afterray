@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 @testable import AfterRayApp
 
+@MainActor
 final class AfterRayDataDirectoryTests: XCTestCase {
     private var directory: URL!
 
@@ -160,13 +161,16 @@ final class AfterRayDataDirectoryTests: XCTestCase {
         // This is the deterministic crash point: the item moved, but the
         // process died before it could record completion or run `catch`.
 
+        var restoredLocation: AfterRayDataDirectory.Location?
         XCTAssertEqual(
             try AfterRayDataDirectory.recoverInterruptedMigration(
                 manifestURL: manifestURL,
-                currentDataLocation: try AfterRayDataDirectory.location(for: source)
+                currentDataLocation: try AfterRayDataDirectory.location(for: source),
+                restoreSourceLocation: { restoredLocation = $0 }
             ),
             .none
         )
+        XCTAssertEqual(restoredLocation, try AfterRayDataDirectory.location(for: source))
         XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: manifestURL.path))
@@ -206,16 +210,90 @@ final class AfterRayDataDirectoryTests: XCTestCase {
             volumeRoot: directory.appendingPathComponent("stale-volume", isDirectory: true),
             volumeUUID: "stale-volume-uuid"
         )
+        let preferenceKeys = [
+            AfterRayPreferences.memoryDataLocationKey,
+            AfterRayPreferences.memoryDataDirectoryKey,
+            AfterRayPreferences.memoryDataVolumeRootKey,
+            AfterRayPreferences.memoryDataVolumeUUIDKey,
+        ]
+        var originalPreferences: [String: Any] = [:]
+        for key in preferenceKeys {
+            if let value = UserDefaults.standard.object(forKey: key) {
+                originalPreferences[key] = value
+            }
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        defer {
+            for key in preferenceKeys {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+            for (key, value) in originalPreferences {
+                UserDefaults.standard.set(value, forKey: key)
+            }
+        }
+        AfterRayPreferences.memoryDataLocation = mixedLocation
+
         XCTAssertEqual(
             try AfterRayDataDirectory.recoverInterruptedMigration(
                 manifestURL: manifestURL,
-                currentDataLocation: mixedLocation
+                currentDataLocation: mixedLocation,
+                restoreSourceLocation: { sourceLocation in
+                    AfterRayPreferences.memoryDataLocation = sourceLocation
+                    guard AfterRayPreferences.canonicalMemoryDataLocation == sourceLocation else {
+                        throw AfterRayDataDirectory.Error.recoveryRequired("test preference write failed")
+                    }
+                }
             ),
             .none
         )
+        XCTAssertEqual(AfterRayPreferences.canonicalMemoryDataLocation, sourceLocation)
+        XCTAssertEqual(DaemonSupervisor.shared.dataDirectory, sourceLocation.url)
         XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: manifestURL.path))
+    }
+
+    func testRecoveryRetainsManifestWhenSourcePreferenceCannotPersist() throws {
+        let source = directory.appendingPathComponent("source", isDirectory: true)
+        let destination = directory.appendingPathComponent("external/AfterRay", isDirectory: true)
+        let manifestURL = directory
+            .appendingPathComponent("control", isDirectory: true)
+            .appendingPathComponent("memory-location-recovery.json")
+        let sourceFile = source.appendingPathComponent("afterray.sqlite3")
+        let destinationFile = destination.appendingPathComponent("afterray.sqlite3")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("vault".utf8).write(to: sourceFile)
+
+        let sourceLocation = try AfterRayDataDirectory.location(for: source)
+        let destinationLocation = try AfterRayDataDirectory.location(for: destination)
+        try AfterRayDataDirectory.beginMigration(
+            sourceRoot: source,
+            destinationRoot: destination,
+            sourceLocation: sourceLocation,
+            destinationLocation: destinationLocation,
+            manifestURL: manifestURL
+        )
+        let journal = try AfterRayDataDirectory.RecoveryJournal(manifestURL: manifestURL)
+        try journal.markMoving()
+        let move = AfterRayDataDirectory.Move(source: sourceFile, destination: destinationFile)
+        try journal.recordIntent(move)
+        try FileManager.default.moveItem(at: sourceFile, to: destinationFile)
+        try journal.recordCompletion(move)
+        try journal.markMoved()
+
+        XCTAssertThrowsError(
+            try AfterRayDataDirectory.recoverInterruptedMigration(
+                manifestURL: manifestURL,
+                currentDataLocation: nil,
+                restoreSourceLocation: { _ in
+                    throw AfterRayDataDirectory.Error.recoveryRequired("injected preference write failure")
+                }
+            )
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: manifestURL.path))
     }
 
     func testValidationRejectsAChildOfTheCurrentVault() throws {
