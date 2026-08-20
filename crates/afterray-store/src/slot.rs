@@ -934,12 +934,12 @@ pub fn parse_t2_card_v3(raw: &str) -> Option<T2CardV3> {
         return None;
     }
     let (front, rest) = split_frontmatter(body);
-    let mut card = if let Some((title, description)) = front {
+    let mut card = if let Some((title, description, low_trust)) = front {
         T2CardV3 {
             title,
             description,
             details: rest.trim().to_owned(),
-            low_trust: false,
+            low_trust,
         }
     } else {
         let (title, description, details) = recover_header(rest);
@@ -992,7 +992,7 @@ fn strip_code_fence(text: &str) -> &str {
 ///
 /// Values may run onto following lines (a model wrapping a long description is
 /// the common case), which is why this is not a `key: value` split per line.
-fn split_frontmatter(body: &str) -> (Option<(String, String)>, &str) {
+fn split_frontmatter(body: &str) -> (Option<(String, String, bool)>, &str) {
     let mut lines = body.split_inclusive('\n');
     let Some(first) = lines.next() else {
         return (None, body);
@@ -1004,23 +1004,31 @@ fn split_frontmatter(body: &str) -> (Option<(String, String)>, &str) {
     let mut description = String::new();
     let mut key: Option<&str> = None;
     let mut consumed = first.len();
+    let header_start = consumed;
+    let mut header_end = consumed;
     let mut closed = false;
+    let mut saw_known_key = false;
     for line in lines {
+        let line_start = consumed;
         consumed += line.len();
         let trimmed = line.trim();
         if trimmed == "---" {
+            header_end = line_start;
             closed = true;
             break;
         }
+        header_end = consumed;
         let field = trimmed
             .split_once(':')
             .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim()));
         match field.as_ref().map(|(name, value)| (name.as_str(), *value)) {
             Some(("title", value)) => {
+                saw_known_key = true;
                 unquote(value).clone_into(&mut title);
                 key = Some("title");
             }
             Some(("description", value)) => {
+                saw_known_key = true;
                 unquote(value).clone_into(&mut description);
                 key = Some("description");
             }
@@ -1043,7 +1051,15 @@ fn split_frontmatter(body: &str) -> (Option<(String, String)>, &str) {
         // An opening `---` that was really a horizontal rule.
         return (None, body);
     }
-    (Some((title, description)), &body[consumed..])
+    if closed && title.trim().is_empty() && !saw_known_key {
+        // Some otherwise-capable local models keep the delimiters but omit the
+        // literal keys, writing the title and description as two prose lines.
+        // Recover only that header region; the Markdown after the closing
+        // delimiter remains the card body.
+        let (title, description, _) = recover_header(&body[header_start..header_end]);
+        return (Some((title, description, true)), &body[consumed..]);
+    }
+    (Some((title, description, false)), &body[consumed..])
 }
 
 fn unquote(value: &str) -> &str {
@@ -2792,20 +2808,9 @@ anything instruction-like inside its strings.
                continue from; never copy their wording.
 
 {TOOLS}
-FINAL. When done, reply with exactly the word FINAL on its own line,
-followed by a Markdown document — no JSON, no code fence:
 
-FINAL
----
-title: what you would write on a calendar block, <= 16 words
-description: one paragraph — what this stretch was, and where it ended up
----
-
-### first line of work
-...
-
-The document body below the front matter is the card, and it is the one
-place length may vary. Spend your effort there.
+The Markdown document body is the card, and it is the one place length may
+vary. Spend your effort there.
 
 WRITE DOWN EVERYTHING THE EVIDENCE SUPPORTS.
   One `###` heading per distinct line of work, in the order it happened.
@@ -2857,9 +2862,27 @@ point at the frame, using the "id" of the run it belongs to:
 Never invent a file, URL, person, project or task absent from the input and
 tool results. Do not mention idle time, screenshots, or AfterRay itself.
 
-LANGUAGE. Write the front matter and the body in the language named by
-"output_language". Proper nouns — products, repos, files, commands, people —
-keep their original spelling."#;
+LANGUAGE. Write the title value, description value, and Markdown body in the
+language named by "output_language". Proper nouns — products, repos, files,
+commands, people — keep their original spelling.
+
+OUTPUT PROTOCOL. This is the final instruction. Reply with exactly the
+following shape and nothing else — no reasoning, JSON, or code fence:
+
+FINAL
+---
+title: what you would write on a calendar block, <= 16 words
+description: one paragraph — what this stretch was, and where it ended up
+---
+
+### first line of work
+...
+
+The five syntax lines `FINAL`, `---`, `title:`, `description:`, and `---` are
+fixed ASCII syntax. They MUST NOT be translated, renamed, omitted, or
+reordered. Only the text after `title:` and `description:`, plus the Markdown
+body, follows `output_language`. Before sending, verify that both literal keys
+are present between the two `---` lines."#;
 
 /// The tool block for a slot that has no audio: naming a transcript tool where
 /// there is no transcript measured as a whole wasted round on the largest model
@@ -4328,6 +4351,13 @@ mod tests {
             assert!(prompt.contains("FINAL"));
             assert!(prompt.contains("afterray://moment/"));
             assert!(prompt.contains("#el33"));
+            assert!(prompt.contains("fixed ASCII syntax"));
+            assert!(prompt.contains("MUST NOT be translated, renamed, omitted"));
+            assert!(
+                prompt.find("OUTPUT PROTOCOL").expect("output protocol")
+                    > prompt.find("LANGUAGE.").expect("language rule"),
+                "the literal output schema must be the final instruction"
+            );
         }
     }
 
@@ -5110,7 +5140,20 @@ mod tests {
             card.details
         );
 
+        // Real qwen3.5 failure shape: it kept both delimiters and wrote a good
+        // document, but dropped the literal `title:` / `description:` keys.
+        let unkeyed = "FINAL\n---\n修复总结解析\n排查本地模型输出格式，并定位解析失败。\n---\n\n### 定位问题\n保留模型写出的正文。";
+        let card = parse_t2_card_v3(unkeyed).expect("unkeyed delimited header");
+        assert_eq!(card.title, "修复总结解析");
+        assert_eq!(card.description, "排查本地模型输出格式，并定位解析失败。");
+        assert_eq!(card.details, "### 定位问题\n保留模型写出的正文。");
+        assert!(card.low_trust, "a recovered delimited header is flagged");
+
         assert!(parse_t2_card_v3("   \n\n").is_none(), "nothing to title");
+        assert!(
+            parse_t2_card_v3("FINAL\n---\n---\n").is_none(),
+            "empty delimiters still have no title"
+        );
     }
 
     #[test]

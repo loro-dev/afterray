@@ -37,6 +37,9 @@ pub struct QueueModel<'a> {
     /// released as soon as the round settles — a queued summary must not inherit
     /// a chat window's outlet.
     pub token_sink: Option<&'a LlmTokenSink>,
+    /// Sampling override for this surface. Summaries use a low temperature;
+    /// interactive chat keeps the provider default.
+    pub temperature: Option<f32>,
 }
 
 impl ModelSurface for QueueModel<'_> {
@@ -91,6 +94,7 @@ impl QueueModel<'_> {
                     prompt: request.prompt.to_owned(),
                     system: Some(request.system.to_owned()),
                     messages: request.messages.iter().map(to_model_message).collect(),
+                    temperature: self.temperature,
                 },
                 self.priority,
                 |job_id| {
@@ -250,6 +254,7 @@ mod tests {
             models: &models,
             priority: JobPriority::Interactive,
             token_sink: None,
+            temperature: None,
         };
         let error = run_turn(
             &model,
@@ -292,6 +297,7 @@ print(json.dumps({
             models: &models,
             priority: JobPriority::Interactive,
             token_sink: None,
+            temperature: None,
         };
         let turn = run_turn(
             &model,
@@ -332,6 +338,7 @@ print(json.dumps({
             models: &models,
             priority: JobPriority::Interactive,
             token_sink: None,
+            temperature: None,
         };
         let cancel = CancelToken::new();
         let fired = cancel.clone();

@@ -905,6 +905,7 @@ mod tests {
             messages: Vec::new(),
             prompt: label.to_owned(),
             system: None,
+            temperature: None,
         }
     }
 
@@ -1144,6 +1145,7 @@ mod tests {
                     messages: Vec::new(),
                     prompt: "hi".into(),
                     system: None,
+                    temperature: None,
                 },
                 JobPriority::Interactive,
                 move |job_id| {

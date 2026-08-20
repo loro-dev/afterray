@@ -113,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 messages: Vec::new(),
                 prompt: user.clone(),
                 system: Some(afterray_store::render_t2_system_prompt(card.facts.has_audio)),
+                temperature: Some(0.1),
             })
             .await?;
         let snapshot = queue.wait(&job).await?;

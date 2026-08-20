@@ -5,7 +5,10 @@
 //! is assembled, so a client can render incrementally without a second
 //! generation.
 
-use super::{LlmRuntimeConfig, chat_completions_url, normalize_origin, remote_http_error};
+use super::{
+    LlmRuntimeConfig, RemoteGenerationOptions, chat_completions_url, normalize_origin,
+    remote_http_error,
+};
 use crate::{AdapterError, Cancellation, ChatMessage, LlmDelta, LlmUsage};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
@@ -64,14 +67,15 @@ pub(super) async fn generate_streaming(
     config: &LlmRuntimeConfig,
     prompt: &str,
     messages: &[ChatMessage],
-    system: Option<&str>,
+    options: RemoteGenerationOptions<'_>,
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
 ) -> Result<(String, Option<LlmUsage>), AdapterError> {
     generate_with(
         client,
         config,
-        chat_messages(prompt, messages, system),
+        chat_messages(prompt, messages, options.system),
+        options.temperature,
         token_tx,
         cancellation,
         STREAM_DEADLINES,
@@ -83,16 +87,35 @@ async fn generate_with(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     body: Vec<Value>,
+    temperature: Option<f32>,
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
     deadlines: StreamDeadlines,
 ) -> Result<(String, Option<LlmUsage>), AdapterError> {
     match config.provider {
         afterray_protocol::LlmProvider::Ollama => {
-            generate_ollama_stream(client, config, body, token_tx, cancellation, deadlines).await
+            generate_ollama_stream(
+                client,
+                config,
+                body,
+                temperature,
+                token_tx,
+                cancellation,
+                deadlines,
+            )
+            .await
         }
         afterray_protocol::LlmProvider::OpenaiCompatible => {
-            generate_openai_stream(client, config, body, token_tx, cancellation, deadlines).await
+            generate_openai_stream(
+                client,
+                config,
+                body,
+                temperature,
+                token_tx,
+                cancellation,
+                deadlines,
+            )
+            .await
         }
         afterray_protocol::LlmProvider::MlxLocal => Err(AdapterError::InvalidOutput(
             "MLX local generation uses the persistent worker protocol".into(),
@@ -104,6 +127,7 @@ async fn generate_ollama_stream(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     messages: Vec<Value>,
+    temperature: Option<f32>,
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
     deadlines: StreamDeadlines,
@@ -121,8 +145,14 @@ async fn generate_ollama_stream(
     // word. The value has to be the one the harness budgeted against — it sizes
     // a KV cache in the same memory the rest of the machine is using, so this
     // is not a place to ask for the maximum and hope.
+    if config.context_tokens.is_some() || temperature.is_some() {
+        body["options"] = json!({});
+    }
     if let Some(num_ctx) = config.context_tokens {
-        body["options"] = json!({ "num_ctx": num_ctx });
+        body["options"]["num_ctx"] = json!(num_ctx);
+    }
+    if let Some(temperature) = temperature {
+        body["options"]["temperature"] = json!(temperature);
     }
     let response = send_chat(client, &url, None, &body, &cancellation, deadlines.headers).await?;
     let status = response.status();
@@ -144,6 +174,7 @@ async fn generate_openai_stream(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     messages: Vec<Value>,
+    temperature: Option<f32>,
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
     deadlines: StreamDeadlines,
@@ -162,6 +193,9 @@ async fn generate_openai_stream(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    if let Some(temperature) = temperature {
+        body["temperature"] = json!(temperature);
+    }
     let mut response = send_chat(
         client,
         &url,
@@ -1082,7 +1116,10 @@ mod tests {
             &config,
             "Reply with exactly the two characters: OK",
             &[],
-            Some("You reply with the requested characters and nothing else."),
+            RemoteGenerationOptions {
+                system: Some("You reply with the requested characters and nothing else."),
+                temperature: None,
+            },
             Some(tx),
             Cancellation::default(),
         )
@@ -1141,6 +1178,7 @@ mod tests {
             &client,
             &config,
             chat_messages("hi", &[], None),
+            None,
             Some(tx),
             cancellation,
             deadlines,
@@ -1155,7 +1193,7 @@ mod tests {
     /// cuts anything longer, which is precisely the case this exists to stop —
     /// and nothing downstream would report it.
     #[tokio::test]
-    async fn the_window_we_budgeted_for_is_declared_on_the_wire() {
+    async fn the_summary_sampling_contract_is_declared_to_ollama() {
         let (origin, captured) = serve_capturing(
             concat!(r#"{"message":{"content":"ok"},"done":true}"#, "\n"),
             "application/x-ndjson",
@@ -1180,7 +1218,10 @@ mod tests {
             &config,
             "prompt",
             &[],
-            None,
+            RemoteGenerationOptions {
+                system: None,
+                temperature: Some(0.1),
+            },
             Some(tx),
             Cancellation::default(),
         )
@@ -1202,6 +1243,60 @@ mod tests {
         let parsed: Value = serde_json::from_str(body)
             .unwrap_or_else(|error| panic!("body was not JSON ({error}); request was:\n{request}"));
         assert_eq!(parsed["options"]["num_ctx"], 32_768, "{body}");
+        let temperature = parsed["options"]["temperature"]
+            .as_f64()
+            .expect("numeric temperature");
+        assert!((temperature - 0.1).abs() < 1e-6, "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_summary_sampling_contract_is_declared_to_openai_compatible() {
+        let response = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (origin, captured) = serve_capturing(response, "text/event-stream").await;
+        let config = LlmRuntimeConfig {
+            provider: LlmProvider::OpenaiCompatible,
+            base_url: origin,
+            model: "mock".into(),
+            api_key: None,
+            context_tokens: None,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        generate_streaming(
+            &client,
+            &config,
+            "prompt",
+            &[],
+            RemoteGenerationOptions {
+                system: None,
+                temperature: Some(0.1),
+            },
+            Some(tx),
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        collector.await.unwrap();
+
+        let request = captured.await.expect("the server never captured a request");
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+        let parsed: Value = serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("body was not JSON ({error}); request was:\n{request}"));
+        let temperature = parsed["temperature"]
+            .as_f64()
+            .expect("numeric temperature");
+        assert!((temperature - 0.1).abs() < 1e-6, "{body}");
     }
 
     /// Like `serve_http`, but hands the request back over a channel.

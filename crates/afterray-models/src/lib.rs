@@ -115,6 +115,10 @@ pub enum ModelInput {
         /// one question and reads one answer.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         messages: Vec<ChatMessage>,
+        /// Per-job sampling temperature for remote runtimes. Managed MLX is
+        /// already deterministic and ignores this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<f32>,
     },
 }
 

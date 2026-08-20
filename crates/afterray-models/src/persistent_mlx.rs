@@ -645,6 +645,7 @@ done
             messages: Vec::new(),
             prompt: value.into(),
             system: Some("system".into()),
+            temperature: None,
         }
     }
 

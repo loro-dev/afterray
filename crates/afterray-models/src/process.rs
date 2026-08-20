@@ -348,6 +348,7 @@ print(json.dumps({
                     messages: Vec::new(),
                     prompt: "hello".to_owned(),
                     system: None,
+                    temperature: None,
                 },
                 Cancellation::default(),
             )
