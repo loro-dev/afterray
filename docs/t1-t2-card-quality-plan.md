@@ -1,6 +1,23 @@
 # T1/T2 卡片质量改进计划
 
-状态：进行中
+> **状态（2026-08-20 更新）：历史计划，以代码为准。**
+> 当前行为：T1 选行打分见 `crates/afterray-store/src/infoscore.rs`；卡片形状、持久化与搜索见 [crates/afterray-store/AGENTS.md](../crates/afterray-store/AGENTS.md)。
+>
+> 已被代码推翻 —— 下文正文保留的是当初的意图：
+> - 「状态：进行中」→ 已完结。**Phase 1 全部落地**：跨 slot DF 表（`text_df` / `text_df_meta`，`crates/afterray-store/src/lib.rs:1840`）、词元级 IDF、次模贪心预算选择（`crates/afterray-store/src/infoscore.rs:284`）、MinHash 近重复（`:175`）、G² keyness（`:433`）、facts 补发 `top_windows`（`crates/afterray-store/src/slot.rs:339`）。
+> - **Phase 2 是以卡片 v2 落地的，而 v2 已经在另一份文档里被 v3 取代** —— [event-capture-v2-plan.md](./event-capture-v2-plan.md) §5。本文"目标格式"一节的 `threads` / `entities` / `decisions` / `category` / `confidence` 全部不再存在；今天写盘的是 `T2CardV3 { title, description, details, low_trust }`，`crates/afterray-store/src/slot.rs:807`。
+> - Phase 2 第 3 项「实体校验（代码侧）」→ v3 没有 entities 可校验。同一位置的代码侧守卫改成了**引用接地**：把卡片里不属于本 slot 的 `afterray://moment/<id>` 剥掉并计数，`crates/afterray-store/src/slot.rs:1114`。
+> - Phase 1 第 6 项「run 合并（同 target 之间夹 < 60s 短暂跳出）」→ **没有按本文实现**。T1 的帧 run 至今是 `target_key` 一变就断（`crates/afterray-store/src/slot.rs:1890`）；"短暂跳出折回"这个语义只存在于 acts 事件流里，且阈值是 2 个事件**或** 15 秒，不是 60 秒（`crates/afterray-store/src/acts.rs:373`、`:782`）。
+> - Phase 1 第 3 项里的「OCR 几何先验（`layout_json` 的框）」→ 未落地；`infoscore.rs` 的打分不读任何版面几何。
+> - Phase 2 第 5 项「语言：`auto` 读 `AppleLanguages`」→ 已实现，走 `CFLocaleCopyPreferredLanguages`，`crates/afterray-platform-macos/src/locale.rs:18`。
+>
+> **未修复的缺陷 —— `scripts/t2-eval.py` 对当前 daemon 是失灵的，这就是 WS7（语料回归）至今没做的原因：**
+> - `card_text`（`scripts/t2-eval.py:102`）读 `title` / `bullets` / `threads[].name,prose` / `entities[].text` / `decisions`，全是 v1 与 v2 的字段。daemon 的 `slot_summarize` 响应里 `card` 就是序列化后的 `T2CardV3`（`crates/afterrayd/src/main.rs:3342`），只有 `title` / `description` / `details` / `low_trust`。**交集只剩 `title` 一项** —— 于是实体保真率、编造数、`han_ratio` 全都只在一张卡的**一行字**上计算，然后报出一个看起来很像回事的数字。
+> - `entities_dropped_by_daemon`（`scripts/t2-eval.py:270`）读 `verification.entities_dropped`；v3 的 `T2GroundingReport` 只有 `citations_dropped` 一个字段（`crates/afterray-store/src/slot.rs:1103`），所以这个计数器**永远是 0**，无论 daemon 丢掉了多少东西。
+>
+> **一对已裁决的历史结论。** 先前两次私有 vault 评测得出了相反的后处理建议；它们的原始输入和输出已从仓库移除，保留的脱敏方法记录见 [T1/T2 evaluation](./evals/t1-t2-2026-08-14/README.md) 与 [card-quality report](./evals/t2-cards/REPORT.md)。今天以代码为准：生成之后仍有 `ground_t2_details` 剥掉接不上的引用（`crates/afterray-store/src/slot.rs:1114`）。
+
+状态：进行中 **[已完结，见上方状态块]**
 日期：2026-08-15
 评测模型：本地 Ollama `qwen3.5:4b` 与 `qwen3.8:27b-mlx`（都走 daemon 现有
 OpenAI-compatible 调用路径）。评测矩阵 2 模型 × 2 管线版本（baseline / after），
@@ -29,6 +46,8 @@ OpenAI-compatible 调用路径）。评测矩阵 2 模型 × 2 管线版本（ba
    任何叙述。
 
 ## 目标格式
+
+**[已推翻 → `crates/afterray-store/src/slot.rs:807`]** 下面这份字段表是卡片 **v2**；v2 已被 v3 取代（[event-capture-v2-plan.md](./event-capture-v2-plan.md) §5），`threads` / `entities` / `decisions` / `not_captured` / `category` / `confidence` 全部不再存在。每个字段是怎么输掉的，写在 `T2CardV3` 上方的注释里。
 
 参照 Skysight 10 分钟摘要的结构（`~/.codex/memories/extensions/skysight/resources/`），
 但把它的"引用文件路径"升级为我们独有的"引用帧"：
@@ -66,7 +85,7 @@ OpenAI-compatible 调用路径）。评测矩阵 2 模型 × 2 管线版本（ba
 4. **预算选择**：次模贪心（token 覆盖目标，边际增益/字符成本排序）替换 round-robin；
    保留 per-run 保底一行与 per-run cap。冗余由覆盖函数天然抑制。
 5. **近重复**：字符 3-gram MinHash（64 perm）补 `dedup_key` 抓不住的滚动错位。
-6. **run 合并**：同 target 之间夹短暂跳出（< 60s）的段落合并。
+6. **run 合并**：同 target 之间夹短暂跳出（< 60s）的段落合并。 **[未实现（2026-08-20 核对）→ `crates/afterray-store/src/slot.rs:1890`；折回语义只在 acts 流里，阈值 2 事件 / 15 秒，`crates/afterray-store/src/acts.rs:373`]**
 7. **G² keyness**（slot vs 背景语料）产出 `theme_key` 与实体候选列表，进 T1 卡。
 8. facts 视图补发 `top_windows` / `top_urls` / `top_documents`。
 
@@ -79,7 +98,7 @@ OpenAI-compatible 调用路径）。评测矩阵 2 模型 × 2 管线版本（ba
    同样受益），不做中途裁剪，轮数 ≤8 封顶。
 2. **新 schema**（见"目标格式"）+ 解析兼容 v1；`slot_summaries` 表迁移。
 3. **实体校验（代码侧）**：卡片生成后，entities 与 threads 文本里的标识符逐字回查
-   "prompt 输入 ∪ 工具返回"，对不上的丢弃并降 confidence。
+   "prompt 输入 ∪ 工具返回"，对不上的丢弃并降 confidence。 **[已推翻 → `crates/afterray-store/src/slot.rs:1114`：v3 无 entities，改为剥掉不属于本 slot 的 `afterray://moment/<id>` 引用]**
 4. **prompt 重写**：内联地图瘦身（目标 ~5k 字符），工具指令与现实一致，输出契约改为新 schema。
 5. **语言**：设置值优先；`auto` → daemon 读 `AppleLanguages`（不再读 `LANG`，
    不做内容语言探测）。
@@ -90,6 +109,8 @@ OpenAI-compatible 调用路径）。评测矩阵 2 模型 × 2 管线版本（ba
 同一批 slot、同一模型重跑，对比 baseline。报告进 `docs/evals/t2-cards/`。
 
 ## 指标（脚本自动计算 + 人工核读）
+
+**[脚本已对不上当前 daemon（2026-08-20 核对）]** `scripts/t2-eval.py:102` 的 `card_text` 读的是 v1/v2 字段，与 `T2CardV3` 的交集只有 `title`，下表中「实体保真率」「标题区分度」等自动指标因此只在一行字上计算；`entities_dropped_by_daemon`（`:270`）读的字段 v3 不发，恒为 0。详见顶部状态块。
 
 | 指标 | 定义 | 期望方向 |
 | --- | --- | --- |

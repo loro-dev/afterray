@@ -1,5 +1,16 @@
 # 输入事件与 T1 acts 重组计划
 
+> **Status (updated 2026-08-20): historical plan. The code is the authority.**
+> Current behavior: [context/acts-join.md](../context/acts-join.md)（join、engaged scope、run 切分、R3 边沿帧、物化）与 [context/event-capture-v2.md](../context/event-capture-v2.md)（输入词汇表、secure 护栏、截图落点）；保留期是 [「The vault expires by size, never by age」](decisions/active/architecture/2026-08-20-size-driven-retention.md)。
+>
+> Superseded by the code on these points — the body below still states the original intent:
+> - 「明确不做」表的**事件驱动截图**已落地：`event_capture_is_due` 把输入批次抬成一次截图请求，节流取 `max(10s, 心跳间隔)`，`crates/afterrayd/src/main.rs:1463`（调用点 `:2424`）。它援引的理由（「事件 48h 删、帧长存」）所依赖的分头保留期不存在
+> - R2/R3 表格的「事件表 48h」「48h，与事件同寿」→ 无按时钟的保留期：事件与边沿树按保留水位线（库里最旧一帧）清扫，`crates/afterray-store/src/lib.rs:3600` / `:3717`；仅剩的时钟是运行标记的 `SIGNAL_MARKER_RETENTION_MS`，`crates/afterray-store/src/lib.rs:113`
+> - T1 卡片重组的「存储层永存原始 events + trees」→ 两者都会被上面那道清扫带走；沉到 `slot_summaries.acts_json` 的物化值才是事件过期后剩下的东西
+> - §已拍板 3「typing burst … 不含 keycode …无法还原明文」→ burst 携带键流原文与目标字段的 value，`crates/afterray-store/src/acts.rs:588`；唯一护栏是 shim 源头的 secure 判定（CAP-005 的禁令已取消，见 [event-capture-v2-plan.md](./event-capture-v2-plan.md) §信任模型变更）
+>
+> **未清偿的开放义务：** 文末 PoC 由「listen-only tap 在系统设置 → 输入监控里不留痕」推出披露义务全部落在应用自身（onboarding/权限页明示）。该披露没有建：`RequiredPermission` 只有 screenRecording / microphone / accessibility，`apps/AfterRay/Sources/SystemPermissionCoordinator.swift:207`；`apps/AfterRay/Resources/Info.plist` 无 `NSInputMonitoringUsageDescription`；onboarding 与隐私文案里没有一处提到按键采集。系统不会替用户指出 AfterRay 在观察输入，应用也没有。
+
 > 状态：已批准（2026-08-17 拍板）；阶段 0–4 已落地（PR #41）。**部分被 [`event-capture-v2-plan.md`](./event-capture-v2-plan.md) 取代（2026-08-18）**：R3 边沿快照被 keyframe 策略吸收；acts 的 typing 布尔方案被 `text_input.value` 取代；CAP-005 击键禁令在本地信任模型下取消。
 > 关系：修订 [`slot-summaries-and-ax-pipeline.md`](./slot-summaries-and-ax-pipeline.md) §7 的若干"已决定"条目（本文为准，修订处已回改）；实现落点见文末阶段表。
 > 起因：IM 类应用（飞书等）的 T1 卡片把侧边栏噪音当成用户行为 —— 实测 2026-08-17 15:20 slot 的 prompt 预算 67% 花在用户从未触碰的会话列表上，T2 卡片写成 "multi-group scan"，真实的 1:1 对话一字未提。
@@ -27,7 +38,7 @@
 
 1. **Return / Tab / Esc 归命令键**，可存时刻 —— 不携带字符内容，语义是"提交/执行"（聊天=发送、终端=执行），且是区分"读 vs 写"的关键。
 2. **鼠标/滚动事件在事件时刻现场解析为 AX 元素**：存元素身份（role / label / rect / 祖先链），坐标解析后即弃。rect 是 UI 几何（树里本就整棵存着），不是指针轨迹。
-3. **typing burst = {起止时刻, 计数, 结束键}**，不含 keycode —— 比 §7.1 原表"slot 粒度计数"细，但无法还原明文，CAP-005 的原始理由（keycode 序列≡明文）不适用。
+3. **typing burst = {起止时刻, 计数, 结束键}**，不含 keycode —— 比 §7.1 原表"slot 粒度计数"细，但无法还原明文，CAP-005 的原始理由（keycode 序列≡明文）不适用。 **[已推翻 → `crates/afterray-store/src/acts.rs:588`]**
 4. **按键归属**：焦点元素够细则用焦点；不够细（实测 Electron 给 AXWebArea、Zed 给 AXWindow）则归到最近一次点击的元素。
 5. **run 切分改为 engaged-scope 变化 + 滞回**（新 scope 需 ≥2 事件或 ≥15s 成段）；快速交替（triage）归并为单 run，由点击目标 label 列表呈现。
 6. **engaged 范围 = 落点 LCA 向上扩到 ≥窗口面积 10% 的祖先** —— 全系统唯一旋钮，真实语料钉死。
@@ -42,7 +53,7 @@
 |---|---|---|---|
 | R1 配对心跳 | 10s 不变（配对不变量 + 均匀节奏隐私论证 + 兜底） | 整窗；已做降本：跳过 AXMenuBar 子树（原生 app 80–90% 节点是菜单）+ 100ms/次 messaging timeout + 500ms 走树预算 | 长期（现状） |
 | R2 事件解析 | 每 click / burst 一次 | 单元素路径 ~30 次属性读，**不是抓树** | 事件表 48h |
-| R3 边沿快照 | 确认成段的 scope 切换 + settle ~500ms + 令牌桶（≥5s 间隔，≤6/min） | 只走新 engaged 子树，AX-only 无截图 | **48h，与事件同寿** |
+| R3 边沿快照 | 确认成段的 scope 切换 + settle ~500ms + 令牌桶（≥5s 间隔，≤6/min） | 只走新 engaged 子树，AX-only 无截图 | **48h，与事件同寿** **[已推翻 → `crates/afterray-store/src/lib.rs:3717`]** |
 
 R3 补的是心跳唯一会整段错过内容的洞（切进会话看 8s 就走）。48h 同寿闭环了时序泄漏：事件删了而事件驱动的帧长存，会在事件过期后仍暴露交互时刻。降级顺序：负载高/电池低先砍 R3，心跳最后死。已知盲区：纯键盘导航（⌘K、j/k）检测不到 → 心跳兜底，接受，不加启发式。
 
@@ -54,7 +65,7 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 - 文本预算按 **provenance** 排序：engaged 子树全文吃满预算 → 无 act 区域压成一行标签 + 行数（`not_engaged`，实验中把弱模型掰过来的关键字段）。IDF 降级为桶内去 chrome。
 - `facts.apps[]` 加 acts 汇总（`Zed 22m, 340 keys, 3 ⌘S` vs `Zed 22m, 0 keys`）；`idle_ratio` 拆成 `not_recording_ratio`（诚实改名 —— 现值实为"录制暂停比例"）+ `no_input_ratio`（新，真的）。
 - `revisits` / `theme_key` 从落点区域派生（现状按 url/document，IM 上恒定 → 永久失效；实测 theme_key 取到头像 `native-resource://…`）。
-- 存储层永存原始 events + trees；折叠只在渲染层，可重渲染，不污染 vault。
+- 存储层永存原始 events + trees **[已推翻 → `crates/afterray-store/src/lib.rs:3600`]**；折叠只在渲染层，可重渲染，不污染 vault。
 
 ## 明确不做（有实验依据）
 
@@ -63,7 +74,7 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 | churn 作能动性信号 | 群聊实测指反方向（engaged 区 0 新增、侧边栏 40） |
 | shape 行距启发式 | 实测无法区分列表与散文 |
 | outcome diff（命令前后区域文本增量）作一等字段 | "前"不可得：帧间隔 ~10.7s，delta 混着自己打的字/别人发来的/UI 异步刷新，无法归因。降级为有条件字段：仅当两帧紧夹事件（各 ≤2s）才允许 attribution |
-| 事件驱动截图 | 时序泄漏（事件 48h 删、帧长存）+ §7.1 心跳论证 |
+| 事件驱动截图 **[已推翻 → `crates/afterrayd/src/main.rs:1463`]** | 时序泄漏（事件 48h 删、帧长存）+ §7.1 心跳论证 |
 | 分区算法作判据、label 阶梯作 thread 身份 | 落点 LCA 天然给出范围；thread 名由模型从 engaged 文本自得（实验 6/6） |
 
 ## 阶段
@@ -138,7 +149,7 @@ R3 需要"无 moment 的 AX artifact"的导入落点（现状 AX 挂在 screen �
 ### 阶段 4 — R3 边沿快照（shim + afterrayd + afterray-store）
 
 - **触发（shim `InputEventMonitor` worker）**：候选 = 前台 bundle 变化，或 click 事件。settle 去抖 500ms（新输入到达则重新计时——绝不在交互中走树）；令牌桶 ≥5s 间隔、≤6/min。v1 简化两处（记为偏差）：① 走树范围 = 触发元素所在的 **AXWindow**（focused window 兜底），不是 engaged 子树——窗口是其超集，shim 侧无需几何逻辑，菜单跳过 + 时间盒照常生效；② 负载/电池降级暂不做 shim 侧开关，令牌桶已把上界钉死（≤6/min × ~窗口级树），降级钩子留给后续。
-- **发射**：`ArtifactKind` 新增 `accessibility_edge`（Swift + Rust 两侧），照常走 artifact 事件；**绝不触发截图**（事件驱动截图的时序泄漏论证仍然成立）。
+- **发射**：`ArtifactKind` 新增 `accessibility_edge`（Swift + Rust 两侧），照常走 artifact 事件；**绝不触发截图**（事件驱动截图的时序泄漏论证仍然成立） **[已推翻 → `crates/afterrayd/src/main.rs:1463`]**。
 - **daemon 导入**：exclusion 判定与 accessibility 分支完全一致（解析不了 → 删文件，fail-closed）；通过后存为 purpose `edge-ax` 的加密 artifact + 新表 `edge_snapshots(id, captured_at_ms, artifact_id)` 一行。**不建 moment、不出缩略图、不跑 OCR。**
 - **store**：`SCHEMA_VERSION` +1（落地时 23 → 24）（`edge_snapshots` 表 + 索引）。保留期 **48h 与事件同寿**（`prune_input_events` 同点执行，连带删除 artifact 文件）；`delete_history` 级联（隐私不变量第四层）。`slot_card()` 的 acts join 把落在 slot 内的 edge 树作为**额外帧**参与 engaged/peripheral partition 与文本抽取——仅此而已，不参与 anchor/缩略图/OCR 证据。
 - **测试**：导入路径（exclusion fail-closed / 正常入库）、48h prune 连带 artifact 删除、级联、join 纳入 edge 帧；IO 测试过 `make test-repeat N=10` ≥5 连绿。shim 侧去抖/令牌桶逻辑提成可单测的纯函数为佳，做不到则如实报告未验证面。

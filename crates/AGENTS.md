@@ -1,6 +1,6 @@
 # crates/ — Rust workspace
 
-Nine crates (`Cargo.toml` workspace, edition 2024, rust 1.85). The daemon `afterrayd` captures via a Swift shim, stores everything in `afterray-store`'s encrypted vault, and drives model jobs; clients talk to it over a versioned NDJSON Unix socket (`afterray-protocol`).
+Eleven crates (`Cargo.toml` workspace, edition 2024, rust 1.85). The daemon `afterrayd` captures via a Swift shim, stores everything in `afterray-store`'s encrypted vault, and drives model jobs; clients talk to it over a versioned NDJSON Unix socket (`afterray-protocol`).
 
 ## Shared conventions
 
@@ -16,10 +16,12 @@ Nine crates (`Cargo.toml` workspace, edition 2024, rust 1.85). The daemon `after
 - [afterray-platform-macos](afterray-platform-macos/AGENTS.md) — `AfterRayCaptureShim` process lifecycle + JSON-lines protocol; power/idle/locale probes.
 - [afterray-codec](afterray-codec/AGENTS.md) — encode-only AV1 (rav1e → IVF), JPEG→I420, thumbnails.
 - [afterray-core](afterray-core/AGENTS.md) — trait definitions only (`CaptureBackend`, `Store`); no logic.
-- [afterray-protocol](afterray-protocol/AGENTS.md) — wire types + `PROTOCOL_VERSION` (src/lib.rs:8); bump the version here, not in the daemon.
+- [afterray-protocol](afterray-protocol/AGENTS.md) — wire types + `PROTOCOL_VERSION` (src/lib.rs:34); bump the version here, not in the daemon.
 - [afterray-models](afterray-models/AGENTS.md) — in-memory `ModelQueue`, worker orchestration, LLM routing and remote-endpoint guards (`src/remote.rs`); the `jobs` table in the store schema is vestigial.
 - [afterray-infer](afterray-infer/AGENTS.md) — in-process ASR/embedding backends + the one-shot `afterray-model-worker` binary; deliberately rejects OCR and LLM.
 - [afterray-cli](afterray-cli/AGENTS.md) — read-only CLI over the socket (`make status`); keep `skills/afterray/` in sync with it.
+- `afterray-harness` — the tool-calling loop, budgets, truncation, compaction and the append-only `History`. **Depends on no `afterray-*` crate and no HTTP client** (`Cargo.toml:9` states the rule); an `afterray-*` line in its dependencies means the separation is lost.
+- `afterray-agent` — the seam binding the harness to `ModelQueue`: one `ModelSurface` impl plus error classification. Tools stay in `afterrayd`, where the vault is.
 
 ## Build / test / lint
 

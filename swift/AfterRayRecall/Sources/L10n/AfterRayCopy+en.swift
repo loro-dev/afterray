@@ -193,7 +193,7 @@ extension AfterRayCopy {
             lessThanTenth: "less than 0.1%",
             diskShare: { share, disk in "AfterRay is \(share) of this \(disk) disk." },
             memoryLimit: "Memory limit",
-            memoryLimitSubtitle: "Oldest unstarred moments are removed first. Favorites and a small metadata overhead may exceed this limit.",
+            memoryLimitSubtitle: "Oldest moments are removed first. A small metadata overhead may exceed this limit. What you type is deleted after 48 hours regardless of this budget.",
             assistantSource: "Assistant source",
             providerMlx: "AfterRay Local (MLX)",
             providerOllama: "Ollama",

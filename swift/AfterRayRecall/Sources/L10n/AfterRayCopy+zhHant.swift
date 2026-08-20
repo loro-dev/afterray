@@ -193,7 +193,7 @@ extension AfterRayCopy {
             lessThanTenth: "不到 0.1%",
             diskShare: { share, disk in "AfterRay 約佔這顆 \(disk) 磁碟的 \(share)。" },
             memoryLimit: "記憶上限",
-            memoryLimitSubtitle: "會先刪除最舊、未加星號的時刻。收藏與少量中繼資料可能略超過此上限。",
+            memoryLimitSubtitle: "會先刪除最舊的時刻。少量中繼資料可能略超過此上限。無論此上限如何，您輸入的內容都會在 48 小時後刪除。",
             assistantSource: "助理來源",
             providerMlx: "AfterRay 本機 (MLX)",
             providerOllama: "Ollama",

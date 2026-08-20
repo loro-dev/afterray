@@ -259,7 +259,7 @@ const en = {
     pillars: [
       {
         title: 'Captured locally',
-        body: 'Screen, system audio, microphone, and Accessibility semantics are written to an encrypted vault on your Mac.',
+        body: 'Screen, system audio, microphone, Accessibility semantics, and what you type are written to an encrypted vault on your Mac. Secure fields and password managers are never read, and the raw record of your keystrokes is deleted after 48 hours.',
       },
       {
         title: 'Indexed locally',
@@ -281,7 +281,7 @@ const en = {
       ['Platform', 'macOS 15+ · Apple Silicon (M3 recommended)'],
       ['Storage', 'SQLCipher + XChaCha20-Poly1305, key in the Keychain'],
       ['On disk', 'Older captures repack to closed-GOP AV1 — 7–10% of the original JPEG'],
-      ['Retention', 'A storage budget you set, 100 GB by default — oldest unstarred go first, favorites never expire'],
+      ['Retention', 'A storage budget you set, 100 GB by default — the oldest goes first when you reach it'],
       ['Models', 'On-device ASR, embeddings, and LLM — or your own Ollama or OpenAI-compatible endpoint'],
       ['Upload', 'No account, no telemetry, no cloud sync — nothing leaves unless you point it at a remote model'],
     ],
@@ -536,7 +536,7 @@ const zh: Copy = {
     pillars: [
       {
         title: '捕获在本地',
-        body: '屏幕、系统音频、麦克风与 Accessibility 语义，全部写入你 Mac 上的加密 Vault。',
+        body: '屏幕、系统音频、麦克风、Accessibility 语义，以及你输入的文字，全部写入你 Mac 上的加密 Vault。密码框与密码管理器从不读取，击键的原始记录 48 小时后删除。',
       },
       {
         title: '索引在本地',
@@ -558,7 +558,7 @@ const zh: Copy = {
       ['平台', 'macOS 15+ · Apple Silicon（推荐 M3）'],
       ['存储', 'SQLCipher + XChaCha20-Poly1305，密钥存于 Keychain'],
       ['磁盘', '较早的捕获会重打包成 closed-GOP AV1——原 JPEG 的 7–10%'],
-      ['保留', '你自己设的存储预算，默认 100 GB——先清最早的非收藏，收藏永不过期'],
+      ['保留', '你自己设的存储预算，默认 100 GB——到达上限后先清最早的'],
       ['模型', '本机 ASR / Embedding / LLM，或你自己的 Ollama、OpenAI 兼容接口'],
       ['上传', '没有账号，没有遥测，没有云同步——除非你指向远程模型，否则什么都不出去'],
     ],

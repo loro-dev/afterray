@@ -1,5 +1,63 @@
 # Agent harness: what to fix, what to extract, and how it reaches the UI
 
+> **Status (updated 2026-08-20): historical plan. The code is the authority.**
+> Current behavior: the shipped tool surface, its grouping and the reply
+> protocol are in [context/agent-tools.md](../context/agent-tools.md); the loop
+> itself lives in `crates/afterray-harness` ([crates/AGENTS.md](../crates/AGENTS.md)).
+>
+> **This document sits in the middle of a chain, and each link partly supersedes
+> the one before it.** [agent-chat-plan.md](agent-chat-plan.md) (2026-08-14)
+> built the chat surface — three tools, a folded history, a CLI entry point.
+> This document is the fix-and-restructure pass over what that produced, and it
+> overturns the folding scheme and the tool list it inherited.
+> [harness-implementation-notes.md](harness-implementation-notes.md) then records
+> what the restructuring actually became, and is the later word wherever it and
+> this document disagree — including on this document's own reasoning (see its
+> §10, which corrects fix 0.4 below). Nothing below has authority over the code.
+>
+> The opening comparison of pi and deepseek-harness is kept verbatim: it is the
+> only recorded measurement of the external systems this design borrowed from,
+> and the "Deliberately not copying" list at the foot is the only record of what
+> it declined.
+>
+> Superseded by the code — the body below still states the original intent:
+>
+> - **Phase 1's named seams never shipped under those names.** `LlmBackend` →
+>   `ModelSurface`, `crates/afterray-harness/src/run.rs:121`. `ContextPolicy` →
+>   `CompactionStrategy`, with a synchronous `compact` and a second
+>   `compact_history`, `crates/afterray-harness/src/compaction.rs:42`.
+> - **`Tool` + `ToolRegistry` were not built.** Dispatch is still a `match`, held
+>   to the catalogue by tests that read their own source,
+>   `crates/afterrayd/src/tools.rs:122`.
+> - **`AgentSession` does not exist.** `afterray-agent` is a queue binding plus
+>   error classification; handlers still assemble the loop,
+>   `crates/afterray-agent/src/lib.rs:28`.
+> - **`tools::vault` never moved into `afterray-agent`.** Tools stayed in the
+>   daemon, where the vault is; `ToolHost` carries `store` / `now_ms` / `budget`
+>   and nothing else, `crates/afterrayd/src/tools.rs:66`.
+> - **"The eleven tools" → eight.** The surface grew to fourteen and was then cut
+>   back; `list_moments` and five others were removed or folded into
+>   `get_moment_context`, `crates/afterrayd/src/tools.rs:122` and
+>   [context/agent-tools.md](../context/agent-tools.md).
+> - **Fix 0.4's claim is wrong and the rule shipped inverted.** A catalogue test
+>   would *not* have caught defect 4; what ships forbids a system prompt from
+>   naming any tool at all, `crates/afterrayd/src/tools.rs:1694`.
+> - **`emit_gate_tokens` / `stream.rs:329` no longer exists anywhere.** Stop is
+>   the plan's "correct" option: an explicit `ChatAbort` on a second connection,
+>   `crates/afterray-protocol/src/lib.rs:233`.
+> - **The event vocabulary is larger and differently spelled.** `kind` not
+>   `type`, and `started` / `reasoning` / `progress` were added alongside `usage`
+>   and `compaction`, `crates/afterray-protocol/src/lib.rs:1331`.
+> - **Compaction covers rounds, not message times — and history too.** The
+>   cross-turn pass the plan only sketched runs before the first round,
+>   `crates/afterray-harness/src/run.rs:419`.
+> - **The usage indicator is not gated at ~50%.** It is shown whenever a round
+>   has reported, `swift/AfterRayRecall/Sources/AfterRayChatView.swift:525`.
+> - **Phases 4 (steering) and 5 (`SummarizeOldest`) never started.** Phase 5 is
+>   blocked on the seam: `CompactionStrategy::compact` is synchronous, which no
+>   model-backed strategy can satisfy,
+>   `crates/afterray-harness/src/compaction.rs:49`.
+
 Written after reading pi (`packages/agent` 1,851-line kernel, `coding-agent`
 76,891-line full body) and deepseek-harness (`core/agent-loop` 1,650 lines,
 `compaction` split into a 172-line contract plus two implementations).
@@ -52,6 +110,9 @@ We have a `handle_send` function where that layer should be.
    which closes the socket. The daemon only notices at its next
    `write_event`, inside `emit_gate_tokens`. During a long tool call, or before
    the first token, nothing is cancelled and the model keeps running.
+   **[Overtaken — `emit_gate_tokens` no longer exists; stop is an explicit
+   `ChatAbort` and a hang-up now means "I will read it later" →
+   `crates/afterray-protocol/src/lib.rs:233`]**
 
 6. **Context usage is invisible.** Nothing on either side computes or reports
    how full the window is, so a user cannot tell why answers degrade.
@@ -90,10 +151,20 @@ response carries one.
 rather than match arms (Phase 1), `tool_catalog_text()` derives from them and
 cannot drift. Until then, add a test that fails when a name in the `invoke`
 match is missing from the catalogue string. That test would have caught defect 4.
+**[Overtaken — it would not have. The rule shipped the other way round: a system
+prompt may not name a tool at all → `crates/afterrayd/src/tools.rs:1694`]**
 
 ## Phase 1 — extract two crates
 
 ### `afterray-harness` (~500 lines, zero AfterRay dependencies)
+
+**[Overtaken — the crate exists and has no AfterRay dependencies, but none of
+the four traits below shipped under these names. `LlmBackend` → `ModelSurface`
+(`crates/afterray-harness/src/run.rs:121`); `ContextPolicy` →
+`CompactionStrategy`, whose `compact` is synchronous
+(`crates/afterray-harness/src/compaction.rs:42`); `Tool` / `ToolRegistry` were
+never built, so dispatch is still a `match`
+(`crates/afterrayd/src/tools.rs:122`).]**
 
 ```rust
 pub trait LlmBackend {
@@ -132,6 +203,12 @@ which is heavier than the problem.
 
 ### `afterray-agent` (~800 lines, the orchestration layer we lack)
 
+**[Overtaken — the crate exists but the type does not. `afterray-agent` is a
+`ModelSurface` implementation over the model queue plus error classification —
+one file, tests included (`crates/afterray-agent/src/lib.rs:28`); every method sketched
+below is still spread across handlers, and `policy::SummarizeOldest` was never
+started.]**
+
 ```rust
 pub struct AgentSession {
     // queue, cancellation, usage, tool registry, policy
@@ -151,6 +228,9 @@ impl AgentSession {
 summary block).
 
 `tools::vault` holds the eleven existing tools, each implementing `Tool`.
+**[Overtaken — tools stayed in the daemon, where the vault is, and the surface
+is eight, not eleven; `list_moments` among others is gone →
+`crates/afterrayd/src/tools.rs:122`, [context/agent-tools.md](../context/agent-tools.md)]**
 
 Then `chat.rs`, `ask.rs`, and `slot_summarize` become thin handlers over one
 session type instead of three separate assemblies.
@@ -216,7 +296,9 @@ one's fullness.
 1. **Usage indicator in `header`** (`AfterRayChatView.swift:168`). A thin bar
    or a "55%" label next to the conversation title. This is the only way a
    user learns why a long conversation starts forgetting. Show it only above
-   ~50% so it is not permanent chrome.
+   ~50% so it is not permanent chrome. **[Overtaken — it is shown whenever a
+   round has reported, turning coral past 75% →
+   `swift/AfterRayRecall/Sources/AfterRayChatView.swift:525`]**
 
 2. **Compaction divider in `thread`** (`:157`). A full-width rule with
    "Summarised 12 earlier messages" and a disclosure that expands the summary

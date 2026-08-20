@@ -1,5 +1,53 @@
 # Agent harness: what was built, and where it left the plan
 
+> **Status (updated 2026-08-20): historical plan. The code is the authority.**
+> Current behavior: the tool surface and reply protocol are in
+> [context/agent-tools.md](../context/agent-tools.md); the loop, budget and
+> compaction types are in `crates/afterray-harness`
+> ([crates/AGENTS.md](../crates/AGENTS.md)).
+>
+> **This is the last link in a chain, and it supersedes the two before it.**
+> [agent-chat-plan.md](agent-chat-plan.md) (2026-08-14) built the chat surface;
+> [harness-plan.md](harness-plan.md) was the fix-and-restructure pass over it;
+> this document records what that restructuring actually became. Where it and
+> `harness-plan.md` disagree, this one is later — but it is not current: several
+> of its own claims have since been overturned by the code, listed below.
+>
+> Superseded by the code — the body below still states what was true when it was
+> written:
+>
+> - **§4 said "Only the second is built" of history vs in-turn compaction.**
+>   Both are built. `CompactionStrategy` grew a `compact_history`,
+>   `crates/afterray-harness/src/compaction.rs:67`, called before the first
+>   round, `crates/afterray-harness/src/run.rs:419`. Corrected in place — a
+>   document contradicting itself is not history worth keeping.
+> - **"Tools hold `&ModelQueue`", listed as outstanding, is resolved.**
+>   `ToolHost` carries `store` / `now_ms` / `budget` and nothing else,
+>   `crates/afterrayd/src/tools.rs:66`. Corrected in place.
+> - **The "Reasoning is stored" section rested on a premise that has inverted.**
+>   It argued the provider round-tripping hazards do not bite "today" because
+>   AfterRay never sends an assistant message. It does now:
+>   `GenerateRequest.messages` is a real `&[Message]`
+>   (`crates/afterray-harness/src/run.rs:40`), forwarded at
+>   `crates/afterray-agent/src/lib.rs:93`, built from `History` including
+>   assistant and tool messages (`crates/afterrayd/src/chat.rs:325`) and emitted
+>   as a full array (`crates/afterray-models/src/remote/stream.rs:230`). That
+>   storage decision is now load-bearing for correctness. Corrected in place,
+>   because leaving it would let a reader conclude the column is decorative.
+> - **`tools::catalog_drift` is nine rules, not four**,
+>   `crates/afterrayd/src/tools.rs:1539`. Count corrected in place.
+> - **`PROTOCOL_VERSION` is 15, not 8**, `crates/afterray-protocol/src/lib.rs:34`.
+>   8 is kept below as the historical value, since the paragraph is about the
+>   bug that came from *not* bumping it.
+>
+> One section is in the wrong tier. The `Opening::render_messages`
+> `continue`-vs-`break` story under "What holds the prefix, and what merely
+> tested it" — rendered `[A, B(huge), C]` came back as `[A, C]`, and no test
+> caught it because the fixtures used uniform small messages — is a postmortem
+> in miniature: a failure, why the guards missed it, and what changed. It
+> belongs in [postmortem/](postmortem/README.md). The text is left where it is;
+> moving it is a separate change, and that file is deliberately not created here.
+
 Companion to [harness-plan.md](harness-plan.md), which is the design. This
 records what phases 0–3 actually landed as, and every place the code and the
 plan disagree — so the disagreements are decisions on record rather than
@@ -12,7 +60,7 @@ things nobody noticed.
 | 0.1 whole-record truncation | `harness::truncate::truncate_head` → `Budgeted { text, truncated, dropped_lines, dropped_tokens, partial_line }`, marker at every seam |
 | 0.2 reconciled budgets | `harness::budget::ContextBudget`, with `is_coherent()` asserted at compile time |
 | 0.3 token estimate | `harness::tokens::estimate_tokens`, CJK ≈1 token/char, Latin ≈4 chars/token |
-| 0.4 catalogue test | `tools::catalog_drift`, four rules read out of the dispatch source |
+| 0.4 catalogue test | `tools::catalog_drift`, nine rules read out of the dispatch source (four when this was written) |
 | 1 two crates | `afterray-harness` (no AfterRay deps), `afterray-agent` |
 | 2 `PruneToolResults`, visible + non-destructive | `harness::compaction`, plus a `compaction` message row |
 | 3 real abort | `harness::cancel::CancelToken` at three points, plus socket hang-up detection |
@@ -60,7 +108,15 @@ compacting stored conversation history. What is implemented compacts the
 
 Both are worth having and they are not the same feature. Compacting history is
 what makes a long conversation survive; compacting a turn is what makes one
-question with many lookups survive. Only the second is built.
+question with many lookups survive.
+
+Both are built now. `CompactionStrategy` gained a second method,
+`compact_history` (`crates/afterray-harness/src/compaction.rs:67`), which one
+policy implements alongside `compact`; the loop runs it over the opening's
+history before the first round and announces the result as the same
+`CompactionNotice` (`crates/afterray-harness/src/run.rs:419`). The range is
+still rounds rather than message times — see "Two kinds of 'out of room'
+behaved differently" below, which is where that work is recorded.
 
 ### 5. Event field names
 
@@ -159,12 +215,35 @@ turn out to require:
   400 on the second turn without it — which broke a long list of tools in
   April–May 2026.
 
-Neither bites us **today**, because AfterRay never sends an assistant message
-at all: `chat_messages` builds `[system, user]` and history is folded into the
-user prompt as flat text. So storage is currently for the reader, not for
-correctness. It stops being optional the moment anyone moves the chat path to a
-structured `messages` array, and the shape above is what makes that possible
-rather than a rewrite.
+When this was written neither bit us, because AfterRay never sent an assistant
+message at all: `chat_messages` built `[system, user]` and history was folded
+into the user prompt as flat text. So storage was for the reader, not for
+correctness — and the paragraph named the condition that would change that: "It
+stops being optional the moment anyone moves the chat path to a structured
+`messages` array."
+
+**That has happened, so this is now a correctness requirement, not a courtesy to
+the reader.** `GenerateRequest` carries a real `messages: &'a [Message]`
+(`crates/afterray-harness/src/run.rs:40`); `afterray-agent` forwards it into the
+model job (`crates/afterray-agent/src/lib.rs:93`); `history_messages` builds it
+from stored rows including `Message::assistant` and the replayed tool calls and
+results (`crates/afterrayd/src/chat.rs:325`); and the OpenAI-compatible adapter
+emits the whole array rather than two messages
+(`crates/afterray-models/src/remote/stream.rs:230`).
+
+One step is still missing, and it is the whole exposure: `to_model_message`
+maps role and content only (`crates/afterray-agent/src/lib.rs:57`), so the
+stored reasoning is not attached to the outbound assistant message.
+`reasoning_content` is read on the way in
+(`crates/afterray-models/src/remote/stream.rs:508`) and never written on the way
+out — the asymmetry is the bug shape. Against a
+provider in the DeepSeek family that means the second turn of a conversation is
+sent an assistant message with its `reasoning_content` stripped — precisely the
+400 described above. The `reasoning` column, its per-round split and its
+`signature` slot are what a fix would be built from; the column is the reason
+that fix is a mapping change rather than a schema migration. Anyone tempted to
+drop it as unused should read this paragraph first — it is the one that used to
+say it was optional.
 
 Full content blocks — pi's `AssistantMessage.content` array of
 `TextContent | ThinkingContent | ToolCall` — were considered and not taken. That
@@ -302,7 +381,11 @@ that fit. It now cuts into that line when enough room remains, which took the
 useful share of a 4 096-token window's tool budget from about a fifth to nearly
 all of it. And `PROTOCOL_VERSION` went to 8: `ChatAbort` was added while the
 version still read 7, so an app that knows stop and a daemon that does not both
-claimed 7, the handshake passed, and the user's stop did nothing.
+claimed 7, the handshake passed, and the user's stop did nothing. (8 is the
+historical value this work landed on; the constant has moved on with every
+later wire change and reads 15 today —
+`crates/afterray-protocol/src/lib.rs:34`, which carries the running log of what
+each bump bought.)
 
 ## The conversation is a list of messages
 
@@ -423,13 +506,18 @@ signature says so.
 Phase 4 (steering) and phase 5 (`SummarizeOldest`), plus the plan's note about
 scoped models for T2 versus chat.
 
-Four more, named in review and genuinely outstanding:
+Two more were named in review. Only the first is still outstanding:
 
 - **`AgentSession` still does not exist.** Turn admission is now enforced, but
   by a map in `AppState` rather than by a type that owns the session, its tool
   registry, its policy hooks and its event log. `afterray-agent` remains a
   queue binding plus error classification; the name is ahead of the contents.
-- **Tools hold `&ModelQueue`** where an embedding port would do.
+
+**Tools holding `&ModelQueue`** was the second, and it is resolved: `ToolHost`
+carries `store`, `now_ms` and `budget`, and nothing that can run a model
+(`crates/afterrayd/src/tools.rs:66`). Dispatch runs entirely inside
+`spawn_blocking` over a read-only vault handle, so there is no port left to
+extract.
 
 Phase 5 also needs the seam widened first: `CompactionStrategy::compact` is
 synchronous, which no model-backed strategy can satisfy. Making it async while

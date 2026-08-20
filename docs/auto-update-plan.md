@@ -1,6 +1,21 @@
 # 自动更新调整计划
 
-> 状态：已实施（阶段 0–2 + Cloudflare 后端），2026-08-15
+> **状态（2026-08-20 更新）：已落地（shipped）。代码是唯一权威。**
+> 这是本目录里最准确的一份计划 —— 文末的[实施记录](#实施记录)已经自己纠正了三处偏差。下面的正文没有改写；剩下的四处漂移与一个真实缺口列在这里。
+>
+> **OPEN（数据完整性风险）：「明确不做 → 降级」里承诺的 schema 上限保护不存在。** 计划写的是「应在 store 里记录最高支持 schema，旧 daemon 遇到更新的 schema 时给明确报错而不是误读或崩溃」。实际：`migrate` 没有任何 `from_version > SCHEMA_VERSION` 检查（`crates/afterray-store/src/lib.rs:5126`），`StoreError` 没有「库太新」这一类（`crates/afterray-store/src/lib.rs:375`），迁移最后还无条件把版本盖回自己的 `SCHEMA_VERSION`（`crates/afterray-store/src/lib.rs:5216`）。旧 daemon 打开更新过的 vault 会照常对它跑迁移，并把版本号盖低。
+>
+> 四处与代码不符：
+> - 阶段 2「用 `DaemonStatus.recordingState` 判断，正在录制时推迟安装」→ 代码从不读 `recordingState`。这个性质是**结构性**得到的：Sparkle 只在退出时安装，`shouldPostponeRelaunchForUpdate` 先 `stop()` 录制再 `shutdown()` daemon，然后才交还 `installHandler()` —— `apps/AfterRay/Sources/AfterRayUpdater.swift`。比原计划更强，但计划那句话字面上是假的
+> - 阶段 0.2「dev 模式下降级为日志警告」→ 实际是静默豁免，一条日志都没有：`hostBuildMatches` 在 dev 树里直接 `return true`，`apps/AfterRay/Sources/DaemonSupervisor.swift:257`
+> - 阶段 0.1「构建号单调递增的硬校验」→ 这条校验不在 `build-release.sh` 里，而在 `scripts/release-preflight.sh:95`（对比 R2 上的 `releases.json`）与 `scripts/publish-release.sh:170`（发布时再拒一次重复构建号）
+> - 「尚未做 → 首次下载链接」→ 已接上，站点按钮指向 `/download/latest`：`site/src/sections/Hero.tsx:25`、`site/src/sections/Closer.tsx:58`
+>
+> 另有两个发布脚本自身的缺陷，记录在这里但**不在本次改动中修**：
+> - `release-preflight.sh:63` 用 `git rev-list --count HEAD` 算构建号，忽略 `AFTERRAY_BUILD_NUMBER`；而 `build-release.sh:118` 是认这个环境变量的。设了它就会出现「校验的号」和「盖进 bundle 的号」不是同一个
+> - `release-preflight.sh:80` 的 `wrangler r2 object get` 没有失败兜底，而脚本开头是 `set -Eeuo pipefail`（`scripts/release-preflight.sh:6`）—— `releases.json` 不存在（也就是第一次发布）会让 preflight 直接硬失败。`publish-release.sh:144` 对同一次取用是有兜底的：取不到就新建一份空索引
+
+> 原状态：已实施（阶段 0–2 + Cloudflare 后端），2026-08-15
 > 基线：`main` @ `1be0c77`，实施于 `worktree-auto-update`
 > 目标：让已安装的 AfterRay 能自己发现、下载、安装新版本，且不丢录制、不丢
 > 系统权限、不静默跑在旧 daemon 上。
@@ -75,6 +90,8 @@ Sparkle 的前提条件，见 1.4。
 - 取值：`AFTERRAY_BUILD_NUMBER` 环境变量优先，否则 `git rev-list --count HEAD`。
 - 增加一条硬校验：新构建号必须严格大于上一次发布的构建号（从 appcast 或 `dist/` 里
   最近一份 manifest 读）。这条校验的价值等同于上面那句加粗的话。
+  **[落地位置不同 → `scripts/release-preflight.sh:95`（对比 R2 上的 `releases.json`）
+  与 `scripts/publish-release.sh:170`，不在 `build-release.sh` 里]**
 
 ### 0.2 daemon 版本握手
 
@@ -93,7 +110,7 @@ if await daemonIsReachable() { return false }   // DaemonSupervisor.swift:64
 - 比对 `status.daemonVersion` 与自身 `CFBundleShortVersionString`。两者同源
   （Rust workspace version，由 `build-release.sh:130` 强制一致），可直接比。
 - 不一致 → 走 `shutdown()` 再拉起新的，而不是复用。
-- dev 模式（`developmentRepoRoot() != nil`）下降级为日志警告，不强制重启。
+- dev 模式（`developmentRepoRoot() != nil`）下降级为日志警告，不强制重启。 **[已推翻 → `apps/AfterRay/Sources/DaemonSupervisor.swift:257`：静默豁免，没有任何警告日志]**
 - 测试：`swift/AfterRayRecall/Tests/DaemonWireTests.swift` 加用例。
 
 ### 0.3 引导用户把 app 移到 `/Applications`
@@ -188,6 +205,8 @@ ticket 只在 DMG 上，更新出来的 app 不带 ticket，离线首次启动�
 - Settings 加自动更新开关，沿用 `SettingsSection` 模式（`AfterRaySettings.swift`）。
 - `SPUUpdaterDelegate`：**录制中不打断**。用 `DaemonStatus.recordingState`
   （`RecallModels.swift:199`）判断，正在录制时推迟安装。
+  **[已推翻 → `apps/AfterRay/Sources/AfterRayUpdater.swift`：代码从不读 `recordingState`；
+  安装只发生在退出时，`shouldPostponeRelaunchForUpdate` 先停录制再关 daemon]**
 - 默认策略：后台自动下载，**退出时安装**。对一个持续录屏的产品，弹窗要求立即重启是
   最差的默认值。
 
@@ -209,6 +228,9 @@ ticket 只在 DMG 上，更新出来的 app 不带 ticket，离线首次启动�
 - **降级**：store 迁移是单向的，装回旧版 daemon 打不开已升级的库。Sparkle 本身不降级；
   但应在 store 里记录最高支持 schema，旧 daemon 遇到更新的 schema 时给明确报错而不是
   误读或崩溃。
+  **[未实现 → `crates/afterray-store/src/lib.rs:5126` 没有 `from_version > SCHEMA_VERSION`
+  检查，`crates/afterray-store/src/lib.rs:375` 的 `StoreError` 没有对应变体，
+  `crates/afterray-store/src/lib.rs:5216` 还无条件把版本盖回去。见顶部状态块的 OPEN 项]**
 - **静默强制更新**：本地录屏产品，用户必须能控制何时替换二进制。
 
 ## 风险清单
@@ -274,6 +296,8 @@ ticket 只在 DMG 上，更新出来的 app 不带 ticket，离线首次启动�
 - **阶段 3 的 CI**：仍是本机发布。
 - **首次下载链接**：站点的下载按钮还是 `href="#download"` 占位。发布之后
   `/download/AfterRay-<version>-arm64.dmg` 即可用，接上即可。
+  **[已完成 → `site/src/sections/Hero.tsx:25` 与 `site/src/sections/Closer.tsx:58`，
+  现在指向 `/download/latest`]**
 - **R2 bucket 与 Pages 绑定尚未创建**：需要跑一次
   `npx wrangler r2 bucket create afterray-releases`。
 - **私钥尚未备份**：见 `docs/releasing.md` 的 "The signing key"。

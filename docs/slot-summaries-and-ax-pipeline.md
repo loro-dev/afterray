@@ -1,5 +1,18 @@
 # 30 分钟 Slot 总结与 Accessibility 管线
 
+> **状态（2026-08-20 更新）：历史计划，以代码为准。**
+> 当前行为：卡片形状、搜索与保留期见 [crates/afterray-store/AGENTS.md](../crates/afterray-store/AGENTS.md)；事件采集与 acts 连接见 [context/event-capture-v2.md](../context/event-capture-v2.md) 与 [context/acts-join.md](../context/acts-join.md)。
+>
+> 已被代码推翻 —— 下文正文保留的是当初的意图：
+> - §1「Slot 固定 30 分钟，V1 不提供用户可配置」→ 长度**是**用户设置，取自封闭集 `[10, 20, 30, 60]` 分钟，默认 10；而且几何是一段持久化的**历史**，改长度只管改动之后的时间，已写的卡片保持原来的形状，`crates/afterray-store/src/slot.rs:17`、`:21`、`:46`
+> - §4 / §5.5 的卡片契约（`artifacts` / `bullets` / `category` / `confidence`，GBNF 强制字段顺序）→ `T2CardV3 { title, description, details, low_trust }`。每个被砍掉的字段各自输在哪里，记在结构体上方的注释里 —— 读那里，不要读这里的复述，`crates/afterray-store/src/slot.rs:807`
+> - §2.3「封口延迟 90 秒」→ `T2_SETTLE_MS` = 3 分钟，另加一道 ASR 等待闸门（上限 30 分钟），`crates/afterrayd/src/main.rs:3358`、`:3379`
+> - §5.10b「预算按行轮转」→ 轮转只剩「每 run 保底一行」；其余预算由 IDF 打分 + 次模贪心覆盖分配，`crates/afterray-store/src/infoscore.rs:284`
+> - §5.3 / §5.5 的 builtin GGUF 前提 → 内置 GGUF LLM 已下架，只剩 MLX 本地档与远程 endpoint；也没有 GBNF / `json_schema` 强制解码，`crates/afterray-models/src/catalog.rs:803`
+> - §4 约束 7「卡片进入 FTS 与 embedding」→ 半假。卡片既不进 FTS 也不进 embedding（`put_t2_summary_v3` 只写 `slot_summaries` 行，`crates/afterray-store/src/lib.rs:2041`）；能搜到卡片的只有一个基于 JSON 列的独立索引 `find_slot_mentions`（`crates/afterray-store/src/lib.rs:2283`），它唯一的调用方是 agent 工具 `search_summaries`（`crates/afterrayd/src/tools.rs:254`）—— **没有协议请求，也没有任何 UI 入口。**
+> - §7 整节 → 被 [event-capture-v2-plan.md](./event-capture-v2-plan.md) 取代：CAP-005 已废止，48 小时事件通道也不存在了。`input_events` 随帧的保留期一起被裁（`prune_input_events_before`，`crates/afterray-store/src/lib.rs:3599`），48 小时只剩 `signal_gap` 标记这一项（`SIGNAL_MARKER_RETENTION_MS`，`crates/afterray-store/src/lib.rs:113`）。
+> - §6（AX 管线改进）、§8.1（OCR 像素签名门控）、§8.2（CAP-004 图片内容寻址）、§8.5 第 2–3 层（污点跟踪、凭据正则脱敏）**一项都没建**，尽管其中几节读起来像已经上线。逐条核对过：`digest_fingerprint` 仍把 `visible_text` 哈希进去、`identity_key` 未拆两级（`crates/afterray-store/src/memory.rs:95`）；AX 遍历仍只有 `maximumNodes = 20_000`，没有深度、遍历或单元素超时（`apps/AfterRayCaptureShim/Sources/AfterRayCaptureShim/main.swift:388`）；没有 `elements` 表；`put_artifact` 每次 capture 无条件写新 blob（`crates/afterray-store/src/lib.rs:4450`）；代码里没有任何凭据正则、敏感窗口或像素遮盖。
+
 > 实现更新（2026-08-16）：新总结固定使用 10 分钟墙钟 slot；旧 vault 在持久化切换点前保留 30 分钟历史。下文仍写 30 分钟的部分属于历史设计背景。
 
 > 状态：Draft 0.1，2026-08-14
@@ -37,7 +50,7 @@ Week
 
 **已决定**：Slot 是存储与 UI 的基本单元；Episode 是语义单元。两者不是父子关系 —— 一个 episode 可以跨多个 slot，一个 slot 可以包含多个 episode 的片段。
 
-**建议**：Slot 固定 30 分钟，V1 不提供用户可配置。存储层若要留余地，`slot_summaries` 应带 `duration_ms` 列而非硬编码。
+**建议**：Slot 固定 30 分钟，V1 不提供用户可配置。存储层若要留余地，`slot_summaries` 应带 `duration_ms` 列而非硬编码。 **[已推翻 → `crates/afterray-store/src/slot.rs:21`]**
 
 ---
 
@@ -140,7 +153,7 @@ AND 至少一个 moment 满足 digest_looks_sufficient()  （crates/afterrayd/sr
 
 ## 4. 数据模型
 
-**建议**：
+**建议**： **[T2 产物那几列已推翻 → `crates/afterray-store/src/slot.rs:807`；持久化的三种卡片形状见 crates/afterray-store/AGENTS.md]**
 
 ```sql
 CREATE TABLE slot_summaries (
@@ -183,7 +196,7 @@ CREATE INDEX slot_summaries_day ON slot_summaries(local_day, slot_start_ms);
 4. **删除级联**：`delete_history` 已在删 `memories`（`crates/afterray-store/src/lib.rs:910`），slot 必须一起删。删了证据留下摘要 = 隐私泄漏 + 幻觉源。
 5. **每 slot 一张卡**（2026-08-14 已决定）：并行活动以 `bullets_json` 内的多条目呈现，不拆子表。
 6. **卡片不可编辑**（2026-08-14 已决定）：V1 不提供用户修改标题/分类的入口。
-7. **卡片进入搜索索引**（2026-08-14 已决定）：`title` + `bullets` + `artifacts` 参与 FTS 与 embedding，命中后跳回该 slot。
+7. **卡片进入搜索索引**（2026-08-14 已决定）：`title` + `bullets` + `artifacts` 参与 FTS 与 embedding，命中后跳回该 slot。 **[已推翻 → `crates/afterray-store/src/lib.rs:2283`]** —— 卡片不进 FTS 也不进 embedding；只有 `find_slot_mentions` 这个基于 JSON 列的独立索引能搜到它们，唯一调用方是 agent 工具（`crates/afterrayd/src/tools.rs:254`），无协议请求、无 UI 入口。
 
 ---
 
@@ -210,7 +223,7 @@ T1 保证用户随时打开 Timeline 都有内容；T2 慢就慢（本地模型�
   "application_name": "Xcode",
   "window_title": "gop.rs — afterray",
   "url": null,
-  "document": "file:///Users/zxch3n/Code/afterray/crates/afterray-store/src/gop.rs",
+  "document": "file:///workspace/afterray/crates/afterray-store/src/gop.rs",
   "truncated": false,
 
   "digest": {                          // ← 目前 Rust 侧只读这一段
@@ -218,7 +231,7 @@ T1 保证用户随时打开 Timeline 都有内容；T2 慢就慢（本地模型�
     "bundle_identifier": "com.apple.dt.Xcode",
     "window_title": "gop.rs — afterray",
     "url": null,
-    "document": "file:///Users/…/gop.rs",
+    "document": "file:///workspace/…/gop.rs",
     "focused_role": "AXTextArea",
     "focused_title": null,
     "focused_value": "fn pack_segment(frames: &[Frame]) -> Result<Segment> {\n    let mut writer = IvfWriter::new(…",
@@ -324,7 +337,7 @@ C  Safari/docs.rs/rav1e Config                09:52                6m，时间�
 
 **触发**：设备接电 + 空闲 + 模型队列空闲。倒序处理未升级的 slot。
 
-**模型（2026-08-14 已决定）**：使用用户配置的模型档（builtin GGUF / Ollama / OpenAI-compatible），本地慢亦可接受。不为弱模型单独做降级管线 —— T2 跑不动就停留在 T1 事实卡，这本身就是降级。
+**模型（2026-08-14 已决定）**：使用用户配置的模型档（builtin GGUF / Ollama / OpenAI-compatible），本地慢亦可接受。 **[builtin GGUF 一档已推翻 → `crates/afterray-models/src/catalog.rs:803`，现在是 MLX 本地档或远程 endpoint]**不为弱模型单独做降级管线 —— T2 跑不动就停留在 T1 事实卡，这本身就是降级。
 
 **流程**：agent 的第一条输入是 §5.2 的 meta 索引，然后自主决定调用哪些工具读取证据，最终产出 §5.5 的结构化卡片，写入 `generation+1`，UI 无缝替换。
 
@@ -365,6 +378,8 @@ compare_frames(moment_a, moment_b, question)
 **安全前提**：agent 的输入含屏幕文本（网页、第三方 app 内容），即攻击者可控输入。因此工具必须只读、预算服务端强制、L3 延后。v1 spec §14.1 的工具全禁令相应改为本节的分级制（见 §12）。
 
 ### 5.5 输出契约与防幻觉
+
+**[整节已推翻 → `crates/afterray-store/src/slot.rs:807`]** 下面这份 JSON 契约、字段顺序论证与 GBNF 前提都不再是代码里的东西：v3 卡片是 `title` / `description` / `details` / `low_trust`，`details` 是一整篇 Markdown；防幻觉从"抄名词 + 字符串回查"改成了引用接地（`ground_t2_details`，`crates/afterray-store/src/slot.rs:1114`）。**每个字段是怎么输掉的，写在 `T2CardV3` 上方的注释里** —— 那是权威，本节是当初的意图。
 
 ```json
 {
@@ -552,7 +567,8 @@ worker 协议升到 v2，`ModelInput::Llm` 增加 `images: Vec<PathBuf>`、`tool
    `Error: Agent 启动前失败` / `Error:Agent启动前失败` / `Error：Agent启动前失败`
    现在合并为一行。显示文本不受影响，只有比较键与前缀桶走 canonical。
 
-3. **预算按行轮转。** 每轮从每个 run 取一行，转圈直到预算耗尽。此前的
+3. **预算按行轮转。** **[已推翻 → `crates/afterray-store/src/infoscore.rs:284`]** 轮转如今只剩「每 run 保底一行」，其余预算按 IDF 打分 + 次模贪心覆盖分配。
+   每轮从每个 run 取一行，转圈直到预算耗尽。此前的
    「按比例 + 保底」从未兑现过保底（14 个饿死 run 全部死于预算提前耗尽），
    因为单遍扫描不为后来者预留。轮转让公平性由结构保证，floor 参数删除。
    实测饿死 run 14 → 0，覆盖延伸至槽末。
@@ -570,6 +586,8 @@ worker 协议升到 v2，`ModelInput::Llm` 增加 `images: Vec<PathBuf>`、`tool
 所有阈值需在真实语料上调参，不得直接采用文献默认值。
 
 ## 6. Accessibility 数据的利用
+
+> **[整节未实现（2026-08-20 核对）]** §6.2 的七条改动没有一条落地，尽管本节读起来像盘点已完成的工作。`digest_fingerprint` 仍把 `visible_text` 哈希进去、`identity_key` 未拆两级（`crates/afterray-store/src/memory.rs:95`）；secure field 只清空 value，没有像素遮盖；AX 遍历仍只有 `maximumNodes = 20_000`，没有 `max_depth` / `walk_timeout` / `element_timeout`（`apps/AfterRayCaptureShim/Sources/AfterRayCaptureShim/main.swift:388`）；没有 `elements` 表、没有 AX 文本进索引、没有树 diff、没有 `text_source` 三态。§6.1 的现状盘点与 §6.3 的不可靠场景仍然成立。
 
 ### 6.1 现状盘点
 
@@ -657,6 +675,8 @@ FTS5 用 `content='elements'`（external content），索引不复制文本。
 ---
 
 ## 7. UI 事件流（AX 通知驱动）
+
+> **[整节已被 [event-capture-v2-plan.md](./event-capture-v2-plan.md) 取代（2026-08-20 核对）]** CAP-005 已废止而非修订 —— 本地信任模型下，原禁令针对的信任边界不存在。§7.5 的「原始事件保留 48 小时」也没了：`input_events` 随帧的保留期一起被裁（`crates/afterray-store/src/lib.rs:3599`），48 小时只剩 `signal_gap` 标记这一项（`crates/afterray-store/src/lib.rs:113`）。当前行为见 [context/event-capture-v2.md](../context/event-capture-v2.md)。下文保留作历史记录。
 
 > 修订（2026-08-17）：本节多项"已决定"被 [`input-events-and-t1-acts-plan.md`](./input-events-and-t1-acts-plan.md) 修订与扩展（Return/Tab/Esc 归命令键、burst 粒度、指针事件的元素解析、R1/R2/R3 采集节奏、T1 acts 重组）。冲突处以该计划为准；下文表格已就地标注修订项。
 
@@ -786,7 +806,7 @@ pub struct UiEvent {
 
 ### 8.1 OCR 门控
 
-**建议**：引入像素签名门控，替代当前"每张截图无条件 OCR"。
+**建议**：引入像素签名门控，替代当前"每张截图无条件 OCR"。 **[未实现（2026-08-20 核对）：代码里没有任何像素签名门控。省 OCR 的实际手段是 event-capture-v2 的截图节流与窗口裁剪（`crates/afterrayd/src/ocr_crop.rs`），走的是另一条路。]**
 
 ```
 截图 → 裁到焦点窗口 → 检测文字区域 → 裁到文字区域并集（含 padding）
@@ -810,7 +830,7 @@ pub struct UiEvent {
 
 ### 8.2 图片去重
 
-**已决定**：CAP-004 已规定「候选帧与上一持久化画面无有效变化时应复用上一 blob」，但 `put_artifact`（`crates/afterray-store/src/lib.rs:1273`）目前**不做内容寻址**，每次 capture 无条件写新 blob。
+**已决定**：CAP-004 已规定「候选帧与上一持久化画面无有效变化时应复用上一 blob」，但 `put_artifact`（`crates/afterray-store/src/lib.rs:1273`）目前**不做内容寻址**，每次 capture 无条件写新 blob。 **[仍然如此（2026-08-20 核对）：`put_artifact` 现在在 `crates/afterray-store/src/lib.rs:4450`，依旧无条件写新 blob。本节的"建议"至今未实现。]**
 
 **建议**的实现方式：
 
@@ -847,7 +867,7 @@ pub struct UiEvent {
 
 典型泄漏路径：从密码管理器复制 → 粘贴进网页登录框。大量网页登录框并非 `AXSecureTextField`，因此 `main.swift:325` 现有的 secure field 保护挡不住；而 API key、token、`.env` 内容、终端里的 `export TOKEN=` 全部是普通文本框，一个都挡不住。
 
-三层防护，**已决定**全部纳入：
+三层防护，**已决定**全部纳入： **[第 2、3 层未实现（2026-08-20 核对）：代码里既没有敏感窗口/污点跟踪，也没有任何凭据正则脱敏 —— 全仓搜 `redact` 只搜到 AX digest 的位置字段与 CLI 响应脱敏，与凭据无关。只有第 1 层的排除清单机制存在。]**
 
 **第 1 层：凭据类应用硬排除**
 
@@ -952,7 +972,7 @@ Day / Week 复盘   同一 agent loop，扩大时间范围
 
 ## 13. 开放问题汇总
 
-1. Slot 时长是否对用户开放配置。（倾向：V1 不开放）
+1. Slot 时长是否对用户开放配置。（倾向：V1 不开放） **[已推翻 → `crates/afterray-store/src/slot.rs:21`：开放了，封闭集 10/20/30/60 分钟，默认 10]**
 2. 看视频 / 读长文档场景的活动闸门判据。（需真实语料）
 3. 外部 agent（C 档）默认关闭还是引导开启。（倾向：默认关闭）
 4. `pi-agent` crate 的归属与供应链审计结论。

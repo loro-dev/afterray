@@ -193,7 +193,7 @@ extension AfterRayCopy {
             lessThanTenth: "0.1% 미만",
             diskShare: { share, disk in "AfterRay는 이 \(disk) 디스크의 \(share)입니다." },
             memoryLimit: "기억 한도",
-            memoryLimitSubtitle: "별표 없는 가장 오래된 순간부터 삭제됩니다. 즐겨찾기와 소량의 메타데이터는 이 한도를 약간 넘을 수 있습니다.",
+            memoryLimitSubtitle: "가장 오래된 기록부터 삭제됩니다. 소량의 메타데이터로 이 한도를 약간 넘을 수 있습니다. 입력한 내용은 이 한도와 관계없이 48시간 후 삭제됩니다.",
             assistantSource: "어시스턴트 소스",
             providerMlx: "AfterRay 로컬 (MLX)",
             providerOllama: "Ollama",

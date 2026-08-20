@@ -1,0 +1,7 @@
+{
+  "//": "Hash of each side of a bilingual pair, as of the last time a human confirmed the two say the same thing. Re-record: node scripts/docs-gate/main.ts --write",
+  "readme :: README.md": "sha256:ed679c5de9835fef",
+  "readme :: README.zh-CN.md": "sha256:16de7f891959b4a5",
+  "site-copy :: site/src/i18n.tsx#const en = {": "sha256:e2bc730590278f86",
+  "site-copy :: site/src/i18n.tsx#const zh: Copy = {": "sha256:9f60454da49f09b2"
+}

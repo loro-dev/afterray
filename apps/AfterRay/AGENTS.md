@@ -4,7 +4,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 ## Key files
 
-- `Sources/AfterRayApp.swift:30` `@main` + app delegate; `RecallOverlayController` (Carbon hot key + status-bar-level panel); `AfterRayMenuBar`; `AfterRayRootView`. Overlay placement policy: `OverlayOpenRoute.swift` (`OverlayPanelPlacement`). `AfterRayMainMenu` is the only menu bar: App + **Edit**. Without Edit, ⌘X/⌘C/⌘V/⌘Z never become `cut:`/`copy:`/`paste:`/`undo:` in *any* field — search bar, settings, chat composer. First launch bootstraps `AfterRayLocalization.shared`; menus, permissions, CLI status, and overlay chrome use `AfterRayCopy`, never hardcoded English ([i18n contract](../../swift/AfterRayRecall/Sources/L10n/AGENTS.md)).
+- `Sources/AfterRayApp.swift:30` — app delegate; `RecallOverlayController` (overlay panel); `AfterRayMenuBar`; `AfterRayRootView`. `AfterRayMainMenu` must retain App + **Edit**, or native editing fails. Shipped chrome uses `AfterRayCopy`; see the [i18n contract](../../swift/AfterRayRecall/Sources/L10n/AGENTS.md).
 - `Sources/DaemonSupervisor.swift:6` — spawns/owns `afterrayd` and helper binaries, resolves socket/data dirs; dev layout detected via `.afterray-dev` parent in `developmentRepoRoot()` (:276)
 - `Sources/HistoryWindow.swift:12` `AfterRayServices` (`static let shared`); `AfterRayStandardWindowPresence` (:39) Dock/Cmd-Tab for pop-outs; `HistoryWindowController` (:57)
 - `Sources/ChatWindow.swift:10` `ChatWindowController` — standalone chat window; stream lives on `AfterRayServices.shared.chat`
@@ -13,10 +13,10 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 ## Invariants
 
-- **The entry point is AppKit (`AfterRayMain`), never a SwiftUI `App`.** A SwiftUI `Scene` assigns its own `NSApp.mainMenu` after `applicationDidFinishLaunching`, and the generated menu has no Edit item for an `LSUIElement` app — that silently killed ⌘X/⌘C/⌘V/⌘Z in every text field in the app. Settings is an AppKit window, so the `Settings` scene bought nothing.
-- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 14, which must match `afterray-protocol`.
+- **Use AppKit `AfterRayMain`, never a SwiftUI `App`:** an `LSUIElement` SwiftUI scene replaces the Edit menu and silently breaks native editing shortcuts.
+- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 15, which must match `afterray-protocol`.
 - On lock/sleep, `.afterRaySystemSessionWillSuspend` clears store/control/chat, closes chat, and clears image/thumbnail/preview caches. Hook every decrypted-content cache into this.
-- Overlay show is Spotlight-class: keep the hosting tree laid out (`orderOut`, not torn down), `present()` only `orderFront`s, `setFrame` only when the mouse screen moved, and post `DidOpen` on the next run-loop turn. Activate with the first paint so Liquid Glass is not an opaque inactive plate. After hide, park the hidden tree on NOW (`shouldParkLiveOnHide`) so reopen is not one history-backdrop frame. Do not invalidate SwiftUI on the hotkey turn. The hosting view must stay non-opaque.
+- Overlay keeps its tree: `orderOut`; `present()` only `orderFront`s; move only to a new screen; post `DidOpen` next turn; first paint activates; hide parks NOW; host stays non-opaque.
 - The overlay, history window, and chat window must share `AfterRayServices.shared` stores — never construct a private `RecallStore` or `AfterRayChatModel`.
 - `RecallView` alone owns the opaque history backdrop; `AfterRayRootView` stays transparent. An outer backdrop lags a fast flick to NOW and can leave a black screen.
 - Pop-outs retain their `NSWindow`; every `show()` ensures daemon/refresh. Chat uses `sizingOptions = [.minSize]` or resize snaps back.

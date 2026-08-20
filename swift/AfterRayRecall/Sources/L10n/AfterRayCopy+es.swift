@@ -193,7 +193,7 @@ extension AfterRayCopy {
             lessThanTenth: "menos del 0.1%",
             diskShare: { share, disk in "AfterRay ocupa el \(share) de este disco de \(disk)." },
             memoryLimit: "Límite de recuerdos",
-            memoryLimitSubtitle: "Se eliminan primero los momentos más antiguos que no son favoritos. Los favoritos y un pequeño margen de metadatos pueden superar este límite.",
+            memoryLimitSubtitle: "Se eliminan primero los momentos más antiguos. Una pequeña sobrecarga de metadatos puede superar este límite. Lo que escribes se elimina después de 48 horas, independientemente de este límite.",
             assistantSource: "Origen del asistente",
             providerMlx: "AfterRay Local (MLX)",
             providerOllama: "Ollama",

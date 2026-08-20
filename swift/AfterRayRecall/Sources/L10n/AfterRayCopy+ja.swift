@@ -193,7 +193,7 @@ extension AfterRayCopy {
             lessThanTenth: "0.1%未満",
             diskShare: { share, disk in "AfterRayは、この\(disk)ディスクの\(share)。" },
             memoryLimit: "記憶の上限",
-            memoryLimitSubtitle: "スターなしの古い記録から先に削除。お気に入りとわずかなメタデータで上限を超える場合がある。",
+            memoryLimitSubtitle: "最も古い記録から削除されます。少量のメタデータにより、この上限を超えることがあります。入力した内容は、この上限に関係なく 48 時間後に削除されます。",
             assistantSource: "アシスタントの提供元",
             providerMlx: "AfterRay ローカル (MLX)",
             providerOllama: "Ollama",

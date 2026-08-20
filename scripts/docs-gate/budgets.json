@@ -1,0 +1,18 @@
+{
+  "//": "Ceilings in characters. A ceiling is a guardrail, not a target. Files listed above the 4000 default are pre-existing debt, grandfathered at their current size so the gate blocks growth rather than demanding an immediate split; lower them as detail moves out.",
+  "defaults": {
+    "agentsMd": 4000,
+    "contextArticle": 32000
+  },
+  "files": {
+    "AGENTS.md": 10000,
+    "apps/AfterRay/AGENTS.md": 6400,
+    "apps/AfterRayCaptureShim/AGENTS.md": 6700,
+    "crates/afterray-models/AGENTS.md": 6500,
+    "crates/afterray-protocol/AGENTS.md": 4300,
+    "crates/afterray-store/AGENTS.md": 10400,
+    "crates/afterrayd/AGENTS.md": 8200,
+    "scripts/AGENTS.md": 5300,
+    "swift/AfterRayRecall/AGENTS.md": 10800
+  }
+}

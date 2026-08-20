@@ -542,9 +542,7 @@ public final class AfterRayChatModel: ObservableObject, AfterRayChatModeling {
                 contextUsage = restored
             }
             // Restored from the thread's own rows, so reopening a conversation
-            // still shows where the agent stopped being able to see. Usage is
-            // not restored: the daemon does not store it, and inventing one
-            // would be worse than showing none.
+            // still shows where the agent stopped being able to see.
             compactionNotices = ChatTranscript.compactions(in: messages)
             errorMessage = nil
         } catch {
