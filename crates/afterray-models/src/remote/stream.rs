@@ -19,16 +19,24 @@ use tokio::sync::mpsc;
 /// Ollama logged `context canceled`.
 #[derive(Clone, Copy)]
 struct StreamDeadlines {
-    /// Time to response headers. Covers model load, not prefill — prefill
-    /// happens after 200, while the body is idle.
+    /// Time to the first response byte after the TCP connect.
+    ///
+    /// This is *not* "the model must finish in this window". Connect stays
+    /// at 2s, so a downed Ollama still fails immediately. Once the socket is
+    /// up, several Ollama / OpenAI-compat stacks (this machine's dflash2
+    /// `/v1/chat/completions` among them) withhold HTTP 200 until the first
+    /// token, so a T2-sized 27B prefill counts against this budget. 180s
+    /// killed those live generations and the queue retried the same prompt
+    /// twice more. Fifteen minutes covers load plus that prefill; a wedged
+    /// server that accepted the socket is the remaining hang.
     headers: Duration,
-    /// Reset on every body chunk. Prefill of ~22k tokens measured at ~60s
-    /// with no bytes; 180s leaves headroom for a loaded machine.
+    /// Reset on every body chunk. Once 200 has arrived, silence means the
+    /// model stalled, not that it is still prefilling.
     idle: Duration,
 }
 
 const STREAM_DEADLINES: StreamDeadlines = StreamDeadlines {
-    headers: Duration::from_secs(180),
+    headers: Duration::from_secs(15 * 60),
     idle: Duration::from_secs(180),
 };
 
@@ -804,7 +812,48 @@ mod tests {
         );
     }
 
-    /// Headers never arriving is a hang before prefill, not a long generate.
+    /// First token arriving after a long prefill, with no HTTP 200 until then,
+    /// must still succeed. The old 180s headers budget treated that silence as
+    /// a dead server and cancelled a live 27B T2 pass.
+    #[tokio::test]
+    async fn first_byte_after_a_long_prefill_is_not_a_headers_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n";
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket
+                .write_all(br#"{"message":{"content":"ok"},"done":false}"#)
+                .await
+                .unwrap();
+            socket.write_all(b"\n").await.unwrap();
+            socket
+                .write_all(br#"{"message":{"content":""},"done":true}"#)
+                .await
+                .unwrap();
+            socket.write_all(b"\n").await.unwrap();
+        });
+        let (text, _) = generate_against_timed(
+            LlmProvider::Ollama,
+            &format!("http://{addr}"),
+            Cancellation::default(),
+            StreamDeadlines {
+                // Shorter than the sleep above would be the old bug.
+                headers: Duration::from_secs(2),
+                idle: Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "ok");
+    }
+
+    /// Headers never arriving is a hang, not a long generate. The production
+    /// budget is 15 minutes; this uses a short one so the test can say so.
     #[tokio::test]
     async fn headers_timeout_stops_a_silent_server() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
