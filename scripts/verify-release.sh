@@ -68,6 +68,8 @@ trap cleanup EXIT
 hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path" >/dev/null
 ditto "$mount_point/AfterRay.app" "$dragged_app"
 hdiutil detach "$mount_point" >/dev/null
+[[ -f "$dragged_app/Contents/Helpers/mlx.metallib" ]] \
+  || die 'dragged app is missing the MLX Metal library'
 xcrun stapler validate "$dragged_app"
 xattr -w com.apple.quarantine '0081;00000000;Safari;' "$dragged_app"
 spctl --assess --type execute --verbose=2 "$dragged_app"

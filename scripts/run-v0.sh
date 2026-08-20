@@ -58,6 +58,7 @@ model_worker="$repo_root/target/release/afterray-model-worker"
 app_bin="$repo_root/.build/debug/afterray-app"
 native_model_worker="$repo_root/.build/release/afterray-native-model-worker"
 mlx_model_worker="$repo_root/.build/release/afterray-mlx-vlm-worker"
+mlx_metallib="$repo_root/.build/release/mlx.metallib"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
 swift_cache="$repo_root/.afterray-dev/swift-cache"
 
@@ -139,6 +140,10 @@ swift build \
   --package-path "$repo_root" \
   --configuration release \
   --product afterray-mlx-vlm-worker
+[[ -f "$mlx_metallib" ]] || {
+  printf 'MLX Metal library not found after worker build: %s\n' "$mlx_metallib" >&2
+  exit 1
+}
 
 printf '%s\n' '==> Assembling AfterRay.app'
 stop_development_processes
@@ -166,8 +171,10 @@ cp "$cli_bin" "$app_bundle/Contents/Helpers/afterray"
 cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
 cp "$mlx_model_worker" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
+cp "$mlx_metallib" "$app_bundle/Contents/Helpers/mlx.metallib"
 cp "$model_worker" "$app_bundle/Contents/Helpers/afterray-model-worker"
 chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
+chmod 0644 "$app_bundle/Contents/Helpers/mlx.metallib"
 
 # The app links @rpath/Sparkle.framework, and the only rpath it carries into a
 # bundle is Contents/Frameworks. Without this the development build dies in
@@ -209,6 +216,11 @@ codesign \
   "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" >/dev/null
+codesign \
+  --force \
+  --options runtime \
+  --sign "$codesign_identity" \
+  "$app_bundle/Contents/Helpers/mlx.metallib" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-model-worker" >/dev/null
 if [[ "$codesign_identity" == '-' ]]; then

@@ -15,6 +15,7 @@ The persistent MLX VLM worker executable (root `Package.swift` target, product `
 - KV-cache session reuse only when system instructions are unchanged and `use_kv_cache` is true (:33)
 - `validateLocalSnapshot` (:347) requires the `.afterray-ready.json` marker with a pinned revision (`qwen35_4BRevision`/`qwen35_9BRevision`, :10-11 — keep in sync with `crates/afterray-models/src/catalog.rs`) and `model_type == "qwen3_5"`
 - mlx-swift-lm is pinned `exact: "3.31.4"` in the root `Package.swift:20`
+- SwiftPM emits `mlx.metallib` beside the worker. `scripts/run-v0.sh` and `scripts/build-release.sh` must copy it beside the bundled executable at `Contents/Helpers/mlx.metallib`; MLX searches that colocated path first, and `scripts/verify-release.sh` rejects a release that omits it.
 
 ## Build / test
 

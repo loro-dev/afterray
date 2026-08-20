@@ -255,6 +255,7 @@ model_worker_bin="$repo_root/target/release/afterray-model-worker"
 app_bin="$repo_root/.build/release/afterray-app"
 native_model_worker_bin="$repo_root/.build/release/afterray-native-model-worker"
 mlx_worker_bin="$repo_root/.build/release/afterray-mlx-vlm-worker"
+mlx_metallib="$repo_root/.build/release/mlx.metallib"
 source_binaries=(
   "$app_bin"
   "$daemon_bin"
@@ -267,6 +268,8 @@ source_binaries=(
 for binary in "${source_binaries[@]}"; do
   [[ -x "$binary" ]] || die "expected release executable is missing: $binary"
 done
+[[ -f "$mlx_metallib" ]] \
+  || die "expected MLX Metal library is missing: $mlx_metallib"
 
 step 'Assembling complete AfterRay.app'
 mkdir -p \
@@ -295,6 +298,8 @@ install -m 0755 "$native_model_worker_bin" \
   "$app_bundle/Contents/Helpers/afterray-native-model-worker"
 install -m 0755 "$mlx_worker_bin" \
   "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
+install -m 0644 "$mlx_metallib" \
+  "$app_bundle/Contents/Helpers/mlx.metallib"
 xcrun swift-stdlib-tool \
   --copy \
   --scan-executable "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" \
@@ -335,11 +340,12 @@ bundle_binaries=(
   "$app_bundle/Contents/Helpers/afterray-native-model-worker"
   "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
 )
-runtime_libraries=(
+nested_runtime_code=(
   "$app_bundle/Contents/Helpers/libswiftCompatibilitySpan.dylib"
+  "$app_bundle/Contents/Helpers/mlx.metallib"
 )
-for library in "${runtime_libraries[@]}"; do
-  [[ -f "$library" ]] || die "expected Swift runtime library is missing: $library"
+for code in "${nested_runtime_code[@]}"; do
+  [[ -f "$code" ]] || die "expected nested runtime code is missing: $code"
 done
 for binary in "${bundle_binaries[@]}"; do
   architectures="$(lipo -archs "$binary")"
@@ -389,8 +395,8 @@ step "Signing nested executables (${codesign_identity})"
 sign_executable "$embedded_sparkle/Versions/B/Autoupdate"
 sign_executable "$embedded_sparkle/Versions/B/Updater.app"
 sign_executable "$embedded_sparkle"
-for library in "${runtime_libraries[@]}"; do
-  sign_executable "$library"
+for code in "${nested_runtime_code[@]}"; do
+  sign_executable "$code"
 done
 for binary in "${bundle_binaries[@]:1}"; do
   if [[ "$binary" == "$app_bundle/Contents/Helpers/AfterRayCaptureShim" ]]; then
@@ -407,10 +413,10 @@ for binary in "${bundle_binaries[@]}"; do
   signature_details="$(codesign -d --verbose=4 "$binary" 2>&1)"
   [[ "$signature_details" == *'runtime'* ]] || die "Hardened Runtime flag is missing: $binary"
 done
-for library in "${runtime_libraries[@]}"; do
-  codesign --verify --strict --verbose=2 "$library"
-  signature_details="$(codesign -d --verbose=4 "$library" 2>&1)"
-  [[ "$signature_details" == *'runtime'* ]] || die "Hardened Runtime flag is missing: $library"
+for code in "${nested_runtime_code[@]}"; do
+  codesign --verify --strict --verbose=2 "$code"
+  signature_details="$(codesign -d --verbose=4 "$code" 2>&1)"
+  [[ "$signature_details" == *'runtime'* ]] || die "Hardened Runtime flag is missing: $code"
 done
 for sparkle_component in \
   "$embedded_sparkle/Versions/B/Autoupdate" \
