@@ -2219,6 +2219,14 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             displayLink?.isPaused = false
         }
 
+        /// A gap this long is not a slow frame, it is the display link
+        /// resuming: nothing is pausing it when the scrub ends, so hiding the
+        /// overlay stops the callbacks and the next one reports the whole
+        /// absence as one interval. That is where `interval_max_ms=7012` in a
+        /// perf log came from — an artifact, not a hang, and one that made the
+        /// only trustworthy pacing metric look untrustworthy.
+        static let frameIntervalCeiling: CFTimeInterval = 0.25
+
         private func shouldHandle(_ event: NSEvent) -> Bool {
             // Only a visible overlay may scrub, and only with its own
             // events. The overlay panel's frame spans the whole screen even
@@ -2261,7 +2269,10 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         @objc private func displayLinkDidFire(_ link: CADisplayLink) {
             let now = link.timestamp
             let previousFrameTime = lastFrameTime
-            let frameInterval = previousFrameTime == 0 ? nil : now - previousFrameTime
+            var frameInterval = previousFrameTime == 0 ? nil : now - previousFrameTime
+            if let interval = frameInterval, interval > Self.frameIntervalCeiling {
+                frameInterval = nil
+            }
             let dt = frameInterval.map { min($0, 0.05) } ?? (1.0 / 120.0)
             lastFrameTime = now
 
