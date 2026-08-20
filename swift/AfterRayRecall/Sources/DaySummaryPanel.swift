@@ -490,7 +490,7 @@ private struct DaySummaryRow: View, Equatable {
                 }
 
                 if !slot.facts.apps.isEmpty {
-                    SlotAppIconStrip(apps: slot.facts.apps)
+                    SlotAppIconStrip(apps: slot.facts.apps, onSelect: onSelect)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -602,11 +602,12 @@ private struct HistorySummaryLoadTrigger: View {
 private struct SlotAppIconStrip: View {
     @Environment(\.afterRayCopy) private var copy
     let apps: [DayAppFact]
+    let onSelect: () -> Void
 
     var body: some View {
         HStack(spacing: 5) {
             ForEach(Array(apps.prefix(DaySummaryMetrics.iconLimit).enumerated()), id: \.offset) { _, app in
-                SlotAppIcon(app: app)
+                SlotAppIcon(app: app, onSelect: onSelect)
             }
             if apps.count > DaySummaryMetrics.iconLimit {
                 Text("+\(apps.count - DaySummaryMetrics.iconLimit)")
@@ -619,7 +620,9 @@ private struct SlotAppIconStrip: View {
 }
 
 private struct SlotAppIcon: View {
+    @Environment(\.afterRayCopy) private var copy
     let app: DayAppFact
+    let onSelect: () -> Void
 
     private enum Resolution: Equatable {
         case loading
@@ -636,12 +639,28 @@ private struct SlotAppIcon: View {
                 .frame(width: 14, height: 14)
                 .task(id: app.bundleIdentifier) { await resolve() }
         case .loaded(let icon):
-            Image(nsImage: icon)
-                .resizable()
-                .interpolation(.medium)
-                .frame(width: 14, height: 14)
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                .help("\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))")
+            Button(action: onSelect) {
+                Label {
+                    Text("\(app.name), \(copy.recall.openThisSlot)")
+                } icon: {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .interpolation(.medium)
+                        .frame(width: 14, height: 14)
+                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                }
+                .labelStyle(.iconOnly)
+                .frame(width: 18, height: 18)
+                .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .recallHoverFill(
+                    in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                )
+            }
+            .buttonStyle(.plain)
+            .help(
+                "\(app.name) · \(DaySummaryLayout.formatDuration(ms: app.ms))\n"
+                    + copy.recall.openThisSlot
+            )
         case .absent:
             EmptyView()
         }

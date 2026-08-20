@@ -97,11 +97,13 @@ final class AfterRayUILanguageTests: XCTestCase {
         XCTAssertEqual(copy.onboarding.headlineHotKey, "打开 AfterRay。")
         XCTAssertEqual(copy.settings.interface, "界面")
         XCTAssertEqual(copy.common.followSystem, "跟随系统")
+        XCTAssertEqual(copy.format.notSummarised, "尚未总结")
         XCTAssertEqual(
             RelativeStamp.short(fromMs: 0, nowMs: 0, copy: copy),
             "现在"
         )
         XCTAssertEqual(AfterRayCopy.traditionalChinese.settings.interface, "介面")
+        XCTAssertEqual(AfterRayCopy.traditionalChinese.format.notSummarised, "尚未總結")
         XCTAssertEqual(AfterRayCopy.japanese.common.followSystem.isEmpty, false)
         XCTAssertEqual(AfterRayCopy.korean.format.now.isEmpty, false)
         XCTAssertEqual(AfterRayCopy.spanish.format.today.isEmpty, false)
