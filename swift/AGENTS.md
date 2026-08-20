@@ -1,6 +1,6 @@
 # swift/ — Swift libraries
 
-SwiftPM library targets shared across the AfterRay apps, declared in the root `Package.swift` (macOS 14+, swift-tools 5.10). `AfterRayRecall` is the SwiftUI recall library (system frameworks plus MarkdownUI for chat); `AfterRayMockData` feeds it fixture data; `AfterRayMlxVlmWorkerCore` is the testable core of the MLX VLM inference worker whose executable lives at `apps/AfterRayMlxVlmWorker`. The shipped app (`apps/AfterRay`), Visual Lab, and snapshot tool all build on these.
+SwiftPM library targets shared across the AfterRay apps, declared in the root `Package.swift` (macOS 15+, swift-tools 5.10). `AfterRayRecall` is the SwiftUI recall library (system frameworks plus MarkdownUI for chat); `AfterRayMockData` feeds it fixture data; `AfterRayMlxVlmWorkerCore` is the testable core of the MLX VLM inference worker whose executable lives at `apps/AfterRayMlxVlmWorker`. The shipped app (`apps/AfterRay`), Visual Lab, and snapshot tool all build on these.
 
 ## Invariants
 

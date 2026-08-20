@@ -4,7 +4,11 @@ import PackageDescription
 
 let package = Package(
     name: "AfterRay",
-    platforms: [.macOS(.v14)],
+    // `.v15` needs swift-tools 6.0, which also switches the default language
+    // mode to Swift 6; the string form raises the deployment target without
+    // dragging in that migration. The shipped app already required macOS 15 —
+    // `AfterRayCaptureShim` is built for it and the site advertises it.
+    platforms: [.macOS("15.0")],
     products: [
         .library(name: "AfterRayRecall", targets: ["AfterRayRecall"]),
         .library(name: "AfterRayMockData", targets: ["AfterRayMockData"]),
