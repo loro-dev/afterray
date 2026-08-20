@@ -1406,7 +1406,7 @@ private struct AppUsageTimeline: View {
 
     /// Synchronous, from `AppIconPalette`'s cache. Warming that cache is the
     /// job of `warmPalette`, once per distinct app, not once per segment.
-    private static func segmentColor(_ run: AppUsageRun) -> Color {
+    fileprivate static func segmentColor(_ run: AppUsageRun) -> Color {
         if run.isIdle { return Color.white.opacity(0.08) }
         return AppIconPalette.cachedColor(
             bundleIdentifier: run.bundleIdentifier,
@@ -1498,9 +1498,7 @@ private struct AppUsageTimeline: View {
     /// one costs nothing: an `HStack` would have to lay out the segments it
     /// never draws just to know where the next one goes.
     private func timelineTrack(visible: ClosedRange<CGFloat>) -> some View {
-        let visibleRuns = layout.runs(intersecting: visible)
-        let lastIndex = layout.runs.count - 1
-        return ZStack(alignment: .leading) {
+        ZStack(alignment: .leading) {
             Color.black.opacity(0.001)
                 .frame(width: layout.contentWidth, height: tuning.timelineSegmentHeight)
                 .contentShape(Rectangle())
@@ -1510,23 +1508,14 @@ private struct AppUsageTimeline: View {
                     }
                 )
 
-            ForEach(Array(visibleRuns.indices), id: \.self) { index in
-                let run = layout.runs[index]
-                let drawnWidth = max(
-                    run.width - (index == lastIndex ? 0 : tuning.timelineSegmentGap),
-                    1
-                )
-                let height = run.isIdle ? 7 : tuning.timelineSegmentHeight
-                AppUsageSegmentView(
-                    run: run,
-                    width: drawnWidth,
-                    height: height,
-                    color: Self.segmentColor(run)
-                )
-                .equatable()
-                .frame(width: drawnWidth, height: height)
-                .position(x: run.startX + run.width / 2, y: 28)
-            }
+            TimelineRunsLayer(
+                layout: layout,
+                range: layout.runs(intersecting: visible).indices,
+                gap: tuning.timelineSegmentGap,
+                segmentHeight: tuning.timelineSegmentHeight,
+                paletteGeneration: paletteGeneration
+            )
+            .equatable()
 
             ForEach(layout.favorites.filter { visible.contains($0.x) }) { favorite in
                 Image(systemName: "star.fill")
@@ -1556,11 +1545,24 @@ private struct AppUsageTimeline: View {
         .accessibilityValue(selectedDate.formatted(date: .abbreviated, time: .shortened))
     }
 
+    /// How far the playhead travels before the mounted window changes.
+    ///
+    /// Recomputing the window from the exact playhead made it a different
+    /// window on every frame of a scrub, so the `ForEach` feeding the track
+    /// had different input every frame and SwiftUI dirtied the whole subtree —
+    /// for several hundred segments whose `run`, width and height had not
+    /// moved at all. The playhead's own motion is an `.offset` on the track and
+    /// needs no relayout.
+    ///
+    /// Snapped, the window is byte-identical for a whole quantum of travel, so
+    /// `TimelineRunsLayer` compares equal and the subtree is skipped. One
+    /// heavier frame per 256pt buys ~25 cheap ones at a typical scrub speed.
     /// One viewport either side of the playhead, plus a margin so a segment
     /// straddling an edge is drawn whole rather than appearing mid-scroll.
+    /// Snapped to a grid — see `TimelineLayout.mountWindow`, which is where
+    /// the arithmetic lives so it can be tested.
     private static func visibleRange(centeredOn x: CGFloat, width: CGFloat) -> ClosedRange<CGFloat> {
-        let reach = width / 2 + 96
-        return (x - reach)...(x + reach)
+        TimelineLayout.mountWindow(centeredOn: x, width: width)
     }
 }
 
@@ -1830,6 +1832,53 @@ private struct TimelineZoomStrip: View {
 /// Why this matters more than it looks: accessibility and graph traversal walk
 /// every node's ancestors, so the per-frame cost is nodes x depth. Three nodes
 /// saved on one view is ~900 saved across a full track.
+/// The run segments, split out so the whole layer can be `.equatable()`.
+///
+/// Quantising the window makes this view's inputs identical for many
+/// consecutive frames, which is only worth anything if SwiftUI is allowed to
+/// notice. Nothing here captures a closure — that is the point; a closure
+/// would make every instance unequal and put the walk straight back.
+///
+/// `==` compares the window and a cheap identity for the layout rather than
+/// the runs themselves: zoom changes `contentWidth`, new data changes the
+/// count, and `paletteGeneration` covers colours resolving in.
+private struct TimelineRunsLayer: View, Equatable {
+    let layout: TimelineLayout
+    let range: Range<Int>
+    let gap: CGFloat
+    let segmentHeight: CGFloat
+    let paletteGeneration: Int
+
+    static func == (lhs: TimelineRunsLayer, rhs: TimelineRunsLayer) -> Bool {
+        lhs.range == rhs.range
+            && lhs.paletteGeneration == rhs.paletteGeneration
+            && lhs.gap == rhs.gap
+            && lhs.segmentHeight == rhs.segmentHeight
+            && lhs.layout.contentWidth == rhs.layout.contentWidth
+            && lhs.layout.runs.count == rhs.layout.runs.count
+    }
+
+    var body: some View {
+        let lastIndex = layout.runs.count - 1
+        // `ForEach` over the `Range` itself: `Array(indices)` allocated a new
+        // array on every pass for no reason.
+        ForEach(range, id: \.self) { index in
+            let run = layout.runs[index]
+            let drawnWidth = max(run.width - (index == lastIndex ? 0 : gap), 1)
+            let height = run.isIdle ? 7 : segmentHeight
+            AppUsageSegmentView(
+                run: run,
+                width: drawnWidth,
+                height: height,
+                color: AppUsageTimeline.segmentColor(run)
+            )
+            .equatable()
+            .frame(width: drawnWidth, height: height)
+            .position(x: run.startX + run.width / 2, y: 28)
+        }
+    }
+}
+
 private struct AppUsageSegmentView: View, Equatable {
     let run: AppUsageRun
     let width: CGFloat

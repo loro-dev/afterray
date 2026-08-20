@@ -289,6 +289,35 @@ public struct TimelineLayout: Equatable, Sendable {
     /// The runs that intersect `range`, for a view that only draws what the
     /// viewport can show. A day of captures is tens of thousands of points
     /// wide; the visible slice is one screen of it.
+    /// How far the playhead travels before the mounted window changes.
+    public static let mountQuantum: CGFloat = 256
+
+    /// The span of track to keep mounted, snapped to a grid.
+    ///
+    /// Computed from the exact playhead, this was a different window on every
+    /// frame of a scrub, so the `ForEach` feeding the track had different
+    /// input every frame and SwiftUI dirtied several hundred segments whose
+    /// geometry had not moved. The playhead's own motion is an `.offset` and
+    /// needs no relayout.
+    ///
+    /// Snapping the centre alone would uncover up to half a quantum on the
+    /// leading side, so the reach is widened by the same amount: the span
+    /// covered around the *real* playhead is exactly what it was, wherever the
+    /// playhead sits inside its bucket. `TimelineLayoutTests` sweeps this —
+    /// getting it wrong drops segments at the edge of the screen, silently.
+    public static func mountWindow(
+        centeredOn x: CGFloat,
+        width: CGFloat,
+        margin: CGFloat = 96,
+        quantum: CGFloat = mountQuantum
+    ) -> ClosedRange<CGFloat> {
+        let reach = width / 2 + margin
+        guard quantum > 0 else { return (x - reach)...(x + reach) }
+        let snapped = (x / quantum).rounded() * quantum
+        let widened = reach + quantum / 2
+        return (snapped - widened)...(snapped + widened)
+    }
+
     public func runs(intersecting range: ClosedRange<CGFloat>) -> ArraySlice<AppUsageRun> {
         guard !runs.isEmpty else { return runs[runs.startIndex..<runs.startIndex] }
         let firstIndex = Self.searchIndex(in: runs) { $0.startX <= range.lowerBound }
