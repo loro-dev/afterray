@@ -57,18 +57,91 @@ final class SystemPermissionGuideTests: XCTestCase {
         ))
     }
 
-    func testMicrophoneGuideUsesTheExistingSystemSettingsEntry() {
-        let guide = RequiredPermission.microphone.settingsGuide
+    func testMicrophoneDoesNotOpenTheSystemSettingsGuide() {
+        XCTAssertFalse(RequiredPermission.microphone.opensSystemSettingsGuide)
+        XCTAssertEqual(
+            SystemPermissionPolicy.gateFollowUp(
+                permission: .microphone,
+                granted: false,
+                allGranted: false,
+                microphoneWasUndetermined: true,
+                microphoneDeclined: false
+            ),
+            .returnToOverlay
+        )
+        XCTAssertEqual(
+            SystemPermissionPolicy.gateFollowUp(
+                permission: .microphone,
+                granted: false,
+                allGranted: false,
+                microphoneWasUndetermined: true,
+                microphoneDeclined: true
+            ),
+            .returnToOverlay
+        )
+        XCTAssertEqual(
+            SystemPermissionPolicy.gateFollowUp(
+                permission: .microphone,
+                granted: true,
+                allGranted: false,
+                microphoneWasUndetermined: true,
+                microphoneDeclined: false
+            ),
+            .returnToOverlay
+        )
+    }
 
-        XCTAssertFalse(guide.allowsApplicationDrag)
-        XCTAssertEqual(guide.title, "Turn on AfterRay for Microphone")
-        XCTAssertEqual(guide.applicationAction, "Turn on the switch beside AfterRay")
+    func testDeclinedMicrophoneRecoveryOpensSettingsWithoutTheGuideCard() {
+        XCTAssertEqual(
+            SystemPermissionPolicy.gateFollowUp(
+                permission: .microphone,
+                granted: false,
+                allGranted: false,
+                microphoneWasUndetermined: false,
+                microphoneDeclined: true
+            ),
+            .systemSettings
+        )
     }
 
     func testManuallyAddablePermissionsKeepTheDragGuide() {
         for permission in [RequiredPermission.screenRecording, .accessibility] {
+            XCTAssertTrue(permission.opensSystemSettingsGuide)
             XCTAssertTrue(permission.settingsGuide.allowsApplicationDrag)
             XCTAssertEqual(permission.settingsGuide.applicationAction, "Drag into System Settings")
+            XCTAssertEqual(
+                SystemPermissionPolicy.gateFollowUp(
+                    permission: permission,
+                    granted: false,
+                    allGranted: false,
+                    microphoneWasUndetermined: false,
+                    microphoneDeclined: false
+                ),
+                .systemSettingsGuide
+            )
         }
+    }
+
+    func testGrantedOrCompleteGateReturnsToTheOverlay() {
+        XCTAssertEqual(
+            SystemPermissionPolicy.gateFollowUp(
+                permission: .screenRecording,
+                granted: true,
+                allGranted: false,
+                microphoneWasUndetermined: false,
+                microphoneDeclined: false
+            ),
+            .returnToOverlay
+        )
+        XCTAssertEqual(
+            SystemPermissionPolicy.gateFollowUp(
+                permission: .accessibility,
+                granted: false,
+                allGranted: true,
+                microphoneWasUndetermined: false,
+                microphoneDeclined: true
+            ),
+            .returnToOverlay
+        )
     }
 }

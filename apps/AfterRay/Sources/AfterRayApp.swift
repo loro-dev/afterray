@@ -860,6 +860,7 @@ private final class PermissionGuideController {
     var isVisible: Bool { panel?.isVisible == true }
 
     func show(for permission: RequiredPermission) {
+        guard permission.opensSystemSettingsGuide else { return }
         let panel = panel ?? makePanel()
         let hostingView = NSHostingView(
             rootView: PermissionSettingsGuide(
@@ -1397,7 +1398,17 @@ private struct AfterRayRootView: View {
         // Let the welcome window have the screen to itself: stacking macOS
         // permission sheets on top of it makes the first launch a pile-up.
         await OnboardingController.shared.waitUntilFinished()
+        // The overlay is `.statusBar`; system consent alerts sit under it.
+        // Hide only if onboarding just ordered it in — later launches keep
+        // the overlay down until the hotkey, so we must not pop it here.
+        let overlayWasVisible = RecallOverlayController.shared.isVisible
+        if overlayWasVisible {
+            RecallOverlayController.shared.hide(returnFocus: false)
+        }
         await permissions.requestInitialPermissionsOnce()
+        if overlayWasVisible {
+            RecallOverlayController.shared.show()
+        }
         if permissions.allGranted {
             AfterRayLog.info("bootstrap: permissions granted, ensuring recording")
             _ = await control.ensureRecording()
@@ -1637,22 +1648,29 @@ private struct PermissionPanel: View {
                     .font(.caption)
                     .foregroundStyle(.green)
             } else {
-                Button(copy.permissions.openSettings) {
+                Button(microphoneActionTitle(permission)) {
                     Task {
                         // The overlay is a full-screen `.statusBar`-level
                         // panel; the system consent alert can be presented
                         // beneath it, which reads as the click doing nothing.
+                        let microphoneWasUndetermined = coordinator.microphoneUndetermined
                         RecallOverlayController.shared.hide(returnFocus: false)
                         await coordinator.requestAgain(permission)
-                        // Declining the microphone resolves the gate too:
-                        // recording proceeds without it, so send the user
-                        // back to recall, not into System Settings.
-                        guard !isGranted(permission), !coordinator.allGranted else {
+                        switch SystemPermissionPolicy.gateFollowUp(
+                            permission: permission,
+                            granted: isGranted(permission),
+                            allGranted: coordinator.allGranted,
+                            microphoneWasUndetermined: microphoneWasUndetermined,
+                            microphoneDeclined: coordinator.microphoneDeclined
+                        ) {
+                        case .returnToOverlay:
                             RecallOverlayController.shared.show()
-                            return
+                        case .systemSettingsGuide:
+                            PermissionGuideController.shared.showAfterOpeningSettings(for: permission)
+                            coordinator.openSettings(for: permission)
+                        case .systemSettings:
+                            coordinator.openSettings(for: permission)
                         }
-                        PermissionGuideController.shared.showAfterOpeningSettings(for: permission)
-                        coordinator.openSettings(for: permission)
                     }
                 }
                     .buttonStyle(.borderless)
@@ -1674,6 +1692,13 @@ private struct PermissionPanel: View {
         case .microphone: coordinator.microphone
         case .accessibility: coordinator.accessibility
         }
+    }
+
+    private func microphoneActionTitle(_ permission: RequiredPermission) -> String {
+        if permission == .microphone, coordinator.microphoneUndetermined {
+            return copy.permissions.allowAccess
+        }
+        return copy.permissions.openSettings
     }
 }
 

@@ -177,9 +177,46 @@ final class SystemPermissionCoordinator: ObservableObject {
     }
 }
 
+enum PermissionGateFollowUp: Equatable {
+    /// Native TCC alert was the grant path. Bring the overlay back.
+    case returnToOverlay
+    /// Screen Recording / Accessibility: open System Settings and show the
+    /// drag card. Those TCC families have no in-place Allow/Don't Allow.
+    case systemSettingsGuide
+    /// Microphone already declined: deep-link to the Microphone pane without
+    /// an instructional card that looks like an AfterRay toggle.
+    case systemSettings
+}
+
 enum SystemPermissionPolicy {
     static func microphoneRequired(recordsAudio: Bool, hasMicrophoneInput: Bool) -> Bool {
         recordsAudio && hasMicrophoneInput
+    }
+
+    /// Screen Recording and Accessibility have no in-place grant, so the
+    /// gate opens System Settings and shows the drag card. Microphone is
+    /// standard TCC: `requestAccess` presents a native alert, and the app
+    /// only appears in the Microphone pane after that alert is answered.
+    /// Reusing the Settings overlay for the mic reads as a toggle on
+    /// AfterRay itself. Already-denied recovery may deep-link to Settings
+    /// with no instructional card.
+    static func gateFollowUp(
+        permission: RequiredPermission,
+        granted: Bool,
+        allGranted: Bool,
+        microphoneWasUndetermined: Bool,
+        microphoneDeclined: Bool
+    ) -> PermissionGateFollowUp {
+        if permission == .microphone {
+            if !granted, microphoneDeclined, !microphoneWasUndetermined {
+                return .systemSettings
+            }
+            return .returnToOverlay
+        }
+        if granted || allGranted {
+            return .returnToOverlay
+        }
+        return .systemSettingsGuide
     }
 
     /// A declined microphone is an answer, not a blocker: capture proceeds
@@ -241,29 +278,27 @@ enum RequiredPermission: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Screen Recording and Accessibility need System Settings; microphone
+    /// is granted (or declined) by the native TCC alert.
+    var opensSystemSettingsGuide: Bool {
+        switch self {
+        case .microphone: false
+        case .screenRecording, .accessibility: true
+        }
+    }
+
     var settingsGuide: PermissionSettingsGuideContent {
         settingsGuide(copy: .english)
     }
 
     func settingsGuide(copy: AfterRayCopy) -> PermissionSettingsGuideContent {
-        switch self {
-        case .microphone:
-            PermissionSettingsGuideContent(
-                title: copy.permissions.turnOnMicrophone,
-                instructions: copy.permissions.microphoneInstructions,
-                applicationAction: copy.permissions.turnOnSwitch,
-                actionIcon: "checkmark.circle",
-                allowsApplicationDrag: false
-            )
-        case .screenRecording, .accessibility:
-            PermissionSettingsGuideContent(
-                title: copy.permissions.addTo(title(copy)),
-                instructions: copy.permissions.dragInstructions,
-                applicationAction: copy.permissions.dragIntoSettings,
-                actionIcon: "hand.draw",
-                allowsApplicationDrag: true
-            )
-        }
+        PermissionSettingsGuideContent(
+            title: copy.permissions.addTo(title(copy)),
+            instructions: copy.permissions.dragInstructions,
+            applicationAction: copy.permissions.dragIntoSettings,
+            actionIcon: "hand.draw",
+            allowsApplicationDrag: true
+        )
     }
 }
 
