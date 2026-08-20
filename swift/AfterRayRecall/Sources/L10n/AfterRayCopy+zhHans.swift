@@ -50,7 +50,7 @@ extension AfterRayCopy {
             idle: "空闲",
             capturePaused: "捕获已暂停",
             asleep: "休眠",
-            notSummarised: "尚未摘要"
+            notSummarised: "尚未总结"
         ),
         onboarding: Onboarding(
             eyebrowHotKey: "仅限本机 / AFTERRAY",
