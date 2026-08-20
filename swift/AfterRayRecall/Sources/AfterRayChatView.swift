@@ -48,6 +48,7 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
     var showsHeader: Bool
     @StateObject private var sidebarState: ChatSidebarState
     @State private var autoScrollState = ChatAutoScrollState()
+    @State private var scrollRuntime = ChatScrollRuntime()
     @State private var scrollToLatestRequest: UInt64 = 0
     @State private var latestScrollInFlight = false
     @State private var latestScrollQueued = false
@@ -365,18 +366,39 @@ public struct AfterRayChatView<Model: AfterRayChatModeling>: View {
                             .frame(height: 1)
                             .id(ChatMetrics.bottomAnchorID)
                     }
-                    .background(
-                        ChatScrollObserver(onChange: handleScrollMetrics)
-                    )
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 16)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 // Pin growth while a turn is streaming and the user still
-                // wants latest. Do not also scrollTo from geometry ticks —
-                // that relayouts the eager transcript on the main thread.
+                // wants latest.
                 .defaultScrollAnchor(pinsToBottom ? .bottom : nil)
                 .background(ScrollFenceView())
+                // Both observers are read-only and must stay that way: asking
+                // for `scrollTo` from a geometry tick relayouts the eager
+                // transcript and pins the main thread at 100%.
+                .onScrollGeometryChange(for: ChatScrollGeometry.self) { geometry in
+                    ChatScrollGeometry(
+                        distanceFromBottom: max(
+                            0,
+                            geometry.contentSize.height - geometry.visibleRect.maxY
+                        ),
+                        contentHeight: geometry.contentSize.height
+                    )
+                } action: { _, geometry in
+                    scrollRuntime.geometry = geometry
+                    handleScrollMetrics(
+                        geometry.metrics(isUserScrolling: scrollRuntime.isUserScrolling)
+                    )
+                }
+                .onScrollPhaseChange { _, phase in
+                    let isUser = ChatScrollPhaseIntent.isUserScrolling(phase)
+                    guard isUser != scrollRuntime.isUserScrolling else { return }
+                    scrollRuntime.isUserScrolling = isUser
+                    handleScrollMetrics(
+                        scrollRuntime.geometry.metrics(isUserScrolling: isUser)
+                    )
+                }
                 .task(id: scrollToLatestRequest) {
                     guard scrollToLatestRequest > 0 else { return }
                     await Task.yield()
