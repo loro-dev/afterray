@@ -134,6 +134,19 @@ profile-frames:
 		--output /tmp/afterray-timeprofile.xml
 	python3 scripts/analyze-frames.py /tmp/afterray-timeprofile.xml
 
+# Two traces side by side. Keep the zoom level and the scrub speed the same
+# between them or the comparison means nothing — run count scales with zoom,
+# and how hard you scrubbed dominates everything else.
+#   make profile-vs BEFORE=/tmp/a.trace AFTER=/tmp/b.trace
+profile-vs:
+	@for t in "$(BEFORE)" "$(AFTER)"; do \
+		echo ""; echo "########## $$t"; \
+		xcrun xctrace export --input "$$t" \
+			--xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
+			--output /tmp/afterray-vs.xml >/dev/null 2>&1; \
+		python3 scripts/analyze-frames.py /tmp/afterray-vs.xml; \
+	done
+
 profile-ab:
 	xcrun xctrace export --input "$(TRACE_IN)" \
 		--xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
