@@ -25,7 +25,7 @@ final class AfterRayUpdater: NSObject {
         // One source of truth for the build number: the daemon handshake
         // compares against the same value.
         guard let build = DaemonSupervisor.hostBuild else { return version }
-        return "\(version) (build \(build))"
+        return AfterRayLocalization.shared.copy.settings.versionBuild(version, build)
     }
 
     var automaticallyChecksForUpdates: Bool {
@@ -59,7 +59,7 @@ final class AfterRayUpdater: NSObject {
     func makeMenuItem() -> NSMenuItem? {
         guard isEnabled else { return nil }
         let item = NSMenuItem(
-            title: "Check for Updates…",
+            title: AfterRayLocalization.shared.copy.menu.checkForUpdates,
             action: #selector(checkForUpdates),
             keyEquivalent: ""
         )
@@ -73,10 +73,10 @@ extension AfterRayUpdater: NSMenuItemValidation {
         // Menu validation runs each time the menu opens, which is the only
         // moment the title needs to be right.
         if let stagedVersion {
-            menuItem.title = "Update \(stagedVersion) Installs on Quit"
+            menuItem.title = AfterRayLocalization.shared.copy.menu.updateInstallsOnQuit(stagedVersion)
             return false
         }
-        menuItem.title = "Check for Updates…"
+        menuItem.title = AfterRayLocalization.shared.copy.menu.checkForUpdates
         return canCheckForUpdates
     }
 }

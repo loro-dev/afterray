@@ -3,6 +3,11 @@ import AppKit
 /// The application menu bar. AfterRay is an `LSUIElement`, so this is the
 /// only menu that exists — and ⌘C / ⌘V / ⌘Z never reach a text view unless
 /// an Edit menu is here to turn those keys into `copy:` / `paste:` / `undo:`.
+///
+/// This menu only survives because the process is launched from AppKit
+/// (`AfterRayMain`). A SwiftUI `App` scene overwrites `NSApp.mainMenu` with a
+/// generated menu that has no Edit item, and it does so after
+/// `applicationDidFinishLaunching`, so reinstalling here would not win.
 enum AfterRayMainMenu {
     static func install(appMenu: NSMenu) {
         let main = NSMenu()

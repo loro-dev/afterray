@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import QuartzCore
 import SwiftUI
 
@@ -22,6 +23,8 @@ enum RecallPresentation {
 }
 
 public struct RecallView: View {
+    @Environment(\.afterRayCopy) private var copy
+    @Environment(\.afterRayLocale) private var afterRayLocale
     public let moments: [RecallMoment]
     @Binding public var playheadMs: Int64
     @Binding public var isLive: Bool
@@ -234,6 +237,7 @@ public struct RecallView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .afterRayLocalized()
     }
 
     private var isProcessing: Bool {
@@ -585,7 +589,7 @@ public struct RecallView: View {
             Spacer(minLength: 24)
 
             if isProcessing, !renderedIsLive {
-                Label("Understanding", systemImage: "sparkles")
+                Label(copy.recall.understanding, systemImage: "sparkles")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.86))
                     .padding(.horizontal, 12)
@@ -598,7 +602,7 @@ public struct RecallView: View {
                     if !renderedIsLive {
                         RecallChromeIconButton(
                             symbol: showsDetails ? "sidebar.right" : "info.circle",
-                            help: showsDetails ? "Hide captured context" : "Show captured context",
+                            help: showsDetails ? copy.recall.hideContext : copy.recall.showContext,
                             action: {
                                 if showsDetails {
                                     showsDetails = false
@@ -626,7 +630,7 @@ public struct RecallView: View {
                     if let onOpenSettings {
                         RecallChromeIconButton(
                             symbol: "gearshape",
-                            help: "Settings",
+                            help: copy.recall.settingsHelp,
                             action: onOpenSettings
                         )
                     }
@@ -645,7 +649,7 @@ public struct RecallView: View {
                 symbol: daySummaryExpanded
                     ? "rectangle.bottomhalf.inset.filled"
                     : "list.bullet.rectangle",
-                help: daySummaryExpanded ? "Hide today's summary" : "Show today's summary",
+                help: daySummaryExpanded ? copy.recall.hideTodaySummary : copy.recall.showTodaySummary,
                 tint: daySummaryExpanded ? RecallPalette.ray : .white,
                 action: {
                     withAnimation(.easeOut(duration: 0.18)) {
@@ -1273,6 +1277,7 @@ public func clearRecallDecodedImageCache() {
 }
 
 private struct AppIdentity: View {
+    @Environment(\.afterRayCopy) private var copy
     let moment: RecallMoment?
     var onOpenWebLink: ((URL) -> Void)?
 
@@ -1297,7 +1302,7 @@ private struct AppIdentity: View {
         HStack(spacing: 9) {
             ApplicationIcon(bundleIdentifier: moment?.bundleIdentifier, size: 24)
             VStack(alignment: .leading, spacing: 1) {
-                Text(moment?.applicationName ?? "Idle")
+                Text(moment?.applicationName ?? copy.format.idle)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .lineLimit(1)
@@ -1332,6 +1337,7 @@ private struct AppIdentity: View {
 /// `arrow.up.right` — the same glyph a chat moment citation uses for "open
 /// this" — are what say it can be followed.
 private struct OpenableTitle: View {
+    @Environment(\.afterRayCopy) private var copy
     let text: String
     let link: RecallWebLink
     var onOpen: ((URL) -> Void)?
@@ -1385,12 +1391,13 @@ private struct OpenableTitle: View {
         }
         // The visible text is normally the page title, so the tooltip is the
         // one place the address can be read in full before clicking it.
-        .help("Open \(link.url.absoluteString)")
-        .accessibilityLabel("Open \(text) at \(link.display)")
+        .help(copy.recall.openURL(link.url.absoluteString))
+        .accessibilityLabel(copy.recall.openAt(text, link.display))
     }
 }
 
 private struct AppUsageTimeline: View {
+    @Environment(\.afterRayCopy) private var copy
     let layout: TimelineLayout
     let playheadMs: Int64
     let isLive: Bool
@@ -1400,9 +1407,51 @@ private struct AppUsageTimeline: View {
     @Binding var isZooming: Bool
     let onSelectMs: (Int64) -> Void
     let onViewportWidthChange: (CGFloat) -> Void
+    /// Bumped once after the palette has been warmed, so the track redraws
+    /// with the sampled colours. Rare — not a per-frame signal.
+    @State private var paletteGeneration = 0
+
+    /// Synchronous, from `AppIconPalette`'s cache. Warming that cache is the
+    /// job of `warmPalette`, once per distinct app, not once per segment.
+    fileprivate static func segmentColor(_ run: AppUsageRun) -> Color {
+        if run.isIdle { return Color.white.opacity(0.08) }
+        return AppIconPalette.cachedColor(
+            bundleIdentifier: run.bundleIdentifier,
+            fallbackSeed: run.bundleIdentifier ?? run.applicationName
+        )
+    }
+
+    /// Identifies a dataset, so warming runs when the data changes rather than
+    /// when the view is laid out. Zoom re-places runs but cannot change which
+    /// apps are in them.
+    private struct PaletteKey: Equatable {
+        var startMs: Int64
+        var endMs: Int64
+        var runCount: Int
+    }
+
+    private var paletteKey: PaletteKey {
+        PaletteKey(startMs: layout.startMs, endMs: layout.endMs, runCount: layout.runs.count)
+    }
+
+    private func warmPalette() async {
+        var seen = Set<String>()
+        for run in layout.runs where !run.isIdle {
+            guard let bundleIdentifier = run.bundleIdentifier,
+                  seen.insert(bundleIdentifier).inserted
+            else { continue }
+            _ = await AppIconPalette.colorAsync(
+                bundleIdentifier: bundleIdentifier,
+                fallbackSeed: bundleIdentifier
+            )
+            if Task.isCancelled { return }
+        }
+        paletteGeneration &+= 1
+    }
 
     var body: some View {
-        VStack(spacing: 9) {
+        let _ = paletteGeneration
+        return VStack(spacing: 9) {
             GeometryReader { geometry in
                 let width = geometry.size.width
                 let selectedX = layout.playheadX(playheadMs: playheadMs, isLive: isLive)
@@ -1432,13 +1481,14 @@ private struct AppUsageTimeline: View {
 
             HStack(spacing: 7) {
                 Image(systemName: "arrow.left.and.right")
-                Text("Drag to zoom · Swipe to travel · Esc to close")
+                Text(copy.recall.dragHint)
             }
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))
         }
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
+        .task(id: paletteKey) { await warmPalette() }
     }
 
     private var selectedDate: Date {
@@ -1455,9 +1505,7 @@ private struct AppUsageTimeline: View {
     /// one costs nothing: an `HStack` would have to lay out the segments it
     /// never draws just to know where the next one goes.
     private func timelineTrack(visible: ClosedRange<CGFloat>) -> some View {
-        let visibleRuns = layout.runs(intersecting: visible)
-        let lastIndex = layout.runs.count - 1
-        return ZStack(alignment: .leading) {
+        ZStack(alignment: .leading) {
             Color.black.opacity(0.001)
                 .frame(width: layout.contentWidth, height: tuning.timelineSegmentHeight)
                 .contentShape(Rectangle())
@@ -1467,22 +1515,14 @@ private struct AppUsageTimeline: View {
                     }
                 )
 
-            ForEach(Array(visibleRuns.indices), id: \.self) { index in
-                let run = layout.runs[index]
-                let drawnWidth = max(
-                    run.width - (index == lastIndex ? 0 : tuning.timelineSegmentGap),
-                    1
-                )
-                let height = run.isIdle ? 7 : tuning.timelineSegmentHeight
-                AppUsageSegmentView(run: run, width: drawnWidth, height: height)
-                    .frame(width: drawnWidth, height: height)
-                    .position(x: run.startX + run.width / 2, y: 28)
-                    .help(
-                        run.isIdle
-                            ? "这段时间没有录制 · \(DurationFormatter.short(milliseconds: run.durationMs))"
-                            : "\(run.applicationName) · \(DurationFormatter.short(milliseconds: run.durationMs))"
-                    )
-            }
+            TimelineRunsLayer(
+                layout: layout,
+                range: layout.runs(intersecting: visible).indices,
+                gap: tuning.timelineSegmentGap,
+                segmentHeight: tuning.timelineSegmentHeight,
+                paletteGeneration: paletteGeneration
+            )
+            .equatable()
 
             ForEach(layout.favorites.filter { visible.contains($0.x) }) { favorite in
                 Image(systemName: "star.fill")
@@ -1491,15 +1531,45 @@ private struct AppUsageTimeline: View {
                     .position(x: favorite.x, y: 2)
             }
         }
-        .frame(width: layout.contentWidth, height: 56)
+        .frame(width: layout.contentWidth, height: TimelineRunsLayer.trackHeight)
         .padding(.vertical, 6)
+        // One element, not one per run.
+        //
+        // Every accessibility attachment is rebuilt on every AttributeGraph
+        // update, and each rebuild calls `AccessibilityNode.visibility`, which
+        // walks the node's ancestors. Cost is nodes x depth x frames, and this
+        // `ForEach` is the largest node source in the overlay: a scrub spent
+        // ~4.0s of 15s of main-thread time in there, ~9.9ms of every 24ms
+        // frame. A scrubber is also *better* exposed as one adjustable element
+        // than as several hundred anonymous rectangles.
+        //
+        // This is why the per-run `.help` tooltip is gone: `.help` is an
+        // accessibility modifier, so it was one attachment per visible run per
+        // frame. Bring it back as a single overlay driven by the hovered run,
+        // never as a modifier inside the loop.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(copy.recall.timeline)
+        .accessibilityValue(selectedDate.formatted(date: .abbreviated, time: .shortened))
     }
 
+    /// How far the playhead travels before the mounted window changes.
+    ///
+    /// Recomputing the window from the exact playhead made it a different
+    /// window on every frame of a scrub, so the `ForEach` feeding the track
+    /// had different input every frame and SwiftUI dirtied the whole subtree —
+    /// for several hundred segments whose `run`, width and height had not
+    /// moved at all. The playhead's own motion is an `.offset` on the track and
+    /// needs no relayout.
+    ///
+    /// Snapped, the window is byte-identical for a whole quantum of travel, so
+    /// `TimelineRunsLayer` compares equal and the subtree is skipped. One
+    /// heavier frame per 256pt buys ~25 cheap ones at a typical scrub speed.
     /// One viewport either side of the playhead, plus a margin so a segment
     /// straddling an edge is drawn whole rather than appearing mid-scroll.
+    /// Snapped to a grid — see `TimelineLayout.mountWindow`, which is where
+    /// the arithmetic lives so it can be tested.
     private static func visibleRange(centeredOn x: CGFloat, width: CGFloat) -> ClosedRange<CGFloat> {
-        let reach = width / 2 + 96
-        return (x - reach)...(x + reach)
+        TimelineLayout.mountWindow(centeredOn: x, width: width)
     }
 }
 
@@ -1576,12 +1646,13 @@ private struct OcrHighlightOverlay: View {
 /// search filmstrip: whatever the strip below is showing, this stays the one
 /// place that spells out *when*.
 struct PlayheadTimestamp: View {
+    @Environment(\.afterRayCopy) private var copy
     let date: Date
     let isLive: Bool
 
     var body: some View {
         VStack(spacing: 2) {
-            Text(isLive ? "NOW" : date.formatted(date: .omitted, time: .standard))
+            Text(isLive ? copy.format.now : date.formatted(date: .omitted, time: .standard))
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 // Explicit, not `.primary`: this always sits on dark chrome, and
@@ -1590,7 +1661,7 @@ struct PlayheadTimestamp: View {
                 .foregroundStyle(RecallPalette.textPrimary)
             Text(
                 isLive
-                    ? "Swipe right to enter history"
+                    ? copy.recall.swipeToHistory
                     : date.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
             )
             .font(.system(size: 10, weight: .medium, design: .rounded))
@@ -1613,6 +1684,7 @@ struct PlayheadTimestamp: View {
 /// is wordier than a dot, but a dot alone cannot say which of the three it is,
 /// and the row has room to spare. Tapping toggles capture.
 private struct TimelineRecordingStatusButton: View {
+    @Environment(\.afterRayCopy) private var copy
     let state: DaemonRecordingState?
     let isChanging: Bool
     let action: () -> Void
@@ -1639,7 +1711,7 @@ private struct TimelineRecordingStatusButton: View {
         .recallGlass(in: .capsule)
         .disabled(effectiveState == .stopping || isChanging)
         .help(toggleHelp)
-        .accessibilityLabel("Capture status")
+        .accessibilityLabel(copy.recall.captureStatus)
         .accessibilityValue(statusLabel)
         .accessibilityHint(toggleHelp)
     }
@@ -1655,12 +1727,12 @@ private struct TimelineRecordingStatusButton: View {
 
     private var statusLabel: String {
         switch effectiveState {
-        case .idle: "Paused"
-        case .waiting: "Waiting"
-        case .recording: "Recording"
-        case .stopping: "Pausing"
-        case .failed: "Failed"
-        case nil: "Offline"
+        case .idle: copy.common.paused
+        case .waiting: copy.common.waiting
+        case .recording: copy.recall.recording
+        case .stopping: copy.recall.pausing
+        case .failed: copy.common.failed
+        case nil: copy.recall.offline
         }
     }
 
@@ -1676,13 +1748,14 @@ private struct TimelineRecordingStatusButton: View {
 
     private var toggleHelp: String {
         switch effectiveState {
-        case .waiting, .recording, .stopping: "Pause capture"
-        case .idle, .failed, nil: "Resume capture"
+        case .waiting, .recording, .stopping: copy.menu.pauseCapture
+        case .idle, .failed, nil: copy.menu.resumeCapture
         }
     }
 }
 
 private struct TimelineZoomStrip: View {
+    @Environment(\.afterRayCopy) private var copy
     @Binding var zoom: CGFloat
     @Binding var isDragging: Bool
     @State private var dragOrigin: CGFloat?
@@ -1721,7 +1794,7 @@ private struct TimelineZoomStrip: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .recallGlass(in: .capsule)
-        .help("Drag left to zoom out, right to zoom in")
+        .help(copy.recall.dragToZoom)
         .highPriorityGesture(drag)
     }
 
@@ -1757,22 +1830,127 @@ private struct TimelineZoomStrip: View {
     }
 }
 
-private struct AppUsageSegmentView: View {
+/// A pure value view: no `@State`, no `.task`, and `Equatable`.
+///
+/// It used to hold two `@State`s and a `.task` to resolve its app's colour.
+/// That is three graph nodes per run, plus `DynamicBody` status, on a view the
+/// timeline mounts several hundred of — and the work was redundant, because
+/// `AppIconPalette` is already a cache and the async path exists only to warm
+/// it. Warming is the parent's job now, once per distinct app rather than once
+/// per segment.
+///
+/// Why this matters more than it looks: accessibility and graph traversal walk
+/// every node's ancestors, so the per-frame cost is nodes x depth. Three nodes
+/// saved on one view is ~900 saved across a full track.
+/// The run segments, split out so the whole layer can be `.equatable()`.
+///
+/// Quantising the window makes this view's inputs identical for many
+/// consecutive frames, which is only worth anything if SwiftUI is allowed to
+/// notice. Nothing here captures a closure — that is the point; a closure
+/// would make every instance unequal and put the walk straight back.
+///
+/// `==` compares the window and a cheap identity for the layout rather than
+/// the runs themselves: zoom changes `contentWidth`, new data changes the
+/// count, and `paletteGeneration` covers colours resolving in.
+private struct TimelineRunsLayer: View, Equatable {
+    let layout: TimelineLayout
+    let range: Range<Int>
+    let gap: CGFloat
+    let segmentHeight: CGFloat
+    let paletteGeneration: Int
+
+    /// The track's own height, which `timelineTrack` also pins. Segments are
+    /// centred on it, so the two must not be able to drift apart.
+    static let trackHeight: CGFloat = 56
+
+    static func == (lhs: TimelineRunsLayer, rhs: TimelineRunsLayer) -> Bool {
+        lhs.range == rhs.range
+            && lhs.paletteGeneration == rhs.paletteGeneration
+            && lhs.gap == rhs.gap
+            && lhs.segmentHeight == rhs.segmentHeight
+            && lhs.layout.contentWidth == rhs.layout.contentWidth
+            && lhs.layout.runs.count == rhs.layout.runs.count
+    }
+
+    var body: some View {
+        let lastIndex = layout.runs.count - 1
+        // `.position` resolves against the *enclosing* view's bounds, so this
+        // layer has to be the full track. Before the segments moved in here
+        // they were direct children of the track's `ZStack` and inherited its
+        // size; on their own, a stack of positioned views collapses and every
+        // segment lands in a heap in the middle. The `Color.clear` is what
+        // establishes the coordinate space the x/y below are written against.
+        // A `ZStack` of `.position`ed children asks every child for its
+        // explicit alignment and dimensions so it can decide where to put it —
+        // `LayoutEngineBox.explicitAlignment` and `LayoutProxy.dimensions`
+        // were ~2ms of a 10ms frame, several hundred children in. We already
+        // know exactly where each run goes, so a `Layout` places them in one
+        // pass and asks nothing.
+        TimelineRunPlacement(
+            centres: range.map { layout.runs[$0].startX + layout.runs[$0].width / 2 },
+            size: CGSize(width: layout.contentWidth, height: Self.trackHeight)
+        ) {
+            // `ForEach` over the `Range` itself: `Array(indices)` allocated a
+            // new array on every pass for no reason.
+            ForEach(range, id: \.self) { index in
+                let run = layout.runs[index]
+                let drawnWidth = max(run.width - (index == lastIndex ? 0 : gap), 1)
+                AppUsageSegmentView(
+                    run: run,
+                    width: drawnWidth,
+                    height: run.isIdle ? 7 : segmentHeight,
+                    color: AppUsageTimeline.segmentColor(run)
+                )
+                .equatable()
+                .frame(width: drawnWidth, height: run.isIdle ? 7 : segmentHeight)
+            }
+        }
+    }
+}
+
+/// Places already-sized run segments at known x centres, vertically centred.
+///
+/// Equivalent to `.position(x:y:)` inside a `ZStack`, minus the stack's
+/// per-child alignment and dimension queries. `centres` must be in the same
+/// order the `ForEach` emits.
+private struct TimelineRunPlacement: Layout {
+    let centres: [CGFloat]
+    let size: CGSize
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        size
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        for (index, subview) in subviews.enumerated() {
+            guard index < centres.count else { break }
+            subview.place(
+                at: CGPoint(x: bounds.minX + centres[index], y: bounds.midY),
+                anchor: .center,
+                proposal: .unspecified
+            )
+        }
+    }
+}
+
+private struct AppUsageSegmentView: View, Equatable {
     let run: AppUsageRun
     let width: CGFloat
     let height: Double
-    @State private var resolvedColor: Color?
-    @State private var resolvedColorBundleIdentifier: String?
+    let color: Color
 
-    private var color: Color {
-        if run.isIdle { return Color.white.opacity(0.08) }
-        let resolved = resolvedColorBundleIdentifier == run.bundleIdentifier
-            ? resolvedColor
-            : nil
-        return resolved ?? AppIconPalette.cachedColor(
-            bundleIdentifier: run.bundleIdentifier,
-            fallbackSeed: run.bundleIdentifier ?? run.applicationName
-        )
+    static func == (lhs: AppUsageSegmentView, rhs: AppUsageSegmentView) -> Bool {
+        lhs.run == rhs.run && lhs.width == rhs.width
+            && lhs.height == rhs.height && lhs.color == rhs.color
     }
 
     private var cornerRadius: CGFloat {
@@ -1816,17 +1994,6 @@ private struct AppUsageSegmentView: View {
         }
         .frame(height: height)
         .contentShape(Rectangle())
-        .task(id: run.bundleIdentifier) {
-            guard !run.isIdle else { return }
-            let bundleIdentifier = run.bundleIdentifier
-            let color = await AppIconPalette.colorAsync(
-                bundleIdentifier: run.bundleIdentifier,
-                fallbackSeed: run.bundleIdentifier ?? run.applicationName
-            )
-            guard !Task.isCancelled else { return }
-            resolvedColor = color
-            resolvedColorBundleIdentifier = bundleIdentifier
-        }
     }
 }
 
@@ -1931,11 +2098,19 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         private var isScrolling = false
         private var lastEventTime: CFTimeInterval = 0
         private var lastFrameTime: CFTimeInterval = 0
-        /// Opt-in release-build measurement for the stress lab. Normal app
-        /// launches do not allocate samples or print anything.
-        private var frameMetrics = ScrubFrameMetrics(
-            enabled: ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_LOG"] == "1"
-        )
+        /// Opt-in measurement. Normal launches allocate no samples and log
+        /// nothing. Enabled either by the environment (the stress lab, which
+        /// `swift run`s a binary) or by a user default:
+        ///
+        ///     defaults write dev.afterray.app AfterRayUIPerfLog -bool YES
+        ///
+        /// The default exists because the shipped app is launched by
+        /// `open`/launchd, which is the only way it gets its own TCC identity
+        /// — run the binary from a terminal and macOS attributes Screen
+        /// Recording to the *terminal*, so the app lands on the permissions
+        /// wall instead of the timeline. There is no environment to set on
+        /// that path.
+        private var frameMetrics = ScrubFrameMetrics(enabled: ScrubFrameMetrics.isEnabled)
         /// Our own deceleration. System momentum events are swallowed:
         /// macOS restarts momentum on every flick, whereas stacking releases
         /// is exactly the accelerate-by-repeated-swipes feel being asked for.
@@ -2091,6 +2266,14 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             displayLink?.isPaused = false
         }
 
+        /// A gap this long is not a slow frame, it is the display link
+        /// resuming: nothing is pausing it when the scrub ends, so hiding the
+        /// overlay stops the callbacks and the next one reports the whole
+        /// absence as one interval. That is where `interval_max_ms=7012` in a
+        /// perf log came from — an artifact, not a hang, and one that made the
+        /// only trustworthy pacing metric look untrustworthy.
+        static let frameIntervalCeiling: CFTimeInterval = 0.25
+
         private func shouldHandle(_ event: NSEvent) -> Bool {
             // Only a visible overlay may scrub, and only with its own
             // events. The overlay panel's frame spans the whole screen even
@@ -2133,7 +2316,10 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
         @objc private func displayLinkDidFire(_ link: CADisplayLink) {
             let now = link.timestamp
             let previousFrameTime = lastFrameTime
-            let frameInterval = previousFrameTime == 0 ? nil : now - previousFrameTime
+            var frameInterval = previousFrameTime == 0 ? nil : now - previousFrameTime
+            if let interval = frameInterval, interval > Self.frameIntervalCeiling {
+                frameInterval = nil
+            }
             let dt = frameInterval.map { min($0, 0.05) } ?? (1.0 / 120.0)
             lastFrameTime = now
 
@@ -2148,7 +2334,13 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 onScroll(delta, pendingIsPrecise, false)
                 frameMetrics.record(
                     frameInterval: frameInterval,
-                    handlerDuration: CACurrentMediaTime() - handlerStart
+                    handlerDuration: CACurrentMediaTime() - handlerStart,
+                    // The budget is the display's, not a constant: this Mac
+                    // has a 60Hz and a 120Hz screen, and the same frame is
+                    // comfortably inside budget on one and misses on the
+                    // other. A hardcoded threshold reads as a regression
+                    // purely from dragging the window across.
+                    nominalInterval: link.targetTimestamp - now
                 )
             }
 
@@ -2177,7 +2369,17 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
 /// opportunities, while handler time tells us whether our own hot path spent
 /// the 8.33 ms budget.
 private struct ScrubFrameMetrics {
+    static let log = Logger(subsystem: "dev.afterray", category: "ui-perf")
+
+    /// Environment for the lab, user default for the shipped app.
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_LOG"] == "1"
+            || UserDefaults.standard.bool(forKey: "AfterRayUIPerfLog")
+    }
+
     let enabled: Bool
+    /// The current display's frame duration, sampled from the link.
+    private var nominalInterval: CFTimeInterval = 1.0 / 60.0
     private var frameIntervals: [CFTimeInterval] = []
     private var handlerDurations: [CFTimeInterval] = []
 
@@ -2187,9 +2389,13 @@ private struct ScrubFrameMetrics {
 
     mutating func record(
         frameInterval: CFTimeInterval?,
-        handlerDuration: CFTimeInterval
+        handlerDuration: CFTimeInterval,
+        nominalInterval: CFTimeInterval
     ) {
         guard enabled else { return }
+        if nominalInterval > 0.001, nominalInterval < 0.1 {
+            self.nominalInterval = nominalInterval
+        }
         if let frameInterval { frameIntervals.append(frameInterval) }
         handlerDurations.append(handlerDuration)
     }
@@ -2202,22 +2408,37 @@ private struct ScrubFrameMetrics {
             ? 0
             : intervals.reduce(0, +) / Double(intervals.count)
         let refreshRate = meanInterval > 0 ? 1 / meanInterval : 0
-        let overTwelvePointFiveMs = intervals.lazy.filter { $0 > 0.0125 }.count
-        let overSixteenPointSevenMs = intervals.lazy.filter { $0 > 1.0 / 60.0 }.count
-        print(
-            String(
-                format: "[afterray-ui-perf] callbacks=%d hz=%.1f interval_p95_ms=%.2f interval_max_ms=%.2f over_12.5ms=%d over_16.7ms=%d handler_p95_ms=%.3f handler_max_ms=%.3f settle_ms=%.3f",
+        // Half a frame of slack: a frame that lands within 1.5x the display's
+        // period is late but not dropped.
+        let budget = nominalInterval
+        let late = intervals.lazy.filter { $0 > budget * 1.5 }.count
+        let dropped = intervals.lazy.filter { $0 > budget * 2 }.count
+        let line = String(
+                format: "[afterray-ui-perf] display=%.0fHz budget=%.1fms callbacks=%d hz=%.1f interval_p95_ms=%.2f interval_max_ms=%.2f late=%d dropped=%d handler_p95_ms=%.3f handler_max_ms=%.3f settle_ms=%.3f",
+                1 / budget,
+                budget * 1_000,
                 handlerDurations.count,
                 refreshRate,
                 percentile(intervals, 0.95) * 1_000,
                 (intervals.last ?? 0) * 1_000,
-                overTwelvePointFiveMs,
-                overSixteenPointSevenMs,
+                late,
+                dropped,
                 percentile(handlers, 0.95) * 1_000,
                 (handlers.last ?? 0) * 1_000,
                 settleDuration * 1_000
             )
-        )
+        print(line)
+        // stdout is block-buffered when it is not a terminal, and a profiling
+        // run ends by killing the process at a time limit — without this the
+        // line is written and then thrown away, which reads as "the harness
+        // never fired". It only ever survived because the lab was run by hand
+        // in a terminal.
+        fflush(stdout)
+        // And stdout goes nowhere at all when launchd started the app, which
+        // is how the real app has to be launched to own its TCC identity.
+        // `log stream --predicate 'subsystem == "dev.afterray"'` works on
+        // every launch path.
+        ScrubFrameMetrics.log.notice("\(line, privacy: .public)")
         frameIntervals.removeAll(keepingCapacity: true)
         handlerDurations.removeAll(keepingCapacity: true)
     }
@@ -2237,6 +2458,7 @@ private enum RecallDetailsPage: Equatable {
 }
 
 private struct TranscriptCaption: View {
+    @Environment(\.afterRayCopy) private var copy
     let text: String?
     let canPlay: Bool
     let isPlaying: Bool
@@ -2249,9 +2471,9 @@ private struct TranscriptCaption: View {
     }
 
     private var playHelp: String {
-        if isBuffering { return "Cancel audio" }
-        if isPlaying { return "Pause audio" }
-        return "Play audio"
+        if isBuffering { return copy.recall.cancelAudio }
+        if isPlaying { return copy.recall.pauseAudio }
+        return copy.recall.playAudio
     }
 
     var body: some View {
@@ -2300,6 +2522,7 @@ private struct TranscriptCaption: View {
 }
 
 private struct RecallDetailsMenu: View {
+    @Environment(\.afterRayCopy) private var copy
     let moment: RecallMoment
     @Binding var page: RecallDetailsPage
     let isProcessing: Bool
@@ -2320,16 +2543,18 @@ private struct RecallDetailsMenu: View {
                     rootList
                 case .ocr:
                     RecallDetailsTextPage(
-                        title: "On Screen",
+                        title: copy.recall.onScreen,
                         text: moment.ocrText,
-                        emptyText: isProcessing ? "OCR is processing…" : "No screen text found",
+                        emptyText: isProcessing ? copy.recall.ocrProcessing : copy.recall.noScreenTextFound,
                         fileName: "afterray-ocr.txt"
                     )
                 case .transcript:
                     RecallDetailsTextPage(
-                        title: "Heard",
+                        title: copy.recall.heard,
                         text: moment.transcriptText,
-                        emptyText: isProcessing ? "Transcript is processing…" : "No transcript near this moment",
+                        emptyText: isProcessing
+                            ? copy.recall.transcriptProcessing
+                            : copy.recall.noTranscriptNear,
                         fileName: "afterray-transcript.txt"
                     )
                 case .accessibility:
@@ -2360,7 +2585,7 @@ private struct RecallDetailsMenu: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            Text(page == .root ? "CAPTURED CONTEXT" : pageTitle)
+            Text(page == .root ? copy.recall.capturedContext : pageTitle)
                 .font(.system(size: 10, weight: .bold, design: .rounded))
                 .tracking(1.4)
                 .foregroundStyle(.secondary)
@@ -2377,7 +2602,7 @@ private struct RecallDetailsMenu: View {
 
     private var pageTitle: String {
         switch page {
-        case .root: "CAPTURED CONTEXT"
+        case .root: copy.recall.capturedContext
         case .ocr: "ON SCREEN"
         case .transcript: "HEARD"
         case .accessibility: "ACCESSIBILITY TREE"
@@ -2394,23 +2619,23 @@ private struct RecallDetailsMenu: View {
                 )
                 detailsRow(
                     icon: "text.viewfinder",
-                    title: "On Screen",
+                    title: copy.recall.onScreen,
                     subtitle: preview(moment.ocrText, empty: isProcessing ? "Processing…" : "No screen text")
                 ) {
                     page = .ocr
                 }
                 detailsRow(
                     icon: "waveform",
-                    title: "Heard",
+                    title: copy.recall.heard,
                     subtitle: preview(moment.transcriptText, empty: isProcessing ? "Processing…" : "No transcript")
                 ) {
                     page = .transcript
                 }
                 detailsRow(
                     icon: "point.3.connected.trianglepath.dotted",
-                    title: "Accessibility tree",
+                    title: copy.recall.accessibilityTree,
                     subtitle: moment.accessibilityArtifactId == nil
-                        ? "No snapshot for this moment"
+                        ? copy.recall.noSnapshot
                         : "Full AX JSON for this screen"
                 ) {
                     page = .accessibility
@@ -2480,9 +2705,9 @@ private struct RecallDetailsMenu: View {
     }
 
     private func detailsAudioTitle(isThis: Bool) -> String {
-        if isThis && isAudioBuffering { return "Cancel audio" }
-        if isThis && isAudioPlaying { return "Pause audio" }
-        return "Play audio"
+        if isThis && isAudioBuffering { return copy.recall.cancelAudio }
+        if isThis && isAudioPlaying { return copy.recall.pauseAudio }
+        return copy.recall.playAudio
     }
 
     private func detailsAudioSymbol(isThis: Bool) -> String {
@@ -2493,6 +2718,7 @@ private struct RecallDetailsMenu: View {
 }
 
 private struct RecallDetailsTextPage: View {
+    @Environment(\.afterRayCopy) private var copy
     let title: String
     let text: String?
     let emptyText: String
@@ -2512,8 +2738,8 @@ private struct RecallDetailsTextPage: View {
         VStack(alignment: .leading, spacing: 10) {
             if hasContent {
                 HStack(spacing: 8) {
-                    Button("Copy") { RecallTextActions.copy(displayText) }
-                    Button("Open") { RecallTextActions.open(displayText, name: fileName) }
+                    Button(copy.recall.copy) { RecallTextActions.copy(displayText) }
+                    Button(copy.recall.open) { RecallTextActions.open(displayText, name: fileName) }
                     Spacer()
                 }
                 .buttonStyle(.plain)
@@ -2537,13 +2763,14 @@ private struct RecallDetailsTextPage: View {
 }
 
 private struct RecallDetailsAccessibilityPage: View {
+    @Environment(\.afterRayCopy) private var copy
     let artifactID: String?
     let loader: RecallArtifactLoader?
     @State private var snapshot = ""
 
     var body: some View {
         RecallDetailsTextPage(
-            title: "Accessibility tree",
+            title: copy.recall.accessibilityTree,
             text: snapshotText,
             emptyText: emptyText,
             fileName: "afterray-accessibility.json"
@@ -2576,9 +2803,9 @@ private struct RecallDetailsAccessibilityPage: View {
     }
 
     private var emptyText: String {
-        if artifactID == nil { return "No snapshot for this moment" }
-        if snapshot == " " { return "Loading…" }
-        return "The snapshot could not be loaded."
+        if artifactID == nil { return copy.recall.noSnapshot }
+        if snapshot == " " { return copy.chat.loading }
+        return copy.recall.snapshotFailed
     }
 }
 
@@ -2600,6 +2827,7 @@ private enum RecallTextActions {
 }
 
 private struct EmptyRecallView: View {
+    @Environment(\.afterRayCopy) private var copy
     let isProcessing: Bool
 
     var body: some View {
@@ -2608,14 +2836,14 @@ private struct EmptyRecallView: View {
                 Rectangle()
                     .fill(RecallPalette.ray)
                     .frame(width: 18, height: 2)
-                Text(isProcessing ? "PREPARING FIRST MOMENT" : "CAPTURE IS READY")
+                Text(copy.recall.localOnly)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .tracking(1.1)
                     .foregroundStyle(RecallPalette.ray)
             }
-            Text(isProcessing ? "The first moments are being prepared" : "Your day begins here")
+            Text(isProcessing ? copy.recall.firstMoments : copy.recall.dayBegins)
                 .font(.system(size: 24, weight: .semibold))
-            Text(isProcessing ? "Keep AfterRay running for a moment." : "AfterRay is capturing automatically. Your first screen will appear shortly.")
+            Text(isProcessing ? copy.recall.keepRunning : copy.recall.capturingAutomatically)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420, alignment: .leading)
@@ -2631,6 +2859,7 @@ private struct EmptyRecallView: View {
 }
 
 private struct FailureView: View {
+    @Environment(\.afterRayCopy) private var copy
     let message: String
     let onReload: (() -> Void)?
 
@@ -2639,14 +2868,14 @@ private struct FailureView: View {
             HStack(spacing: 9) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 12, weight: .semibold))
-                Text("LOCAL SERVICE UNAVAILABLE")
+                Text(copy.recall.serviceUnavailable)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .tracking(1.0)
             }
             .foregroundStyle(RecallPalette.ray)
-            Text("Couldn’t open your memory")
+            Text(copy.recall.couldntOpen)
                 .font(.system(size: 24, weight: .semibold))
-            Text("The local AfterRay daemon failed to start.")
+            Text(copy.recall.daemonFailed)
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Text(message)
@@ -2658,7 +2887,7 @@ private struct FailureView: View {
             if let onReload {
                 HStack {
                     Spacer()
-                    Button("Try Again", action: onReload)
+                    Button(copy.recall.tryAgain, action: onReload)
                         .buttonStyle(RecallCapsuleButtonStyle())
                 }
             }

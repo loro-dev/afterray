@@ -1,4 +1,8 @@
 node_modules/
 dist/
+# scripts/usage.mjs reads its Cloudflare token from the environment; this is
+# only here so a convenience .env can never be the thing that commits one.
+.env
+.env.*
 # intermediate SSR bundle; prerender.mjs deletes it, but a failed build leaves it
 dist-ssr/

@@ -1,8 +1,12 @@
 import XCTest
 @testable import AfterRayRecall
 
+/// Following is live again — the panel must track the playhead while it moves,
+/// not wait for the drag to end. The cost that made it wait is handled one
+/// level down by `HistoryListLayout.offsetToReveal`, which answers nil when
+/// the card is already on screen.
 final class HistoryDocumentFollowTests: XCTestCase {
-    func testSlotChangeRequestsImmediateFollow() {
+    func testSlotChangeFollowsLive() {
         XCTAssertTrue(
             HistoryDocumentFollow.shouldFollow(
                 previousSlot: 1,
@@ -22,7 +26,7 @@ final class HistoryDocumentFollowTests: XCTestCase {
         )
     }
 
-    func testSettleRequestsFinalCorrectionWithinSameSlot() {
+    func testSettleRequestsAFinalCorrectionWithinTheSameSlot() {
         XCTAssertTrue(
             HistoryDocumentFollow.shouldFollow(
                 previousSlot: 2,
@@ -32,12 +36,20 @@ final class HistoryDocumentFollowTests: XCTestCase {
         )
     }
 
-    func testMissingCurrentSlotDoesNotRequestLiveFollow() {
+    /// An idle gap has no card to reveal, settle or not.
+    func testNoSlotNeverFollows() {
         XCTAssertFalse(
             HistoryDocumentFollow.shouldFollow(
                 previousSlot: 2,
                 currentSlot: nil,
                 settleRequested: false
+            )
+        )
+        XCTAssertFalse(
+            HistoryDocumentFollow.shouldFollow(
+                previousSlot: 2,
+                currentSlot: nil,
+                settleRequested: true
             )
         )
     }
@@ -69,6 +81,9 @@ final class HistoryLoadMoreTests: XCTestCase {
     }
 }
 
+/// The chip is computed from the layout model, because the headings it asks
+/// about are above the fold and therefore not mounted. The model is exact up
+/// there: a row already scrolled past has been measured.
 final class HistoryStickyHeadingTests: XCTestCase {
     private let today = HistoryListItem.heading(
         dayStartMs: 2,
@@ -83,11 +98,7 @@ final class HistoryStickyHeadingTests: XCTestCase {
 
     func testNoChipWhileTheInFlowHeadingIsOnScreen() {
         XCTAssertNil(
-            HistoryStickyHeading.chip(
-                items: [today],
-                origins: [0, 28],
-                offset: 0
-            )
+            HistoryStickyHeading.chip(items: [today], origins: [0, 28], offset: 0)
         )
     }
 

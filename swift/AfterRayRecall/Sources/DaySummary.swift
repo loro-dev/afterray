@@ -298,6 +298,19 @@ public enum DaySummaryLayout {
         )
     }
 
+    /// Local midnight for `atMs`. The summary panel only ever asks "is this
+    /// day today", so it takes this rather than a live clock: a wall-clock
+    /// `nowMs` changes on every frame and would make the panel unequal to its
+    /// previous value forever, defeating every update SwiftUI could skip.
+    public static func dayStartMs(atMs: Int64, timeZone: TimeZone = .current) -> Int64 {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let date = Date(timeIntervalSince1970: TimeInterval(atMs) / 1_000)
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        let midnight = calendar.date(from: parts) ?? date
+        return Int64((midnight.timeIntervalSince1970 * 1_000).rounded())
+    }
+
     public static func slotStartMs(atMs: Int64, timeZone: TimeZone = .current) -> Int64 {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
@@ -318,12 +331,18 @@ public enum DaySummaryLayout {
     ) -> Int64? {
         // Only consider rows the panel actually draws, so scrubbing through
         // an idle gap does not try to follow a card that was never rendered.
-        let visible = slots.filter(isVisibleInPanel)
-        if let covering = visible.first(where: { $0.slotStartMs <= playheadMs && playheadMs < $0.slotEndMs }) {
+        // Filtered in the predicates rather than into an array: this runs once
+        // per day on every frame of a timeline scrub, and the intermediate was
+        // an allocation per day per frame.
+        if let covering = slots.first(where: {
+            isVisibleInPanel($0) && $0.slotStartMs <= playheadMs && playheadMs < $0.slotEndMs
+        }) {
             return covering.slotStartMs
         }
+        // Only reached in an idle gap — `slotStartMs` builds a `Calendar`, so
+        // keep it off the path a normal scrub takes.
         let start = slotStartMs(atMs: playheadMs, timeZone: timeZone)
-        return visible.contains(where: { $0.slotStartMs == start }) ? start : nil
+        return slots.contains { isVisibleInPanel($0) && $0.slotStartMs == start } ? start : nil
     }
 
     /// Idle half-hours carry no activity worth reading; the summary panel
@@ -355,22 +374,28 @@ public enum DaySummaryLayout {
     public static func dateHeading(
         dayStartMs: Int64,
         nowMs: Int64,
-        timeZone: TimeZone = .current
+        timeZone: TimeZone = .current,
+        copy: AfterRayCopy = .english,
+        locale: Locale = Locale(identifier: "en")
     ) -> DaySummaryHeading {
         if dayStartMs == 0 {
-            return DaySummaryHeading(kicker: "TODAY", title: "No day selected", isToday: true)
+            return DaySummaryHeading(
+                kicker: copy.format.todayKicker,
+                title: copy.format.noDaySelected,
+                isToday: true
+            )
         }
         let isToday = localDayKey(ms: dayStartMs, timeZone: timeZone)
             == localDayKey(ms: nowMs, timeZone: timeZone)
         let date = Date(timeIntervalSince1970: TimeInterval(dayStartMs) / 1_000)
         let weekday = date.formatted(
-            Date.FormatStyle().weekday(.abbreviated).locale(Locale(identifier: "en_US_POSIX"))
+            Date.FormatStyle().weekday(.abbreviated).locale(locale)
         )
         let monthDay = date.formatted(
-            Date.FormatStyle().month(.abbreviated).day().locale(Locale(identifier: "en_US_POSIX"))
+            Date.FormatStyle().month(.abbreviated).day().locale(locale)
         )
         if isToday {
-            return DaySummaryHeading(kicker: "TODAY", title: monthDay, isToday: true)
+            return DaySummaryHeading(kicker: copy.format.todayKicker, title: monthDay, isToday: true)
         }
         return DaySummaryHeading(kicker: weekday.uppercased(), title: monthDay, isToday: false)
     }
@@ -390,13 +415,17 @@ public enum DaySummaryLayout {
         return remain == 0 ? "\(hours)h" : "\(hours)h \(remain)m"
     }
 
-    public static func factLine(apps: [DayAppFact]) -> String {
+    public static func factLine(apps: [DayAppFact], copy: AfterRayCopy = .english) -> String {
         let parts = apps.prefix(3).map { "\($0.name) \(formatDuration(ms: $0.ms))" }
-        if parts.isEmpty { return "Quiet — nothing on screen" }
+        if parts.isEmpty { return copy.format.quietNothingOnScreen }
         return parts.joined(separator: " · ")
     }
 
-    public static func rowText(slot: DaySlotSummary, timeZone: TimeZone = .current) -> DaySummaryRowText {
+    public static func rowText(
+        slot: DaySlotSummary,
+        timeZone: TimeZone = .current,
+        copy: AfterRayCopy = .english
+    ) -> DaySummaryRowText {
         let time = timeLabel(slotStartMs: slot.slotStartMs, timeZone: timeZone)
         if let title = slot.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
             let description = shortDescription(slot: slot)
@@ -409,10 +438,10 @@ public enum DaySummaryLayout {
         }
         return DaySummaryRowText(
             time: time,
-            primary: factLine(apps: slot.facts.apps),
+            primary: factLine(apps: slot.facts.apps, copy: copy),
             detail: [],
             isT2: false,
-            badge: fallbackBadge(state: slot.state)
+            badge: fallbackBadge(state: slot.state, copy: copy)
         )
     }
 
@@ -425,6 +454,34 @@ public enum DaySummaryLayout {
             source = (slot.bullets ?? []).joined(separator: " ")
         }
         return String(normalizedParagraph(source).prefix(400))
+    }
+
+    /// Whether the row should offer a "Full details" link — answered without
+    /// parsing anything.
+    ///
+    /// `expandedSections` runs the card body through `AttributedString`'s
+    /// Markdown parser once per line, and the row is drawn on every scroll
+    /// frame and every playhead tick. Asking it `isEmpty` just to decide
+    /// whether to draw a link cost ~1.2ms per card, per pass. Every branch
+    /// below mirrors the matching branch there, minus the parse.
+    ///
+    /// One inexactness: a non-blank v3 body is assumed to yield at least one
+    /// section. A body that is entirely Markdown punctuation (`***`) would
+    /// offer a link that expands to nothing. That is a cosmetic edge; paying a
+    /// parse per row per frame to rule it out is not worth it.
+    public static func hasExpandableDetail(slot: DaySlotSummary) -> Bool {
+        if let details = slot.details,
+           !details.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        if let threads = slot.threads, !threads.isEmpty {
+            if threads.contains(where: { !normalizedParagraph($0.prose).isEmpty }) { return true }
+            if slot.decisions?.contains(where: { !normalizedParagraph($0).isEmpty }) == true {
+                return true
+            }
+            return slot.notCaptured?.contains { !normalizedParagraph($0).isEmpty } == true
+        }
+        return (slot.bullets ?? []).contains { !normalizedParagraph($0).isEmpty }
     }
 
     public static func expandedSections(slot: DaySlotSummary) -> [DaySummaryExpandedSection] {
@@ -533,14 +590,14 @@ public enum DaySummaryLayout {
     /// failed" are different situations — one is waiting its turn, the other
     /// needs the model looked at — and a row that was deliberately skipped
     /// should not claim to be pending forever.
-    static func fallbackBadge(state: String) -> String? {
+    static func fallbackBadge(state: String, copy: AfterRayCopy = .english) -> String? {
         switch state {
-        case "failed": "Summary failed"
-        case "skipped_idle": "Idle"
-        case "paused": "Capture paused"
-        case "asleep": "Asleep"
+        case "failed": copy.format.summaryFailed
+        case "skipped_idle": copy.format.idle
+        case "paused": copy.format.capturePaused
+        case "asleep": copy.format.asleep
         case "no_data": nil
-        default: "Not summarised"
+        default: copy.format.notSummarised
         }
     }
 }

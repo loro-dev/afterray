@@ -305,3 +305,47 @@ private extension ChatScrollMetrics {
         )
     }
 }
+
+/// The scroll-phase mapping that replaced the AppKit live-scroll bridge.
+/// Only a user scroll may switch following off, so each case here is the
+/// difference between following working and following silently giving up.
+final class ChatScrollPhaseIntentTests: XCTestCase {
+    func testAGestureAndItsMomentumBothCountAsTheUserScrolling() {
+        XCTAssertTrue(ChatScrollPhaseIntent.isUserScrolling(.interacting))
+        XCTAssertTrue(ChatScrollPhaseIntent.isUserScrolling(.tracking))
+        XCTAssertTrue(
+            ChatScrollPhaseIntent.isUserScrolling(.decelerating),
+            "a flick that carries the viewport off the bottom is the user leaving"
+        )
+    }
+
+    func testOurOwnScrollToIsNotTheUserScrolling() {
+        XCTAssertFalse(
+            ChatScrollPhaseIntent.isUserScrolling(.animating),
+            "counting our own scrollTo would switch following off every time it worked"
+        )
+        XCTAssertFalse(ChatScrollPhaseIntent.isUserScrolling(.idle))
+    }
+
+    /// The end-to-end consequence: a programmatic scroll to the bottom must
+    /// leave the transcript following.
+    func testFollowingSurvivesAProgrammaticScroll() {
+        var state = ChatAutoScrollState()
+        state.followLatest()
+        state.observe(
+            distanceFromBottom: 900,
+            isUserScrolling: ChatScrollPhaseIntent.isUserScrolling(.animating)
+        )
+        XCTAssertTrue(state.isFollowingLatest)
+    }
+
+    func testAUserFlickAwayFromTheBottomStopsFollowing() {
+        var state = ChatAutoScrollState()
+        state.followLatest()
+        state.observe(
+            distanceFromBottom: 900,
+            isUserScrolling: ChatScrollPhaseIntent.isUserScrolling(.decelerating)
+        )
+        XCTAssertFalse(state.isFollowingLatest)
+    }
+}

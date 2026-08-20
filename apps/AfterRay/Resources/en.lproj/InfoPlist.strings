@@ -1,0 +1,3 @@
+NSAppleEventsUsageDescription = "AfterRay checks whether the active browser window is private so it can skip recording it. This permission does not read the page URL.";
+NSMicrophoneUsageDescription = "AfterRay transcribes your voice locally while recording your computer activity.";
+NSHumanReadableCopyright = "Copyright © 2026 AfterRay.";

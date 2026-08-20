@@ -8,6 +8,7 @@ struct AfterRayVisualLabApp: App {
         WindowGroup("AfterRay Visual Lab") {
             VisualLabView()
                 .frame(minWidth: 1_080, minHeight: 680)
+                .onAppear { AfterRayLocalization.shared.bootstrapFromSystem() }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1_320, height: 820)
@@ -84,8 +85,20 @@ private struct VisualLabView: View {
         let hotKeys = RecallHotKeyStore(storageKey: "dev.afterray.visual-lab.hotkey")
         _labHotKeys = State(initialValue: hotKeys)
         _onboardingModel = State(initialValue: Self.makeOnboardingModel(hotKeys: hotKeys))
+        // Anchored to the end of whichever timeline is loaded, so the week of
+        // summaries actually covers the range a scrub travels. Pinned to
+        // `.long` it did not: `--stress` runs 55 hours forward from the same
+        // base, so with both flags most of the scrub had no summary to
+        // highlight and the panel sat idle — the opposite of what profiling
+        // the two together is for.
+        let timeline: RecallScenario = CommandLine.arguments.contains("--stress")
+            ? .stress
+            : .long
         summaryStressHistory = CommandLine.arguments.contains("--summary-stress")
-            ? DaySummary.mockMixedSlotWeek(around: RecallScenario.long.moments[12].capturedAtMs)
+            ? DaySummary.mockMixedSlotWeek(
+                around: timeline.moments.last?.capturedAtMs
+                    ?? RecallScenario.long.moments[12].capturedAtMs
+            )
             : []
     }
 

@@ -519,3 +519,48 @@ final class TimelineLayoutTests: XCTestCase {
         )
     }
 }
+
+/// The mounted window is snapped so that a scrub does not hand SwiftUI a
+/// different `ForEach` input on every frame. Snapping must not cost coverage:
+/// getting this wrong drops segments at the edge of the screen, silently.
+final class TimelineMountWindowTests: XCTestCase {
+    private let width: CGFloat = 1_600
+    private let margin: CGFloat = 96
+
+    func testSnappingNeverUncoversWhatTheUnsnappedWindowCovered() {
+        for step in stride(from: CGFloat(-3_000), through: 20_000, by: 7) {
+            let window = TimelineLayout.mountWindow(centeredOn: step, width: width, margin: margin)
+            XCTAssertLessThanOrEqual(
+                window.lowerBound,
+                step - (width / 2 + margin),
+                "uncovered on the leading side at \(step)"
+            )
+            XCTAssertGreaterThanOrEqual(
+                window.upperBound,
+                step + (width / 2 + margin),
+                "uncovered on the trailing side at \(step)"
+            )
+        }
+    }
+
+    /// The point of the exercise: the window has to actually hold still.
+    func testTheWindowIsIdenticalAcrossAQuantumOfTravel() {
+        var windows = Set<ClosedRange<CGFloat>>()
+        let base = TimelineLayout.mountQuantum * 12
+        for step in stride(from: CGFloat(0), to: TimelineLayout.mountQuantum / 2, by: 3) {
+            windows.insert(TimelineLayout.mountWindow(centeredOn: base + step, width: width))
+        }
+        XCTAssertEqual(windows.count, 1, "the window moved inside one bucket")
+    }
+
+    func testTravellingFarEnoughDoesMoveTheWindow() {
+        let a = TimelineLayout.mountWindow(centeredOn: 0, width: width)
+        let b = TimelineLayout.mountWindow(centeredOn: TimelineLayout.mountQuantum * 3, width: width)
+        XCTAssertNotEqual(a, b)
+    }
+
+    func testAZeroQuantumFallsBackToTheExactWindow() {
+        let window = TimelineLayout.mountWindow(centeredOn: 500, width: width, quantum: 0)
+        XCTAssertEqual(window.lowerBound, 500 - (width / 2 + margin))
+    }
+}

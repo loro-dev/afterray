@@ -12,20 +12,24 @@ public enum ComputeMode: String, Codable, Equatable, Sendable, CaseIterable {
 
     /// One word each. As phrases these were wider than the control that held
     /// them, and the detail line underneath already said the rest.
-    public var title: String {
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .full: "Full"
-        case .essential: "Essential"
-        case .off: "Off"
+        case .full: copy.compute.full
+        case .essential: copy.compute.essential
+        case .off: copy.compute.off
         }
     }
 
     /// What choosing this costs, in the terms the user is deciding in.
-    public var detail: String {
+    public var detail: String { detail(.english) }
+
+    public func detail(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .full: "Everything runs, when the machine can afford it."
-        case .essential: "Screen text and transcripts keep up. No summaries, no compression."
-        case .off: "Nothing runs in the background — new screens are not indexed."
+        case .full: copy.compute.fullDetail
+        case .essential: copy.compute.essentialDetail
+        case .off: copy.compute.offDetail
         }
     }
 }
@@ -53,13 +57,15 @@ public enum ComputeWorkload: String, Codable, Equatable, Sendable {
     case summary
     case archive
 
-    public var title: String {
+    public var title: String { title(.english) }
+
+    public func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .ocr: "Screen text"
-        case .asr: "Transcription"
-        case .embedding: "Search index"
-        case .summary: "Summaries"
-        case .archive: "Archive compression"
+        case .ocr: copy.compute.screenText
+        case .asr: copy.compute.transcription
+        case .embedding: copy.compute.searchIndex
+        case .summary: copy.compute.summaries
+        case .archive: copy.compute.archive
         }
     }
 
@@ -468,13 +474,16 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
     /// importantly, to "what would make it run?". Built from thresholds the
     /// daemon sent rather than numbers written into the UI, so it cannot drift
     /// from the gate that actually decides.
-    public func automaticConditions(for workload: ComputeWorkload) -> [ComputeCondition] {
+    public func automaticConditions(
+        for workload: ComputeWorkload,
+        copy: AfterRayCopy = .english
+    ) -> [ComputeCondition] {
         var conditions: [ComputeCondition] = []
         if mode == .off {
             conditions.append(
                 ComputeCondition(
-                    label: "Local computation switched on",
-                    detail: "currently off",
+                    label: copy.compute.switchedOn,
+                    detail: copy.compute.currentlyOff,
                     met: false
                 )
             )
@@ -485,8 +494,8 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         if workload != .ocr, let minutes = pauseMinutesRemaining() {
             conditions.append(
                 ComputeCondition(
-                    label: "Not suspended",
-                    detail: "you suspended it — \(minutes) min left",
+                    label: copy.compute.notSuspended,
+                    detail: copy.compute.youSuspended(minutes),
                     met: false
                 )
             )
@@ -495,8 +504,8 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         case .summary, .archive:
             conditions.append(
                 ComputeCondition(
-                    label: "Plugged in",
-                    detail: machine.onAc ? "on power" : "on battery",
+                    label: copy.compute.pluggedIn,
+                    detail: machine.onAc ? copy.compute.onPower : copy.compute.onBatteryShort,
                     met: machine.onAc
                 )
             )
@@ -507,8 +516,8 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
             if workload == .asr, !machine.onAc {
                 conditions.append(
                     ComputeCondition(
-                        label: "Full speed",
-                        detail: "on battery it runs five times slower, not never",
+                        label: copy.compute.fullSpeed,
+                        detail: copy.compute.batterySlower,
                         met: true
                     )
                 )
@@ -520,22 +529,22 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         let battery = machine.batteryFraction
         conditions.append(
             ComputeCondition(
-                label: "Battery above \(Int(thresholds.summaryMinBatteryFraction * 100))%",
-                detail: ComputeFormat.battery(battery) ?? "no battery to conserve",
+                label: copy.compute.batteryAbove(Int(thresholds.summaryMinBatteryFraction * 100)),
+                detail: ComputeFormat.battery(battery) ?? copy.compute.noBatteryToConserve,
                 met: battery.map { $0 >= thresholds.summaryMinBatteryFraction } ?? true
             )
         )
         conditions.append(
             ComputeCondition(
-                label: "Idle for \(Int(thresholds.summaryMinIdleSeconds))s",
-                detail: "last input \(Int(machine.idleSeconds))s ago",
+                label: copy.compute.idleFor(Int(thresholds.summaryMinIdleSeconds)),
+                detail: copy.compute.lastInput(Int(machine.idleSeconds)),
                 met: machine.idleSeconds >= thresholds.summaryMinIdleSeconds
             )
         )
         conditions.append(
             ComputeCondition(
-                label: String(format: "Load below %.2f/core", thresholds.summaryMaxLoadPerCore),
-                detail: ComputeFormat.load(machine.loadPerCore) ?? "unreadable — treated as busy",
+                label: copy.compute.loadBelow(String(format: "%.2f", thresholds.summaryMaxLoadPerCore)),
+                detail: ComputeFormat.load(machine.loadPerCore) ?? copy.compute.unreadableBusy,
                 met: machine.loadPerCore.map { $0 <= thresholds.summaryMaxLoadPerCore } ?? false
             )
         )
@@ -630,16 +639,18 @@ public enum ComputeIndicator: Equatable, Sendable {
     }
 
     /// The tooltip, which is the only text most users will ever read here.
-    public var help: String {
+    public var help: String { help(.english) }
+
+    public func help(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .idle: "Local computation is idle"
+        case .idle: copy.compute.idleHelp
         case let .working(count):
-            count == 1 ? "1 local task running" : "\(count) local tasks running"
+            count == 1 ? copy.compute.oneTaskRunning : copy.compute.tasksRunning(count)
         case let .paused(minutes):
-            if let minutes { "Background computation suspended for \(minutes) more min" }
-            else { "Background computation suspended" }
-        case .off: "Local computation is switched off"
-        case let .waiting(reason): "Waiting — \(reason)"
+            if let minutes { copy.compute.suspendedMinutes(minutes) }
+            else { copy.compute.suspended }
+        case .off: copy.compute.switchedOff
+        case let .waiting(reason): copy.compute.waitingReason(reason)
         }
     }
 

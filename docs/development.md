@@ -70,8 +70,11 @@ Start from an empty, disposable vault instead — this never touches
 ```sh
 cargo test --workspace
 swift test
+./scripts/check-i18n.sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+`make test` and `make check` both run `scripts/check-i18n.sh`. It is the static UI i18n gate: shipped locale lists must match, catalog strings cannot be empty, views cannot use English-default model APIs, and new hardcoded chrome must go through `AfterRayCopy`. Known leftover English is ratcheted in `scripts/i18n-allowlist.tsv` — shrink that file, do not grow it. Details: `swift/AfterRayRecall/Sources/L10n/AGENTS.md`.
 
 Two habits neither the compiler nor the Makefile can enforce, both written down
 because each was learned by shipping the mistake.

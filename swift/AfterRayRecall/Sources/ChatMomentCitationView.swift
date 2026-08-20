@@ -8,6 +8,7 @@ import SwiftUI
 /// moment link when the capture was deleted or could not be decoded, so
 /// missing media never erases the citation itself.
 struct ChatMomentCitationView: View {
+    @Environment(\.afterRayCopy) private var copy
     let label: String
     let momentID: String
     let thumbnailLoader: RecallThumbnailLoader?
@@ -84,7 +85,7 @@ struct ChatMomentCitationView: View {
     }
 
     private var title: String {
-        label.isEmpty ? "Captured moment" : label
+        label.isEmpty ? copy.chat.capturedMoment : label
     }
 
     private var timeLabel: String? {
@@ -93,16 +94,16 @@ struct ChatMomentCitationView: View {
 
     private var helpText: String {
         if let timeLabel {
-            return "Open this captured moment · \(timeLabel)"
+            return copy.chat.openCapturedMomentAt(timeLabel)
         }
-        return "Open this captured moment"
+        return copy.chat.openCapturedMoment
     }
 
     private var accessibilityText: String {
         if let timeLabel {
-            return "Open captured moment: \(title), \(timeLabel)"
+            return copy.chat.openCapturedTitledAt(title, timeLabel)
         }
-        return "Open captured moment: \(title)"
+        return copy.chat.openCapturedTitled(title)
     }
 
     @ViewBuilder
@@ -113,7 +114,7 @@ struct ChatMomentCitationView: View {
                 .scaledToFill()
                 .clipped()
         } else if loadFinished {
-            Label("Screenshot unavailable", systemImage: "photo")
+            Label(copy.chat.screenshotUnavailable, systemImage: "photo")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

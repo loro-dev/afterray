@@ -1,3 +1,4 @@
+import AfterRayRecall
 import ApplicationServices
 import AVFoundation
 import AppKit
@@ -211,11 +212,13 @@ enum RequiredPermission: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var title: String {
+    var title: String { title(.english) }
+
+    func title(_ copy: AfterRayCopy) -> String {
         switch self {
-        case .screenRecording: "Screen & System Audio"
-        case .microphone: "Microphone"
-        case .accessibility: "Accessibility"
+        case .screenRecording: copy.permissions.screenAndSystemAudio
+        case .microphone: copy.permissions.microphone
+        case .accessibility: copy.permissions.accessibility
         }
     }
 
@@ -239,20 +242,24 @@ enum RequiredPermission: String, CaseIterable, Identifiable {
     }
 
     var settingsGuide: PermissionSettingsGuideContent {
+        settingsGuide(copy: .english)
+    }
+
+    func settingsGuide(copy: AfterRayCopy) -> PermissionSettingsGuideContent {
         switch self {
         case .microphone:
             PermissionSettingsGuideContent(
-                title: "Turn on AfterRay for Microphone",
-                instructions: "Microphone access can't be added by dragging. Turn on AfterRay in the list.",
-                applicationAction: "Turn on the switch beside AfterRay",
+                title: copy.permissions.turnOnMicrophone,
+                instructions: copy.permissions.microphoneInstructions,
+                applicationAction: copy.permissions.turnOnSwitch,
                 actionIcon: "checkmark.circle",
                 allowsApplicationDrag: false
             )
         case .screenRecording, .accessibility:
             PermissionSettingsGuideContent(
-                title: "Add AfterRay to \(title)",
-                instructions: "Drag the application below into the list in System Settings, then turn it on.",
-                applicationAction: "Drag into System Settings",
+                title: copy.permissions.addTo(title(copy)),
+                instructions: copy.permissions.dragInstructions,
+                applicationAction: copy.permissions.dragIntoSettings,
                 actionIcon: "hand.draw",
                 allowsApplicationDrag: true
             )

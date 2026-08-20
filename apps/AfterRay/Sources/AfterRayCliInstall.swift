@@ -43,20 +43,20 @@ enum AfterRayCliInstall {
         }
     }
 
-    static var statusSummary: String {
+    static func statusSummary(copy: AfterRayCopy = .english) -> String {
         if isInstalled {
             if isOnPath {
-                return "Installed at \(installURL.path) and available on PATH."
+                return copy.settings.cliInstalledOnPath(installURL.path)
             }
-            return "Installed at \(installURL.path). Add ~/.local/bin to your PATH."
+            return copy.settings.cliInstalledNeedPath(installURL.path)
         }
-        return "Not installed. Other AI agents cannot call `afterray` yet."
+        return copy.settings.cliNotInstalledAgents
     }
 
     @discardableResult
-    static func install() throws -> URL {
+    static func install(copy: AfterRayCopy = .english) throws -> URL {
         guard let source = sourceBinaryURL() else {
-            throw CliInstallError.sourceMissing
+            throw CliInstallError.sourceMissing(copy.settings.cliBinaryMissing)
         }
         try FileManager.default.createDirectory(
             at: installDirectory,
@@ -111,12 +111,12 @@ enum AfterRayCliInstall {
 }
 
 enum CliInstallError: LocalizedError {
-    case sourceMissing
+    case sourceMissing(String)
 
     var errorDescription: String? {
         switch self {
-        case .sourceMissing:
-            "Could not find the afterray CLI binary in the app bundle. Rebuild AfterRay and try again."
+        case let .sourceMissing(message):
+            message
         }
     }
 }

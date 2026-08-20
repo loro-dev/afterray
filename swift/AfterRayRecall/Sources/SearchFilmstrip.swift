@@ -7,6 +7,7 @@ import SwiftUI
 /// It replaces `AppUsageTimeline` rather than sitting beside it. During a
 /// search, wall-clock browsing is not the task — moving between hits is.
 struct SearchFilmstrip: View {
+    @Environment(\.afterRayCopy) private var copy
     let session: RecallSearchSession
     let tuning: RecallVisualTuning
     let selectedDate: Date
@@ -30,7 +31,7 @@ struct SearchFilmstrip: View {
 
             HStack(spacing: 7) {
                 Image(systemName: "arrow.left.and.right")
-                Text("Swipe or ↑↓ to walk matches · Esc to close")
+                Text(copy.recall.swipeMatches)
             }
             .font(.system(size: 10, weight: .medium, design: .rounded))
             .foregroundStyle(.white.opacity(0.42))

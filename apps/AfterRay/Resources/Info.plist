@@ -4,6 +4,17 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>zh-Hans</string>
+        <string>zh-Hant</string>
+        <string>ja</string>
+        <string>ko</string>
+        <string>es</string>
+        <string>de</string>
+        <string>fr</string>
+    </array>
     <key>CFBundleDisplayName</key>
     <string>AfterRay</string>
     <key>CFBundleExecutable</key>
@@ -23,7 +34,7 @@
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
+    <string>15.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>

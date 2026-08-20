@@ -4,6 +4,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 ## Dev loop
 
+- `check-i18n.sh` — static chrome i18n gate (`make check-i18n`); see `swift/AfterRayRecall/Sources/L10n/AGENTS.md`.
 - `dev.sh` — watch-mode rebuild loop; change fingerprint via `stat` + `shasum` (dev.sh:57). `--ui` watches only Swift UI + mock data and runs the Visual Lab instead of the app. An explicit `AFTERRAY_DATA_DIR` is forwarded through LaunchServices on every relaunch.
 - `run-v0.sh` — builds shim + Rust workspace (release) and the app (debug — mixed configs are deliberate), assembles and signs `.afterray-dev/AfterRay.app`. Dev vault data lives in `.afterray/`, dev bundle/socket in `.afterray-dev/` (both gitignored); `--ephemeral` uses a throwaway vault.
 - `open-dev.sh` / `stop-dev.sh` — reopen/quit the dev bundle (bundle id `dev.afterray.app`).
@@ -17,8 +18,8 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 ## Docs gate
 
-- `docs-gate/` — `make docs-sync`, run by `make test`. Six checks: links, doc paths cited from source, size ceilings, record shape, bilingual pairs, and `@dec:` anchors. What each sees, and what none of them can: [decisions/README.md](../docs/decisions/README.md#what-the-gate-checks).
-- **Node runs the TypeScript directly** (type stripping, Node ≥22.6). No `package.json`, no `node_modules`, no dependencies — and nothing here is on a product path. That is the whole reason a JS runtime is acceptable in this repo at all; keep it that way.
+- `docs-gate/` — `make docs-sync`, run by `make test`; coverage and limits: [decisions/README.md](../docs/decisions/README.md#what-the-gate-checks).
+- **Node ≥22.6 runs TypeScript directly**: no dependencies, `package.json`, or `node_modules`; never put this runtime on a product path.
 - A red anchor hash means a decision was not re-read when its code changed. Re-read it, then `node scripts/docs-gate/main.ts --write` and commit the sidecar diff — the diff is the confirmation. Never hand-edit a sidecar.
 
 ## Invariants
@@ -34,6 +35,7 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 
 ## Commands
 
+- `make check-i18n` — static i18n gate; also runs from `make check` and `make test`
 - `make dev` / `make dev-ui` / `make v0` / `make v0-daemon` / `make open` / `make stop`
 - `make release-preflight` (needs explicit `AFTERRAY_CODESIGN_IDENTITY` + `AFTERRAY_NOTARY_PROFILE`; checks remote release-index collisions before a costly build) / `make release` (runs that preflight) / `make release-local` (needs neither)
 - `make verify-release MANIFEST=dist/AfterRay-<version>-arm64.json` / `make publish-dry-run MANIFEST=…` / `make publish MANIFEST=…` / `make tag-release MANIFEST=…` — production steps always use one explicit manifest; never select an artifact by `dist/` ordering. Tag only after publish and public appcast verification.

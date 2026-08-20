@@ -30,6 +30,11 @@ final class OverlayOpenRouteTests: XCTestCase {
             .selectedSearch
         )
     }
+
+    func testHideParksLiveWhenReopenWouldGoLive() {
+        XCTAssertTrue(OverlayOpenRoute.shouldParkLiveOnHide(hasSelectedSearch: false))
+        XCTAssertFalse(OverlayOpenRoute.shouldParkLiveOnHide(hasSelectedSearch: true))
+    }
 }
 
 final class OverlayPanelPlacementTests: XCTestCase {

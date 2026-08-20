@@ -6,6 +6,7 @@ import SwiftUI
 private extension Notification.Name {
     static let afterRayRecallDidOpen = Notification.Name("dev.afterray.recall-did-open")
     static let afterRayRecallWillHide = Notification.Name("dev.afterray.recall-will-hide")
+    static let afterRayRecallDidHide = Notification.Name("dev.afterray.recall-did-hide")
     static let afterRayRecallToggleAudio = Notification.Name("dev.afterray.recall-toggle-audio")
     static let afterRaySystemSessionWillSuspend = Notification.Name(
         "dev.afterray.system-session-will-suspend"
@@ -28,34 +29,37 @@ private final class RecallOverlayLayout: ObservableObject {
     }
 }
 
+/// AppKit owns the process, not a SwiftUI `App`.
+///
+/// A SwiftUI `Scene` assigns its own `NSApp.mainMenu` shortly after
+/// `applicationDidFinishLaunching` — on the first hosting view or the first
+/// activation, whichever lands first. That generated menu carries no Edit
+/// item for an `LSUIElement` app, so it silently threw away the one this app
+/// installs and every ⌘X/⌘C/⌘V/⌘Z/⌘A in the process stopped resolving: with
+/// no Edit menu, `performKeyEquivalent` returns false and the keystroke dies
+/// before it can reach the field editor. Settings is an AppKit window
+/// (`AfterRaySettingsController`), so the `Settings` scene bought nothing.
 @main
-struct AfterRayApp: App {
-    @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
-
-    var body: some Scene {
-        Settings {
-            AfterRaySettingsScene()
+enum AfterRayMain {
+    static func main() {
+        let app = NSApplication.shared
+        MainActor.assumeIsolated {
+            app.delegate = AfterRayAppDelegate.shared
         }
-        .windowResizability(.contentSize)
-    }
-}
-
-private struct AfterRaySettingsScene: View {
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        AfterRaySettingsView(
-            model: AfterRaySettingsController.shared.model,
-            onClose: { dismiss() }
-        )
+        app.run()
     }
 }
 
 @MainActor
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
+    /// `NSApplication.delegate` is weak, so the process has to hold this.
+    static let shared = AfterRayAppDelegate()
+
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var localizationObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_: Notification) {
+        AfterRayLocalization.shared.bootstrapFromSystem()
         AfterRayLog.install()
         AfterRayLog.info("application launched")
         Task {
@@ -103,15 +107,20 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
             distributed.removeObserver(observer)
         }
         workspaceObservers.removeAll()
+        if let localizationObserver {
+            NotificationCenter.default.removeObserver(localizationObserver)
+            self.localizationObserver = nil
+        }
         AfterRayMenuBar.shared.remove()
         RecallOverlayController.shared.stop()
         DaemonSupervisor.shared.stop()
     }
 
     private func installAppMenu() {
+        let copy = AfterRayLocalization.shared.copy
         let appMenu = NSMenu()
         let settingsItem = NSMenuItem(
-            title: "Settings…",
+            title: copy.menu.settings,
             action: #selector(openSettings),
             keyEquivalent: ","
         )
@@ -122,13 +131,22 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         }
         appMenu.addItem(.separator())
         let quitItem = NSMenuItem(
-            title: "Quit AfterRay",
+            title: copy.menu.quit,
             action: #selector(quitAfterRay),
             keyEquivalent: "q"
         )
         quitItem.target = self
         appMenu.addItem(quitItem)
         AfterRayMainMenu.install(appMenu: appMenu)
+        if localizationObserver == nil {
+            localizationObserver = NotificationCenter.default.addObserver(
+                forName: .afterRayLocalizationDidChange,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.installAppMenu() }
+            }
+        }
     }
 
     private func makeUpdateMenuItem() -> NSMenuItem? {
@@ -232,10 +250,22 @@ private final class AfterRayMenuBar: NSObject {
         ) { _ in
             Task { @MainActor in AfterRayMenuBar.shared.refreshComputeItem() }
         }
+        NotificationCenter.default.addObserver(
+            forName: .afterRayLocalizationDidChange,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in AfterRayMenuBar.shared.reinstall() }
+        }
     }
 
     func refreshComputeItem() {
         computeItem?.isHidden = !AfterRayPreferences.computeDashboardEnabled
+    }
+
+    func reinstall() {
+        remove()
+        install()
     }
 
     func install() {
@@ -251,16 +281,17 @@ private final class AfterRayMenuBar: NSObject {
             button.setButtonType(.momentaryPushIn)
         }
 
+        let copy = AfterRayLocalization.shared.copy
         let menu = NSMenu()
         let openItem = NSMenuItem(
-            title: "Open AfterRay",
+            title: copy.menu.openAfterRay,
             action: #selector(openAfterRay),
             keyEquivalent: ""
         )
         openItem.target = self
         menu.addItem(openItem)
         let settingsItem = NSMenuItem(
-            title: "Settings…",
+            title: copy.menu.settings,
             action: #selector(openSettings),
             keyEquivalent: ","
         )
@@ -268,7 +299,7 @@ private final class AfterRayMenuBar: NSObject {
         menu.addItem(settingsItem)
         menu.addItem(.separator())
         let pauseItem = NSMenuItem(
-            title: "Pause Capture",
+            title: copy.menu.pauseCapture,
             action: #selector(toggleCapture),
             keyEquivalent: ""
         )
@@ -276,7 +307,7 @@ private final class AfterRayMenuBar: NSObject {
         menu.addItem(pauseItem)
         self.pauseItem = pauseItem
         let computeItem = NSMenuItem(
-            title: "Local Computation…",
+            title: copy.menu.localComputation,
             action: #selector(openComputeActivity),
             keyEquivalent: ""
         )
@@ -286,7 +317,7 @@ private final class AfterRayMenuBar: NSObject {
         menu.addItem(computeItem)
         self.computeItem = computeItem
         let clearHour = NSMenuItem(
-            title: "Delete Last Hour",
+            title: copy.menu.deleteLastHour,
             action: #selector(deleteLastHour),
             keyEquivalent: ""
         )
@@ -297,7 +328,7 @@ private final class AfterRayMenuBar: NSObject {
             menu.addItem(updateItem)
         }
         let quitItem = NSMenuItem(
-            title: "Quit AfterRay",
+            title: copy.menu.quit,
             action: #selector(quitAfterRay),
             keyEquivalent: "q"
         )
@@ -382,9 +413,10 @@ private final class AfterRayMenuBar: NSObject {
         statusItem?.isVisible = true
         button.image = Self.icon()
         button.alphaValue = isRecording ? 1 : 0.46
-        let state = isRecording ? "AfterRay is recording" : "AfterRay is paused"
-        button.toolTip = "\(state) · press \(shortcut.displayString) to open"
-        pauseItem?.title = isRecording ? "Pause Capture" : "Resume Capture"
+        let copy = AfterRayLocalization.shared.copy
+        let state = isRecording ? copy.menu.recording : copy.menu.paused
+        button.toolTip = copy.menu.tooltip(state, shortcut.displayString)
+        pauseItem?.title = isRecording ? copy.menu.pauseCapture : copy.menu.resumeCapture
     }
 
     private static func icon() -> NSImage {
@@ -396,8 +428,31 @@ private final class AfterRayMenuBar: NSObject {
 /// scrolls over empty timeline chrome fall through to the app behind and
 /// AfterRay never sees them.
 private final class OverlayHostingView<Content: View>: NSHostingView<Content> {
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+        configureTransparency()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configureTransparency()
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         super.hitTest(point) ?? self
+    }
+
+    private func configureTransparency() {
+        wantsLayer = true
+        layer?.isOpaque = false
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 }
 
@@ -459,6 +514,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         let hostingView = OverlayHostingView(rootView: AfterRayRootView())
         hostingView.autoresizingMask = [.width, .height]
         panel.contentView = hostingView
+        panel.appearance = NSAppearance(named: .darkAqua)
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
@@ -565,10 +621,12 @@ final class RecallOverlayController: RecallHotKeyBinding {
             previousApplication = NSWorkspace.shared.frontmostApplication
         }
         // Same-screen show is orderFront of an already-laid-out tree.
-        // setFrame(display: true), activate, DidOpen, and focus all invalidate
-        // or block the window server before the first frame can commit.
+        // Activate first so Liquid Glass samples as an active window —
+        // deferring it left 1–2 frames of opaque inactive material.
+        // DidOpen (focus, route) still waits until after this commit.
         placeOnTargetScreen()
         panel.alphaValue = 1
+        NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
         AfterRayMenuBar.shared.setOverlayVisible(true)
@@ -590,8 +648,8 @@ final class RecallOverlayController: RecallHotKeyBinding {
         panel.contentView?.layoutSubtreeIfNeeded()
     }
 
-    /// Focus, live-route, and app activation run after this turn's
-    /// CATransaction commits so the overlay can paint first.
+    /// Focus and open-route run after this turn's CATransaction commits
+    /// so they cannot rebuild the tree on the first painted frame.
     private func scheduleWorkAfterFirstFrame(_ intent: OverlayOpenIntent?) {
         DispatchQueue.main.async { [intent] in
             MainActor.assumeIsolated {
@@ -602,7 +660,6 @@ final class RecallOverlayController: RecallHotKeyBinding {
 
     fileprivate func completePresent(intent: OverlayOpenIntent?) {
         guard panel?.isVisible == true else { return }
-        NSApp.activate(ignoringOtherApps: true)
         NotificationCenter.default.post(name: .afterRayRecallDidOpen, object: intent)
     }
 
@@ -641,6 +698,10 @@ final class RecallOverlayController: RecallHotKeyBinding {
         OverlayVisibility.shared.set(false)
         setCapturePaused(false)
         application?.activate(options: [])
+        // After the window is off-screen: park the hidden tree in the live
+        // presentation so the next orderFront is not one opaque history
+        // frame followed by glass.
+        NotificationCenter.default.post(name: .afterRayRecallDidHide, object: nil)
     }
 
     private var targetScreen: NSScreen {
@@ -805,6 +866,7 @@ private final class PermissionGuideController {
                 permission: permission,
                 onDismiss: { [weak self] in self?.hide() }
             )
+                .afterRayLocalized()
                 .frame(width: panelSize.width, height: panelSize.height)
         )
         hostingView.frame = NSRect(origin: .zero, size: panelSize)
@@ -899,9 +961,12 @@ private struct PermissionSettingsGuide: View {
     let permission: RequiredPermission
     let onDismiss: () -> Void
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
+    @ObservedObject private var localization = AfterRayLocalization.shared
 
     private var applicationURL: URL { Bundle.main.bundleURL }
-    private var guide: PermissionSettingsGuideContent { permission.settingsGuide }
+    private var guide: PermissionSettingsGuideContent {
+        permission.settingsGuide(copy: localization.copy)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -931,7 +996,7 @@ private struct PermissionSettingsGuide: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.72))
-                .help("Dismiss")
+                .help(localization.copy.common.dismiss)
             }
 
             HStack(spacing: 12) {
@@ -967,7 +1032,7 @@ private struct PermissionSettingsGuide: View {
                 }
             }
 
-            Text("After granting access, press \(hotKeys.hotKey.displayString) to return.")
+            Text(AfterRayLocalization.shared.copy.permissions.afterGranting(hotKeys.hotKey.displayString))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
@@ -1122,6 +1187,7 @@ private struct AfterRayRootView: View {
             onSelectSearchFrame: selectSearchFrame
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.clear)
         .opacity(permissions.allGranted ? 1 : 0)
         // RecallView alone owns the full-screen history backdrop because it
         // can see transient scrub state. A second backdrop here only sees the
@@ -1250,6 +1316,15 @@ private struct AfterRayRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallWillHide)) { _ in
             audioPlayer.stop()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidHide)) { _ in
+            // Park only the default reopen. A selected search must survive
+            // hide so the next first frame is still the filmstrip, not NOW.
+            if OverlayOpenRoute.shouldParkLiveOnHide(
+                hasSelectedSearch: control.searchSession?.selectedFrame != nil
+            ) {
+                enterLive()
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallToggleAudio)) { _ in
             guard !isLive, let moment = store.selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else { return }
             audioPlayer.toggle(moment: moment)
@@ -1277,6 +1352,7 @@ private struct AfterRayRootView: View {
             Task { await images.clearSensitiveData() }
             Task { try? await SummaryExportFileStore.shared.cleanupAll() }
         }
+        .afterRayLocalized()
     }
 
     private func openSummarySlot(_ slot: DaySlotSummary) {
@@ -1311,6 +1387,9 @@ private struct AfterRayRootView: View {
         // capture pause; a fresh launch always starts with the overlay hidden.
         do {
             let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            if let settings = try? await client.settings() {
+                AfterRayLocalization.shared.apply(stored: settings.uiLanguage)
+            }
             _ = try await client.setCapturePaused(paused: false, reason: "launch")
         } catch {
             AfterRayLog.info("bootstrap: clearing capture pause failed: \(error.localizedDescription)")
@@ -1459,6 +1538,9 @@ private struct AfterRayRootView: View {
 private struct PermissionPanel: View {
     @ObservedObject var coordinator: SystemPermissionCoordinator
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
+    @ObservedObject private var localization = AfterRayLocalization.shared
+
+    private var copy: AfterRayCopy { localization.copy }
 
     var body: some View {
         ZStack {
@@ -1468,14 +1550,14 @@ private struct PermissionPanel: View {
                         Rectangle()
                             .fill(RecallPalette.ray)
                             .frame(width: 18, height: 2)
-                        Text("LOCAL ONLY / AFTERRAY")
+                        Text(copy.permissions.eyebrow)
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
                             .tracking(1.1)
                     }
                     .foregroundStyle(RecallPalette.ray)
                     Text(coordinator.microphoneRequired && !coordinator.microphoneDeclined
-                         ? "Three local permissions are required"
-                         : "Two local permissions are required")
+                         ? copy.permissions.threeRequired
+                         : copy.permissions.twoRequired)
                         .font(.title2.weight(.semibold))
                     Text(permissionSummary)
                         .font(.callout)
@@ -1491,21 +1573,21 @@ private struct PermissionPanel: View {
                     }
                 }
 
-                Text("After changing a permission, press \(hotKeys.hotKey.displayString) to return to AfterRay.")
+                Text(copy.permissions.afterChanging(hotKeys.hotKey.displayString))
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
                 if coordinator.isRequesting {
                     HStack(spacing: 9) {
                         ProgressView().controlSize(.small)
-                        Text("Waiting for macOS approval…")
+                        Text(copy.permissions.waitingApproval)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 } else {
                     HStack {
                         Spacer()
-                        Button("Check permissions") { coordinator.refresh() }
+                        Button(copy.permissions.checkPermissions) { coordinator.refresh() }
                             .buttonStyle(.borderedProminent)
                             .tint(RecallPalette.ray)
                     }
@@ -1520,19 +1602,20 @@ private struct PermissionPanel: View {
             }
             .shadow(color: .black.opacity(0.5), radius: 28, y: 14)
         }
+        .afterRayLocalized()
     }
 
     private var permissionSummary: String {
         if !coordinator.recordsAudio {
-            return "Audio recording is off, so the microphone is optional. Screen and Accessibility are still required."
+            return copy.permissions.audioOffSummary
         }
         if !coordinator.hasMicrophoneInput {
-            return "No microphone input is connected. AfterRay can still record screen and system audio, so microphone access is not required."
+            return copy.permissions.noMicSummary
         }
         if coordinator.microphoneDeclined {
-            return "Microphone access is declined, so transcripts use system audio only. You can turn it on anytime in System Settings."
+            return copy.permissions.micDeclinedSummary
         }
-        return "AfterRay starts recording automatically as soon as macOS grants all three. Nothing is uploaded."
+        return copy.permissions.allThreeSummary
     }
 
     private func permissionRow(_ permission: RequiredPermission) -> some View {
@@ -1542,19 +1625,19 @@ private struct PermissionPanel: View {
             Image(systemName: permission.icon)
                 .frame(width: 22)
                 .foregroundStyle(unavailable ? Color.secondary : (granted ? Color.green : Color.red))
-            Text(permission.title)
+            Text(permission.title(copy))
                 .font(.callout.weight(.medium))
             Spacer()
             if unavailable {
-                Label("No input device", systemImage: "minus.circle.fill")
+                Label(copy.permissions.noInputDevice, systemImage: "minus.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if granted {
-                Label("Allowed", systemImage: "checkmark.circle.fill")
+                Label(copy.permissions.allowed, systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
             } else {
-                Button("Open Settings") {
+                Button(copy.permissions.openSettings) {
                     Task {
                         // The overlay is a full-screen `.statusBar`-level
                         // panel; the system consent alert can be presented
@@ -1599,7 +1682,11 @@ private struct PermissionPanel: View {
 /// or on the chat button, never merely because you pressed Tab.
 private struct ImmersiveQueryBar: View {
     @ObservedObject var model: AfterRayControlModel
+    @ObservedObject private var localization = AfterRayLocalization.shared
+    @Environment(\.afterRayCopy) private var environmentCopy
     @Binding var mode: ImmersiveQueryMode
+
+    private var copy: AfterRayCopy { localization.copy }
     let focusRequest: UInt64
     let onSubmit: () -> Void
     let onOpenChat: () -> Void
@@ -1612,7 +1699,7 @@ private struct ImmersiveQueryBar: View {
             Button(action: toggleMode) {
                 HStack(spacing: 5) {
                     queryModeIcon
-                    Text(mode.title)
+                    Text(mode.title(copy))
                 }
                 .font(.system(size: 10, weight: .semibold, design: .rounded))
                 .foregroundStyle(mode == .ask ? RecallPalette.ray : .white.opacity(0.86))
@@ -1623,17 +1710,17 @@ private struct ImmersiveQueryBar: View {
                 .recallHoverFill(in: Capsule())
             }
             .buttonStyle(RecallGlassPressStyle())
-            .help("\(mode.toggleHelp) (Tab)")
-            .accessibilityLabel("Input mode")
-            .accessibilityValue(mode.title)
-            .accessibilityHint(mode.toggleHelp)
+            .help("\(mode.toggleHelp(copy)) (Tab)")
+            .accessibilityLabel(copy.recall.inputMode)
+            .accessibilityValue(mode.title(copy))
+            .accessibilityHint(mode.toggleHelp(copy))
 
             Rectangle()
                 .fill(.white.opacity(0.12))
                 .frame(width: 1, height: 18)
 
             HStack(spacing: 8) {
-                TextField(mode.placeholder, text: $model.searchQuery)
+                TextField(mode.placeholder(copy), text: $model.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
                     .focused($isInputFocused)
@@ -1653,7 +1740,7 @@ private struct ImmersiveQueryBar: View {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
-                    .help("Clear")
+                    .help(copy.recall.clear)
                 }
             }
             .frame(width: 268)
@@ -1677,8 +1764,8 @@ private struct ImmersiveQueryBar: View {
                     )
             }
             .buttonStyle(RecallGlassPressStyle())
-            .help("Open chat")
-            .accessibilityLabel("Open chat")
+            .help(copy.recall.openChat)
+            .accessibilityLabel(copy.recall.openChat)
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -1687,7 +1774,7 @@ private struct ImmersiveQueryBar: View {
                     .frame(width: 26, height: 26)
             }
             .buttonStyle(.plain)
-            .help("Close AfterRay")
+            .help(copy.recall.closeAfterRay)
         }
         .padding(.horizontal, 14)
         .frame(height: RecallGeometry.overlayChromeButtonSize)
@@ -1758,9 +1845,9 @@ private struct ImmersiveQueryBar: View {
             // Pointing the way the strip runs: older matches lie to its left,
             // newer to its right, as on the timeline.
             HStack(spacing: 2) {
-                stepButton(symbol: "chevron.left", help: "Older match", delta: 1)
+                stepButton(symbol: "chevron.left", help: copy.recall.olderMatch, delta: 1)
                     .disabled(session.selectedIndex >= session.frames.count - 1)
-                stepButton(symbol: "chevron.right", help: "Newer match", delta: -1)
+                stepButton(symbol: "chevron.right", help: copy.recall.newerMatch, delta: -1)
                     .disabled(session.selectedIndex == 0)
             }
         }
@@ -1791,7 +1878,7 @@ private struct CaptureFailureBanner: View {
                 .font(.system(size: 11, weight: .medium, design: .rounded))
                 .foregroundStyle(.white.opacity(0.88))
                 .lineLimit(3)
-            Button("Retry", action: onRetry)
+            Button(AfterRayLocalization.shared.copy.common.retry, action: onRetry)
                 .buttonStyle(.plain)
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .padding(.horizontal, 10)

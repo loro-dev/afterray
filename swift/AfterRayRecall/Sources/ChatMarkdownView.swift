@@ -60,6 +60,7 @@ struct ChatMarkdownView: View {
 }
 
 private struct ChatCodeBlock: View {
+    @Environment(\.afterRayCopy) private var copy
     let language: String?
     let text: String
     let closed: Bool
@@ -67,13 +68,13 @@ private struct ChatCodeBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text((language?.isEmpty == false ? language! : "code").uppercased())
+                Text((language?.isEmpty == false ? language! : copy.chat.code).uppercased())
                     .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                     .tracking(0.8)
                     .foregroundStyle(ChatPalette.coral.opacity(0.9))
                 Spacer()
                 if !closed {
-                    Text("streaming")
+                    Text(copy.chat.streaming)
                         .font(.system(size: 9.5, weight: .medium, design: .rounded))
                         .foregroundStyle(ChatPalette.tertiary)
                 }

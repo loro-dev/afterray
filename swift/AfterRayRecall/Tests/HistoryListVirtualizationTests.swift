@@ -84,88 +84,55 @@ final class HistoryListVirtualizationTests: XCTestCase {
         XCTAssertEqual(items.map(\.id), ["d-0", "s-0"])
     }
 
-    func testEstimateGrowsWhenASlotIsExpanded() {
-        let collapsed = HistoryListItem.slot(slot(start: 0, title: "work", bullets: ["a", "b"]), expanded: false)
-        let expanded = HistoryListItem.slot(slot(start: 0, title: "work", bullets: ["a", "b"]), expanded: true)
-        XCTAssertGreaterThan(
-            HistoryRowHeight.estimate(expanded),
-            HistoryRowHeight.estimate(collapsed)
+    /// `ScrollGeometry.visibleRect.minY` is the distance scrolled from the top
+    /// and goes negative only while rubber-banding above it.
+    func testOverscrollingAboveTheTopIsNotADownwardOffset() {
+        XCTAssertEqual(HistoryListLayout.offset(visibleMinY: 620), 620)
+        XCTAssertEqual(HistoryListLayout.offset(visibleMinY: 0), 0)
+        XCTAssertEqual(HistoryListLayout.offset(visibleMinY: -42), 0)
+    }
+
+    func testPrefetchLeadsTheContentEnd() {
+        // 400pt of lead: a flick at the bottom is already loading.
+        XCTAssertFalse(
+            HistoryLoadMore.isNearBottom(offset: 0, viewportHeight: 460, contentHeight: 4000)
+        )
+        XCTAssertTrue(
+            HistoryLoadMore.isNearBottom(offset: 3200, viewportHeight: 460, contentHeight: 4000)
         )
     }
 
-    func testHeightCachePrefersTheMeasuredValueAndCanShrink() {
-        let cache = HistoryRowHeightCache()
-        cache.record(id: "s-1", measured: 140)
-        XCTAssertEqual(cache.height(for: "s-1", estimate: 96), 140)
-        cache.record(id: "s-1", measured: 80)
-        XCTAssertEqual(cache.height(for: "s-1", estimate: 96), 80)
-        cache.invalidate("s-1")
-        XCTAssertEqual(cache.height(for: "s-1", estimate: 96), 96)
-    }
-
-    func testOriginsFoldSpacingIntoTheNextEdge() {
-        let origins = HistoryListLayout.origins(heights: [100, 100, 100], spacing: 8)
-        XCTAssertEqual(origins, [0, 108, 216, 316])
-    }
-
-    func testVisibleRangeCoversTheViewportPlusOverscan() {
-        let origins = HistoryListLayout.origins(heights: Array(repeating: 100, count: 10), spacing: 8)
-        let range = HistoryListLayout.visibleRange(
-            origins: origins,
-            offset: 0,
-            viewportHeight: 200,
-            overscan: 0
-        )
-        XCTAssertEqual(range, 0..<2)
-    }
-
-    func testUnmountedRowsStillContributeToContentHeight() {
-        let origins = HistoryListLayout.origins(heights: Array(repeating: 100, count: 5), spacing: 8)
-        XCTAssertEqual(origins.last, 532)
-        let window = HistoryListLayout.visibleRange(
-            origins: origins,
-            offset: 0,
-            viewportHeight: 200,
-            overscan: 0
-        )
-        XCTAssertLessThan(window.count, 5)
-    }
-
-    func testHeightChangeAboveTheFoldMovesTheClipOrigin() {
-        XCTAssertEqual(
-            HistoryListLayout.offsetDeltaAfterHeightChange(
-                rowOrigin: 0,
-                viewportOffset: 200,
-                heightDelta: 40
+    /// The "Full details" link must appear exactly when there is something to
+    /// expand, without paying for a Markdown parse to find out.
+    func testExpandableDetailAgreesWithTheParsedSections() {
+        let cases: [DaySlotSummary] = [
+            slot(start: 0, title: "work", bullets: ["a"]),
+            slot(start: 0, title: "work", bullets: []),
+            slot(start: 0, title: "work", bullets: ["   "]),
+            DaySlotSummary(
+                slotStartMs: 0,
+                slotEndMs: 1,
+                state: "done",
+                facts: DaySlotFacts(apps: []),
+                title: "v3",
+                details: "## Heading\n- a bullet"
             ),
-            40
-        )
-        XCTAssertEqual(
-            HistoryListLayout.offsetDeltaAfterHeightChange(
-                rowOrigin: 400,
-                viewportOffset: 200,
-                heightDelta: 40
+            DaySlotSummary(
+                slotStartMs: 0,
+                slotEndMs: 1,
+                state: "done",
+                facts: DaySlotFacts(apps: []),
+                title: "blank v3",
+                details: "   \n  "
             ),
-            0
-        )
-    }
-
-    func testPrefetchStartsFiveRowsFromTheLoadedEdge() {
-        XCTAssertFalse(HistoryListLayout.shouldPrefetchOlder(visibleLastIndex: 2, itemCount: 20))
-        XCTAssertTrue(HistoryListLayout.shouldPrefetchOlder(visibleLastIndex: 16, itemCount: 20))
-        XCTAssertTrue(HistoryListLayout.shouldPrefetchOlder(visibleLastIndex: 19, itemCount: 20))
-    }
-
-    func testPinningAFarIndexAddsASecondMountedRange() {
-        let origins = HistoryListLayout.origins(heights: Array(repeating: 100, count: 10), spacing: 8)
-        let ranges = HistoryListLayout.mountedRanges(
-            origins: origins,
-            offset: 400,
-            viewportHeight: 200,
-            extraIndices: [0],
-            overscan: 0
-        )
-        XCTAssertEqual(ranges, [0..<1, 3..<6])
+        ]
+        for slot in cases {
+            XCTAssertEqual(
+                DaySummaryLayout.hasExpandableDetail(slot: slot),
+                !DaySummaryLayout.expandedSections(slot: slot).isEmpty,
+                "cheap predicate disagreed with the parser for \(slot.title ?? "?")"
+            )
+        }
     }
 
     private func slot(start: Int64, title: String, bullets: [String] = ["detail"]) -> DaySlotSummary {
