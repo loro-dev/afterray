@@ -5,8 +5,8 @@ import MLXLMCommon
 import MLXVLM
 import Tokenizers
 
-public let mlxWorkerProtocolVersion = 1
-public let mlxRuntimeVersion = "mlx-swift-lm@3.31.4"
+public let mlxWorkerProtocolVersion = 2
+public let mlxRuntimeVersion = "mlx-swift-lm@65be34c"
 public let qwen35_4BRevision = "32f3e8ecf65426fc3306969496342d504bfa13f3"
 public let qwen35_9BRevision = "938d8919941c6e7efd3c7150eff7fe9d12afa631"
 
@@ -23,14 +23,12 @@ public struct MlxWorkerRequest: Decodable, Sendable {
     public let messages: [Message]?
     public let images: [String]?
     public let maxTokens: Int?
-    public let useKvCache: Bool?
 
     enum CodingKeys: String, CodingKey {
         case v, kind, messages, images
         case requestId = "request_id"
         case modelDir = "model_dir"
         case maxTokens = "max_tokens"
-        case useKvCache = "use_kv_cache"
     }
 }
 
@@ -55,10 +53,9 @@ public struct MlxWorkerResponse: Encodable, Sendable {
     public var usage: Usage?
     public var loadMilliseconds: Int?
     public var error: String?
-    public var cache: String?
 
     enum CodingKeys: String, CodingKey {
-        case v, kind, runtime, text, usage, error, cache
+        case v, kind, runtime, text, usage, error
         case requestId = "request_id"
         case loadMilliseconds = "load_ms"
     }
@@ -94,8 +91,6 @@ actor MlxModelRuntime {
     private(set) var container: ModelContainer?
     private var activeTask: Task<Void, Never>?
     private var activeRequestId: String?
-    private var cachedSession: ChatSession?
-    private var cachedInstructions: String?
 
     func load(modelDirectory: URL) async throws -> Int {
         guard container == nil else { return 0 }
@@ -182,27 +177,16 @@ actor MlxModelRuntime {
                 maxTokens: max(1, min(request.maxTokens ?? 512, 4_096)),
                 temperature: 0
             )
-            let session: ChatSession
-            let cacheMode: String
-            if request.useKvCache == true,
-               cachedInstructions == instructions,
-               let cachedSession
-            {
-                session = cachedSession
-                cacheMode = "reused"
-            } else {
-                session = ChatSession(
-                    container,
-                    instructions: instructions,
-                    generateParameters: parameters,
-                    additionalContext: ["enable_thinking": false]
-                )
-                cacheMode = "full_prefill"
-                if request.useKvCache == true {
-                    cachedSession = session
-                    cachedInstructions = instructions
-                }
-            }
+            // @dec:mlx-prefill-and-request-isolation — docs/decisions/active/architecture/2026-08-20-mlx-prefill-and-request-isolation.md
+            // Each request contains a complete, independent prompt. Keep the
+            // expensive model container resident, but never carry conversation
+            // or KV state from one daemon job into the next.
+            let session = ChatSession(
+                container,
+                instructions: instructions,
+                generateParameters: parameters,
+                additionalContext: ["enable_thinking": false]
+            )
             let imageInputs = try (request.images ?? []).map { path -> UserInput.Image in
                 let url = URL(fileURLWithPath: path)
                 guard url.isFileURL, FileManager.default.fileExists(atPath: url.path) else {
@@ -253,8 +237,7 @@ actor MlxModelRuntime {
                     promptTokens: promptTokens,
                     completionTokens: completionTokens,
                     generationMs: generationMs
-                ),
-                cache: cacheMode
+                )
             ))
         } catch is CancellationError {
             // The cancel request emits the sole terminal protocol event.

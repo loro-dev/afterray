@@ -10,6 +10,7 @@
 > - **Phase 0 的量测从未发生。** [docs/evals/qwen35-4b-mlx-phase0.md](evals/qwen35-4b-mlx-phase0.md) 自己写着 “real-device run pending”，8/16/24 GB 矩阵是空模板，结尾明说「No throughput, memory, compatibility, or quality claim has been recorded」。Phase 0 的退出条件因此从未被证明满足，Phase 1–2 是在它之上直接落地的。
 > - **计划没有预料到的第二个包已经发货：** `llm_qwen35_9b_mlx4`（`crates/afterray-models/src/catalog.rs:13`，pack spec 在 `:339`）。本计划通篇只规划了单一 4B 包。
 > - **OptiQ 对照从未做。** 树内没有任何 OptiQ 包或基准记录；§Phase 0 写的「否则固定标准版」是靠默认落地的，不是靠证据落地的。
+> - **「跨请求复用 KV cache，失败后完整 prefill」会混合独立总结，并且无法从 Metal 致命分配中恢复。** 当前 worker 协议为 v2：常驻的只有模型容器，每个完整 prompt 都创建新 `ChatSession`；`mlx-swift-lm` 固定到带 Qwen3.5 windowed prefill 的 `65be34c`。见 [2026-08-20-mlx-prefill-and-request-isolation](decisions/active/architecture/2026-08-20-mlx-prefill-and-request-isolation.md)。下文 v1 协议和 cache 回退是历史设计，不是当前行为。
 
 状态：提案，待真实设备验证后实施  
 日期：2026-08-15  
