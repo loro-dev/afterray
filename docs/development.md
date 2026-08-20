@@ -244,7 +244,12 @@ stops the daemon first, then moves the database, encrypted artifacts,
 recordings, GOP archives, model weights, and MLX runtime together; the socket
 stays at its normal Application Support path. If the chosen external volume is
 not mounted later, startup reports that condition instead of creating an empty
-replacement vault on the internal disk.
+replacement vault on the internal disk. Before any move, the App synchronizes a
+recovery manifest under `~/Library/Application Support/AfterRayRelocation/`,
+outside both data roots. On the next launch it either proves every recorded item
+is back at the old root and resumes there, or holds capture stopped for manual
+recovery; it never starts a daemon on a split vault. The manifest is removed
+only after the new preference is committed and the new daemon answers `status`.
 
 ## Environment variables
 

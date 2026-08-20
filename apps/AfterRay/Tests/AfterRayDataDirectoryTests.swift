@@ -118,6 +118,60 @@ final class AfterRayDataDirectoryTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: destinationFile.path))
     }
 
+    func testRollbackRequiresSourceToExistWhenDestinationHasDisappeared() throws {
+        let source = directory.appendingPathComponent("source", isDirectory: true)
+        let destination = directory.appendingPathComponent("external", isDirectory: true)
+        let move = AfterRayDataDirectory.Move(
+            source: source.appendingPathComponent("afterray.sqlite3"),
+            destination: destination.appendingPathComponent("afterray.sqlite3")
+        )
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try AfterRayDataDirectory.rollback([move])) { error in
+            XCTAssertTrue(AfterRayDataDirectory.needsManualRecovery(error))
+        }
+    }
+
+    func testRestartRecoversAnInterruptedMoveFromItsPersistentManifest() throws {
+        let source = directory.appendingPathComponent("source", isDirectory: true)
+        let destination = directory.appendingPathComponent("external/AfterRay", isDirectory: true)
+        let manifestURL = directory
+            .appendingPathComponent("control", isDirectory: true)
+            .appendingPathComponent("memory-location-recovery.json")
+        let sourceFile = source.appendingPathComponent("afterray.sqlite3")
+        let destinationFile = destination.appendingPathComponent("afterray.sqlite3")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("vault".utf8).write(to: sourceFile)
+
+        try AfterRayDataDirectory.beginMigration(
+            sourceRoot: source,
+            destinationRoot: destination,
+            sourceLocation: try AfterRayDataDirectory.location(for: source),
+            destinationLocation: try AfterRayDataDirectory.location(for: destination),
+            manifestURL: manifestURL
+        )
+        let journal = try AfterRayDataDirectory.RecoveryJournal(manifestURL: manifestURL)
+        try journal.markMoving()
+        let move = AfterRayDataDirectory.Move(source: sourceFile, destination: destinationFile)
+        try journal.recordIntent(move)
+        try FileManager.default.moveItem(at: sourceFile, to: destinationFile)
+        // This is the deterministic crash point: the item moved, but the
+        // process died before it could record completion or run `catch`.
+
+        XCTAssertEqual(
+            try AfterRayDataDirectory.recoverInterruptedMigration(
+                manifestURL: manifestURL,
+                currentDataDirectory: source
+            ),
+            .none
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: manifestURL.path))
+    }
+
     func testValidationRejectsAChildOfTheCurrentVault() throws {
         let source = directory.appendingPathComponent("source", isDirectory: true)
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)

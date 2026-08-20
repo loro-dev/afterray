@@ -51,6 +51,19 @@ final class DaemonSupervisor {
     private var isSuspendedForSystemLock = false
     private var isStopped = false
 
+    /// This control record stays beside, never inside, either data root. The
+    /// default vault is `Application Support/AfterRay`; using a sibling keeps
+    /// the journal available while that root is crossing a volume boundary.
+    private static var relocationRecoveryManifestURL: URL {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        return applicationSupport
+            .appendingPathComponent("AfterRayRelocation", isDirectory: true)
+            .appendingPathComponent("memory-location-recovery.json")
+    }
+
     private init() {
         let environment = ProcessInfo.processInfo.environment
         if let repoRoot = Self.developmentRepoRoot() {
@@ -93,6 +106,17 @@ final class DaemonSupervisor {
               !requiresDataDirectoryRecovery,
               allowingDataRelocation || !isRelocatingDataDirectory
         else { return false }
+        let recoveryManifestURL = Self.relocationRecoveryManifestURL
+        let startupRecovery: AfterRayDataDirectory.StartupRecovery
+        do {
+            startupRecovery = try AfterRayDataDirectory.recoverInterruptedMigration(
+                manifestURL: recoveryManifestURL,
+                currentDataDirectory: dataDirectory
+            )
+        } catch {
+            requiresDataDirectoryRecovery = true
+            throw error
+        }
         if configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
            let location = AfterRayPreferences.memoryDataLocation {
             try AfterRayDataDirectory.validateConfiguredVolume(
@@ -101,7 +125,13 @@ final class DaemonSupervisor {
             )
         }
         if let status = await daemonStatus() {
-            if Self.hostBuildMatches(status) { return false }
+            if Self.hostBuildMatches(status) {
+                clearRecoveryManifestAfterDaemonVerification(
+                    startupRecovery,
+                    manifestURL: recoveryManifestURL
+                )
+                return false
+            }
             // An update replaced the bundle while the old daemon kept the
             // socket. Reusing it would run this build's UI against the
             // previous build's logic, against the same store, with nothing
@@ -187,7 +217,13 @@ final class DaemonSupervisor {
                 processOutput = nil
                 return false
             }
-            if await daemonIsReachable() { return true }
+            if await daemonIsReachable() {
+                clearRecoveryManifestAfterDaemonVerification(
+                    startupRecovery,
+                    manifestURL: recoveryManifestURL
+                )
+                return true
+            }
             if !child.isRunning {
                 process = nil
                 processOutput = nil
@@ -288,6 +324,20 @@ final class DaemonSupervisor {
         try? await UnixSocketDaemonClient(socketPath: socketPath).status()
     }
 
+    private func clearRecoveryManifestAfterDaemonVerification(
+        _ recovery: AfterRayDataDirectory.StartupRecovery,
+        manifestURL: URL
+    ) {
+        guard recovery == .clearAfterDaemonIsReachable else { return }
+        do {
+            try AfterRayDataDirectory.clearRecoveryManifest(at: manifestURL)
+        } catch {
+            // Keeping a verified journal is safe: the next startup will verify
+            // the selected root again before attempting to remove it.
+            AfterRayLog.error("could not clear memory relocation journal: \(error.localizedDescription)")
+        }
+    }
+
     /// `CFBundleVersion`, which `scripts/build-release.sh` stamps per release.
     /// The marketing version cannot distinguish two builds of one release, and
     /// an update that only fixes the daemon is exactly that case.
@@ -336,9 +386,12 @@ final class DaemonSupervisor {
         let sourceRuntime = mlxRuntimeDirectory
         try AfterRayDataDirectory.validateDestination(destination, currentDirectory: sourceData)
         let location = try AfterRayDataDirectory.location(for: destination)
+        let sourceLocation = try AfterRayDataDirectory.location(for: sourceData)
         let previousLocation = AfterRayPreferences.memoryDataLocation
         let socketName = URL(fileURLWithPath: socketPath).lastPathComponent
+        let recoveryManifestURL = Self.relocationRecoveryManifestURL
         var moves: [AfterRayDataDirectory.Move] = []
+        var migrationFinished = false
 
         guard !isRelocatingDataDirectory else { return }
         isRelocatingDataDirectory = true
@@ -352,6 +405,15 @@ final class DaemonSupervisor {
         await terminateDaemon()
         do {
             if migrateExistingData {
+                // This synchronous write is intentionally before the detached
+                // first move; it is the crash/restart fence for cross-volume IO.
+                try AfterRayDataDirectory.beginMigration(
+                    sourceRoot: sourceData,
+                    destinationRoot: destination,
+                    sourceLocation: sourceLocation,
+                    destinationLocation: location,
+                    manifestURL: recoveryManifestURL
+                )
                 // `FileManager.moveItem` may copy tens of gigabytes across a
                 // volume. Keep AppKit and the progress indicator responsive.
                 moves = try await Task.detached(priority: .userInitiated) {
@@ -360,20 +422,28 @@ final class DaemonSupervisor {
                         sourceModels: sourceModels,
                         sourceRuntime: sourceRuntime,
                         destination: destination,
-                        socketName: socketName
+                        socketName: socketName,
+                        recoveryManifestURL: recoveryManifestURL
                     )
                 }.value
+                migrationFinished = true
             }
 
             AfterRayPreferences.memoryDataLocation = location
+            if migrateExistingData {
+                try AfterRayDataDirectory.markPreferenceCommitted(at: recoveryManifestURL)
+            }
             _ = try await startIfNeeded(allowingDataRelocation: true)
         } catch {
             AfterRayPreferences.memoryDataLocation = previousLocation
             var recoveryError: (any Swift.Error)?
-            if !moves.isEmpty {
+            if migrationFinished {
                 do {
                     try await Task.detached(priority: .userInitiated) {
-                        try AfterRayDataDirectory.rollback(moves)
+                        try AfterRayDataDirectory.rollback(
+                            moves,
+                            manifestURL: recoveryManifestURL
+                        )
                     }.value
                 } catch {
                     recoveryError = error

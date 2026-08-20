@@ -4,6 +4,7 @@ Status: active
 Area: privacy
 Anchors:
 - apps/AfterRay/Sources/DaemonSupervisor.swift @dec:vault-location-relocation
+- apps/AfterRay/Sources/AfterRayDataDirectory.swift @dec:vault-location-relocation
 Supersedes: —
 Superseded-by: —
 
@@ -42,6 +43,17 @@ relaunch before capture can resume. Explicit `AFTERRAY_DATA_DIR` or
 `AFTERRAY_MODEL_DIR` overrides are developer-controlled and disable the UI
 migration path.
 
+Before the first item moves, the App synchronizes a recovery manifest in an
+internal control directory outside both the old and selected roots. It records
+both roots, their volume identities, the transaction phase, and a per-item
+intent before `moveItem` plus completion after it. Startup checks this manifest
+before it starts a daemon. An interrupted transition with the old preference is
+returned deterministically to the source root only when every item is confirmed
+at its source and absent at its destination. Any missing, duplicate, or
+inaccessible item fails closed for manual recovery. A fully moved root selected
+by preferences retains the manifest until a newly started daemon responds to
+`status`; only then is the record removed.
+
 ## Alternatives considered
 
 **Store the selected path in `settings.json`.** Rejected because that file is
@@ -58,6 +70,11 @@ volume path can be recreated under `/Volumes` on the internal disk, producing a
 new empty vault that looks like missing history. The volume identity check makes
 the absence visible instead.
 
+**Keep recovery state only in the relocating process.** Rejected because force
+quit and power loss skip its rollback handler. A durable control record makes
+the next launch either restore the source root or refuse to write either split
+root.
+
 ## Consequences
 
 **Bought:** one selected root contains the database, encrypted artifacts,
@@ -67,10 +84,10 @@ location and client discovery do not change.
 
 **Cost:** a location change pauses capture and needs enough space for the
 filesystem's move operation. Cross-volume moves are not atomic; the App can
-roll back entries it moved before an error, but a storage failure that also
-prevents rollback keeps capture stopped and requires the user to repair the two
-visible folders. A disconnected external drive blocks startup rather than
-falling back silently.
+roll back entries it moved before an error, and a durable manifest carries that
+same fence across crashes. A storage failure that prevents confirming rollback
+keeps capture stopped and requires the user to repair the two visible folders.
+A disconnected external drive blocks startup rather than falling back silently.
 
 ## Related
 
