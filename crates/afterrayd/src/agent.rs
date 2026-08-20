@@ -165,6 +165,7 @@ pub async fn run_readonly_agent_traced(
         models,
         priority: JobPriority::Interactive,
         token_sink: None,
+        temperature: None,
     };
     let strategy = PruneToolResults;
     let turn = run_turn(

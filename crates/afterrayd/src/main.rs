@@ -3258,6 +3258,7 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
             lease: Some(lease_hold.id()),
         },
         token_sink: None,
+        temperature: Some(T2_TEMPERATURE),
     };
     let turn = afterray_harness::run_turn(
         &model,
@@ -3351,6 +3352,8 @@ async fn run_slot_t2(state: &Arc<AppState>, at_ms: i64) -> Result<serde_json::Va
 /// transcript is append-only — never pruned — so a prefix-caching runtime
 /// re-prefills only each round's delta.
 const T2_MAX_ROUNDS: usize = 8;
+/// Summary cards are a structured extraction task, so keep sampling stable.
+const T2_TEMPERATURE: f32 = 0.1;
 
 /// How long after a slot closes before it is eligible. Frames captured near the
 /// boundary land in the vault a beat late; summarising immediately would read a
@@ -4088,6 +4091,7 @@ async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
             system: Some(
                 "You are AfterRay. Be concise and never invent missing evidence.".to_owned(),
             ),
+            temperature: Some(T2_TEMPERATURE),
         })
         .await
     {

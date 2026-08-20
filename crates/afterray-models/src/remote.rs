@@ -266,6 +266,7 @@ impl ModelAdapter for LlmRouterAdapter {
                     prompt,
                     system,
                     messages,
+                    temperature,
                 } = input
                 else {
                     return Err(AdapterError::InvalidOutput(
@@ -281,7 +282,10 @@ impl ModelAdapter for LlmRouterAdapter {
                     &config,
                     prompt,
                     messages,
-                    system.as_deref(),
+                    RemoteGenerationOptions {
+                        system: system.as_deref(),
+                        temperature: *temperature,
+                    },
                     token_tx,
                     cancellation,
                 )
@@ -419,12 +423,18 @@ async fn probe_openai(
     Ok(models_from_openai_list(&value))
 }
 
+#[derive(Clone, Copy)]
+struct RemoteGenerationOptions<'a> {
+    system: Option<&'a str>,
+    temperature: Option<f32>,
+}
+
 async fn generate_remote(
     client: &reqwest::Client,
     config: &LlmRuntimeConfig,
     prompt: &str,
     messages: &[crate::ChatMessage],
-    system: Option<&str>,
+    options: RemoteGenerationOptions<'_>,
     token_tx: Option<mpsc::Sender<LlmDelta>>,
     cancellation: Cancellation,
 ) -> Result<(String, Option<crate::LlmUsage>), AdapterError> {
@@ -438,7 +448,7 @@ async fn generate_remote(
         config,
         prompt,
         messages,
-        system,
+        options,
         token_tx,
         cancellation,
     )
@@ -954,6 +964,7 @@ mod tests {
                     prompt: "hi".into(),
                     system: None,
                     messages: Vec::new(),
+                    temperature: None,
                 },
                 Cancellation::default(),
             )

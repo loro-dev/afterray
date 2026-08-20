@@ -568,6 +568,7 @@ async fn run_agent<W: AsyncWrite + Unpin + Send>(
         models: ctx.models,
         priority: JobPriority::Interactive,
         token_sink: Some(ctx.token_sink),
+        temperature: None,
     };
     let strategy = PruneToolResults;
     let mut sink = StreamSink {
