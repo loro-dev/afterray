@@ -1871,27 +1871,65 @@ private struct TimelineRunsLayer: View, Equatable {
         // size; on their own, a stack of positioned views collapses and every
         // segment lands in a heap in the middle. The `Color.clear` is what
         // establishes the coordinate space the x/y below are written against.
-        ZStack(alignment: .leading) {
-            Color.clear.frame(width: layout.contentWidth, height: TimelineRunsLayer.trackHeight)
-
+        // A `ZStack` of `.position`ed children asks every child for its
+        // explicit alignment and dimensions so it can decide where to put it —
+        // `LayoutEngineBox.explicitAlignment` and `LayoutProxy.dimensions`
+        // were ~2ms of a 10ms frame, several hundred children in. We already
+        // know exactly where each run goes, so a `Layout` places them in one
+        // pass and asks nothing.
+        TimelineRunPlacement(
+            centres: range.map { layout.runs[$0].startX + layout.runs[$0].width / 2 },
+            size: CGSize(width: layout.contentWidth, height: Self.trackHeight)
+        ) {
             // `ForEach` over the `Range` itself: `Array(indices)` allocated a
             // new array on every pass for no reason.
             ForEach(range, id: \.self) { index in
                 let run = layout.runs[index]
                 let drawnWidth = max(run.width - (index == lastIndex ? 0 : gap), 1)
-                let height = run.isIdle ? 7 : segmentHeight
                 AppUsageSegmentView(
                     run: run,
                     width: drawnWidth,
-                    height: height,
+                    height: run.isIdle ? 7 : segmentHeight,
                     color: AppUsageTimeline.segmentColor(run)
                 )
                 .equatable()
-                .frame(width: drawnWidth, height: height)
-                .position(x: run.startX + run.width / 2, y: TimelineRunsLayer.trackHeight / 2)
+                .frame(width: drawnWidth, height: run.isIdle ? 7 : segmentHeight)
             }
         }
-        .frame(width: layout.contentWidth, height: TimelineRunsLayer.trackHeight)
+    }
+}
+
+/// Places already-sized run segments at known x centres, vertically centred.
+///
+/// Equivalent to `.position(x:y:)` inside a `ZStack`, minus the stack's
+/// per-child alignment and dimension queries. `centres` must be in the same
+/// order the `ForEach` emits.
+private struct TimelineRunPlacement: Layout {
+    let centres: [CGFloat]
+    let size: CGSize
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        size
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        for (index, subview) in subviews.enumerated() {
+            guard index < centres.count else { break }
+            subview.place(
+                at: CGPoint(x: bounds.minX + centres[index], y: bounds.midY),
+                anchor: .center,
+                proposal: .unspecified
+            )
+        }
     }
 }
 
