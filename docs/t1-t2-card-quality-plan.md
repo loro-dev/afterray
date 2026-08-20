@@ -15,7 +15,7 @@
 > - `card_text`（`scripts/t2-eval.py:102`）读 `title` / `bullets` / `threads[].name,prose` / `entities[].text` / `decisions`，全是 v1 与 v2 的字段。daemon 的 `slot_summarize` 响应里 `card` 就是序列化后的 `T2CardV3`（`crates/afterrayd/src/main.rs:3342`），只有 `title` / `description` / `details` / `low_trust`。**交集只剩 `title` 一项** —— 于是实体保真率、编造数、`han_ratio` 全都只在一张卡的**一行字**上计算，然后报出一个看起来很像回事的数字。
 > - `entities_dropped_by_daemon`（`scripts/t2-eval.py:270`）读 `verification.entities_dropped`；v3 的 `T2GroundingReport` 只有 `citations_dropped` 一个字段（`crates/afterray-store/src/slot.rs:1103`），所以这个计数器**永远是 0**，无论 daemon 丢掉了多少东西。
 >
-> **一对无人认领的矛盾结论。** [`docs/evals/t1-t2-2026-08-14/local-model/README.md:37-48`](./evals/t1-t2-2026-08-14/local-model/README.md) 断言后处理「已全部移除……直接信任模型输出」，理由是静态匹配分不清"没见过的真词"和"编造的词"；**一天之后**的 [`docs/evals/t2-cards/REPORT.md:32-36`](./evals/t2-cards/REPORT.md) 记录代码侧实体校验把 27b 的硬编造从 5 压到 0。两份文档互不引用，也没有第三份裁决。今天的代码站在后者一边：生成之后仍有代码侧接地在剥掉接不上的引用（`ground_t2_details`，`crates/afterray-store/src/slot.rs:1114`）。
+> **一对已裁决的历史结论。** 先前两次私有 vault 评测得出了相反的后处理建议；它们的原始输入和输出已从仓库移除，保留的脱敏方法记录见 [T1/T2 evaluation](./evals/t1-t2-2026-08-14/README.md) 与 [card-quality report](./evals/t2-cards/REPORT.md)。今天以代码为准：生成之后仍有 `ground_t2_details` 剥掉接不上的引用（`crates/afterray-store/src/slot.rs:1114`）。
 
 状态：进行中 **[已完结，见上方状态块]**
 日期：2026-08-15

@@ -31,7 +31,7 @@ That fallback applies to the plan and spec documents listed below, not to the wh
 - `auto-update-plan.md` — Sparkle + Cloudflare updates.
 - `qwen3.5-4b-mlx-integration-plan.md` — MLX VLM integration.
 - `search-presentation.md` — search UX; the most accurate plan in this directory.
-- `evals/` — eval notes and card samples.
+- `evals/` — privacy-safe evaluation methods and aggregate results only; never raw vault inputs or outputs.
 
 ## Convention
 

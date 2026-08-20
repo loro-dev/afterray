@@ -223,7 +223,7 @@ T1 保证用户随时打开 Timeline 都有内容；T2 慢就慢（本地模型�
   "application_name": "Xcode",
   "window_title": "gop.rs — afterray",
   "url": null,
-  "document": "file:///Users/zxch3n/Code/afterray/crates/afterray-store/src/gop.rs",
+  "document": "file:///workspace/afterray/crates/afterray-store/src/gop.rs",
   "truncated": false,
 
   "digest": {                          // ← 目前 Rust 侧只读这一段
@@ -231,7 +231,7 @@ T1 保证用户随时打开 Timeline 都有内容；T2 慢就慢（本地模型�
     "bundle_identifier": "com.apple.dt.Xcode",
     "window_title": "gop.rs — afterray",
     "url": null,
-    "document": "file:///Users/…/gop.rs",
+    "document": "file:///workspace/…/gop.rs",
     "focused_role": "AXTextArea",
     "focused_title": null,
     "focused_value": "fn pack_segment(frames: &[Frame]) -> Result<Segment> {\n    let mut writer = IvfWriter::new(…",
