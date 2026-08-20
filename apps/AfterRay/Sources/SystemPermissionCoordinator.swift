@@ -193,6 +193,7 @@ enum SystemPermissionPolicy {
         recordsAudio && hasMicrophoneInput
     }
 
+    // @dec:microphone-tcc-alert — docs/decisions/active/product/2026-08-20-microphone-tcc-alert.md
     /// Screen Recording and Accessibility have no in-place grant, so the
     /// gate opens System Settings and shows the drag card. Microphone is
     /// standard TCC: `requestAccess` presents a native alert, and the app
