@@ -218,6 +218,7 @@ public extension AfterRayDaemonServing {
     }
 }
 
+// @dec:daemon-owns-the-vault — docs/decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     public static let protocolVersion = 15
     public nonisolated let socketPath: String

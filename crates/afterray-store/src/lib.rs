@@ -96,6 +96,7 @@ pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
 pub const SCHEMA_VERSION: u32 = 26;
 
+// @dec:size-driven-retention — docs/decisions/active/architecture/2026-08-20-size-driven-retention.md
 /// How long a runtime marker in the event stream lives.
 ///
 /// This is **not** content retention. A `signal_gap` row records that the
@@ -175,9 +176,10 @@ pub const EDGE_SNAPSHOT_CONTENT_TYPE: &str = "application/vnd.afterray.ax+json; 
 ///
 /// It has no moment, no thumbnail, and no OCR — it is not a frame of the screen,
 /// it is extra tree for the join to partition text against. It lives exactly as
-/// long as the input events that triggered it
-/// ([`INPUT_EVENT_RETENTION_MS`]): a frame driven by an event and outliving it
-/// would still expose the instant of an interaction whose record was erased.
+/// long as the input events that triggered it — both are swept against the same
+/// retention horizon ([`Vault::prune_edge_snapshots_before`]): a tree driven by
+/// an event and outliving it would still expose the instant of an interaction
+/// whose record was erased.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeSnapshotRow {
     pub id: String,
@@ -4719,6 +4721,7 @@ impl Vault {
         )?)
     }
 
+    // @dec:size-driven-retention — docs/decisions/active/architecture/2026-08-20-size-driven-retention.md
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
         // Before the size sweep, and outside its early return: a marker's
@@ -5816,7 +5819,8 @@ fn migrate_schema_21(connection: &Connection) -> Result<(), StoreError> {
 /// window", and both spans and points start there.
 ///
 /// `slot_summaries.acts_json` migrates in the same step even though nothing
-/// writes it yet: events expire after [`INPUT_EVENT_RETENTION_MS`] while T1
+/// writes it yet: events expire with the frames around them
+/// ([`Vault::prune_input_events_before`]) while T1
 /// cards are computed lazily and forever, so the acts a sealed slot derived
 /// must have somewhere to be frozen before the events they came from are gone.
 ///

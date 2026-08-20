@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 /// checkout, and so tests can run against a throwaway socket.
 pub const SOCKET_ENV: &str = "AFTERRAY_SOCKET";
 
+// @dec:daemon-owns-the-vault — docs/decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md
 /// Resolution order: the environment, then a socket inside the checkout when
 /// this binary is a `cargo build` artifact, then the installed location.
 ///

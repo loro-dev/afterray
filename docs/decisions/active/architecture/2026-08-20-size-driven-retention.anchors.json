@@ -1,0 +1,5 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterray-store/src/lib.rs::fn enforce_retention(&self) -> Result<(), StoreError> {": "sha256:190ababee957690e",
+  "crates/afterray-store/src/lib.rs::pub const SIGNAL_MARKER_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;": "sha256:54a24dca62d018ae"
+}

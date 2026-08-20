@@ -15,6 +15,12 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 - `tag-release.sh` — after appcast verification, creates and pushes annotated `v<version>` at the exact published `origin/main` commit.
 - `fetch-sparkle-tools.sh` — Sparkle 2.9.5 tools (`sign_update`, `generate_keys`) into `.afterray-dev/sparkle-tools/`, tarball SHA-256 pinned (fetch-sparkle-tools.sh:10-13). Once per machine.
 
+## Docs gate
+
+- `docs-gate/` — `make docs-sync`, run by `make test`. Checks Markdown links and `#fragment` anchors, decision-record shape (`docs/decisions/`), and the `@dec:` anchor relation both ways, including a hash of the code under each marker.
+- **Node runs the TypeScript directly** (type stripping, Node ≥22.6). No `package.json`, no `node_modules`, no dependencies — and nothing here is on a product path. That is the whole reason a JS runtime is acceptable in this repo at all; keep it that way.
+- A red anchor hash means a decision was not re-read when its code changed. Re-read it, then `node scripts/docs-gate/main.ts --write` and commit the sidecar diff — the diff is the confirmation. Never hand-edit a sidecar.
+
 ## Invariants
 
 - Sparkle compares only `CFBundleVersion` = `git rev-list --count HEAD` (build-release.sh:117, override `AFTERRAY_BUILD_NUMBER`); stamped into the assembled bundle only — never hand-edit the source plist.

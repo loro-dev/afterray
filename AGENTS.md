@@ -19,11 +19,17 @@ Before editing, read every `AGENTS.md` along the path from root to leaf. Every `
 - [apps/](apps/AGENTS.md) — shipped app (`AfterRay`), capture shim (standalone SwiftPM package), model worker executables, visual tooling
 - [scripts/](scripts/AGENTS.md) — dev loop, signing/notarization/Sparkle release, publish; the root `Makefile` is the entry point
 - [site/](site/AGENTS.md) — afterray.com: React+Vite, Cloudflare Pages, R2-backed appcast/download functions
-- [docs/](docs/AGENTS.md) — specs and plans (some plans are historical; code wins)
+- [docs/](docs/AGENTS.md) — specs and plans (historical; code wins), plus [decisions/](docs/decisions/AGENTS.md) — why the code is this way, authoritative — and [postmortem/](docs/postmortem/README.md)
 - [context/](context/) — navigation articles: [capture-pipeline](context/capture-pipeline.md), [event-capture-v2](context/event-capture-v2.md), [wire-protocol](context/wire-protocol.md), [compute-governance](context/compute-governance.md), [agent-tools](context/agent-tools.md), [acts-join](context/acts-join.md), [ocr-text-selection](context/ocr-text-selection.md); [CONTEXT-GAPS.md](context/CONTEXT-GAPS.md) — gaps backlog
 - `skills/afterray/` — the shipped Agent Skill for the read-only CLI surface; keep in sync with `afterray-cli`
 
 ## Working agreements
+
+### Decisions and incidents
+
+- **Decisions are recorded, not remembered.** A change to behavior, a format, a trust boundary, or a product requirement adds or updates a record under [docs/decisions/](docs/decisions/AGENTS.md) in the same change. Changing a requirement supersedes a record; it never edits one into a different decision.
+- **Before changing behavior, grep the files you touch for `@dec:`** and read what they point at. A bug that turns out to be a decision working as designed needs a new record, not a patch.
+- Serious incidents — data loss, key or plaintext exposure, a pulled release, silently degraded capture, or more than a day to locate — get a [postmortem](docs/postmortem/README.md), linked from every decision it implicates.
 
 ### Commits
 
@@ -40,7 +46,7 @@ Before editing, read every `AGENTS.md` along the path from root to leaf. Every `
 ### Agent-facing docs
 
 - Important directories carry an `AGENTS.md`; add `CLAUDE.md` as a symlink next to it: `ln -s AGENTS.md CLAUDE.md`.
-- Keep each `AGENTS.md` under ~4000 chars (`wc -m`); past ~2000 chars of detail, extract into a linked article under `context/` (each under ~32000 chars).
+- Keep this root `AGENTS.md` under ~10000 chars and every other `AGENTS.md` under ~4000 (`wc -m`); past ~2000 chars of detail, extract into a linked article under `context/` (each under ~32000 chars).
 
 ## Self-Maintained Agent Context
 
