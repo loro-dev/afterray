@@ -14,11 +14,11 @@ use afterray_harness::ContextBudget;
 use afterray_models::{
     Cancellation, DownloadError, JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink,
     ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, OcrRegion,
-    PersistentMlxAdapter,
-    PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig, QWEN35_4B_MLX_PACK_ID,
-    QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION, QueueConfig,
-    download_packs_with_cancellation, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
-    qwen35_mlx_manifest, reclaim_abandoned_downloads, remove_pack, spec_by_id, specs_for_download,
+    PersistentMlxAdapter, PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig,
+    QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION,
+    QueueConfig, download_packs_with_cancellation, library, model_directory, probe_llm,
+    qwen35_9b_mlx_manifest, qwen35_mlx_manifest, reclaim_abandoned_downloads, remove_pack,
+    spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, InputEventRecord, MacOsCaptureBackend,
@@ -35,15 +35,15 @@ use afterray_store::{
     StoreError, Vault, VaultConfig,
 };
 use anyhow::Context;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::Mutex,
     task::JoinHandle,
@@ -160,7 +160,12 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+    // `spawn_blocking` work cannot be aborted once it has started. Do not let a
+    // disposable maintenance read keep the process alive after the bounded
+    // shutdown path has completed.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -220,7 +225,6 @@ async fn async_main() -> anyhow::Result<()> {
     let models = ModelQueue::new(adapters, QueueConfig::default())?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let migration_store = Arc::clone(&store);
     let packer = Arc::new(gop_packer::GopPacker::new(
         gop_packer::GopPackerConfig::from_env(),
     ));
@@ -251,9 +255,7 @@ async fn async_main() -> anyhow::Result<()> {
     let recording_active = Arc::new(AtomicBool::new(false));
     let app_anchor = parent_app_anchor();
     if app_anchor.is_none() {
-        eprintln!(
-            "no AfterRay parent to pin; socket clients stay on the CLI query surface"
-        );
+        eprintln!("no AfterRay parent to pin; socket clients stay on the CLI query surface");
     }
     let state = Arc::new(AppState {
         store,
@@ -300,6 +302,8 @@ async fn async_main() -> anyhow::Result<()> {
         backlog: tokio::sync::Mutex::new(None),
         t2_changed: tokio::sync::Notify::new(),
         running_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        draining: AtomicBool::new(false),
+        lifecycle: BackgroundLifecycle::default(),
     });
 
     // Off the boot path: `recent_summary_runs` sorts an unindexed column, and
@@ -308,24 +312,32 @@ async fn async_main() -> anyhow::Result<()> {
     {
         let seed_store = Arc::clone(&state.store);
         let seed_compute = Arc::clone(&state.compute);
-        tokio::task::spawn_blocking(move || seed_summary_history(&seed_store, &seed_compute));
+        state
+            .lifecycle
+            .track_task(tokio::task::spawn_blocking(move || {
+                seed_summary_history(&seed_store, &seed_compute);
+            }));
     }
 
     settle_orphaned_turns(&state);
     {
-        let removed = reclaim_abandoned_downloads(&model_directory(), &std::collections::HashSet::new());
+        let removed =
+            reclaim_abandoned_downloads(&model_directory(), &std::collections::HashSet::new());
         if removed > 0 {
-            eprintln!(
-                "reclaimed {removed} abandoned model download staging dir(s) older than 24h"
-            );
+            eprintln!("reclaimed {removed} abandoned model download staging dir(s) older than 24h");
         }
     }
     println!("afterrayd listening on {}", socket.display());
-    tokio::task::spawn_blocking(move || match migration_store.run_artifact_maintenance() {
-        Ok(0) => {}
-        Ok(count) => eprintln!("migrated {count} legacy artifact(s) in the background"),
-        Err(error) => eprintln!("background artifact maintenance paused: {error}"),
-    });
+    let migration_store = Arc::clone(&state.store);
+    state
+        .lifecycle
+        .track_task(tokio::task::spawn_blocking(move || {
+            match migration_store.run_artifact_maintenance() {
+                Ok(0) => {}
+                Ok(count) => eprintln!("migrated {count} legacy artifact(s) in the background"),
+                Err(error) => eprintln!("background artifact maintenance paused: {error}"),
+            }
+        }));
     spawn_gop_packer(Arc::clone(&state));
     spawn_slot_summarizer(Arc::clone(&state));
     spawn_text_df_maintainer(Arc::clone(&state));
@@ -351,12 +363,13 @@ async fn async_main() -> anyhow::Result<()> {
                         continue;
                     }
                 }
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(error) = handle(stream, state).await {
+                let task_state = Arc::clone(&state);
+                let task = tokio::spawn(async move {
+                    if let Err(error) = handle(stream, task_state).await {
                         eprintln!("client error: {error:#}");
                     }
                 });
+                state.lifecycle.track_task(task);
             }
             () = &mut shutdown => break,
             changed = shutdown_rx.changed() => {
@@ -367,7 +380,13 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    let response = record_stop(&state, None).await;
+    state.begin_draining();
+    let shutdown_started = Instant::now();
+    cancel_disposable_work(&state).await;
+    // The helper wait and failed-helper recovery are bounded inside `record_stop`.
+    // A healthy consumer drain, memory flush, and session close are required
+    // durability work and must not be cancelled by an outer timeout.
+    let response = record_stop(&state, Some("shutdown")).await;
     if !response.ok {
         eprintln!(
             "could not finish the active session during shutdown: {}",
@@ -377,8 +396,16 @@ async fn async_main() -> anyhow::Result<()> {
     if let Err(error) = clear_stale_capture_files(&staging_dir) {
         eprintln!("could not clear capture staging during shutdown: {error}");
     }
+    state
+        .lifecycle
+        .cancel_and_join(Duration::from_millis(750))
+        .await;
     drop(listener);
     let _ = std::fs::remove_file(&socket);
+    eprintln!(
+        "shutdown: daemon drain completed in {} ms",
+        shutdown_started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -492,6 +519,200 @@ fn resolve_helper_path(env_key: &str, helper_name: &str, development_path: &str)
     PathBuf::from(development_path)
 }
 
+#[derive(Default)]
+struct BackgroundTaskRegistry {
+    next_id: AtomicU64,
+    active: std::sync::Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct BackgroundLifecycle {
+    tasks: Arc<BackgroundTaskRegistry>,
+    threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl BackgroundLifecycle {
+    fn track_task(&self, task: JoinHandle<()>) {
+        let id = self.tasks.next_id.fetch_add(1, Ordering::Relaxed);
+        self.tasks
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, task.abort_handle());
+        let registry = Arc::clone(&self.tasks);
+        // The reaper is deliberately detached: it owns the JoinHandle and
+        // removes the registry entry as soon as the tracked task completes.
+        // It is itself bounded by that task and holds no daemon resources.
+        drop(tokio::spawn(async move {
+            let _ = task.await;
+            registry
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            registry.changed.notify_waiters();
+        }));
+    }
+
+    fn track_thread(&self, thread: std::thread::JoinHandle<()>) {
+        self.threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(thread);
+    }
+
+    fn abort_tasks(&self) -> usize {
+        let tasks = self
+            .tasks
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for task in tasks.values() {
+            task.abort();
+        }
+        tasks.len()
+    }
+
+    fn active_task_count(&self) -> usize {
+        self.tasks
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    async fn wait_for_tasks_until(&self, deadline: Instant) -> usize {
+        loop {
+            // Register before reading the count so completion cannot happen
+            // between the observation and the wait without waking us.
+            let changed = self.tasks.changed.notified();
+            let active = self.active_task_count();
+            if active == 0 {
+                return 0;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, changed).await.is_err() {
+                return self.active_task_count();
+            }
+        }
+    }
+
+    async fn cancel_and_join(&self, budget: Duration) {
+        let started = Instant::now();
+        let deadline = Instant::now() + budget;
+        let task_count = self.abort_tasks();
+        let task_timeouts = self.wait_for_tasks_until(deadline).await;
+
+        let mut threads = {
+            let mut tracked = self
+                .threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *tracked)
+        };
+        let thread_count = threads.len();
+        while !threads.is_empty() && Instant::now() < deadline {
+            let mut index = 0;
+            while index < threads.len() {
+                if threads[index].is_finished() {
+                    let thread = threads.swap_remove(index);
+                    let _ = thread.join();
+                } else {
+                    index += 1;
+                }
+            }
+            if !threads.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let thread_timeouts = threads.len();
+        drop(threads);
+        eprintln!(
+            "shutdown: background lifecycle tasks={task_count} timed_out={task_timeouts} threads={thread_count} timed_out={thread_timeouts} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+async fn finish_required_recording_close<M, S, MemoryResult, SessionResult>(
+    memory_flush: M,
+    session_close: S,
+) -> (MemoryResult, SessionResult)
+where
+    M: std::future::Future<Output = MemoryResult>,
+    S: std::future::Future<Output = SessionResult>,
+{
+    let memory_result = memory_flush.await;
+    let session_result = session_close.await;
+    (memory_result, session_result)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureConsumerOutcome {
+    Stopped,
+    Failed(String),
+}
+
+fn capture_consumer_join_result(
+    result: Result<CaptureConsumerOutcome, tokio::task::JoinError>,
+) -> Option<String> {
+    match result {
+        Ok(CaptureConsumerOutcome::Stopped) => None,
+        Ok(CaptureConsumerOutcome::Failed(error)) => Some(error),
+        Err(error) => Some(format!("capture event consumer failed: {error}")),
+    }
+}
+
+/// Drains events already emitted by the capture helper.
+///
+/// A successful helper stop promises a finite stream ending in `Stopped`, so
+/// importing every event ahead of it is required durability work. Only a
+/// helper that already failed or was forced down gets the short recovery
+/// window; the supervisor remains the outer bound for wedged durable I/O.
+async fn drain_capture_consumer(
+    consumer: Option<JoinHandle<CaptureConsumerOutcome>>,
+    helper_failed: bool,
+    operation: &str,
+) -> Option<String> {
+    let Some(mut consumer) = consumer else {
+        return None;
+    };
+    if !helper_failed {
+        return capture_consumer_join_result(consumer.await);
+    }
+
+    const FAILED_HELPER_DRAIN_BUDGET: Duration = Duration::from_millis(250);
+    match tokio::time::timeout(FAILED_HELPER_DRAIN_BUDGET, &mut consumer).await {
+        Ok(result) => capture_consumer_join_result(result),
+        Err(_) => {
+            consumer.abort();
+            eprintln!(
+                "{operation}: failed capture helper's event consumer timed out after {} ms and was cancelled",
+                FAILED_HELPER_DRAIN_BUDGET.as_millis()
+            );
+            Some("capture event consumer timed out".to_owned())
+        }
+    }
+}
+
+async fn finish_recording_after_helper_stop<M, S, MemoryResult, SessionResult>(
+    consumer: Option<JoinHandle<CaptureConsumerOutcome>>,
+    helper_failed: bool,
+    operation: &str,
+    memory_flush: M,
+    session_close: S,
+) -> (Option<String>, MemoryResult, SessionResult)
+where
+    M: std::future::Future<Output = MemoryResult>,
+    S: std::future::Future<Output = SessionResult>,
+{
+    let consumer_error = drain_capture_consumer(consumer, helper_failed, operation).await;
+    let (memory_result, session_result) =
+        finish_required_recording_close(memory_flush, session_close).await;
+    (consumer_error, memory_result, session_result)
+}
+
 struct AppState {
     store: Arc<Vault>,
     capture: Arc<MacOsCaptureBackend>,
@@ -561,6 +782,65 @@ struct AppState {
     /// stops — the stream's own connection is busy writing events — so the
     /// token has to be reachable by name.
     running_turns: Arc<crate::stream::RunningTurns>,
+    /// Set only after the shutdown ACK has been written (or immediately for an
+    /// OS signal). Every request and long-lived loop treats it as a hard gate.
+    draining: AtomicBool,
+    lifecycle: BackgroundLifecycle,
+}
+
+// @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
+impl AppState {
+    fn begin_draining(&self) {
+        if !self.draining.swap(true, Ordering::AcqRel) {
+            let _ = self.shutdown.send(true);
+        }
+    }
+}
+
+async fn cancel_disposable_work(state: &Arc<AppState>) {
+    let started = Instant::now();
+    state
+        .download_cancel_requested
+        .store(true, Ordering::Release);
+    if let Some(cancellation) = state
+        .download_cancellation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        cancellation.cancel();
+    }
+    state.download_changed.notify_waiters();
+
+    let turn_tokens: Vec<_> = state
+        .running_turns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    for token in &turn_tokens {
+        token.cancel();
+    }
+    let model_jobs = state.models.shutdown().await;
+    let tasks = state.lifecycle.abort_tasks();
+
+    let mlx_result = tokio::time::timeout(Duration::from_millis(750), async {
+        for (_, adapter) in &state.mlx_adapters {
+            adapter.shutdown().await;
+        }
+    })
+    .await;
+    eprintln!(
+        "shutdown: cancelled downloads, {} turn(s), {model_jobs} model job(s), {tasks} task(s); mlx={} elapsed_ms={}",
+        turn_tokens.len(),
+        if mlx_result.is_ok() {
+            "stopped"
+        } else {
+            "timeout"
+        },
+        started.elapsed().as_millis()
+    );
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -620,10 +900,10 @@ fn default_language() -> String {
 
 /// Reply language for chat and ask, from the stored **summary** preference.
 pub(crate) fn reply_language(state: &AppState) -> String {
-    let (ui, summary) = state
-        .languages
-        .lock()
-        .map_or_else(|_| (default_language(), default_language()), |langs| langs.clone());
+    let (ui, summary) = state.languages.lock().map_or_else(
+        |_| (default_language(), default_language()),
+        |langs| langs.clone(),
+    );
     agent::reply_language_from_prefs(&ui, &summary)
 }
 
@@ -661,7 +941,7 @@ struct RecordingRuntime {
     active_session_id: Option<String>,
     captured_frame: bool,
     scheduler: Option<JoinHandle<()>>,
-    event_consumer: Option<JoinHandle<()>>,
+    event_consumer: Option<JoinHandle<CaptureConsumerOutcome>>,
 }
 
 fn recording_state_of(runtime: &RecordingRuntime) -> RecordingState {
@@ -681,16 +961,13 @@ async fn handle(stream: UnixStream, state: Arc<AppState>) -> anyhow::Result<()> 
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Request>(&line) {
             Ok(request) if !privileged => {
-                if let Err(message) = authorize_cli_request(
-                    &request,
-                    cli_evidence_until_ms(&state),
-                    now_ms(),
-                ) {
+                if let Err(message) =
+                    authorize_cli_request(&request, cli_evidence_until_ms(&state), now_ms())
+                {
                     write_json_response(&mut write, &Response::failure(message)).await?;
                     continue;
                 }
-                handle_authorized_request(request, &state, &mut write, &mut lines, false)
-                    .await?;
+                handle_authorized_request(request, &state, &mut write, &mut lines, false).await?;
             }
             Ok(request) => {
                 handle_authorized_request(request, &state, &mut write, &mut lines, true).await?;
@@ -728,83 +1005,99 @@ async fn handle_authorized_request(
     lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     privileged: bool,
 ) -> anyhow::Result<()> {
+    if state.draining.load(Ordering::Acquire) && !matches!(&request, Request::Shutdown) {
+        write_json_response(write, &Response::failure("daemon is shutting down")).await?;
+        return Ok(());
+    }
     match request {
-            // Artifact / thumbnail reads decrypt on the blocking pool. Doing
-            // that on a worker used to freeze accepts and chat streams while
-            // the filmstrip scrubbed.
-            Request::ReadArtifact { artifact_id } => {
-                let result =
-                    run_store(state, move |s| read_still_artifact(s, &artifact_id)).await;
-                write_artifact_response(write, result).await?;
-            }
-            Request::ReadGopSegment { segment_id } => {
-                let result =
-                    run_store(state, move |s| s.store.read_gop_artifact(&segment_id)).await;
-                write_artifact_response(write, result).await?;
-            }
-            Request::ReadGopFrame {
-                segment_id,
-                index,
-                mode,
-            } => {
-                let result = run_store(state, move |s| {
-                    gop_packer::read_gop_frame(&s.store, &segment_id, index, mode)
-                })
-                .await;
-                write_artifact_response(write, result).await?;
-            }
-            Request::ChatStream {
-                conversation_id,
-                message,
-            } => {
-                // A hang-up no longer cancels. Closing the panel means "I will
-                // read it later": the turn runs on and writes itself into its
-                // row, so coming back finds the finished answer. Only an
-                // explicit ChatAbort stops a turn — see Request::ChatAbort.
-                let cancel = afterray_harness::CancelToken::new();
-                let (result, _peer_present) = stream::run_watching_for_hangup(
-                    stream::handle_chat_stream(
-                        write,
-                        state,
-                        conversation_id,
-                        message,
-                        cancel.clone(),
-                    ),
-                    lines,
-                )
-                .await;
-                result?;
-            }
-            Request::ReadThumbnail {
-                moment_id,
-                max_edge,
-            } => {
-                let result = run_store(state, move |s| {
-                    read_moment_thumbnail(&s.store, &moment_id, max_edge)
-                })
-                .await;
-                write_artifact_response(write, result).await?;
-            }
-            other => {
-                let mut response = dispatch(other.clone(), state).await;
-                if !privileged
-                    && let Some(data) = response.data.as_mut()
-                {
-                    redact_cli_response_data(&other, data);
-                }
-                write_json_response(write, &response).await?;
-            }
+        Request::Shutdown => {
+            acknowledge_shutdown(write, || state.begin_draining()).await?;
         }
+        // Artifact / thumbnail reads decrypt on the blocking pool. Doing
+        // that on a worker used to freeze accepts and chat streams while
+        // the filmstrip scrubbed.
+        Request::ReadArtifact { artifact_id } => {
+            let result = run_store(state, move |s| read_still_artifact(s, &artifact_id)).await;
+            write_artifact_response(write, result).await?;
+        }
+        Request::ReadGopSegment { segment_id } => {
+            let result = run_store(state, move |s| s.store.read_gop_artifact(&segment_id)).await;
+            write_artifact_response(write, result).await?;
+        }
+        Request::ReadGopFrame {
+            segment_id,
+            index,
+            mode,
+        } => {
+            let result = run_store(state, move |s| {
+                gop_packer::read_gop_frame(&s.store, &segment_id, index, mode)
+            })
+            .await;
+            write_artifact_response(write, result).await?;
+        }
+        Request::ChatStream {
+            conversation_id,
+            message,
+        } => {
+            // A hang-up no longer cancels. Closing the panel means "I will
+            // read it later": the turn runs on and writes itself into its
+            // row, so coming back finds the finished answer. Only an
+            // explicit ChatAbort stops a turn — see Request::ChatAbort.
+            let cancel = afterray_harness::CancelToken::new();
+            let (result, _peer_present) = stream::run_watching_for_hangup(
+                stream::handle_chat_stream(write, state, conversation_id, message, cancel.clone()),
+                lines,
+            )
+            .await;
+            result?;
+        }
+        Request::ReadThumbnail {
+            moment_id,
+            max_edge,
+        } => {
+            let result = run_store(state, move |s| {
+                read_moment_thumbnail(&s.store, &moment_id, max_edge)
+            })
+            .await;
+            write_artifact_response(write, result).await?;
+        }
+        other => {
+            let mut response = dispatch(other.clone(), state).await;
+            if !privileged && let Some(data) = response.data.as_mut() {
+                redact_cli_response_data(&other, data);
+            }
+            write_json_response(write, &response).await?;
+        }
+    }
     Ok(())
 }
 
-async fn write_json_response(
-    write: &mut tokio::net::unix::OwnedWriteHalf,
-    response: &Response,
-) -> anyhow::Result<()> {
+async fn write_json_response<W>(write: &mut W, response: &Response) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut encoded = serde_json::to_vec(response)?;
     encoded.push(b'\n');
     write.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// The ACK is the handoff contract with the app: it must be fully written
+/// before draining can stop the socket handler or tear the runtime down.
+async fn acknowledge_shutdown<W, F>(write: &mut W, begin_draining: F) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    F: FnOnce(),
+{
+    write_json_response(
+        write,
+        &Response::success(serde_json::json!({
+            "stopping": true,
+            "pid": std::process::id(),
+        })),
+    )
+    .await?;
+    begin_draining();
     Ok(())
 }
 
@@ -898,9 +1191,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         // Every Vault touch below goes through `run_store`. The async surface
         // (accepts, Status/Ping, chat stream IO) stays on workers; SQLite and
         // decrypt stay on the blocking pool.
-        Request::SessionsList => {
-            run_store(state, |s| into_response(s.store.sessions_sync())).await
-        }
+        Request::SessionsList => run_store(state, |s| into_response(s.store.sessions_sync())).await,
         Request::TimelineList => run_store(state, |s| into_response(s.store.timeline_sync())).await,
         Request::TimelineSince { since_ms } => {
             run_store(state, move |s| {
@@ -942,7 +1233,10 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::ChatAbort { conversation_id } => abort_turn(state, &conversation_id),
         Request::PackStatus => run_store(state, |s| pack_status(s)).await,
         Request::GopShow { segment_id } => {
-            run_store(state, move |s| into_response(s.store.gop_segment_view(&segment_id))).await
+            run_store(state, move |s| {
+                into_response(s.store.gop_segment_view(&segment_id))
+            })
+            .await
         }
         Request::FavoriteSet { .. } => Response::failure("favorites are disabled"),
         Request::Search {
@@ -951,15 +1245,19 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             from_ms,
             to_ms,
         } => {
-            run_store(state, move |s| match text_hits(&s.store, &query, limit.clamp(1, 100)) {
-                Ok(mut hits) => {
-                    if let (Some(from), Some(to)) = (from_ms, to_ms) {
-                        let (from, to) = if from <= to { (from, to) } else { (to, from) };
-                        hits.retain(|hit| hit.captured_at_ms >= from && hit.captured_at_ms <= to);
+            run_store(state, move |s| {
+                match text_hits(&s.store, &query, limit.clamp(1, 100)) {
+                    Ok(mut hits) => {
+                        if let (Some(from), Some(to)) = (from_ms, to_ms) {
+                            let (from, to) = if from <= to { (from, to) } else { (to, from) };
+                            hits.retain(|hit| {
+                                hit.captured_at_ms >= from && hit.captured_at_ms <= to
+                            });
+                        }
+                        Response::success(hits)
                     }
-                    Response::success(hits)
+                    Err(error) => Response::failure(error.to_string()),
                 }
-                Err(error) => Response::failure(error.to_string()),
             })
             .await
         }
@@ -1016,9 +1314,11 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                 max_rounds: T2_MAX_ROUNDS,
                 ..resolve_context_budget(state).await
             });
-            run_store(state, move |s| match slot_prompt_for(s, at_ms, budget_chars) {
-                Ok(prompt) => Response::success(prompt),
-                Err(error) => Response::failure(error.to_string()),
+            run_store(state, move |s| {
+                match slot_prompt_for(s, at_ms, budget_chars) {
+                    Ok(prompt) => Response::success(prompt),
+                    Err(error) => Response::failure(error.to_string()),
+                }
             })
             .await
         }
@@ -1033,7 +1333,8 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         }
         Request::EvidenceOcr { moment_id } => {
             run_store(state, move |s| {
-                match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&s.store), &moment_id) {
+                match tools::ocr_evidence(afterray_store::ReadOnlyVault::new(&s.store), &moment_id)
+                {
                     Ok(evidence) => Response::success(evidence),
                     Err(error) => Response::failure(error),
                 }
@@ -1164,10 +1465,16 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         }
         Request::ChatList => run_store(state, |s| chat::handle_list(&s.store)).await,
         Request::ChatHistory { conversation_id } => {
-            run_store(state, move |s| chat::handle_history(&s.store, &conversation_id)).await
+            run_store(state, move |s| {
+                chat::handle_history(&s.store, &conversation_id)
+            })
+            .await
         }
         Request::ChatDelete { conversation_id } => {
-            run_store(state, move |s| chat::handle_delete(&s.store, &conversation_id)).await
+            run_store(state, move |s| {
+                chat::handle_delete(&s.store, &conversation_id)
+            })
+            .await
         }
         Request::Settings => Response::success(current_settings(state)),
         Request::UpdateSettings {
@@ -1241,13 +1548,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::CancelModelDownloads => cancel_model_downloads(state).await,
         Request::CancelModelDownload { pack_id } => cancel_model_download(state, &pack_id).await,
         Request::RemoveModel { pack_id } => remove_model(state, &pack_id).await,
-        Request::Shutdown => {
-            let _ = state.shutdown.send(true);
-            Response::success(serde_json::json!({
-                "stopping": true,
-                "pid": std::process::id(),
-            }))
-        }
+        Request::Shutdown => Response::failure("shutdown is handled by the socket ACK path"),
     }
 }
 
@@ -1277,7 +1578,10 @@ async fn record_start(state: &Arc<AppState>) -> Response {
     if let Err(error) = start_capture_runtime(state, session.id.clone()).await {
         eprintln!("record_start: capture runtime failed: {error}");
         let session_id = session.id.clone();
-        let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
+        let _ = run_store(state, move |s| {
+            s.store.end_session_sync(&session_id, now_ms())
+        })
+        .await;
         let mut recording = state.recording.lock().await;
         if recording.active_session_id.as_deref() == Some(session.id.as_str()) {
             recording.active_session_id = None;
@@ -1361,7 +1665,8 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
                 .saturating_add(interval_ms)
                 .saturating_sub(now_ms());
             if wait_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(u64::try_from(wait_ms).unwrap_or(0))).await;
+                tokio::time::sleep(Duration::from_millis(u64::try_from(wait_ms).unwrap_or(0)))
+                    .await;
                 continue;
             }
             match fire_capture_tick(&scheduler_state).await {
@@ -1378,7 +1683,7 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
     let event_state = Arc::clone(state);
     let consumer_session = session_id.clone();
     let event_consumer = tokio::spawn(async move {
-        consume_capture_events(event_state, consumer_session).await;
+        consume_capture_events(event_state, consumer_session).await
     });
     let mut recording = state.recording.lock().await;
     if recording.active_session_id.as_deref() != Some(session_id.as_str()) {
@@ -1487,12 +1792,15 @@ async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
         }
         (session_id, recording.event_consumer.take())
     };
-    match state.capture.stop_capture().await {
+    let capture_result = state.capture.stop_capture().await;
+    let consumer_error =
+        drain_capture_consumer(consumer, capture_result.is_err(), "capture restart").await;
+    match capture_result {
         Ok(()) | Err(CaptureError::NotRunning) => {}
         Err(error) => return Err(error.to_string()),
     }
-    if let Some(consumer) = consumer {
-        let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
+    if let Some(error) = consumer_error {
+        return Err(error);
     }
     start_capture_runtime(state, session_id).await
 }
@@ -2274,15 +2582,17 @@ fn migrate_api_key_to_keychain(
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
+    let stop_started = Instant::now();
+    let is_shutdown = reason == Some("shutdown");
     let reason = reason.unwrap_or("pause").to_owned();
-    let _ = run_store(state, move |s| {
-        memory::flush(&s.store, &s.memories);
-        s.store.begin_idle_span(now_ms(), &reason)
-    })
-    .await;
     let (session_id, scheduler, consumer) = {
         let mut recording = state.recording.lock().await;
         let Some(session_id) = recording.active_session_id.take() else {
+            let _ = run_store(state, move |s| {
+                memory::flush(&s.store, &s.memories);
+                s.store.begin_idle_span(now_ms(), &reason)
+            })
+            .await;
             return Response::success(serde_json::json!({"already_stopped": true}));
         };
         state.last_capture_ms.store(0, Ordering::SeqCst);
@@ -2296,13 +2606,52 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
     if let Some(scheduler) = scheduler {
         scheduler.abort();
     }
+    let capture_started = Instant::now();
     let capture_error = state.capture.stop_capture().await.err();
-    if let Some(consumer) = consumer {
-        let _ = tokio::time::timeout(Duration::from_secs(12), consumer).await;
+    if is_shutdown {
+        eprintln!(
+            "shutdown: capture helper stop completed in {} ms ({})",
+            capture_started.elapsed().as_millis(),
+            if capture_error.is_some() {
+                "forced/error"
+            } else {
+                "graceful"
+            }
+        );
     }
+    let memory_flush = run_store(state, move |s| {
+        memory::flush(&s.store, &s.memories);
+        s.store.begin_idle_span(now_ms(), &reason)
+    });
     let session_for_store = session_id.clone();
-    let store_result =
-        run_store(state, move |s| s.store.end_session_sync(&session_for_store, now_ms())).await;
+    let session_close = run_store(state, move |s| {
+        s.store.end_session_sync(&session_for_store, now_ms())
+    });
+    // A graceful helper emitted a finite stream ending in `Stopped`. Every
+    // final artifact ahead of it must finish importing before memory flush and
+    // session close. None of this required durability seam has a daemon-local
+    // timeout; only a helper already known to have failed gets the 250 ms
+    // consumer recovery cap.
+    let (consumer_error, _, store_result) = finish_recording_after_helper_stop(
+        consumer,
+        capture_error.is_some(),
+        if is_shutdown { "shutdown" } else { "record_stop" },
+        memory_flush,
+        session_close,
+    )
+    .await;
+    if is_shutdown {
+        eprintln!(
+            "shutdown: capture/session close completed in {} ms",
+            stop_started.elapsed().as_millis()
+        );
+    }
+    let capture_error = match (capture_error, consumer_error) {
+        (Some(error), Some(consumer_error)) => Some(format!("{error}; {consumer_error}")),
+        (Some(error), None) => Some(error.to_string()),
+        (None, Some(consumer_error)) => Some(consumer_error),
+        (None, None) => None,
+    };
     match (capture_error, store_result) {
         (None, Ok(())) => Response::success(serde_json::json!({"session_id": session_id})),
         (Some(capture_error), Ok(())) => Response::failure(format!(
@@ -2345,104 +2694,188 @@ async fn record_signal_gap(state: &Arc<AppState>, from_ms: i64, to_ms: i64, reas
     }
 }
 
-async fn consume_capture_events(state: Arc<AppState>, session_id: String) {
-    while let Some(event) = state.capture.next_event().await {
-        match event {
-            // The startup handshake already recorded this, but the shim may
-            // re-announce after a display change, and the OCR crop is only as
-            // good as the dimensions it maps against.
-            Ok(CaptureEvent::Ready { width, height, .. }) => {
-                remember_capture_display(&state, width, height);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureStreamDisposition {
+    Continue,
+    Stopped,
+    Failed,
+}
+
+fn capture_stream_disposition(
+    event: &Result<CaptureEvent, CaptureError>,
+) -> CaptureStreamDisposition {
+    match event {
+        Ok(CaptureEvent::Stopped) => CaptureStreamDisposition::Stopped,
+        Ok(CaptureEvent::Failed { .. }) | Err(_) => CaptureStreamDisposition::Failed,
+        Ok(_) => CaptureStreamDisposition::Continue,
+    }
+}
+
+/// Reads the capture stream in protocol order and does not observe `Stopped`
+/// until the handler for every earlier event has completed.
+async fn consume_capture_event_stream<N, NFuture, H, HFuture, F, FFuture>(
+    mut next_event: N,
+    mut handle_event: H,
+    mut finish_failed: F,
+) -> CaptureConsumerOutcome
+where
+    N: FnMut() -> NFuture,
+    NFuture: std::future::Future<Output = Option<Result<CaptureEvent, CaptureError>>>,
+    H: FnMut(CaptureEvent) -> HFuture,
+    HFuture: std::future::Future<Output = ()>,
+    F: FnMut() -> FFuture,
+    FFuture: std::future::Future<Output = ()>,
+{
+    loop {
+        let Some(event) = next_event().await else {
+            let error = "capture event stream ended before stopped".to_owned();
+            eprintln!("{error}");
+            finish_failed().await;
+            return CaptureConsumerOutcome::Failed(error);
+        };
+        match capture_stream_disposition(&event) {
+            CaptureStreamDisposition::Stopped => return CaptureConsumerOutcome::Stopped,
+            CaptureStreamDisposition::Failed => {
+                let error = match &event {
+                    Ok(CaptureEvent::Failed { code, message }) => {
+                        eprintln!("capture failed [{code}]: {message}");
+                        format!("capture failed [{code}]: {message}")
+                    }
+                    Err(error) => {
+                        eprintln!("capture event stream failed: {error}");
+                        error.to_string()
+                    }
+                    Ok(_) => unreachable!("failed disposition requires a terminal failure"),
+                };
+                finish_failed().await;
+                return CaptureConsumerOutcome::Failed(error);
             }
-            Ok(CaptureEvent::Artifact {
+            CaptureStreamDisposition::Continue => {}
+        }
+
+        handle_event(event.expect("continued capture event must be successful")).await;
+    }
+}
+
+async fn handle_capture_event(state: &Arc<AppState>, session_id: &str, event: CaptureEvent) {
+    match event {
+        // The startup handshake already recorded this, but the shim may
+        // re-announce after a display change, and the OCR crop is only as
+        // good as the dimensions it maps against.
+        CaptureEvent::Ready { width, height, .. } => {
+            remember_capture_display(state, width, height);
+        }
+        CaptureEvent::Artifact {
+            kind,
+            path,
+            content_type,
+            started_at_ms,
+            ended_at_ms,
+            ..
+        } => {
+            let result = import_artifact(
+                state,
+                session_id,
                 kind,
-                path,
-                content_type,
+                &path,
+                &content_type,
                 started_at_ms,
                 ended_at_ms,
-                ..
-            }) => {
-                let result = import_artifact(
-                    &state,
-                    &session_id,
-                    kind,
-                    &path,
-                    &content_type,
-                    started_at_ms,
-                    ended_at_ms,
-                )
-                .await;
-                if let Err(error) = result {
-                    eprintln!("capture artifact import failed: {error:#}");
-                    let _ = tokio::fs::remove_file(&path).await;
-                }
-            }
-            Ok(CaptureEvent::Warning { code, message }) => {
-                eprintln!("capture warning [{code}]: {message}");
-                // A dead input tap is a hole in one of the two fact streams,
-                // and it has to be recorded *in* that stream: T1 reads the
-                // absence of events as "the user did nothing here", which is
-                // exactly the inference this pipeline exists to prevent. The
-                // marker rides the same table (the vault stores `kind`
-                // uninterpreted) so the gap arrives in its place in time.
-                if matches!(code.as_str(), "input_tap_stalled" | "input_tap_unavailable") {
-                    let at = now_ms();
-                    record_signal_gap(&state, at, at, &code).await;
-                }
-            }
-            Ok(CaptureEvent::InputEvents { events, dropped }) => {
-                if !events.is_empty() || dropped > 0 {
-                    eprintln!("capture input events batch={} dropped={dropped}", events.len());
-                }
-                if !events.is_empty() {
-                    let rows: Vec<InputEventRow> = events.iter().map(input_event_row).collect();
-                    let span = rows
-                        .first()
-                        .map(|first| (first.at_ms, rows.last().map_or(first.at_ms, |l| l.at_ms)));
-                    // A failed batch is not retried: the events are one of two
-                    // independent fact streams, and stalling capture over the
-                    // softer one would cost frames. But it must not vanish
-                    // quietly either — a stretch with no rows reads as "the
-                    // user did nothing", which is the one thing this pipeline
-                    // may never say by accident. Mark the stretch unobservable
-                    // instead, the same way a dead tap is marked.
-                    if let Err(error) =
-                        run_store(&state, move |s| s.store.insert_input_events(&rows)).await
-                    {
-                        eprintln!("capture input events store failed: {error}");
-                        if let Some((from_ms, to_ms)) = span {
-                            record_signal_gap(&state, from_ms, to_ms, "input_events_store_failed").await;
-                        }
-                    }
-                }
-                // The user did something; the heartbeat's next tick may be nine
-                // seconds away. Pull the frame forward so the screenshot lands
-                // near the interaction rather than wherever the timer's phase
-                // happened to fall — the cadence stays the same, its phase
-                // stops being arbitrary. A failed store above does not change
-                // this: the frame is worth having either way.
-                if event_capture_is_due(
-                    events.len(),
-                    state.last_capture_ms.load(Ordering::SeqCst),
-                    now_ms(),
-                    i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
-                ) {
-                    fire_capture_tick(&state).await;
-                }
-            }
-            Ok(CaptureEvent::Failed { code, message }) => {
-                eprintln!("capture failed [{code}]: {message}");
-                finish_failed_recording(&state, &session_id).await;
-                break;
-            }
-            Ok(CaptureEvent::Stopped) => break,
-            Err(error) => {
-                eprintln!("capture event stream failed: {error}");
-                finish_failed_recording(&state, &session_id).await;
-                break;
+            )
+            .await;
+            if let Err(error) = result {
+                eprintln!("capture artifact import failed: {error:#}");
+                let _ = tokio::fs::remove_file(&path).await;
             }
         }
+        CaptureEvent::Warning { code, message } => {
+            eprintln!("capture warning [{code}]: {message}");
+            // A dead input tap is a hole in one of the two fact streams,
+            // and it has to be recorded *in* that stream: T1 reads the
+            // absence of events as "the user did nothing here", which is
+            // exactly the inference this pipeline exists to prevent. The
+            // marker rides the same table (the vault stores `kind`
+            // uninterpreted) so the gap arrives in its place in time.
+            if matches!(code.as_str(), "input_tap_stalled" | "input_tap_unavailable") {
+                let at = now_ms();
+                record_signal_gap(state, at, at, &code).await;
+            }
+        }
+        CaptureEvent::InputEvents { events, dropped } => {
+            if !events.is_empty() || dropped > 0 {
+                eprintln!(
+                    "capture input events batch={} dropped={dropped}",
+                    events.len()
+                );
+            }
+            if !events.is_empty() {
+                let rows: Vec<InputEventRow> = events.iter().map(input_event_row).collect();
+                let span = rows
+                    .first()
+                    .map(|first| (first.at_ms, rows.last().map_or(first.at_ms, |l| l.at_ms)));
+                // A failed batch is not retried: the events are one of two
+                // independent fact streams, and stalling capture over the
+                // softer one would cost frames. But it must not vanish
+                // quietly either — a stretch with no rows reads as "the
+                // user did nothing", which is the one thing this pipeline
+                // may never say by accident. Mark the stretch unobservable
+                // instead, the same way a dead tap is marked.
+                if let Err(error) =
+                    run_store(state, move |s| s.store.insert_input_events(&rows)).await
+                {
+                    eprintln!("capture input events store failed: {error}");
+                    if let Some((from_ms, to_ms)) = span {
+                        record_signal_gap(state, from_ms, to_ms, "input_events_store_failed")
+                            .await;
+                    }
+                }
+            }
+            // The user did something; the heartbeat's next tick may be nine
+            // seconds away. Pull the frame forward so the screenshot lands
+            // near the interaction rather than wherever the timer's phase
+            // happened to fall — the cadence stays the same, its phase
+            // stops being arbitrary. A failed store above does not change
+            // this: the frame is worth having either way.
+            if event_capture_is_due(
+                events.len(),
+                state.last_capture_ms.load(Ordering::SeqCst),
+                now_ms(),
+                i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
+            ) {
+                fire_capture_tick(state).await;
+            }
+        }
+        CaptureEvent::Failed { .. } | CaptureEvent::Stopped => {
+            unreachable!("terminal capture events are handled before import")
+        }
     }
+}
+
+async fn consume_capture_events(
+    state: Arc<AppState>,
+    session_id: String,
+) -> CaptureConsumerOutcome {
+    let capture = Arc::clone(&state.capture);
+    let event_state = Arc::clone(&state);
+    let event_session_id = session_id.clone();
+    let failed_state = Arc::clone(&state);
+    consume_capture_event_stream(
+        move || {
+            let capture = Arc::clone(&capture);
+            async move { capture.next_event().await }
+        },
+        move |event| {
+            let state = Arc::clone(&event_state);
+            let session_id = event_session_id.clone();
+            async move { handle_capture_event(&state, &session_id, event).await }
+        },
+        move || {
+            let state = Arc::clone(&failed_state);
+            let session_id = session_id.clone();
+            async move { finish_failed_recording(&state, &session_id).await }
+        },
+    )
+    .await
 }
 
 async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
@@ -2461,7 +2894,10 @@ async fn finish_failed_recording(state: &Arc<AppState>, session_id: &str) {
         scheduler.abort();
     }
     let session_id = session_id.to_owned();
-    let _ = run_store(state, move |s| s.store.end_session_sync(&session_id, now_ms())).await;
+    let _ = run_store(state, move |s| {
+        s.store.end_session_sync(&session_id, now_ms())
+    })
+    .await;
 }
 
 /// Maps one shim observation onto its vault row.
@@ -2647,7 +3083,7 @@ async fn import_artifact(
                 .await?;
             let model_state = Arc::clone(state);
             let path = path.to_path_buf();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let snapshot = model_state.models.wait(&job).await;
                 if let Ok(snapshot) = snapshot
                     && let Some(ModelOutput::Ocr { text, regions }) = snapshot.output
@@ -2684,6 +3120,7 @@ async fn import_artifact(
                 }
                 let _ = tokio::fs::remove_file(path).await;
             });
+            state.lifecycle.track_task(task);
         }
         ArtifactKind::SystemAudio | ArtifactKind::Microphone => {
             let track = match kind {
@@ -3049,10 +3486,7 @@ async fn compute_status(state: &Arc<AppState>) -> afterray_protocol::ComputeStat
         let (cpu_percent, footprint_bytes) = state.compute.sample(pid);
         resident_models.push(ComputeResidentModel {
             pack_id: pack_id.clone(),
-            name: health
-                .runtime
-                .clone()
-                .unwrap_or_else(|| pack_id.clone()),
+            name: health.runtime.clone().unwrap_or_else(|| pack_id.clone()),
             pid: Some(pid),
             footprint_bytes,
             cpu_percent,
@@ -3218,7 +3652,11 @@ async fn run_slot_t2_recording(
     let slot_start_ms = outcome
         .as_ref()
         .ok()
-        .and_then(|value| value.get("slot_start_ms").and_then(serde_json::Value::as_i64))
+        .and_then(|value| {
+            value
+                .get("slot_start_ms")
+                .and_then(serde_json::Value::as_i64)
+        })
         .unwrap_or(at_ms);
     state
         .compute
@@ -3494,12 +3932,7 @@ const fn asr_wait_verdict(
 /// No ASR gate: this is the list of slots that *want* summarising, which is
 /// what the backlog count reports and what `slot backfill` works through. The
 /// sweeper takes [`slots_ready_for_t2`] instead.
-fn slots_awaiting_t2(
-    store: &Vault,
-    interval_ms: i64,
-    now: i64,
-    lookback_days: i64,
-) -> Vec<i64> {
+fn slots_awaiting_t2(store: &Vault, interval_ms: i64, now: i64, lookback_days: i64) -> Vec<i64> {
     slot_windows_awaiting_t2(store, interval_ms, now, lookback_days)
         .into_iter()
         .map(|(slot_start_ms, _)| slot_start_ms)
@@ -3538,12 +3971,7 @@ fn slot_windows_awaiting_t2(
 /// with one model; its health is not a property of a slot), and doubles as the
 /// short circuit: with nothing anywhere owed a transcript, no slot needs the
 /// per-slot query at all.
-fn slots_ready_for_t2(
-    store: &Vault,
-    interval_ms: i64,
-    now: i64,
-    lookback_days: i64,
-) -> T2Sweep {
+fn slots_ready_for_t2(store: &Vault, interval_ms: i64, now: i64, lookback_days: i64) -> T2Sweep {
     let windows = slot_windows_awaiting_t2(store, interval_ms, now, lookback_days);
     if windows.is_empty() {
         return T2Sweep::default();
@@ -3580,7 +4008,9 @@ fn slots_ready_for_t2(
                         health.waiting_segments,
                         human_duration(Duration::from_millis(
                             u64::try_from(
-                                slot_end_ms.saturating_add(ASR_WAIT_CAP_MS).saturating_sub(now)
+                                slot_end_ms
+                                    .saturating_add(ASR_WAIT_CAP_MS)
+                                    .saturating_sub(now)
                             )
                             .unwrap_or_default()
                         ))
@@ -3685,7 +4115,8 @@ async fn slot_backfill(state: &Arc<AppState>, days: i64) -> Response {
 /// ever holding the store lock long.
 fn spawn_text_df_maintainer(state: Arc<AppState>) {
     let mut shutdown = state.shutdown.subscribe();
-    tokio::spawn(async move {
+    let lifecycle_state = Arc::clone(&state);
+    let task = tokio::spawn(async move {
         // After the model runtimes settle; this touches only SQLite.
         tokio::time::sleep(Duration::from_secs(20)).await;
         let interval_ms = i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000);
@@ -3723,12 +4154,14 @@ fn spawn_text_df_maintainer(state: Arc<AppState>) {
             }
         }
     });
+    lifecycle_state.lifecycle.track_task(task);
 }
 
 fn spawn_asr_sweeper(state: Arc<AppState>) {
     let mut shutdown = state.shutdown.subscribe();
     state.asr_changed.notify_one();
-    tokio::spawn(async move {
+    let lifecycle_state = Arc::clone(&state);
+    let task = tokio::spawn(async move {
         // Logged on change only, like the T2 sweeper's.
         let mut blocked_reason: Option<String> = None;
         loop {
@@ -3775,12 +4208,15 @@ fn spawn_asr_sweeper(state: Arc<AppState>) {
         }
         eprintln!("asr backlog: stopped");
     });
+    lifecycle_state.lifecycle.track_task(task);
 }
 
 async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, String> {
     let claimed = run_store(state, |state| {
         state.store.claim_audio_transcription(now_ms())
-    }).await.map_err(|error| error.to_string())?;
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     let Some(claimed) = claimed else {
         return Ok(false);
     };
@@ -3793,11 +4229,19 @@ async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, Stri
         }
     };
     let outcome = async {
-        let job = state.models.submit(ModelInput::Asr {
-            audio_path: path.clone(),
-            language: None,
-        }).await.map_err(|error| error.to_string())?;
-        let snapshot = state.models.wait(&job).await.map_err(|error| error.to_string())?;
+        let job = state
+            .models
+            .submit(ModelInput::Asr {
+                audio_path: path.clone(),
+                language: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let snapshot = state
+            .models
+            .wait(&job)
+            .await
+            .map_err(|error| error.to_string())?;
         match snapshot.output {
             Some(ModelOutput::Asr { text, language }) => {
                 if text.trim().is_empty() {
@@ -3812,21 +4256,28 @@ async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, Stri
                 let adapter = snapshot.adapter.clone();
                 let evidence_id = run_store(state, move |state| {
                     state.store.complete_audio_transcription(
-                        &stored_segment, &stored_text, &adapter, now_ms(),
+                        &stored_segment,
+                        &stored_text,
+                        &adapter,
+                        now_ms(),
                     )
-                }).await.map_err(|error| error.to_string())?;
+                })
+                .await
+                .map_err(|error| error.to_string())?;
                 // Embeddings are switched off; see `search_hits`.
                 let _ = evidence_id;
                 Ok(())
             }
             Some(_) => Err(format!(
-                "ASR job {} returned a non-transcript output", snapshot.id
+                "ASR job {} returned a non-transcript output",
+                snapshot.id
             )),
-            None => Err(snapshot.last_error.unwrap_or_else(|| {
-                format!("ASR job {} ended {:?}", snapshot.id, snapshot.state)
-            })),
+            None => Err(snapshot
+                .last_error
+                .unwrap_or_else(|| format!("ASR job {} ended {:?}", snapshot.id, snapshot.state))),
         }
-    }.await;
+    }
+    .await;
     let _ = tokio::fs::remove_file(&path).await;
     if let Err(error) = outcome {
         fail_claimed_audio(state, &segment.id, claimed.attempts, &error).await;
@@ -3845,7 +4296,9 @@ async fn materialize_audio_for_asr(
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        let payload = state.store.read_artifact(&artifact_id)
+        let payload = state
+            .store
+            .read_artifact(&artifact_id)
             .map_err(|error| error.to_string())?;
         let directory = state.data_dir.join("capture-staging");
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
@@ -3859,20 +4312,19 @@ async fn materialize_audio_for_asr(
             .mode(0o600)
             .open(&path)
             .map_err(|error| format!("could not materialize encrypted audio: {error}"))?;
-        if let Err(error) = file.write_all(&payload.bytes).and_then(|()| file.sync_all()) {
+        if let Err(error) = file
+            .write_all(&payload.bytes)
+            .and_then(|()| file.sync_all())
+        {
             let _ = std::fs::remove_file(&path);
             return Err(format!("could not materialize encrypted audio: {error}"));
         }
         Ok(path)
-    }).await
+    })
+    .await
 }
 
-async fn fail_claimed_audio(
-    state: &Arc<AppState>,
-    segment_id: &str,
-    attempts: u32,
-    error: &str,
-) {
+async fn fail_claimed_audio(state: &Arc<AppState>, segment_id: &str, attempts: u32, error: &str) {
     // The saturation point is shared with the store: past it the delay stops
     // growing, which is what `AsrHealth::exhausted_segments` counts.
     let delay_minutes = 1_i64 << attempts.min(afterray_store::AUDIO_BACKOFF_SATURATION_ATTEMPTS);
@@ -3881,8 +4333,12 @@ async fn fail_claimed_audio(
     let segment_id = segment_id.to_owned();
     let error = error.to_owned();
     if let Err(store_error) = run_store(state, move |state| {
-        state.store.fail_audio_transcription(&segment_id, &error, next, now)
-    }).await {
+        state
+            .store
+            .fail_audio_transcription(&segment_id, &error, next, now)
+    })
+    .await
+    {
         eprintln!("asr backlog: could not persist failure: {store_error}");
     }
 }
@@ -4011,7 +4467,9 @@ async fn expire_raw_input_events(state: &Arc<AppState>, now: i64) {
 
     match run_store(state, move |s| s.store.prune_input_events_before(cutoff)).await {
         Ok(0) => {}
-        Ok(removed) => eprintln!("input events expiry: deleted {removed} row(s) older than {cutoff}"),
+        Ok(removed) => {
+            eprintln!("input events expiry: deleted {removed} row(s) older than {cutoff}")
+        }
         Err(error) => eprintln!("input events expiry: delete failed: {error}"),
     }
 }
@@ -4023,7 +4481,8 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
         return;
     }
     let mut shutdown = state.shutdown.subscribe();
-    tokio::spawn(async move {
+    let lifecycle_state = Arc::clone(&state);
+    let task = tokio::spawn(async move {
         // Long enough for the model runtime to come up; a sweep that races it
         // just burns an attempt on every slot.
         tokio::time::sleep(Duration::from_secs(45)).await;
@@ -4157,6 +4616,7 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
         }
         eprintln!("slot.t2 sweeper: stopped");
     });
+    lifecycle_state.lifecycle.track_task(task);
 }
 
 async fn summarize(state: &Arc<AppState>, session_id: &str) -> Response {
@@ -4281,11 +4741,7 @@ fn slot_t2_inputs(
     // The catalog is cut to this slot's evidence: a silent slot is never told
     // about a transcript tool, which measured as a whole wasted round.
     let system = afterray_store::render_t2_system_prompt(card.facts.has_audio);
-    Ok(SlotT2Inputs {
-        card,
-        system,
-        user,
-    })
+    Ok(SlotT2Inputs { card, system, user })
 }
 
 /// Renders the full T2 prompt: system instructions plus the JSON card view.
@@ -4361,7 +4817,6 @@ impl SlotT2Tools<'_> {
         let clipped: String = text.chars().take(T2_TOOL_PAGE_CHARS).collect();
         Ok(clipped)
     }
-
 }
 
 impl afterray_harness::ToolSurface for SlotT2Tools<'_> {
@@ -4541,9 +4996,10 @@ fn start_model_downloads(
             .store(false, Ordering::Release);
         state.download_paused.store(false, Ordering::Release);
         let task_state = Arc::clone(state);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             run_model_downloads(task_state).await;
         });
+        state.lifecycle.track_task(task);
     } else if state.download_paused.load(Ordering::Acquire) {
         resume_download_worker(state);
     }
@@ -5068,16 +5524,18 @@ fn spawn_gop_packer(state: Arc<AppState>) {
         "gop packer: enabled keyint={} cold_gop_only",
         state.packer.config.policy.keyint
     );
-    let shutdown = state.shutdown.subscribe();
-    if let Err(error) = std::thread::Builder::new()
+    let lifecycle_state = Arc::clone(&state);
+    match std::thread::Builder::new()
         .name("gop-packer".into())
         .spawn(move || {
             apply_background_qos();
             eprintln!("gop packer: background thread started");
-            std::thread::sleep(Duration::from_secs(15));
+            if thread_sleep_until_draining(&state, Duration::from_secs(15)) {
+                return;
+            }
             let mut blocked_reason: Option<String> = None;
             loop {
-                if *shutdown.borrow() {
+                if state.draining.load(Ordering::Acquire) {
                     break;
                 }
                 // rav1e is the only all-core workload here, so it is the one a
@@ -5095,7 +5553,9 @@ fn spawn_gop_packer(state: Arc<AppState>) {
                     // Ten seconds, not a minute: this is also how long "run now"
                     // takes to visibly start, and the probes it re-reads are
                     // cheap.
-                    std::thread::sleep(Duration::from_secs(10));
+                    if thread_sleep_until_draining(&state, Duration::from_secs(10)) {
+                        break;
+                    }
                     continue;
                 }
                 if blocked_reason.take().is_some() {
@@ -5112,7 +5572,9 @@ fn spawn_gop_packer(state: Arc<AppState>) {
                         i64::try_from(state.capture_interval.as_millis()).unwrap_or(10_000),
                     )
                 {
-                    std::thread::sleep(Duration::from_secs(1));
+                    if thread_sleep_until_draining(&state, Duration::from_secs(1)) {
+                        break;
+                    }
                     continue;
                 }
                 match state.packer.pack_one(&state.store, now_ms()) {
@@ -5131,12 +5593,29 @@ fn spawn_gop_packer(state: Arc<AppState>) {
                     }
                     Err(error) => eprintln!("gop packer: {error:#}"),
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                if thread_sleep_until_draining(&state, Duration::from_secs(5)) {
+                    break;
+                }
             }
-        })
-    {
-        eprintln!("gop packer: failed to spawn background thread: {error}");
+        }) {
+        Ok(thread) => lifecycle_state.lifecycle.track_thread(thread),
+        Err(error) => eprintln!("gop packer: failed to spawn background thread: {error}"),
     }
+}
+
+fn thread_sleep_until_draining(state: &AppState, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if state.draining.load(Ordering::Acquire) {
+            return true;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        );
+    }
+    state.draining.load(Ordering::Acquire)
 }
 
 fn read_still_artifact(state: &AppState, artifact_id: &str) -> Result<ArtifactPayload, StoreError> {
@@ -5205,7 +5684,9 @@ fn is_near_silent_audio(byte_len: usize, started_at_ms: i64, ended_at_ms: i64) -
     if duration_ms < 30_000 {
         return false;
     }
-    let bits = u128::try_from(byte_len).unwrap_or(u128::MAX).saturating_mul(8);
+    let bits = u128::try_from(byte_len)
+        .unwrap_or(u128::MAX)
+        .saturating_mul(8);
     let bps = bits.saturating_mul(1000) / u128::try_from(duration_ms).unwrap_or(1);
     bps < SILENCE_BPS
 }
@@ -5252,6 +5733,179 @@ mod tests {
     use super::*;
 
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn required_shutdown_work_is_not_cut_off_by_disposable_deadlines() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_after_close = Arc::clone(&completed);
+        let started = Instant::now();
+
+        let (memory_flushed, session_closed) = tokio::time::timeout(
+            Duration::from_secs(6),
+            finish_required_recording_close(
+                async { "memory flushed" },
+                async move {
+                    // This stands in for slow vault maintenance plus
+                    // end_session_sync after the active session was taken. It
+                    // deliberately exceeds the retired four-second aggregate
+                    // timeout: required close must still run to completion.
+                    tokio::time::sleep(Duration::from_millis(4_100)).await;
+                    completed_after_close.store(true, Ordering::Release);
+                    "session closed"
+                },
+            ),
+        )
+        .await
+        .expect("the test guard should not expire");
+
+        assert_eq!(memory_flushed, "memory flushed");
+        assert_eq!(session_closed, "session closed");
+        assert!(completed.load(Ordering::Acquire));
+        assert!(started.elapsed() >= Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn graceful_stopped_drains_slow_final_artifact_before_session_close() {
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(2);
+        let events_rx = Arc::new(tokio::sync::Mutex::new(events_rx));
+        let import_completed = Arc::new(AtomicBool::new(false));
+        let session_closed = Arc::new(AtomicBool::new(false));
+        let imported_by_consumer = Arc::clone(&import_completed);
+        let closed_seen_by_consumer = Arc::clone(&session_closed);
+        let receiver = Arc::clone(&events_rx);
+        let consumer = tokio::spawn(consume_capture_event_stream(
+            move || {
+                let receiver = Arc::clone(&receiver);
+                async move { receiver.lock().await.recv().await }
+            },
+            move |event| {
+                let imported_by_consumer = Arc::clone(&imported_by_consumer);
+                let closed_seen_by_consumer = Arc::clone(&closed_seen_by_consumer);
+                async move {
+                    match event {
+                        CaptureEvent::Artifact { .. } => {
+                            // Model a final vault import held behind slow disk I/O
+                            // for longer than the retired one-second drain budget.
+                            tokio::time::sleep(Duration::from_millis(1_200)).await;
+                            assert!(!closed_seen_by_consumer.load(Ordering::Acquire));
+                            imported_by_consumer.store(true, Ordering::Release);
+                        }
+                        other => panic!("unexpected non-terminal test event: {other:?}"),
+                    }
+                }
+            },
+            || async { panic!("graceful test stream must not fail") },
+        ));
+
+        events_tx
+            .send(Ok(CaptureEvent::Artifact {
+                kind: ArtifactKind::Screen,
+                path: PathBuf::from("final-frame.jpg"),
+                content_type: "image/jpeg".to_owned(),
+                started_at_ms: 1,
+                ended_at_ms: 1,
+                byte_count: 1,
+                request_id: Some("final-frame".to_owned()),
+            }))
+            .await
+            .unwrap();
+        events_tx.send(Ok(CaptureEvent::Stopped)).await.unwrap();
+        drop(events_tx);
+
+        let imported_before_close = Arc::clone(&import_completed);
+        let closed_by_session = Arc::clone(&session_closed);
+        let (consumer_error, memory_flushed, session_result) = tokio::time::timeout(
+            Duration::from_secs(3),
+            finish_recording_after_helper_stop(
+                Some(consumer),
+                false,
+                "test graceful stop",
+                async { "memory flushed" },
+                async move {
+                    assert!(imported_before_close.load(Ordering::Acquire));
+                    closed_by_session.store(true, Ordering::Release);
+                    Ok::<(), String>(())
+                },
+            ),
+        )
+        .await
+        .expect("a finite graceful stream must drain");
+
+        assert_eq!(consumer_error, None);
+        assert_eq!(memory_flushed, "memory flushed");
+        assert_eq!(session_result, Ok(()));
+        assert!(import_completed.load(Ordering::Acquire));
+        assert!(session_closed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn failed_helper_consumer_keeps_the_short_recovery_boundary() {
+        let consumer = tokio::spawn(std::future::pending::<CaptureConsumerOutcome>());
+        let started = Instant::now();
+
+        let error = drain_capture_consumer(Some(consumer), true, "test failed stop")
+            .await
+            .expect("a stuck failed-helper consumer must time out");
+
+        assert_eq!(error, "capture event consumer timed out");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn background_lifecycle_reaps_completed_tasks_and_joins_cancelled_tasks() {
+        let lifecycle = BackgroundLifecycle::default();
+        for _ in 0..500 {
+            lifecycle.track_task(tokio::spawn(async {
+                tokio::task::yield_now().await;
+            }));
+        }
+
+        let remaining = lifecycle
+            .wait_for_tasks_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(remaining, 0);
+        assert_eq!(lifecycle.active_task_count(), 0);
+
+        lifecycle.track_task(tokio::spawn(std::future::pending()));
+        assert_eq!(lifecycle.active_task_count(), 1);
+        lifecycle.cancel_and_join(Duration::from_millis(250)).await;
+        assert_eq!(lifecycle.active_task_count(), 0);
+    }
+
+    #[test]
+    fn unexpected_capture_eof_takes_the_failed_recording_path() {
+        assert_eq!(
+            capture_stream_disposition(&Err(CaptureError::UnexpectedEof)),
+            CaptureStreamDisposition::Failed
+        );
+        assert_eq!(
+            capture_stream_disposition(&Ok(CaptureEvent::Stopped)),
+            CaptureStreamDisposition::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_ack_is_fully_written_before_draining_starts() {
+        let (mut client, mut server) = tokio::io::duplex(1);
+        let draining = Arc::new(AtomicBool::new(false));
+        let triggered = Arc::clone(&draining);
+        let ack = tokio::spawn(async move {
+            acknowledge_shutdown(&mut server, || triggered.store(true, Ordering::Release)).await
+        });
+
+        // One byte of capacity cannot hold the JSON ACK. With nobody reading,
+        // write_all must still be suspended and the drain signal must stay off.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!draining.load(Ordering::Acquire));
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        ack.await.unwrap().unwrap();
+        assert!(draining.load(Ordering::Acquire));
+        let response: Response = serde_json::from_slice(&response).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.data.unwrap()["stopping"], true);
+    }
 
     #[test]
     fn near_silent_audio_drops_long_quiet_tracks_but_keeps_speech() {
@@ -5416,7 +6070,10 @@ mod tests {
         let old: InputEventRecord =
             serde_json::from_str(r#"{"at_ms":7000,"kind":"click"}"#).unwrap();
         let row = input_event_row(&old);
-        assert_eq!((row.text, row.extra_json, row.target_json), (None, None, None));
+        assert_eq!(
+            (row.text, row.extra_json, row.target_json),
+            (None, None, None)
+        );
     }
 
     /// The sweeper log is where somebody goes to answer "how long did that
@@ -5790,7 +6447,6 @@ mod tests {
         );
     }
 
-
     fn day_slot(start_ms: i64, state: SlotSummaryState) -> afterray_store::DaySlot {
         afterray_store::DaySlot {
             slot_start_ms: start_ms,
@@ -5842,9 +6498,8 @@ mod tests {
     #[test]
     fn a_slot_whose_events_have_expired_is_never_summarised() {
         let base = 1_700_000_000_000;
-        let expired = base
-            - afterray_store::RAW_EVENT_RETENTION_MS
-            - 2 * afterray_store::SLOT_DURATION_MS;
+        let expired =
+            base - afterray_store::RAW_EVENT_RETENTION_MS - 2 * afterray_store::SLOT_DURATION_MS;
         let live = base - 10 * afterray_store::SLOT_DURATION_MS;
         let slots = [
             day_slot(expired, SlotSummaryState::Degraded),
@@ -5967,7 +6622,10 @@ mod tests {
             last_success_ms: Some(now - 3 * 24 * 60 * 60 * 1000),
             ..healthy_asr(now)
         };
-        assert_eq!(asr_wait_verdict(&weekend, true, slot_end, now), AsrWait::Wait);
+        assert_eq!(
+            asr_wait_verdict(&weekend, true, slot_end, now),
+            AsrWait::Wait
+        );
     }
 
     /// The failure an unconditional wait would produce: a machine where the
@@ -6005,7 +6663,10 @@ mod tests {
             last_failure_ms: Some(now - 60 * 60 * 1000),
             ..healthy_asr(now)
         };
-        assert_eq!(asr_wait_verdict(&recovered, true, slot_end, now), AsrWait::Wait);
+        assert_eq!(
+            asr_wait_verdict(&recovered, true, slot_end, now),
+            AsrWait::Wait
+        );
     }
 
     /// The only case wall-clock staleness can see: a worker that stopped
@@ -6042,7 +6703,10 @@ mod tests {
             exhausted_segments: 2,
             ..stuck
         };
-        assert_eq!(asr_wait_verdict(&partly, true, slot_end, now), AsrWait::Wait);
+        assert_eq!(
+            asr_wait_verdict(&partly, true, slot_end, now),
+            AsrWait::Wait
+        );
     }
 
     /// Measured: a ten-job backlog is about fifty minutes of audio, so the cap
@@ -6109,7 +6773,12 @@ mod tests {
             )
             .unwrap();
         vault
-            .complete_audio_transcription(&elsewhere, "an earlier meeting", "test-asr", settled - 60_000)
+            .complete_audio_transcription(
+                &elsewhere,
+                "an earlier meeting",
+                "test-asr",
+                settled - 60_000,
+            )
             .unwrap();
         // …and this slot's own audio has not been transcribed yet.
         let pending = vault
@@ -6143,7 +6812,12 @@ mod tests {
 
         // The transcript lands: the slot is swept on the next round.
         vault
-            .complete_audio_transcription(&pending, "we agreed to ship on Friday", "test-asr", settled)
+            .complete_audio_transcription(
+                &pending,
+                "we agreed to ship on Friday",
+                "test-asr",
+                settled,
+            )
             .unwrap();
         assert_eq!(
             slots_ready_for_t2(&vault, interval_ms, settled, 1).ready,
@@ -6178,7 +6852,8 @@ mod tests {
         }
         let interval_ms = 10_000;
         let settled = base + afterray_store::SLOT_DURATION_MS + T2_SETTLE_MS + 60_000;
-        let (slot_start_ms, slot_end_ms) = slot_windows_awaiting_t2(&vault, interval_ms, settled, 1)[0];
+        let (slot_start_ms, slot_end_ms) =
+            slot_windows_awaiting_t2(&vault, interval_ms, settled, 1)[0];
         let alive = vault
             .insert_audio_segment(
                 &session.id,
@@ -6201,7 +6876,12 @@ mod tests {
             .unwrap();
         let expired = slot_end_ms + ASR_WAIT_CAP_MS;
         vault
-            .complete_audio_transcription(&alive, "an earlier meeting", "test-asr", expired - 60_000)
+            .complete_audio_transcription(
+                &alive,
+                "an earlier meeting",
+                "test-asr",
+                expired - 60_000,
+            )
             .unwrap();
         assert_eq!(
             slots_ready_for_t2(&vault, interval_ms, expired, 1).ready,
@@ -6378,7 +7058,15 @@ mod tests {
         ] {
             vault
                 .insert_text_evidence(
-                    &session.id, None, None, "ocr", text, at_ms, None, "ocr-model", None,
+                    &session.id,
+                    None,
+                    None,
+                    "ocr",
+                    text,
+                    at_ms,
+                    None,
+                    "ocr-model",
+                    None,
                 )
                 .unwrap();
         }

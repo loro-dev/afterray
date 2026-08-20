@@ -39,7 +39,15 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 const EVENT_BUFFER_CAPACITY: usize = 128;
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+// `stopCapture()` and the shim's synchronous audio finalization can take more
+// than a scheduler tick on a healthy machine. Keep this below the daemon's
+// aggregate capture drain budget, but long enough to preserve the last event.
+const STOP_GRACE_TIMEOUT: Duration = Duration::from_millis(1_500);
+const FORCE_REAP_TIMEOUT: Duration = Duration::from_millis(750);
+// Only a helper already known to have failed or been forced down gets a local
+// reader bound. A successful child exit leaves a finite stdout stream whose
+// delivery may be backpressured by required vault imports.
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
@@ -273,7 +281,9 @@ pub enum CaptureError {
         line: String,
         source: serde_json::Error,
     },
-    #[error("capture shim did not stop within ten seconds")]
+    #[error("capture shim stdout closed before a stopped event")]
+    UnexpectedEof,
+    #[error("capture shim did not stop within the graceful window and was killed")]
     StopTimeout,
 }
 
@@ -422,6 +432,7 @@ impl MacOsCaptureBackend {
         let events_tx = self.events_tx.clone();
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
+            let mut saw_stopped = false;
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
@@ -433,11 +444,23 @@ impl MacOsCaptureBackend {
                                     source,
                                 }
                             });
+                        if matches!(&parsed, Ok(CaptureEvent::Stopped)) {
+                            saw_stopped = true;
+                        }
                         if events_tx.send(parsed).await.is_err() {
                             break;
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // EOF wakes the single consumer, but it is only a
+                        // normal terminal condition after the protocol-level
+                        // `stopped` event. Otherwise the helper disappeared
+                        // and capture must take the failed-recording path.
+                        if !saw_stopped {
+                            let _ = events_tx.send(Err(CaptureError::UnexpectedEof)).await;
+                        }
+                        break;
+                    }
                     Err(error) => {
                         let _ = events_tx.send(Err(CaptureError::Io(error))).await;
                         break;
@@ -478,6 +501,7 @@ impl MacOsCaptureBackend {
         self.events_rx.lock().await.recv().await
     }
 
+    // @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
     /// Stops capture, finalizes open audio segments, and waits for the helper.
     ///
     /// # Errors
@@ -489,20 +513,69 @@ impl MacOsCaptureBackend {
         let Some(mut process) = running.take() else {
             return Err(CaptureError::NotRunning);
         };
-        write_command(&mut process.stdin, &ShimCommand::Stop).await?;
-        drop(process.stdin);
-        let status = timeout(STOP_TIMEOUT, process.child.wait())
+        let mut stop_error = write_command(&mut process.stdin, &ShimCommand::Stop)
             .await
-            .map_err(|_| CaptureError::StopTimeout)??;
-        let Ok(reader_result) = timeout(STOP_TIMEOUT, &mut process.reader).await else {
-            process.reader.abort();
+            .err();
+        drop(process.stdin);
+
+        let mut status = None;
+        if stop_error.is_none() {
+            match timeout(STOP_GRACE_TIMEOUT, process.child.wait()).await {
+                Ok(Ok(exited)) => status = Some(exited),
+                Ok(Err(error)) => stop_error = Some(CaptureError::Io(error)),
+                Err(_) => stop_error = Some(CaptureError::StopTimeout),
+            }
+        }
+        if status.is_none() {
+            if let Err(error) = process.child.start_kill()
+                && stop_error.is_none()
+            {
+                stop_error = Some(CaptureError::Io(error));
+            }
+            match timeout(FORCE_REAP_TIMEOUT, process.child.wait()).await {
+                Ok(Ok(exited)) => status = Some(exited),
+                Ok(Err(error)) if stop_error.is_none() => {
+                    stop_error = Some(CaptureError::Io(error));
+                }
+                Err(_) if stop_error.is_none() => {
+                    stop_error = Some(CaptureError::StopTimeout);
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+
+        let healthy_exit = stop_error.is_none()
+            && status.as_ref().is_some_and(std::process::ExitStatus::success);
+        let reader_result = if healthy_exit {
+            // exit=0 closes stdout into a finite stream. The reader may still
+            // be blocked on the bounded channel while the daemon imports an
+            // earlier artifact; that backpressure is required durability work.
+            process.reader.await
+        } else {
+            let Ok(reader_result) =
+                timeout(READER_DRAIN_TIMEOUT, &mut process.reader).await
+            else {
+                process.reader.abort();
+                if stop_error.is_none() {
+                    stop_error = Some(CaptureError::StopTimeout);
+                }
+                return Err(stop_error.unwrap_or(CaptureError::StopTimeout));
+            };
+            reader_result
+        };
+        if let Err(error) = reader_result
+            && stop_error.is_none()
+        {
+            stop_error = Some(CaptureError::Io(std::io::Error::other(format!(
+                "capture event reader failed: {error}"
+            ))));
+        }
+        if let Some(error) = stop_error {
+            return Err(error);
+        }
+        let Some(status) = status else {
             return Err(CaptureError::StopTimeout);
         };
-        reader_result.map_err(|error| {
-            CaptureError::Io(std::io::Error::other(format!(
-                "capture event reader failed: {error}"
-            )))
-        })?;
         if !status.success() {
             return Err(CaptureError::Io(std::io::Error::other(format!(
                 "capture shim exited with {status}"
@@ -541,6 +614,116 @@ impl CaptureBackend for MacOsCaptureBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stuck_shim_is_killed_reaped_and_wakes_the_event_consumer() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let shim = temporary.path().join("stuck-shim.sh");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nwhile :; do :; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend =
+            MacOsCaptureBackend::new(CaptureConfig::new(&shim, temporary.path().join("capture")));
+
+        backend.start_capture().await.unwrap();
+        let started = std::time::Instant::now();
+        let error = backend.stop_capture().await.unwrap_err();
+
+        assert!(matches!(error, CaptureError::StopTimeout));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), backend.next_event()).await,
+            Ok(Some(Err(CaptureError::UnexpectedEof)))
+        ));
+        assert!(matches!(
+            backend.stop_capture().await,
+            Err(CaptureError::NotRunning)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthy_exit_drains_a_backpressured_reader_through_stopped() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let shim = temporary.path().join("backpressured-shim.sh");
+        let event_count = EVENT_BUFFER_CAPACITY + 2;
+        let script = format!(
+            "#!/bin/sh\nIFS= read -r line\nIFS= read -r line\ni=0\nwhile [ \"$i\" -lt {event_count} ]; do\n  printf '%s\\n' '{{\"event\":\"warning\",\"code\":\"test\",\"message\":\"queued\"}}'\n  i=$((i + 1))\ndone\nprintf '%s\\n' '{{\"event\":\"stopped\"}}'\n"
+        );
+        std::fs::write(&shim, script).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend =
+            MacOsCaptureBackend::new(CaptureConfig::new(&shim, temporary.path().join("capture")));
+
+        backend.start_capture().await.unwrap();
+        let stopping_backend = Arc::clone(&backend);
+        let stop = tokio::spawn(async move { stopping_backend.stop_capture().await });
+
+        // Fill the real capacity-128 channel and leave the reader blocked for
+        // longer than the retired successful-exit reader timeout.
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(
+            !stop.is_finished(),
+            "a healthy reader must wait for consumer backpressure, not time out"
+        );
+
+        let mut warnings = 0;
+        loop {
+            let event = timeout(Duration::from_secs(5), backend.next_event())
+                .await
+                .expect("the finite healthy stream should keep draining")
+                .expect("the reader should deliver an event");
+            match event {
+                Ok(CaptureEvent::Warning { .. }) => {
+                    warnings += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(CaptureEvent::Stopped) => break,
+                other => panic!("unexpected capture event: {other:?}"),
+            }
+        }
+
+        assert_eq!(warnings, event_count);
+        assert!(
+            timeout(Duration::from_secs(5), stop)
+                .await
+                .expect("healthy stop should complete after the consumer drains")
+                .expect("stop task should not panic")
+                .is_ok(),
+            "exit=0 plus protocol Stopped is a graceful stop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_eof_without_protocol_stopped_is_an_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let shim = temporary.path().join("crashing-shim.sh");
+        std::fs::write(&shim, "#!/bin/sh\nIFS= read -r line\nexit 0\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend =
+            MacOsCaptureBackend::new(CaptureConfig::new(&shim, temporary.path().join("capture")));
+
+        backend.start_capture().await.unwrap();
+        assert!(matches!(
+            // Process launch and pipe delivery can be delayed substantially by
+            // parallel linker/test load. This is only a test guard; production
+            // stop/reap deadlines remain unchanged.
+            timeout(Duration::from_secs(5), backend.next_event()).await,
+            Ok(Some(Err(CaptureError::UnexpectedEof)))
+        ));
+        let _ = backend.stop_capture().await;
+    }
 
     #[test]
     fn parses_artifact_event() {
