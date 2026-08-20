@@ -175,6 +175,12 @@ button:focus-visible {
 .lang-menu {
   position: relative;
 }
+.lang-menu > summary {
+  list-style: none;
+}
+.lang-menu > summary::-webkit-details-marker {
+  display: none;
+}
 .lang-btn {
   display: flex;
   align-items: center;
@@ -191,7 +197,7 @@ button:focus-visible {
   transition-timing-function: ease-out;
 }
 .lang-btn:hover,
-.lang-btn[aria-expanded='true'] {
+.lang-menu[open] > .lang-btn {
   color: var(--accent);
   border-color: var(--accent);
 }
@@ -204,6 +210,8 @@ button:focus-visible {
   inset-inline-end: 0;
   z-index: 60;
   min-width: 8.5rem;
+  max-height: calc(100vh - 5rem);
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   padding: 0.3rem;
@@ -213,7 +221,11 @@ button:focus-visible {
     0 0 0 1px oklch(1 0 0 / 0.1),
     0 12px 30px rgba(0, 0, 0, 0.55);
 }
+.lang-menu:not([open]) .lang-list {
+  display: none;
+}
 .lang-item {
+  display: block;
   background: none;
   border: none;
   border-radius: var(--r-control);
@@ -223,6 +235,7 @@ button:focus-visible {
   text-align: start;
   padding: 0.45rem 0.7rem;
   cursor: pointer;
+  text-decoration: none;
   transition-property: color, background;
   transition-duration: 150ms;
   transition-timing-function: ease-out;
@@ -1304,6 +1317,83 @@ button.sa-chip.sa-chip-active {
   color: var(--ink-dim);
   font-size: 0.82rem;
 }
+.footer-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+}
+.footer-links a,
+.info-article a:not(.btn) {
+  color: var(--ink-dim);
+  text-decoration-color: var(--accent-deep);
+  text-underline-offset: 0.2em;
+  transition: color 150ms ease-out;
+}
+.footer-links a:hover,
+.info-article a:not(.btn):hover {
+  color: var(--accent);
+}
+
+/* ---------------- indexable information pages ---------------- */
+.info-page {
+  min-height: calc(100vh - 8rem);
+  padding: 10rem 2rem 7rem;
+}
+.info-article {
+  width: min(100%, 50rem);
+  margin: 0 auto;
+}
+.info-head {
+  padding-bottom: 4.5rem;
+  border-bottom: 1px solid var(--line);
+}
+.info-head h1 {
+  max-width: 47rem;
+  margin-top: 1rem;
+  font-size: clamp(2.8rem, 7vw, 5.4rem);
+  font-weight: 600;
+  line-height: 1.05;
+  letter-spacing: -0.035em;
+}
+.info-intro {
+  max-width: 43rem;
+  margin-top: 1.8rem;
+  color: var(--ink-dim);
+  font-size: clamp(1.05rem, 2vw, 1.25rem);
+  line-height: 1.75;
+}
+.info-head .btn {
+  margin-top: 2.2rem;
+}
+.info-sections section {
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.7fr) minmax(0, 1.3fr);
+  gap: 2rem 3rem;
+  padding: 3rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.info-sections h2 {
+  font-size: 1.15rem;
+  line-height: 1.4;
+}
+.info-sections p,
+.info-sections ul {
+  color: var(--ink-dim);
+}
+.info-sections ul {
+  padding-inline-start: 1.2rem;
+}
+.info-sections li + li {
+  margin-top: 0.35rem;
+}
+.info-note {
+  margin-top: 2rem;
+}
 
 /* ---------------- responsive ---------------- */
 @media (max-width: 900px) {
@@ -1337,6 +1427,12 @@ button.sa-chip.sa-chip-active {
   }
   .section {
     padding: 5rem 1.4rem;
+  }
+  .info-page {
+    padding: 8rem 1.4rem 5rem;
+  }
+  .info-sections section {
+    grid-template-columns: 1fr;
   }
   .rc-body-split {
     grid-template-columns: 1fr;

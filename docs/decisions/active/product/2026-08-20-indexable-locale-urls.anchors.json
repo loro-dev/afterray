@@ -1,0 +1,5 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "site/functions/download/[[path]].ts::if (name === '') {": "sha256:385775569381db90",
+  "site/src/routes.ts::function buildSiteRoutes(): SiteRoute[] {": "sha256:85cdc0b6dad67370"
+}

@@ -1,13 +1,18 @@
 import { StrictMode } from 'react'
-import { hydrateRoot } from 'react-dom/client'
+import { createRoot, hydrateRoot } from 'react-dom/client'
 import App from './App'
 import './styles.css'
+import { resolveRoute } from './routes'
 
-// The markup is prerendered at build time, so attach to it rather than
-// throwing it away and rendering again.
-hydrateRoot(
-  document.getElementById('root')!,
+const route = resolveRoute(window.location.pathname)
+const root = document.getElementById('root')!
+const app = (
   <StrictMode>
-    <App />
-  </StrictMode>,
+    <App route={route} />
+  </StrictMode>
 )
+
+// Production pages are prerendered; Vite's development shell is intentionally
+// empty and needs an ordinary client render.
+if (root.hasChildNodes()) hydrateRoot(root, app)
+else createRoot(root).render(app)

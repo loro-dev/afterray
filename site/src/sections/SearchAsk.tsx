@@ -47,6 +47,7 @@ export default function SearchAsk() {
   const active = useMemo(() => {
     const q = queryText.toLowerCase()
     return (
+      t.mock.scenarios.find((s) => s.query.toLowerCase() === q) ??
       t.mock.scenarios.find((s) => s.keys.some((k) => q.includes(k.toLowerCase()))) ??
       t.mock.scenarios[0]
     )

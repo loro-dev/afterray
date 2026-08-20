@@ -22,6 +22,11 @@ const handler: PagesFunction<Env> = async (context) => {
   const { path } = context.params
   const name = Array.isArray(path) ? path.join('/') : (path ?? '')
 
+  // @dec:indexable-locale-urls — docs/decisions/active/product/2026-08-20-indexable-locale-urls.md
+  if (name === '') {
+    return context.next()
+  }
+
   // The site links here so its download button never names a version, and a
   // release becomes downloadable by being uploaded rather than deployed.
   if (name === 'latest' || name === 'latest.dmg') {

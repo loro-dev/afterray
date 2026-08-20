@@ -155,7 +155,7 @@ export default function RecallStage() {
   const h24 = Math.floor(mins / 60)
   const mm = String(Math.floor(mins % 60)).padStart(2, '0')
   const time =
-    lang === 'zh' ? `${h24}:${mm}` : `${((h24 + 11) % 12) + 1}:${mm} ${h24 < 12 ? 'AM' : 'PM'}`
+    lang === 'en' ? `${((h24 + 11) % 12) + 1}:${mm} ${h24 < 12 ? 'AM' : 'PM'}` : `${h24}:${mm}`
 
   return (
     <div className="mock rc-stage">

@@ -4,10 +4,6 @@
     "readme": [
       { "file": "README.md" },
       { "file": "README.zh-CN.md" }
-    ],
-    "site-copy": [
-      { "file": "site/src/i18n.tsx", "from": "const en = {", "to": "export type Copy = typeof en" },
-      { "file": "site/src/i18n.tsx", "from": "const zh: Copy = {", "to": "export const copy" }
     ]
   }
 }
