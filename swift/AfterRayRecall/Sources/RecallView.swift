@@ -1524,7 +1524,7 @@ private struct AppUsageTimeline: View {
                     .position(x: favorite.x, y: 2)
             }
         }
-        .frame(width: layout.contentWidth, height: 56)
+        .frame(width: layout.contentWidth, height: TimelineRunsLayer.trackHeight)
         .padding(.vertical, 6)
         // One element, not one per run.
         //
@@ -1849,6 +1849,10 @@ private struct TimelineRunsLayer: View, Equatable {
     let segmentHeight: CGFloat
     let paletteGeneration: Int
 
+    /// The track's own height, which `timelineTrack` also pins. Segments are
+    /// centred on it, so the two must not be able to drift apart.
+    static let trackHeight: CGFloat = 56
+
     static func == (lhs: TimelineRunsLayer, rhs: TimelineRunsLayer) -> Bool {
         lhs.range == rhs.range
             && lhs.paletteGeneration == rhs.paletteGeneration
@@ -1860,22 +1864,33 @@ private struct TimelineRunsLayer: View, Equatable {
 
     var body: some View {
         let lastIndex = layout.runs.count - 1
-        // `ForEach` over the `Range` itself: `Array(indices)` allocated a new
-        // array on every pass for no reason.
-        ForEach(range, id: \.self) { index in
-            let run = layout.runs[index]
-            let drawnWidth = max(run.width - (index == lastIndex ? 0 : gap), 1)
-            let height = run.isIdle ? 7 : segmentHeight
-            AppUsageSegmentView(
-                run: run,
-                width: drawnWidth,
-                height: height,
-                color: AppUsageTimeline.segmentColor(run)
-            )
-            .equatable()
-            .frame(width: drawnWidth, height: height)
-            .position(x: run.startX + run.width / 2, y: 28)
+        // `.position` resolves against the *enclosing* view's bounds, so this
+        // layer has to be the full track. Before the segments moved in here
+        // they were direct children of the track's `ZStack` and inherited its
+        // size; on their own, a stack of positioned views collapses and every
+        // segment lands in a heap in the middle. The `Color.clear` is what
+        // establishes the coordinate space the x/y below are written against.
+        ZStack(alignment: .leading) {
+            Color.clear.frame(width: layout.contentWidth, height: TimelineRunsLayer.trackHeight)
+
+            // `ForEach` over the `Range` itself: `Array(indices)` allocated a
+            // new array on every pass for no reason.
+            ForEach(range, id: \.self) { index in
+                let run = layout.runs[index]
+                let drawnWidth = max(run.width - (index == lastIndex ? 0 : gap), 1)
+                let height = run.isIdle ? 7 : segmentHeight
+                AppUsageSegmentView(
+                    run: run,
+                    width: drawnWidth,
+                    height: height,
+                    color: AppUsageTimeline.segmentColor(run)
+                )
+                .equatable()
+                .frame(width: drawnWidth, height: height)
+                .position(x: run.startX + run.width / 2, y: TimelineRunsLayer.trackHeight / 2)
+            }
         }
+        .frame(width: layout.contentWidth, height: TimelineRunsLayer.trackHeight)
     }
 }
 
