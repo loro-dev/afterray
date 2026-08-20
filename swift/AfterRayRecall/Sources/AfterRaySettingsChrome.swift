@@ -2282,11 +2282,16 @@ private struct SettingsDeveloperUnlockMonitor: NSViewRepresentable {
             guard monitor == nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 guard let self,
-                      self.view?.window?.isKeyWindow == true,
+                      let window = self.view?.window,
+                      window.isKeyWindow,
                       !event.isARepeat,
                       event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
                       let characters = event.charactersIgnoringModifiers
                 else { return event }
+                // A field being typed in owns its letters: swallowing them
+                // here made "l", "o" and "r" undeliverable in every settings
+                // text field.
+                if window.firstResponder is NSText { return event }
                 if sequence.consume(characters, at: event.timestamp) {
                     onUnlock()
                 }

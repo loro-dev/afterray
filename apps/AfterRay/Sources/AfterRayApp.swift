@@ -28,31 +28,32 @@ private final class RecallOverlayLayout: ObservableObject {
     }
 }
 
+/// AppKit owns the process, not a SwiftUI `App`.
+///
+/// A SwiftUI `Scene` assigns its own `NSApp.mainMenu` shortly after
+/// `applicationDidFinishLaunching` — on the first hosting view or the first
+/// activation, whichever lands first. That generated menu carries no Edit
+/// item for an `LSUIElement` app, so it silently threw away the one this app
+/// installs and every ⌘X/⌘C/⌘V/⌘Z/⌘A in the process stopped resolving: with
+/// no Edit menu, `performKeyEquivalent` returns false and the keystroke dies
+/// before it can reach the field editor. Settings is an AppKit window
+/// (`AfterRaySettingsController`), so the `Settings` scene bought nothing.
 @main
-struct AfterRayApp: App {
-    @NSApplicationDelegateAdaptor(AfterRayAppDelegate.self) private var appDelegate
-
-    var body: some Scene {
-        Settings {
-            AfterRaySettingsScene()
+enum AfterRayMain {
+    static func main() {
+        let app = NSApplication.shared
+        MainActor.assumeIsolated {
+            app.delegate = AfterRayAppDelegate.shared
         }
-        .windowResizability(.contentSize)
-    }
-}
-
-private struct AfterRaySettingsScene: View {
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        AfterRaySettingsView(
-            model: AfterRaySettingsController.shared.model,
-            onClose: { dismiss() }
-        )
+        app.run()
     }
 }
 
 @MainActor
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
+    /// `NSApplication.delegate` is weak, so the process has to hold this.
+    static let shared = AfterRayAppDelegate()
+
     private var workspaceObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_: Notification) {

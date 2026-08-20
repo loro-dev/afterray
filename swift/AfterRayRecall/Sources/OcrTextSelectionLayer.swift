@@ -338,11 +338,11 @@ final class OcrTextSelectionView: NSView {
 
     /// ⌘C, ⌘A and Escape without touching the responder chain.
     ///
-    /// The overlay is a borderless panel in an accessory app whose menu has no
-    /// Edit item, so a key equivalent has nowhere to be dispatched from; and
-    /// making this view first responder would steal the arrow keys and space
-    /// that drive the playhead. A local monitor sidesteps both, and only acts
-    /// while a selection exists.
+    /// The Edit menu dispatches `copy:` to the first responder, and making
+    /// this view first responder would steal the arrow keys and space that
+    /// drive the playhead — so the selection would never be the thing ⌘C
+    /// reaches. A local monitor sidesteps that, and only acts while a
+    /// selection exists and no text field is being typed in.
     private func installEventMonitor() {
         guard eventMonitor == nil else { return }
         eventMonitor = NSEvent.addLocalMonitorForEvents(
