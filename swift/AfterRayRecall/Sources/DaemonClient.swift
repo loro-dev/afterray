@@ -218,9 +218,13 @@ public extension AfterRayDaemonServing {
     }
 }
 
+// @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
 // @dec:daemon-owns-the-vault — docs/decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     public static let protocolVersion = 15
+    /// Shutdown is a handoff, not a normal query. A wedged daemon must not hold
+    /// application termination behind the ordinary 30-second unary deadline.
+    public static let shutdownReceiveTimeout: TimeInterval = 1.5
     public nonisolated let socketPath: String
 
     public init(socketPath: String? = nil) {
@@ -264,7 +268,11 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     }
 
     public func shutdown() async throws -> DaemonShutdownResult {
-        try await request(WireRequest(type: "shutdown"), as: DaemonShutdownResult.self)
+        try await request(
+            WireRequest(type: "shutdown"),
+            as: DaemonShutdownResult.self,
+            receiveTimeout: Self.shutdownReceiveTimeout
+        )
     }
 
     public func modelLibrary() async throws -> ModelLibrary {
@@ -562,14 +570,19 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     private func request<T: Decodable>(
         _ request: WireRequest,
         as type: T.Type,
-        allowEmptyObject: Bool = false
+        allowEmptyObject: Bool = false,
+        receiveTimeout: TimeInterval = UnixLineTransport.unaryReceiveTimeout
     ) async throws -> T {
         let encoder = JSONEncoder()
         var payload = try encoder.encode(request)
         payload.append(0x0A)
         let path = socketPath
         let responseData = try await Task.detached(priority: .userInitiated) {
-            try UnixLineTransport.exchange(path: path, payload: payload)
+            try UnixLineTransport.exchange(
+                path: path,
+                payload: payload,
+                receiveTimeout: receiveTimeout
+            )
         }.value
 
         guard

@@ -1,6 +1,13 @@
 use crate::{AdapterError, Cancellation, ModelAdapter, ModelCapability, ModelInput, ModelOutput};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use uuid::Uuid;
 
@@ -134,6 +141,8 @@ pub enum QueueError {
     MissingJob(String),
     #[error("model job `{0}` is not in a retryable state")]
     NotRetryable(String),
+    #[error("model queue is shutting down")]
+    ShuttingDown,
 }
 
 /// Scheduling class for LLM jobs. Interactive work (a user waiting on a chat
@@ -330,6 +339,7 @@ struct QueueInner {
     jobs: Mutex<HashMap<JobId, JobRecord>>,
     changed: Notify,
     config: QueueConfig,
+    draining: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -377,6 +387,7 @@ impl ModelQueue {
                 jobs: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
                 config,
+                draining: AtomicBool::new(false),
             }),
         })
     }
@@ -455,6 +466,9 @@ impl ModelQueue {
         priority: JobPriority,
         prepare: impl FnOnce(&str),
     ) -> Result<JobId, QueueError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(QueueError::ShuttingDown);
+        }
         let capability = input.capability();
         let adapter = self
             .inner
@@ -482,7 +496,12 @@ impl ModelQueue {
             generation: 0,
             priority,
         };
-        self.inner.jobs.lock().await.insert(id.clone(), record);
+        let mut jobs = self.inner.jobs.lock().await;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(QueueError::ShuttingDown);
+        }
+        jobs.insert(id.clone(), record);
+        drop(jobs);
         // Before the attempt is spawned, so an outlet armed here cannot be
         // missed by an adapter that starts immediately.
         prepare(&id);
@@ -592,17 +611,59 @@ impl ModelQueue {
         Ok(snapshot)
     }
 
+    // @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
+    /// Stops admission and cooperatively cancels every pending/running worker.
+    /// Terminal history stays available for the final diagnostic snapshot.
+    pub async fn shutdown(&self) -> usize {
+        self.inner.draining.store(true, Ordering::Release);
+        let mut cancelled = 0;
+        let mut jobs = self.inner.jobs.lock().await;
+        for record in jobs.values_mut() {
+            if record.snapshot.state.terminal() {
+                continue;
+            }
+            record.cancellation.cancel();
+            record.generation = record.generation.wrapping_add(1);
+            record.snapshot.state = JobState::Cancelled;
+            record.snapshot.updated_at_ms = unix_time_ms();
+            record.snapshot.last_error = Some("cancelled during daemon shutdown".to_owned());
+            cancelled += 1;
+        }
+        drop(jobs);
+        self.inner.changed.notify_waiters();
+        cancelled
+    }
+
     /// Restarts a failed or cancelled job with a fresh retry budget.
     ///
     /// # Errors
     ///
     /// Returns [`QueueError::MissingJob`] when `id` is unknown, or
     /// [`QueueError::NotRetryable`] when it has not failed or been cancelled.
+    /// Returns [`QueueError::ShuttingDown`] after queue draining begins.
     pub async fn retry(&self, id: &str) -> Result<JobSnapshot, QueueError> {
+        self.retry_with_pre_lock_hook(id, || {}).await
+    }
+
+    async fn retry_with_pre_lock_hook(
+        &self,
+        id: &str,
+        before_lock: impl FnOnce(),
+    ) -> Result<JobSnapshot, QueueError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(QueueError::ShuttingDown);
+        }
+        before_lock();
         let generation;
         let snapshot;
         {
             let mut jobs = self.inner.jobs.lock().await;
+            // Shutdown sets `draining` before taking this lock. A retry that
+            // passed the optimistic check and then queued behind shutdown must
+            // not turn a Cancelled job back into live model work.
+            if self.inner.draining.load(Ordering::Acquire) {
+                return Err(QueueError::ShuttingDown);
+            }
             let record = jobs
                 .get_mut(id)
                 .ok_or_else(|| QueueError::MissingJob(id.to_owned()))?;
@@ -1084,6 +1145,85 @@ mod tests {
         ModelInput::Embedding {
             text: "hello".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_active_jobs_and_rejects_new_work() {
+        let adapter = Arc::new(TestAdapter {
+            failures_left: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            delay: Duration::from_secs(30),
+        });
+        let queue = queue(Arc::clone(&adapter), 1, 1);
+        let id = queue.submit(embedding_input()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.running.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the model job starts");
+
+        assert_eq!(queue.shutdown().await, 1);
+        assert_eq!(queue.get(&id).await.unwrap().state, JobState::Cancelled);
+        assert!(matches!(
+            queue.submit(embedding_input()).await,
+            Err(QueueError::ShuttingDown)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.running.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the adapter observes shutdown cancellation");
+    }
+
+    #[tokio::test]
+    async fn retry_waiting_on_jobs_lock_is_rejected_once_shutdown_starts() {
+        let adapter = Arc::new(TestAdapter {
+            failures_left: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            delay: Duration::from_secs(30),
+        });
+        let queue = queue(adapter, 1, 1);
+        let id = queue.submit(embedding_input()).await.unwrap();
+        assert_eq!(queue.cancel(&id).await.unwrap().state, JobState::Cancelled);
+
+        let jobs_guard = queue.inner.jobs.lock().await;
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let retry_queue = queue.clone();
+        let retry_id = id.clone();
+        let retry = tokio::spawn(async move {
+            retry_queue
+                .retry_with_pre_lock_hook(&retry_id, || {
+                    let _ = reached_tx.send(());
+                })
+                .await
+        });
+        reached_rx
+            .await
+            .expect("retry must pass its optimistic check before blocking on jobs");
+
+        let shutdown_queue = queue.clone();
+        let shutdown = tokio::spawn(async move { shutdown_queue.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !queue.inner.draining.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must close admission before waiting for jobs");
+        drop(jobs_guard);
+
+        assert!(matches!(
+            retry.await.expect("retry task should not panic"),
+            Err(QueueError::ShuttingDown)
+        ));
+        shutdown.await.expect("shutdown task should not panic");
+        assert_eq!(queue.get(&id).await.unwrap().state, JobState::Cancelled);
     }
 
     #[tokio::test]

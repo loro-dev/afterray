@@ -2,6 +2,7 @@ import AfterRayRecall
 import Darwin
 import Foundation
 
+// @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
 @MainActor
 final class DaemonSupervisor {
     static let shared = DaemonSupervisor()
@@ -51,6 +52,15 @@ final class DaemonSupervisor {
     private var isSuspendedForSystemLock = false
     private var isStopped = false
 
+    private enum ShutdownDeadline {
+        // Covers disposable cancellation, the healthy finite capture drain,
+        // required session close, and the short aggregate background join.
+        // It is the outer bound if required daemon I/O itself wedges.
+        static let graceful: TimeInterval = 6
+        static let afterTerminate: TimeInterval = 1.5
+        static let afterKill: TimeInterval = 0.5
+    }
+
     /// This control record stays beside, never inside, either data root. The
     /// default vault is `Application Support/AfterRay`; using a sibling keeps
     /// the journal available while that root is crossing a volume boundary.
@@ -86,8 +96,8 @@ final class DaemonSupervisor {
 
     @discardableResult
     func startIfNeeded(allowingDataRelocation: Bool = false) async throws -> Bool {
-        guard !isStopped,
-              !requiresDataDirectoryRecovery,
+        guard !isStopped else { throw RuntimeError.daemonTerminating }
+        guard !requiresDataDirectoryRecovery,
               allowingDataRelocation || !isRelocatingDataDirectory
         else { return false }
         if let recoveryTask {
@@ -277,50 +287,123 @@ final class DaemonSupervisor {
         // still-shutting-down daemon or remove a genuinely stale socket.
     }
 
-    /// Stops afterrayd and its children, including a daemon this process did
-    /// not spawn. Further `startIfNeeded()` calls become no-ops.
-    func shutdown() async {
+    /// Latches the request gate synchronously. The app calls this before it
+    /// creates its asynchronous termination task, so no activation/poll task can
+    /// sneak a daemon restart into that scheduling gap.
+    func beginTermination() {
+        guard !isStopped else { return }
         isStopped = true
         recoveryTask?.cancel()
         recoveryTask = nil
+    }
+
+    /// Stops afterrayd and its children, including a daemon this process did
+    /// not spawn. Further `startIfNeeded()` calls become no-ops.
+    func shutdown() async {
+        beginTermination()
         await terminateDaemon()
     }
 
     /// Stops whoever currently owns the socket without latching `isStopped`,
     /// so a replaced daemon can be followed by a fresh one in the same launch.
     private func terminateDaemon() async {
+        let totalStarted = Date.now
         var daemonPid = process?.processIdentifier
+        var acknowledged = false
+        let rpcStarted = Date.now
         do {
             let result = try await UnixSocketDaemonClient(socketPath: socketPath).shutdown()
             if let pid = result.pid, pid > 1 {
                 daemonPid = pid
             }
+            acknowledged = true
+            AfterRayLog.info(
+                "daemon shutdown acknowledged in \(Self.elapsedMilliseconds(since: rpcStarted)) ms"
+            )
         } catch {
-            // The daemon may already be gone, or an older build may not
-            // understand shutdown. Fall through to SIGTERM.
+            AfterRayLog.info(
+                "daemon shutdown RPC ended after \(Self.elapsedMilliseconds(since: rpcStarted)) ms: "
+                    + error.localizedDescription
+            )
         }
 
-        terminateOwnedProcess()
-        if let daemonPid {
-            kill(daemonPid, SIGTERM)
-        }
-
-        let deadline = Date().addingTimeInterval(15)
-        while Date() < deadline {
-            let ownedRunning = process?.isRunning == true
-            if !ownedRunning, await !daemonIsReachable() {
-                break
+        if acknowledged {
+            let phaseStarted = Date.now
+            if await waitForDaemonExit(pid: daemonPid, timeout: ShutdownDeadline.graceful) {
+                AfterRayLog.info(
+                    "daemon exited gracefully in \(Self.elapsedMilliseconds(since: phaseStarted)) ms"
+                )
+                clearOwnedProcess()
+                return
             }
-            try? await Task.sleep(for: .milliseconds(100))
+            AfterRayLog.info(
+                "daemon graceful-exit window timed out after "
+                    + "\(Self.elapsedMilliseconds(since: phaseStarted)) ms"
+            )
         }
 
-        if process?.isRunning == true, let pid = process?.processIdentifier {
-            kill(pid, SIGKILL)
+        if let daemonPid, Self.processIsAlive(daemonPid) {
+            let phaseStarted = Date.now
+            kill(daemonPid, SIGTERM)
+            if await waitForDaemonExit(pid: daemonPid, timeout: ShutdownDeadline.afterTerminate) {
+                AfterRayLog.info(
+                    "daemon exited after SIGTERM in \(Self.elapsedMilliseconds(since: phaseStarted)) ms"
+                )
+                clearOwnedProcess()
+                return
+            }
+            AfterRayLog.info(
+                "daemon SIGTERM window timed out after "
+                    + "\(Self.elapsedMilliseconds(since: phaseStarted)) ms"
+            )
         }
-        if let daemonPid, await daemonIsReachable() {
+
+        if let daemonPid, Self.processIsAlive(daemonPid) {
+            let phaseStarted = Date.now
             kill(daemonPid, SIGKILL)
+            let exited = await waitForDaemonExit(
+                pid: daemonPid,
+                timeout: ShutdownDeadline.afterKill
+            )
+            AfterRayLog.info(
+                "daemon SIGKILL \(exited ? "completed" : "did not confirm exit") in "
+                    + "\(Self.elapsedMilliseconds(since: phaseStarted)) ms"
+            )
         }
 
+        clearOwnedProcess()
+        AfterRayLog.info(
+            "daemon shutdown path completed in \(Self.elapsedMilliseconds(since: totalStarted)) ms"
+        )
+    }
+
+    /// Waits on process death or socket removal only. A status request has the
+    /// ordinary 30-second receive timeout and must never be part of termination.
+    private func waitForDaemonExit(pid: pid_t?, timeout: TimeInterval) async -> Bool {
+        let deadline = Date.now.addingTimeInterval(timeout)
+        while Date.now < deadline {
+            if Self.daemonHasExited(pid: pid, socketPath: socketPath) { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return Self.daemonHasExited(pid: pid, socketPath: socketPath)
+    }
+
+    private static func daemonHasExited(pid: pid_t?, socketPath: String) -> Bool {
+        if let pid, !processIsAlive(pid) { return true }
+        return !FileManager.default.fileExists(atPath: socketPath)
+    }
+
+    private static func processIsAlive(_ pid: pid_t) -> Bool {
+        guard pid > 1 else { return false }
+        if Darwin.kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    private static func elapsedMilliseconds(since started: Date) -> Int {
+        Int(Date.now.timeIntervalSince(started) * 1_000)
+    }
+
+    private func clearOwnedProcess() {
         process = nil
         processOutput = nil
     }
@@ -549,12 +632,15 @@ enum RuntimeError: LocalizedError, Equatable {
     case daemonExited(status: Int32, detail: String)
     case daemonTimeout(detail: String)
     case daemonSuspended
+    case daemonTerminating
     case dataDirectoryManagedByEnvironment
     case dataDirectoryRecoveryRequired
 
     var isUserVisibleFailure: Bool {
-        if case .daemonSuspended = self { return false }
-        return true
+        switch self {
+        case .daemonSuspended, .daemonTerminating: false
+        default: true
+        }
     }
 
     var errorDescription: String? {
@@ -570,6 +656,8 @@ enum RuntimeError: LocalizedError, Equatable {
             )
         case .daemonSuspended:
             "afterrayd is paused while this Mac is locked or asleep."
+        case .daemonTerminating:
+            "afterrayd is stopping with AfterRay."
         case .dataDirectoryManagedByEnvironment:
             "The memory location is controlled by an environment setting."
         case .dataDirectoryRecoveryRequired:

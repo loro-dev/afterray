@@ -50,6 +50,51 @@ enum AfterRayMain {
     }
 }
 
+// @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
+/// Claims application termination synchronously and owns the one cleanup task.
+/// AppKit may ask more than once while a `.terminateLater` reply is outstanding;
+/// only the first caller is allowed to start teardown.
+@MainActor
+final class AfterRayTerminationState {
+    static let shared = AfterRayTerminationState()
+
+    private(set) var isTerminating = false
+    private var cleanupTask: Task<Void, Never>?
+
+    @discardableResult
+    func begin(
+        onStart: () -> Void,
+        cleanup: @escaping @MainActor @Sendable () async -> Void
+    ) -> Bool {
+        guard !isTerminating else { return false }
+        isTerminating = true
+        onStart()
+        cleanupTask = Task { @MainActor in
+            await cleanup()
+        }
+        return true
+    }
+
+    func waitForCleanup() async {
+        if let cleanupTask {
+            await cleanupTask.value
+        }
+    }
+}
+
+/// Runs both required application-owned cleanup paths and returns only after
+/// both are complete. The caller remains single-flight via
+/// `AfterRayTerminationState.begin`.
+@MainActor
+func performAfterRayTerminationCleanup(
+    exportCleanup: @escaping @MainActor @Sendable () async -> Void,
+    daemonCleanup: @escaping @MainActor @Sendable () async -> Void
+) async {
+    async let exports: Void = exportCleanup()
+    async let daemon: Void = daemonCleanup()
+    _ = await (exports, daemon)
+}
+
 @MainActor
 private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     /// `NSApplication.delegate` is weak, so the process has to hold this.
@@ -90,10 +135,37 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
-        Task { @MainActor in
+        AfterRayTerminationState.shared.begin(onStart: {
+            // Visible feedback and the request gate happen synchronously, before
+            // the cleanup task can yield or a second Quit can arrive.
+            AfterRayMenuBar.shared.remove()
             RecallOverlayController.shared.stop()
-            try? await SummaryExportFileStore.shared.cleanupAll()
-            await DaemonSupervisor.shared.shutdown()
+            AfterRayServices.shared.compute.stopWatching()
+            AfterRaySettingsController.shared.model.pauseDownloadMonitoring()
+            AfterRayServices.shared.chat.clearSensitiveState()
+            DaemonSupervisor.shared.beginTermination()
+        }) {
+            let started = Date.now
+            await performAfterRayTerminationCleanup(
+                exportCleanup: {
+                    let exportStarted = Date.now
+                    do {
+                        try await SummaryExportFileStore.shared.cleanupAll()
+                        let elapsedMs = Int(Date.now.timeIntervalSince(exportStarted) * 1_000)
+                        AfterRayLog.info("summary export cleanup completed in \(elapsedMs) ms")
+                    } catch {
+                        let elapsedMs = Int(Date.now.timeIntervalSince(exportStarted) * 1_000)
+                        AfterRayLog.error(
+                            "summary export cleanup failed after \(elapsedMs) ms: \(error.localizedDescription)"
+                        )
+                    }
+                },
+                daemonCleanup: {
+                    await DaemonSupervisor.shared.shutdown()
+                }
+            )
+            let elapsedMs = Int(Date.now.timeIntervalSince(started) * 1_000)
+            AfterRayLog.info("application shutdown completed in \(elapsedMs) ms")
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -215,6 +287,7 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     fileprivate static func pauseCapture(reason: String) async {
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         NotificationCenter.default.post(name: .afterRaySystemSessionWillSuspend, object: nil)
         DaemonSupervisor.shared.suspendForSystemLock()
         let client = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
@@ -223,6 +296,7 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     fileprivate static func resumeCapture() {
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         DaemonSupervisor.shared.resumeAfterSystemUnlock()
         NotificationCenter.default.post(name: .afterRaySystemSessionDidResume, object: nil)
     }
@@ -264,11 +338,13 @@ private final class AfterRayMenuBar: NSObject {
     }
 
     func reinstall() {
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         remove()
         install()
     }
 
     func install() {
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         guard statusItem == nil else {
             refresh()
             return
@@ -375,6 +451,7 @@ private final class AfterRayMenuBar: NSObject {
 
     @objc private func toggleCapture() {
         Task {
+            guard !AfterRayTerminationState.shared.isTerminating else { return }
             let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
             do {
                 if isRecording {
@@ -393,6 +470,7 @@ private final class AfterRayMenuBar: NSObject {
 
     @objc private func deleteLastHour() {
         Task {
+            guard !AfterRayTerminationState.shared.isTerminating else { return }
             do {
                 let result = try await UnixSocketDaemonClient(
                     socketPath: DaemonSupervisor.shared.socketPath
@@ -1264,7 +1342,10 @@ private struct AfterRayRootView: View {
             await keepDaemonAlive()
         }
         .task(id: control.status?.recordingState) {
-            while !Task.isCancelled, control.isCaptureSessionActive || control.isChangingRecording {
+            while !Task.isCancelled,
+                  !AfterRayTerminationState.shared.isTerminating,
+                  control.isCaptureSessionActive || control.isChangingRecording
+            {
                 try? await Task.sleep(for: .seconds(control.isWaitingToRecord ? 1 : 5))
                 guard !Task.isCancelled else { return }
                 await control.refreshStatus()
@@ -1279,9 +1360,10 @@ private struct AfterRayRootView: View {
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task {
+                guard !AfterRayTerminationState.shared.isTerminating else { return }
                 guard await startDaemonOrReportFailure() != nil else { return }
                 permissions.refresh()
-                if permissions.allGranted {
+                if permissions.allGranted, !AfterRayTerminationState.shared.isTerminating {
                     _ = await control.ensureRecording()
                     await store.refreshTimeline(preservingSelection: !isLive)
                 }
@@ -1332,9 +1414,13 @@ private struct AfterRayRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionDidResume)) { _ in
             Task {
+                guard !AfterRayTerminationState.shared.isTerminating else { return }
                 guard await startDaemonOrReportFailure() != nil else { return }
                 permissions.refresh()
-                if permissions.allGranted, !DaemonSupervisor.shared.isCapturePausedForSystemLock {
+                if permissions.allGranted,
+                   !DaemonSupervisor.shared.isCapturePausedForSystemLock,
+                   !AfterRayTerminationState.shared.isTerminating
+                {
                     _ = await control.ensureRecording()
                 }
                 await store.refreshTimeline(preservingSelection: !isLive)
@@ -1383,6 +1469,7 @@ private struct AfterRayRootView: View {
     }
 
     private func bootstrap() async {
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         guard await startDaemonOrReportFailure() != nil else { return }
         // A daemon that outlived a crashed app may still carry the overlay's
         // capture pause; a fresh launch always starts with the overlay hidden.
@@ -1398,6 +1485,7 @@ private struct AfterRayRootView: View {
         // Let the welcome window have the screen to itself: stacking macOS
         // permission sheets on top of it makes the first launch a pile-up.
         await OnboardingController.shared.waitUntilFinished()
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         // The overlay is `.statusBar`; system consent alerts sit under it.
         // Hide only if onboarding just ordered it in — later launches keep
         // the overlay down until the hotkey, so we must not pop it here.
@@ -1406,6 +1494,7 @@ private struct AfterRayRootView: View {
             RecallOverlayController.shared.hide(returnFocus: false)
         }
         await permissions.requestInitialPermissionsOnce()
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         if overlayWasVisible {
             RecallOverlayController.shared.show()
         }
@@ -1418,11 +1507,13 @@ private struct AfterRayRootView: View {
             )
             await control.refreshStatus()
         }
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
         await store.loadTimeline()
     }
 
     private func toggleRecording() {
         Task {
+            guard !AfterRayTerminationState.shared.isTerminating else { return }
             let changed = await control.toggleRecording()
             if changed { await store.refreshTimeline(preservingSelection: !isLive) }
         }
@@ -1430,6 +1521,7 @@ private struct AfterRayRootView: View {
 
     private func reload() {
         Task {
+            guard !AfterRayTerminationState.shared.isTerminating else { return }
             guard await startDaemonOrReportFailure() != nil else { return }
             async let status: Void = control.refreshStatus()
             async let timeline: Void = store.refreshTimeline(preservingSelection: !isLive)
@@ -1438,10 +1530,13 @@ private struct AfterRayRootView: View {
     }
 
     private func keepDaemonAlive() async {
-        while !Task.isCancelled {
+        while !Task.isCancelled, !AfterRayTerminationState.shared.isTerminating {
             if let restarted = await startDaemonOrReportFailure(), restarted {
                 permissions.refresh()
-                if permissions.allGranted, !DaemonSupervisor.shared.isCapturePausedForSystemLock {
+                if permissions.allGranted,
+                   !DaemonSupervisor.shared.isCapturePausedForSystemLock,
+                   !AfterRayTerminationState.shared.isTerminating
+                {
                     _ = await control.ensureRecording()
                 } else {
                     await control.refreshStatus()
@@ -1456,6 +1551,7 @@ private struct AfterRayRootView: View {
     /// or `nil` when startup failed and the user-visible error was recorded.
     @discardableResult
     private func startDaemonOrReportFailure() async -> Bool? {
+        guard !AfterRayTerminationState.shared.isTerminating else { return nil }
         do {
             return try await DaemonSupervisor.shared.startIfNeeded()
         } catch let error as RuntimeError where !error.isUserVisibleFailure {
