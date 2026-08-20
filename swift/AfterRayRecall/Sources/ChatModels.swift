@@ -566,6 +566,18 @@ public struct ChatProgress: Equatable, Sendable {
             ? String(format: "%.1fs", value)
             : "\(Int(value.rounded()))s"
     }
+
+    /// Progress heartbeats arrive every 400 ms to keep the daemon stream
+    /// quiet. The visible clock fills in the gaps locally, without claiming
+    /// that a fresh heartbeat arrived.
+    public static func displayedElapsed(
+        reportedElapsedMs: Int,
+        reportedAt: Date,
+        now: Date
+    ) -> Int {
+        let localElapsedMs = Int((max(0, now.timeIntervalSince(reportedAt)) * 1_000).rounded())
+        return max(0, reportedElapsedMs) + localElapsedMs
+    }
 }
 
 /// One pass where the daemon dropped earlier evidence to make room.

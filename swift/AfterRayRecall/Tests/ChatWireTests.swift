@@ -86,6 +86,18 @@ final class ChatWireTests: XCTestCase {
         XCTAssertEqual(waiting.detail, "13s")
     }
 
+    func testDisplayedElapsedInterpolatesBetweenProgressHeartbeats() {
+        let reportedAt = Date(timeIntervalSince1970: 1_000)
+        let displayed = ChatProgress.displayedElapsed(
+            reportedElapsedMs: 1_100,
+            reportedAt: reportedAt,
+            now: reportedAt.addingTimeInterval(0.16)
+        )
+
+        XCTAssertEqual(displayed, 1_260)
+        XCTAssertEqual(ChatProgress.formatElapsed(displayed), "1.3s")
+    }
+
     /// Once there is something to read, the indicator has to get out of the way
     /// — two "it is working" signals at once is worse than one.
     func testProgressClearsAsSoonAsThereIsSomethingToShow() {
