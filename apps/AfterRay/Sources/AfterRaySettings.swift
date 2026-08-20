@@ -11,6 +11,35 @@ enum AfterRayPreferences {
     static let developerOptionsUnlockedKey = "dev.afterray.developer-options.unlocked"
     static let developerOptionsEnabledKey = "dev.afterray.developer-options.enabled"
     static let computeDashboardKey = "dev.afterray.compute-dashboard.enabled"
+    static let memoryDataDirectoryKey = "dev.afterray.memory-data-directory"
+    static let memoryDataVolumeRootKey = "dev.afterray.memory-data-volume-root"
+    static let memoryDataVolumeUUIDKey = "dev.afterray.memory-data-volume-uuid"
+
+    static var memoryDataLocation: AfterRayDataDirectory.Location? {
+        get {
+            guard let path = UserDefaults.standard.string(forKey: memoryDataDirectoryKey),
+                  let volumeRoot = UserDefaults.standard.string(forKey: memoryDataVolumeRootKey)
+            else {
+                return nil
+            }
+            return AfterRayDataDirectory.Location(
+                url: URL(fileURLWithPath: path, isDirectory: true),
+                volumeRoot: URL(fileURLWithPath: volumeRoot, isDirectory: true),
+                volumeUUID: UserDefaults.standard.string(forKey: memoryDataVolumeUUIDKey)
+            )
+        }
+        set {
+            guard let newValue else {
+                UserDefaults.standard.removeObject(forKey: memoryDataDirectoryKey)
+                UserDefaults.standard.removeObject(forKey: memoryDataVolumeRootKey)
+                UserDefaults.standard.removeObject(forKey: memoryDataVolumeUUIDKey)
+                return
+            }
+            UserDefaults.standard.set(newValue.url.path, forKey: memoryDataDirectoryKey)
+            UserDefaults.standard.set(newValue.volumeRoot.path, forKey: memoryDataVolumeRootKey)
+            UserDefaults.standard.set(newValue.volumeUUID, forKey: memoryDataVolumeUUIDKey)
+        }
+    }
 
     /// Whether the local-computation dashboard is offered at all.
     ///
@@ -125,6 +154,8 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var isControllingDownload = false
     @Published var isUpdatingAudio = false
     @Published var isUpdatingStorageLimit = false
+    @Published var isRelocatingMemory = false
+    @Published private(set) var relocationDestinationPath: String?
     @Published var isUpdatingSummarySlot = false
     @Published var isUpdatingLanguage = false
     @Published var isUpdatingExclusions = false
@@ -512,6 +543,44 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         } catch {
             message = error.localizedDescription
         }
+    }
+
+    func chooseMemoryLocation() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = copy.settings.changeMemoryLocation
+        guard panel.runModal() == .OK, let selectedDirectory = panel.url else { return }
+        do {
+            relocationDestinationPath = try DaemonSupervisor.shared
+                .relocationDestination(in: selectedDirectory)
+                .path
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func confirmMemoryLocation(migrateExistingData: Bool) async {
+        guard let path = relocationDestinationPath else { return }
+        isRelocatingMemory = true
+        defer { isRelocatingMemory = false }
+        do {
+            try await DaemonSupervisor.shared.relocateDataDirectory(
+                to: URL(fileURLWithPath: path, isDirectory: true).deletingLastPathComponent(),
+                migrateExistingData: migrateExistingData
+            )
+            relocationDestinationPath = nil
+            await refresh()
+            message = copy.settings.memoryLocationChanged(dataDirectoryPath)
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func cancelMemoryLocationChange() {
+        relocationDestinationPath = nil
     }
 
     func setSummarySlotMinutes(_ minutes: UInt32) async {

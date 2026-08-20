@@ -26,6 +26,8 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var isControllingDownload = false
     @Published public var isUpdatingAudio = false
     @Published public var isUpdatingStorageLimit = false
+    @Published public var isRelocatingMemory = false
+    @Published public var relocationDestinationPath: String?
     @Published public var isUpdatingSummarySlot = false
     @Published public var isUpdatingLanguage = false
     @Published public var isUpdatingExclusions = false
@@ -153,6 +155,24 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         settings = replacing(current, storageLimitBytes: bytes)
         isUpdatingStorageLimit = false
         message = "Preview memory limit updated."
+    }
+
+    public func chooseMemoryLocation() {
+        relocationDestinationPath = "/Volumes/External/AfterRay"
+    }
+
+    public func confirmMemoryLocation(migrateExistingData: Bool) async {
+        guard let destination = relocationDestinationPath else { return }
+        isRelocatingMemory = true
+        defer { isRelocatingMemory = false }
+        relocationDestinationPath = nil
+        message = migrateExistingData
+            ? "Preview would move memories to \(destination)."
+            : "Preview would use the empty folder \(destination)."
+    }
+
+    public func cancelMemoryLocationChange() {
+        relocationDestinationPath = nil
     }
 
     public func setSummarySlotMinutes(_ minutes: UInt32) async {

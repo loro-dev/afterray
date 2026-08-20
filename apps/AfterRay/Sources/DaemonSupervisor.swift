@@ -10,10 +10,29 @@ final class DaemonSupervisor {
     let defaultDataDirectory: URL
     let defaultModelDirectory: URL
 
-    var dataDirectory: URL { defaultDataDirectory }
-    var modelDirectory: URL { defaultModelDirectory }
+    var dataDirectory: URL {
+        if let overridden = configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") {
+            return overridden
+        }
+        return AfterRayPreferences.memoryDataLocation?.url ?? defaultDataDirectory
+    }
+    var modelDirectory: URL {
+        if let overridden = configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") {
+            return overridden
+        }
+        if configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+           AfterRayPreferences.memoryDataLocation != nil {
+            return dataDirectory.appendingPathComponent("Models", isDirectory: true)
+        }
+        return defaultModelDirectory
+    }
     var mlxRuntimeDirectory: URL {
-        defaultModelDirectory
+        if configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") == nil,
+           configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+           AfterRayPreferences.memoryDataLocation != nil {
+            return dataDirectory.appendingPathComponent("mlx-runtime", isDirectory: true)
+        }
+        return defaultModelDirectory
             .deletingLastPathComponent()
             .appendingPathComponent("mlx-runtime", isDirectory: true)
     }
@@ -61,6 +80,13 @@ final class DaemonSupervisor {
 
     private func recoverIfNeeded() async throws -> Bool {
         guard !isStopped else { return false }
+        if configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+           let location = AfterRayPreferences.memoryDataLocation {
+            try AfterRayDataDirectory.validateConfiguredVolume(
+                volumeRoot: location.volumeRoot,
+                volumeUUID: location.volumeUUID
+            )
+        }
         if let status = await daemonStatus() {
             if Self.hostBuildMatches(status) { return false }
             // An update replaced the bundle while the old daemon kept the
@@ -98,8 +124,7 @@ final class DaemonSupervisor {
         child.executableURL = daemon
         var environment = ProcessInfo.processInfo.environment
         environment["AFTERRAY_SOCKET"] = socketPath
-        environment["AFTERRAY_DATA_DIR"] = environment["AFTERRAY_DATA_DIR"]
-            ?? defaultDataDirectory.path
+        environment["AFTERRAY_DATA_DIR"] = dataDirectory.path
         environment["AFTERRAY_CAPTURE_SHIM"] = try resolveExecutable(
             environmentKey: "AFTERRAY_CAPTURE_SHIM",
             bundledName: "AfterRayCaptureShim",
@@ -120,7 +145,7 @@ final class DaemonSupervisor {
             bundledName: "afterray-mlx-vlm-worker",
             developmentPath: ".build/release/afterray-mlx-vlm-worker"
         ).path
-        environment["AFTERRAY_MODEL_DIR"] = defaultModelDirectory.path
+        environment["AFTERRAY_MODEL_DIR"] = modelDirectory.path
         if let hostBuild = Self.hostBuild {
             environment["AFTERRAY_HOST_BUILD"] = hostBuild
         }
@@ -261,9 +286,9 @@ final class DaemonSupervisor {
 
     private func applyModelDefaults(to environment: inout [String: String]) {
         let defaults = [
-            "AFTERRAY_ASR_MODEL": defaultModelDirectory
+            "AFTERRAY_ASR_MODEL": modelDirectory
                 .appendingPathComponent("Qwen3-ASR-1.7B"),
-            "AFTERRAY_EMBEDDING_MODEL": defaultModelDirectory
+            "AFTERRAY_EMBEDDING_MODEL": modelDirectory
                 .appendingPathComponent("nomic-embed-text-v1.5.Q4_K_M.gguf"),
         ]
         for (key, url) in defaults where environment[key] == nil {
@@ -273,10 +298,89 @@ final class DaemonSupervisor {
         }
     }
 
+    /// Stops capture before moving any bytes. The preference changes only after
+    /// every move succeeds, so a failed cross-volume move still opens the old
+    /// vault on the next launch.
+    // @dec:vault-location-relocation — docs/decisions/active/architecture/2026-08-20-vault-location-relocation.md
+    func relocateDataDirectory(to selectedDirectory: URL, migrateExistingData: Bool) async throws {
+        guard configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+              configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") == nil
+        else {
+            throw RuntimeError.dataDirectoryManagedByEnvironment
+        }
+
+        let destination = AfterRayDataDirectory.destination(in: selectedDirectory)
+        let sourceData = dataDirectory
+        let sourceModels = modelDirectory
+        let sourceRuntime = mlxRuntimeDirectory
+        try AfterRayDataDirectory.validateDestination(destination, currentDirectory: sourceData)
+        let location = try AfterRayDataDirectory.location(for: destination)
+        let previousLocation = AfterRayPreferences.memoryDataLocation
+        let socketName = URL(fileURLWithPath: socketPath).lastPathComponent
+        var moves: [AfterRayDataDirectory.Move] = []
+
+        await terminateDaemon()
+        do {
+            if migrateExistingData {
+                moves += try AfterRayDataDirectory.moveContents(
+                    from: sourceData,
+                    to: destination,
+                    excluding: [socketName]
+                )
+                if !Self.isDescendant(sourceModels, of: sourceData),
+                   let move = try AfterRayDataDirectory.moveDirectory(
+                       from: sourceModels,
+                       to: destination.appendingPathComponent("Models", isDirectory: true)
+                   ) {
+                    moves.append(move)
+                }
+                if !Self.isDescendant(sourceRuntime, of: sourceData),
+                   !Self.isDescendant(sourceRuntime, of: sourceModels),
+                   let move = try AfterRayDataDirectory.moveDirectory(
+                       from: sourceRuntime,
+                       to: destination.appendingPathComponent("mlx-runtime", isDirectory: true)
+                   ) {
+                    moves.append(move)
+                }
+            }
+
+            AfterRayPreferences.memoryDataLocation = location
+            _ = try await startIfNeeded()
+        } catch {
+            AfterRayPreferences.memoryDataLocation = previousLocation
+            AfterRayDataDirectory.rollback(moves)
+            _ = try? await startIfNeeded()
+            throw error
+        }
+    }
+
+    func relocationDestination(in selectedDirectory: URL) throws -> URL {
+        guard configuredEnvironmentDirectory("AFTERRAY_DATA_DIR") == nil,
+              configuredEnvironmentDirectory("AFTERRAY_MODEL_DIR") == nil
+        else {
+            throw RuntimeError.dataDirectoryManagedByEnvironment
+        }
+        let destination = AfterRayDataDirectory.destination(in: selectedDirectory)
+        try AfterRayDataDirectory.validateDestination(destination, currentDirectory: dataDirectory)
+        _ = try AfterRayDataDirectory.location(for: destination)
+        return destination
+    }
+
     private static func developmentRepoRoot() -> URL? {
         let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
         guard bundleParent.lastPathComponent == ".afterray-dev" else { return nil }
         return bundleParent.deletingLastPathComponent()
+    }
+
+    private func configuredEnvironmentDirectory(_ key: String) -> URL? {
+        guard let path = ProcessInfo.processInfo.environment[key], !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    private static func isDescendant(_ url: URL, of parent: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let parentPath = parent.standardizedFileURL.path
+        return path == parentPath || path.hasPrefix(parentPath + "/")
     }
 
     private func resolveExecutable(
@@ -303,6 +407,7 @@ enum RuntimeError: LocalizedError, Equatable {
     case daemonExited(status: Int32, detail: String)
     case daemonTimeout(detail: String)
     case daemonSuspended
+    case dataDirectoryManagedByEnvironment
 
     var isUserVisibleFailure: Bool {
         if case .daemonSuspended = self { return false }
@@ -322,6 +427,8 @@ enum RuntimeError: LocalizedError, Equatable {
             )
         case .daemonSuspended:
             "afterrayd is paused while this Mac is locked or asleep."
+        case .dataDirectoryManagedByEnvironment:
+            "The memory location is controlled by an environment setting."
         }
     }
 

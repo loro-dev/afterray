@@ -237,6 +237,15 @@ onboarding completion preference.
 Override the log directory with `AFTERRAY_LOG_DIR`. **Settings → Diagnostics**
 can reveal the folder or copy a diagnostic report.
 
+In a packaged build, **Settings → Storage → Change memory location** selects a
+folder and stores AfterRay's complete data root in its `AfterRay/` child. When
+the child is empty, the app asks whether to move the existing vault. A move
+stops the daemon first, then moves the database, encrypted artifacts,
+recordings, GOP archives, model weights, and MLX runtime together; the socket
+stays at its normal Application Support path. If the chosen external volume is
+not mounted later, startup reports that condition instead of creating an empty
+replacement vault on the internal disk.
+
 ## Environment variables
 
 | Variable | Purpose | Default |
