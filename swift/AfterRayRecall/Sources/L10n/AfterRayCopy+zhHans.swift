@@ -412,6 +412,8 @@ extension AfterRayCopy {
             copyAllLoadedDays: "复制已加载的全部日期",
             copyThisDay: "复制这一天",
             copyThisSlot: "复制此时段",
+            copySummary: "复制总结",
+            openSummaryAsMarkdown: "在 Markdown 文件中打开总结",
             nothingRecorded: "还没有记录。",
             pastDaysWillAppear: "AfterRay 捕获后，过去的日子会出现在这里。",
             noRecordings: "没有记录",

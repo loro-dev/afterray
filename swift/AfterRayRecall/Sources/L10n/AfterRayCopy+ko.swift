@@ -412,6 +412,8 @@ extension AfterRayCopy {
             copyAllLoadedDays: "불러온 모든 날짜 복사",
             copyThisDay: "이 날짜 복사",
             copyThisSlot: "이 구간 복사",
+            copySummary: "요약 복사",
+            openSummaryAsMarkdown: "요약을 Markdown 파일로 열기",
             nothingRecorded: "아직 기록된 내용이 없습니다.",
             pastDaysWillAppear: "AfterRay가 캡처하면 지난 날들이 여기에 나타납니다.",
             noRecordings: "기록 없음",

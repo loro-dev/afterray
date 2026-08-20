@@ -432,6 +432,8 @@ extension AfterRayCopy {
         public var copyAllLoadedDays: String
         public var copyThisDay: String
         public var copyThisSlot: String
+        public var copySummary: String
+        public var openSummaryAsMarkdown: String
         public var nothingRecorded: String
         public var pastDaysWillAppear: String
         public var noRecordings: String

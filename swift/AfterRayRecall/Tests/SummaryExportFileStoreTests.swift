@@ -35,6 +35,18 @@ final class SummaryExportFileStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directoryAfterCleanup.path))
     }
 
+    func testWritesPrivateMarkdownWithAStableTrailingNewline() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "afterray-markdown-test-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SummaryExportFileStore(temporaryRoot: root)
+
+        let url = try await store.write(markdown: "20:00 Shipped the fix")
+
+        XCTAssertEqual(url.pathExtension, "md")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "20:00 Shipped the fix\n")
+        XCTAssertEqual(try permissionMode(at: url), 0o600)
+    }
+
     private var fixture: SlotSummaryExport {
         SlotSummaryExport(
             slotStartMs: 100,
