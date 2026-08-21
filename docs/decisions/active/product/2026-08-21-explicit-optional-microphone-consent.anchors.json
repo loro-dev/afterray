@@ -1,0 +1,5 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "apps/AfterRay/Sources/AfterRayApp.swift::private final class PermissionGuideController {": "sha256:b9d00d9fcbc1329d",
+  "apps/AfterRay/Sources/SystemPermissionCoordinator.swift::enum SystemPermissionPolicy {": "sha256:e0dbc0df5b6e406e"
+}

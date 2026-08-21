@@ -2,6 +2,12 @@ import XCTest
 @testable import AfterRayApp
 
 final class SystemPermissionGuideTests: XCTestCase {
+    func testBootstrapRequestsOnlyRequiredSystemSettingsPermissions() {
+        XCTAssertTrue(SystemPermissionPolicy.shouldRequestAutomatically(.screenRecording))
+        XCTAssertTrue(SystemPermissionPolicy.shouldRequestAutomatically(.accessibility))
+        XCTAssertFalse(SystemPermissionPolicy.shouldRequestAutomatically(.microphone))
+    }
+
     func testMissingMicrophoneDoesNotBlockOtherwiseGrantedPermissions() {
         XCTAssertTrue(SystemPermissionPolicy.allGranted(
             screenRecording: true,

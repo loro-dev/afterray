@@ -927,6 +927,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 }
 
+// @dec:explicit-optional-microphone-consent — docs/decisions/active/product/2026-08-21-explicit-optional-microphone-consent.md
 @MainActor
 private final class PermissionGuideController {
     static let shared = PermissionGuideController()
@@ -937,7 +938,10 @@ private final class PermissionGuideController {
 
     var isVisible: Bool { panel?.isVisible == true }
 
-    func show(for permission: RequiredPermission) {
+    func show(
+        for permission: RequiredPermission,
+        onGranted: @escaping @MainActor () -> Void
+    ) {
         guard permission.opensSystemSettingsGuide else { return }
         let panel = panel ?? makePanel()
         let hostingView = NSHostingView(
@@ -966,13 +970,18 @@ private final class PermissionGuideController {
             context.duration = 0.14
             panel.animator().alphaValue = 1
         }
-        monitorPermission(permission)
+        monitorPermission(permission, onGranted: onGranted)
     }
 
-    func showAfterOpeningSettings(for permission: RequiredPermission) {
+    func showAfterOpeningSettings(
+        for permission: RequiredPermission,
+        onGranted: @escaping @MainActor () -> Void
+    ) {
         hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
-            self?.show(for: permission)
+        permissionPollTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled else { return }
+            self?.show(for: permission, onGranted: onGranted)
         }
     }
 
@@ -1014,7 +1023,10 @@ private final class PermissionGuideController {
         return panel
     }
 
-    private func monitorPermission(_ permission: RequiredPermission) {
+    private func monitorPermission(
+        _ permission: RequiredPermission,
+        onGranted: @escaping @MainActor () -> Void
+    ) {
         permissionPollTask?.cancel()
         permissionPollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -1022,6 +1034,7 @@ private final class PermissionGuideController {
                 guard !Task.isCancelled, self?.panel?.isVisible == true else { return }
                 if permission.isGrantedNow {
                     self?.hide()
+                    onGranted()
                     return
                 }
             }
@@ -1294,7 +1307,12 @@ private struct AfterRayRootView: View {
         }
         .overlay {
             if !permissions.allGranted {
-                PermissionPanel(coordinator: permissions)
+                PermissionPanel(
+                    coordinator: permissions,
+                    onPermissionStateChanged: {
+                        Task { await reconcilePermissionState() }
+                    }
+                )
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                     .transition(.opacity)
             }
@@ -1360,13 +1378,7 @@ private struct AfterRayRootView: View {
         .animation(.easeOut(duration: 0.18), value: permissions.allGranted)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task {
-                guard !AfterRayTerminationState.shared.isTerminating else { return }
-                guard await startDaemonOrReportFailure() != nil else { return }
-                permissions.refresh()
-                if permissions.allGranted, !AfterRayTerminationState.shared.isTerminating {
-                    _ = await control.ensureRecording()
-                    await store.refreshTimeline(preservingSelection: !isLive)
-                }
+                await reconcilePermissionState()
             }
         }
         // Posted on the turn *after* orderFront so this work cannot hitch
@@ -1511,6 +1523,23 @@ private struct AfterRayRootView: View {
         await store.loadTimeline()
     }
 
+    /// Every permission completion path converges here: returning from System
+    /// Settings, the guide's live poll, the manual refresh button, and the
+    /// native microphone prompt. This keeps the UI gate and capture startup on
+    /// one current snapshot instead of letting the guide hide around stale
+    /// coordinator state.
+    private func reconcilePermissionState() async {
+        guard !AfterRayTerminationState.shared.isTerminating else { return }
+        permissions.refresh()
+        guard await startDaemonOrReportFailure() != nil else { return }
+        if permissions.allGranted {
+            _ = await control.ensureRecording()
+            await store.refreshTimeline(preservingSelection: !isLive)
+        } else {
+            await control.refreshStatus()
+        }
+    }
+
     private func toggleRecording() {
         Task {
             guard !AfterRayTerminationState.shared.isTerminating else { return }
@@ -1644,6 +1673,7 @@ private struct AfterRayRootView: View {
 
 private struct PermissionPanel: View {
     @ObservedObject var coordinator: SystemPermissionCoordinator
+    let onPermissionStateChanged: () -> Void
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
     @ObservedObject private var localization = AfterRayLocalization.shared
 
@@ -1694,7 +1724,9 @@ private struct PermissionPanel: View {
                 } else {
                     HStack {
                         Spacer()
-                        Button(copy.permissions.checkPermissions) { coordinator.refresh() }
+                        Button(copy.permissions.checkPermissions) {
+                            permissionStateChanged()
+                        }
                             .buttonStyle(.borderedProminent)
                             .tint(RecallPalette.ray)
                     }
@@ -1752,6 +1784,7 @@ private struct PermissionPanel: View {
                         let microphoneWasUndetermined = coordinator.microphoneUndetermined
                         RecallOverlayController.shared.hide(returnFocus: false)
                         await coordinator.requestAgain(permission)
+                        onPermissionStateChanged()
                         switch SystemPermissionPolicy.gateFollowUp(
                             permission: permission,
                             granted: isGranted(permission),
@@ -1762,7 +1795,13 @@ private struct PermissionPanel: View {
                         case .returnToOverlay:
                             RecallOverlayController.shared.show()
                         case .systemSettingsGuide:
-                            PermissionGuideController.shared.showAfterOpeningSettings(for: permission)
+                            PermissionGuideController.shared.showAfterOpeningSettings(
+                                for: permission,
+                                onGranted: {
+                                    permissionStateChanged()
+                                    RecallOverlayController.shared.show()
+                                }
+                            )
                             coordinator.openSettings(for: permission)
                         case .systemSettings:
                             coordinator.openSettings(for: permission)
@@ -1788,6 +1827,11 @@ private struct PermissionPanel: View {
         case .microphone: coordinator.microphone
         case .accessibility: coordinator.accessibility
         }
+    }
+
+    private func permissionStateChanged() {
+        coordinator.refresh()
+        onPermissionStateChanged()
     }
 
     private func microphoneActionTitle(_ permission: RequiredPermission) -> String {
