@@ -22,6 +22,56 @@ enum RecallPresentation {
     }
 }
 
+/// Per-frame scrub state is deliberately not observed by `RecallView`.
+///
+/// Keeping the continuous playhead in root `@State` invalidated the complete
+/// overlay at display-link frequency: history, header, localisation, and all
+/// of their layout graph were compared even though only the timeline moved.
+/// The timeline, recalled still, and timestamp observe this object directly;
+/// the root still owns the begin/end boolean because those two transitions
+/// really do change the rest of the surface (hide OCR, then settle chrome).
+private final class RecallScrubState: ObservableObject {
+    @Published var playheadMs: Int64?
+    @Published var frozenLayout: TimelineLayout?
+    var movementDirection = -1
+    var requestedExtensions: Set<TimelineExtendDirection> = []
+}
+
+/// Pure state machine for deciding when the expensive exact frame may replace
+/// the scrub thumbnail. Keeping the decision separate makes rapid
+/// move/stop/move sequences deterministic and testable; SwiftUI owns only the
+/// cancellable quiet-period sleep around the returned action.
+struct RecallExactFramePromotionGate {
+    enum Action: Equatable {
+        case hold
+        case clear
+        case promoteNow(String)
+        case promoteAfterQuietPeriod(String)
+    }
+
+    static let quietPeriodMilliseconds = 250
+
+    private(set) var hasUnsettledMotion = false
+
+    mutating func update(targetID: String?, isMoving: Bool) -> Action {
+        if isMoving {
+            hasUnsettledMotion = true
+            return .hold
+        }
+        guard let targetID else {
+            hasUnsettledMotion = false
+            return .clear
+        }
+        return hasUnsettledMotion
+            ? .promoteAfterQuietPeriod(targetID)
+            : .promoteNow(targetID)
+    }
+
+    mutating func didPromote() {
+        hasUnsettledMotion = false
+    }
+}
+
 public struct RecallView: View {
     @Environment(\.afterRayCopy) private var copy
     @Environment(\.afterRayLocale) private var afterRayLocale
@@ -87,7 +137,9 @@ public struct RecallView: View {
 
     @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
     @State private var searchDragOrigin: Int?
-    @State private var movementDirection = -1
+    /// Continuous playhead, frozen layout, direction, and refill de-dup live
+    /// here so only the timeline leaves observe display-link ticks.
+    @State private var scrubState = RecallScrubState()
     @State private var showsDetails = false
     @State private var detailsPage = RecallDetailsPage.root
     @State private var timelineViewportWidth: CGFloat = 720
@@ -101,20 +153,11 @@ public struct RecallView: View {
     /// Continuous travel stays inside this view. The store binding is committed
     /// once when motion settles, so the app root, history and audio pipeline do
     /// not republish at display-link frequency.
-    @State private var scrubPlayheadMs: Int64?
     @State private var scrubIsLive: Bool?
     @State private var followPulse = 0
     @AppStorage(DaySummaryLayout.expandedStorageKey) private var daySummaryExpanded = true
     @State private var settledStill: SettledStill?
     @State private var searchScrollAccumulator: CGFloat = 0
-    /// Layout snapshot for the current scrub. Neighbour days may merge in
-    /// while the gesture is live; freezing x-mapping keeps the drag origin
-    /// from jumping when `visualTotalMs` changes.
-    @State private var frozenScrubLayout: TimelineLayout?
-    /// One outstanding fetch per direction and loaded boundary. Publishing a
-    /// new outer day clears that direction so a single long gesture can
-    /// replenish the next warm day without issuing a request every frame.
-    @State private var requestedExtendDuringScrub: Set<TimelineExtendDirection> = []
     /// Trackpad travel needed to advance one filmstrip cell.
     private static let searchScrollPointsPerCell: CGFloat = 46
     @State private var highlightRegions: [OcrRegion] = []
@@ -217,27 +260,19 @@ public struct RecallView: View {
     }
 
     private var renderedPlayheadMs: Int64 {
-        scrubPlayheadMs ?? playheadMs
+        scrubState.playheadMs ?? playheadMs
     }
 
     private var renderedIsLive: Bool {
         RecallPresentation.isLive(committed: isLive, transient: scrubIsLive)
     }
 
-    private var displayedArtifactID: String? {
-        guard let selectedMoment else { return nil }
-        return RecallStillRequestPolicy.artifactID(
-            for: selectedMoment,
-            isMoving: isScrubbing
-        )
-    }
-
     /// Read on every scroll tick from three places — the drag handler, the
     /// playhead setter, and `body`. Building it there meant sorting and
     /// scanning every capture of the day three times a frame.
     private var timelineLayout: TimelineLayout {
-        if isScrubbing, let frozenScrubLayout {
-            return frozenScrubLayout
+        if isScrubbing, let frozenLayout = scrubState.frozenLayout {
+            return frozenLayout
         }
         return layoutCache.layout(
             moments: moments,
@@ -277,14 +312,17 @@ public struct RecallView: View {
 
     private var recallContent: some View {
         ZStack {
-            if !renderedIsLive, let artifactID = displayedArtifactID {
-                ImmersiveArtifactImage(
-                    artifactID: artifactID,
-                    loader: imageLoader,
-                    animatesTransition: !isScrubbing,
-                    onSettled: { settledStill = $0 }
-                )
-            }
+            ScrubArtifactImage(
+                moments: moments,
+                scrubState: scrubState,
+                committedPlayheadMs: playheadMs,
+                isLive: renderedIsLive,
+                committedIsLive: isLive,
+                isMoving: isScrubbing,
+                loader: imageLoader,
+                thumbnailLoader: thumbnailLoader,
+                onSettled: { settledStill = $0 }
+            )
 
             chromeGradients
 
@@ -370,10 +408,10 @@ public struct RecallView: View {
                         .padding(.bottom, 18)
                     } else {
                         AppUsageTimeline(
-                            layout: timelineLayout,
-                            playheadMs: renderedPlayheadMs,
+                            baseLayout: timelineLayout,
+                            scrubState: scrubState,
+                            committedPlayheadMs: playheadMs,
                             isLive: renderedIsLive,
-                            selectedMoment: selectedMoment,
                             tuning: tuning,
                             zoom: $timelineZoom,
                             isZooming: $isZoomingTimeline,
@@ -384,7 +422,10 @@ public struct RecallView: View {
                     }
                 }
                 .overlay(alignment: .top) {
-                    if !renderedIsLive, selectedMoment?.hasVisibleTranscript == true {
+                    if !isScrubbing,
+                       !renderedIsLive,
+                       selectedMoment?.hasVisibleTranscript == true
+                    {
                         TranscriptCaption(
                             text: selectedMoment?.transcriptText,
                             canPlay: selectedMoment?.audioArtifactId != nil,
@@ -448,7 +489,7 @@ public struct RecallView: View {
         }
         .animation(.easeOut(duration: 0.18), value: showsDetails)
         .animation(.easeOut(duration: 0.18), value: daySummaryExpanded)
-        .task(id: "\(selectedMoment?.id ?? "-"):\(movementDirection):\(isScrubbing)") {
+        .task(id: selectionPrefetchTaskKey) {
             // While the scrub coasts, the selected moment changes every
             // frame; forty-artifact prefetch batches at that rate were pure
             // main-thread churn. The visible still keeps updating through
@@ -468,7 +509,7 @@ public struct RecallView: View {
             guard !isScrubbing else { return }
             onVisibleDayChange?(renderedPlayheadMs)
         }
-        .task(id: "\(highlightKey):\(isScrubbing)") {
+        .task(id: highlightTaskKey) {
             await loadHighlightRegions()
         }
         // Any change to this key cancels the task, which is the whole
@@ -492,14 +533,26 @@ public struct RecallView: View {
         "\(selectedMoment?.id ?? "-")|\(searchSession?.query ?? "")"
     }
 
+    /// A guard inside a task body is too late: changing the id still cancels
+    /// and recreates the task graph. During motion these keys stay byte-stable
+    /// and change once to the settled selection at the end.
+    private var selectionPrefetchTaskKey: String {
+        guard !isScrubbing else { return "scrubbing" }
+        return "\(selectedMoment?.id ?? "-"):\(scrubState.movementDirection)"
+    }
+
+    private var highlightTaskKey: String {
+        isScrubbing ? "scrubbing" : highlightKey
+    }
+
     /// Everything that means "the picture is not standing still yet". Motion
     /// state is in here as well as identity: `isScrubbing` only goes false once
     /// the scroll inertia has run out, so it already carries the glide.
     private var textLayerKey: String {
-        [
+        if isScrubbing { return "scrubbing" }
+        return [
             selectedMoment?.id ?? "-",
             settledStill?.id ?? "-",
-            String(isScrubbing),
             String(isZoomingTimeline),
             String(renderedIsLive),
         ].joined(separator: "|")
@@ -720,7 +773,11 @@ public struct RecallView: View {
             }
             .padding(.horizontal, RecallGeometry.overlayChromeMargin)
 
-            PlayheadTimestamp(date: selectedDate, isLive: renderedIsLive)
+            ScrubPlayheadTimestamp(
+                scrubState: scrubState,
+                committedPlayheadMs: playheadMs,
+                isLive: renderedIsLive
+            )
         }
     }
 
@@ -874,7 +931,7 @@ public struct RecallView: View {
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             if clampedMs != playheadMs {
-                movementDirection = clampedMs > playheadMs ? 1 : -1
+                scrubState.movementDirection = clampedMs > playheadMs ? 1 : -1
             }
             playheadMs = clampedMs
             isLive = resolvedLive
@@ -887,16 +944,16 @@ public struct RecallView: View {
         // of the run loop; a selection must not survive even one frame of
         // travel, or it sits over text it no longer describes.
         textSelection.clearSelection()
-        frozenScrubLayout = layoutCache.layout(
+        scrubState.frozenLayout = layoutCache.layout(
             moments: moments,
             preparedSpine: timelineSpine,
             revision: timelineRevision,
             viewportWidth: max(timelineViewportWidth, 1),
             density: tuning.timelineDensity * Double(timelineZoom)
         )
-        requestedExtendDuringScrub = []
+        scrubState.requestedExtensions = []
         if holdsPlayhead {
-            scrubPlayheadMs = playheadMs
+            scrubState.playheadMs = playheadMs
             scrubIsLive = isLive
         }
         isScrubbing = true
@@ -910,10 +967,17 @@ public struct RecallView: View {
             ? (moments.last?.capturedAtMs ?? nextMs)
             : layout.clamp(nextMs)
         if clampedMs != renderedPlayheadMs {
-            movementDirection = clampedMs > renderedPlayheadMs ? 1 : -1
+            scrubState.movementDirection = clampedMs > renderedPlayheadMs ? 1 : -1
         }
-        scrubPlayheadMs = clampedMs
-        scrubIsLive = nextLive
+        if scrubState.playheadMs != clampedMs {
+            scrubState.playheadMs = clampedMs
+        }
+        // `@State` writes are invalidations even when the semantic value did
+        // not change. Live/history changes only at the archive edge, so keep
+        // the root out of ordinary display-link ticks explicitly.
+        if scrubIsLive != nextLive {
+            scrubIsLive = nextLive
+        }
         requestTimelineExtendIfNeeded(clampedMs: clampedMs, isLive: nextLive)
     }
 
@@ -926,11 +990,11 @@ public struct RecallView: View {
         withTransaction(transaction) {
             playheadMs = settledMs
             isLive = settledIsLive
-            scrubPlayheadMs = nil
+            scrubState.playheadMs = nil
             scrubIsLive = nil
             isScrubbing = false
-            frozenScrubLayout = nil
-            requestedExtendDuringScrub = []
+            scrubState.frozenLayout = nil
+            scrubState.requestedExtensions = []
             followPulse += 1
         }
     }
@@ -955,7 +1019,7 @@ public struct RecallView: View {
         if let direction = TimelineEdgePrefetch.direction(
             playheadMs: clampedMs,
             isLive: isLive,
-            movementDirection: movementDirection,
+            movementDirection: scrubState.movementDirection,
             layout: timelineDayCoverage == nil ? liveTimelineLayout : nil,
             coverage: timelineDayCoverage,
             viewportWidth: timelineViewportWidth
@@ -968,7 +1032,7 @@ public struct RecallView: View {
         _ direction: TimelineExtendDirection,
         anchorMs: Int64
     ) {
-        if isScrubbing, !requestedExtendDuringScrub.insert(direction).inserted { return }
+        if isScrubbing, !scrubState.requestedExtensions.insert(direction).inserted { return }
         guard let onApproachTimelineEdge else { return }
         Task { @MainActor in
             guard await onApproachTimelineEdge(direction, anchorMs) else { return }
@@ -981,16 +1045,16 @@ public struct RecallView: View {
 
     private func adoptExpandedFrozenLayout(_ updatedMoments: [RecallMoment]) {
         guard isScrubbing,
-              let frozenScrubLayout,
-              TimelineEdgePrefetch.expandsFrozenWindow(frozenScrubLayout, with: updatedMoments)
+              let frozenLayout = scrubState.frozenLayout,
+              TimelineEdgePrefetch.expandsFrozenWindow(frozenLayout, with: updatedMoments)
         else { return }
-        if let first = updatedMoments.first, first.capturedAtMs < frozenScrubLayout.startMs {
-            requestedExtendDuringScrub.remove(.older)
+        if let first = updatedMoments.first, first.capturedAtMs < frozenLayout.startMs {
+            scrubState.requestedExtensions.remove(.older)
         }
-        if let last = updatedMoments.last, last.capturedAtMs > frozenScrubLayout.endMs {
-            requestedExtendDuringScrub.remove(.newer)
+        if let last = updatedMoments.last, last.capturedAtMs > frozenLayout.endMs {
+            scrubState.requestedExtensions.remove(.newer)
         }
-        self.frozenScrubLayout = layoutCache.layout(
+        scrubState.frozenLayout = layoutCache.layout(
             moments: updatedMoments,
             preparedSpine: timelineSpine,
             revision: timelineRevision,
@@ -1005,8 +1069,8 @@ public struct RecallView: View {
             ?? moments.count - 1
         var offsets = [0]
         for distance in 1...8 {
-            offsets.append(distance * movementDirection)
-            offsets.append(-distance * movementDirection)
+            offsets.append(distance * scrubState.movementDirection)
+            offsets.append(-distance * scrubState.movementDirection)
         }
         let artifactIDs = offsets.compactMap { offset -> String? in
             let index = center + offset
@@ -1068,6 +1132,214 @@ private struct ImmersiveArtifactImage: View {
         }
         .onDisappear {
             player.invalidate()
+        }
+    }
+}
+
+/// The recalled picture follows the transient playhead without making the
+/// complete overlay observe display-link ticks. While moving it overlays the
+/// existing 360px thumbnail instead of decoding a full-resolution GOP poster;
+/// the exact player stays mounted underneath and advances only after settle.
+/// This keeps VideoToolbox and full-size IOSurface submission off the 120Hz
+/// composition path without freezing the picture during a scrub.
+private struct ScrubArtifactImage: View {
+    let moments: [RecallMoment]
+    @ObservedObject var scrubState: RecallScrubState
+    let committedPlayheadMs: Int64
+    let isLive: Bool
+    let committedIsLive: Bool
+    let isMoving: Bool
+    let loader: RecallImageLoader
+    let thumbnailLoader: RecallThumbnailLoader?
+    let onSettled: (SettledStill) -> Void
+
+    @State private var lastSettled: SettledStill?
+    @State private var promotedExactArtifactID: String?
+    @State private var exactPromotionGate = RecallExactFramePromotionGate()
+
+    private struct ExactPromotionKey: Equatable {
+        let artifactID: String?
+        let isMoving: Bool
+    }
+
+    private var transientPlayheadMs: Int64 {
+        scrubState.playheadMs ?? committedPlayheadMs
+    }
+
+    private var transientMoment: RecallMoment? {
+        guard !isLive else { return nil }
+        return RecallPlayhead.resolve(playheadMs: transientPlayheadMs, moments: moments)
+    }
+
+    private var desiredExactArtifactID: String? {
+        guard !isLive, !(isMoving && committedIsLive) else { return nil }
+        let exactPlayheadMs = isMoving ? committedPlayheadMs : transientPlayheadMs
+        guard let moment = RecallPlayhead.resolve(playheadMs: exactPlayheadMs, moments: moments)
+        else { return nil }
+        return RecallStillRequestPolicy.artifactID(for: moment, isMoving: false)
+    }
+
+    private var exactPromotionKey: ExactPromotionKey {
+        ExactPromotionKey(artifactID: desiredExactArtifactID, isMoving: isMoving)
+    }
+
+    private var showsThumbnail: Bool {
+        guard thumbnailLoader != nil, transientMoment != nil else { return false }
+        if isMoving { return true }
+        return lastSettled?.id != desiredExactArtifactID
+    }
+
+    private var fallbackPreviewArtifactID: String? {
+        guard isMoving, let transientMoment else { return nil }
+        return RecallStillRequestPolicy.artifactID(for: transientMoment, isMoving: true)
+    }
+
+    var body: some View {
+        ZStack {
+            if !isLive, let promotedExactArtifactID {
+                ImmersiveArtifactImage(
+                    artifactID: promotedExactArtifactID,
+                    loader: loader,
+                    animatesTransition: true,
+                    onSettled: { still in
+                        lastSettled = still
+                        if !isMoving { onSettled(still) }
+                    }
+                )
+            }
+
+            if showsThumbnail, let thumbnailLoader, let momentID = transientMoment?.id {
+                ScrubThumbnailImage(momentID: momentID, loader: thumbnailLoader)
+            } else if isMoving, let fallbackPreviewArtifactID {
+                // Static previews may not provide the daemon thumbnail seam.
+                // Keep their old bounded GOP-poster path functional.
+                ImmersiveArtifactImage(
+                    artifactID: fallbackPreviewArtifactID,
+                    loader: loader,
+                    animatesTransition: false
+                )
+            }
+        }
+        .task(id: exactPromotionKey) {
+            let action = exactPromotionGate.update(
+                targetID: desiredExactArtifactID,
+                isMoving: isMoving
+            )
+            switch action {
+            case .hold:
+                // The currently displayed exact frame remains underneath the
+                // moving thumbnail. The gate remembers that the next idle
+                // target must pass through the quiet period.
+                return
+            case .clear:
+                promotedExactArtifactID = nil
+                return
+            case let .promoteAfterQuietPeriod(artifactID):
+                // The scroll monitor considers 75 ms quiet to be settled so
+                // controls respond promptly. Full-resolution GOP decoding has
+                // a different requirement: wait through rapid reversals before
+                // touching VideoToolbox or allocating a full-size IOSurface.
+                // A new gesture changes the task id and cancels this sleep.
+                try? await Task.sleep(
+                    for: .milliseconds(RecallExactFramePromotionGate.quietPeriodMilliseconds)
+                )
+                guard !Task.isCancelled else { return }
+                promotedExactArtifactID = artifactID
+                exactPromotionGate.didPromote()
+            case let .promoteNow(artifactID):
+                promotedExactArtifactID = artifactID
+                exactPromotionGate.didPromote()
+            }
+        }
+        .onChange(of: isMoving) { _, moving in
+            // A loose still has the same preview and exact key, so the player
+            // does not emit another settle event when motion ends. Forward the
+            // leaf-owned result now; the root needs it only for settled OCR.
+            if !moving, let lastSettled { onSettled(lastSettled) }
+        }
+        .onChange(of: desiredExactArtifactID) { _, newID in
+            if newID == nil { lastSettled = nil }
+        }
+    }
+}
+
+private struct ScrubThumbnailImage: View {
+    let momentID: String
+    let loader: RecallThumbnailLoader
+
+    @StateObject private var player = RecallScrubThumbnailPlayer()
+
+    var body: some View {
+        Group {
+            if let image = player.image {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .interpolation(.medium)
+                    .aspectRatio(contentMode: .fit)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(false)
+        .onAppear { player.request(momentID: momentID, loader: loader) }
+        .onChange(of: momentID) { _, newID in
+            player.request(momentID: newID, loader: loader)
+        }
+        .onDisappear { player.invalidate() }
+    }
+}
+
+/// At most one thumbnail request is owned by the full-screen preview. Rapid
+/// playhead changes only replace `requestedID`; they cannot fan out one daemon
+/// read/decode task per display-link tick.
+@MainActor
+private final class RecallScrubThumbnailPlayer: ObservableObject {
+    @Published private(set) var image: CGImage?
+
+    private var requestedID: String?
+    private var loader: RecallThumbnailLoader?
+    private var loadTask: Task<Void, Never>?
+    private var generation: UInt64 = 0
+
+    func request(momentID: String, loader: @escaping RecallThumbnailLoader) {
+        self.loader = loader
+        guard requestedID != momentID else { return }
+        requestedID = momentID
+        if let cached = RecallThumbnailCache.shared.cached(momentID: momentID) {
+            image = cached
+        }
+        startNextIfNeeded()
+    }
+
+    func invalidate() {
+        generation &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+        requestedID = nil
+        loader = nil
+    }
+
+    private func startNextIfNeeded() {
+        guard loadTask == nil, let requestedID, let loader else { return }
+        if let cached = RecallThumbnailCache.shared.cached(momentID: requestedID) {
+            image = cached
+            return
+        }
+        let targetID = requestedID
+        let requestGeneration = generation
+        loadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let loaded = await RecallThumbnailCache.shared.image(
+                momentID: targetID,
+                loader: loader
+            )
+            guard !Task.isCancelled, requestGeneration == self.generation else { return }
+            self.loadTask = nil
+            if self.requestedID == targetID, let loaded {
+                self.image = loaded
+            }
+            if self.requestedID != targetID {
+                self.startNextIfNeeded()
+            }
         }
     }
 }
@@ -1516,10 +1788,10 @@ private struct OpenableTitle: View {
 
 private struct AppUsageTimeline: View {
     @Environment(\.afterRayCopy) private var copy
-    let layout: TimelineLayout
-    let playheadMs: Int64
+    let baseLayout: TimelineLayout
+    @ObservedObject var scrubState: RecallScrubState
+    let committedPlayheadMs: Int64
     let isLive: Bool
-    let selectedMoment: RecallMoment?
     let tuning: RecallVisualTuning
     @Binding var zoom: CGFloat
     @Binding var isZooming: Bool
@@ -1546,6 +1818,14 @@ private struct AppUsageTimeline: View {
         var startMs: Int64
         var endMs: Int64
         var runCount: Int
+    }
+
+    private var layout: TimelineLayout {
+        scrubState.frozenLayout ?? baseLayout
+    }
+
+    private var playheadMs: Int64 {
+        scrubState.playheadMs ?? committedPlayheadMs
     }
 
     private var paletteKey: PaletteKey {
@@ -1607,11 +1887,18 @@ private struct AppUsageTimeline: View {
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
         .task(id: paletteKey) { await warmPalette() }
+        .overlay(alignment: .topLeading) {
+            if ScrubFrameMetrics.isEnabled {
+                TimelineCommitProbe(playheadMs: playheadMs)
+                    .frame(width: 1, height: 1)
+                    .accessibilityHidden(true)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     private var selectedDate: Date {
-        let ms = selectedMoment?.capturedAtMs ?? playheadMs
-        return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
+        Date(timeIntervalSince1970: TimeInterval(playheadMs) / 1_000)
     }
 
     /// The track is as wide as the whole archive — tens of thousands of points
@@ -1757,6 +2044,26 @@ private struct OcrHighlightOverlay: View {
         withAnimation(.easeOut(duration: Self.pulseDuration)) {
             opacity = Self.restingOpacity
         }
+    }
+}
+
+/// The clock is the only chrome that follows the continuous scrub. Observing
+/// the leaf state here keeps that tiny update from invalidating `RecallView`
+/// and the history/header hierarchy above it.
+private struct ScrubPlayheadTimestamp: View {
+    @ObservedObject var scrubState: RecallScrubState
+    let committedPlayheadMs: Int64
+    let isLive: Bool
+
+    var body: some View {
+        let playheadMs = scrubState.playheadMs ?? committedPlayheadMs
+        // The label has one-second precision. Quantising its input prevents
+        // sub-second timeline ticks from producing new text/layout values.
+        let wholeSecondMs = playheadMs / 1_000 * 1_000
+        PlayheadTimestamp(
+            date: Date(timeIntervalSince1970: TimeInterval(wholeSecondMs) / 1_000),
+            isLive: isLive
+        )
     }
 }
 
@@ -2176,6 +2483,58 @@ private final class ScrollWheelHostView: NSView {
     override func hitTest(_: NSPoint) -> NSView? { nil }
 }
 
+/// Counts timeline values that survive SwiftUI reconciliation and reach an
+/// AppKit/Core Animation update pass. Display-link callbacks alone only prove
+/// that input was requested; this probe reveals coalesced or skipped visual
+/// updates. It is mounted only for the opt-in performance harness.
+private struct TimelineCommitProbe: NSViewRepresentable {
+    let playheadMs: Int64
+
+    func makeNSView(context _: Context) -> TimelineCommitProbeView {
+        let view = TimelineCommitProbeView()
+        view.note(playheadMs)
+        return view
+    }
+
+    func updateNSView(_ nsView: TimelineCommitProbeView, context _: Context) {
+        nsView.note(playheadMs)
+    }
+}
+
+@MainActor
+private final class TimelineCommitProbeView: NSView {
+    private var lastToken: Int64?
+    private var pendingToken: Int64?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) is unavailable")
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    func note(_ token: Int64) {
+        guard token != lastToken else { return }
+        lastToken = token
+        pendingToken = token
+        TimelineCommitMetrics.shared.recordViewUpdate()
+        needsDisplay = true
+    }
+
+    override func updateLayer() {
+        guard pendingToken != nil else { return }
+        pendingToken = nil
+        TimelineCommitMetrics.shared.recordCommit()
+    }
+
+    override func hitTest(_: NSPoint) -> NSView? { nil }
+}
+
 private struct ScrollWheelMonitor: NSViewRepresentable {
     let onScroll: (_ delta: CGFloat, _ isPrecise: Bool, _ ended: Bool) -> Void
 
@@ -2346,27 +2705,27 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                     }
                     guard let self else { return }
                     try await Task.sleep(for: .milliseconds(delayMilliseconds))
+
+                    // A real overlay opens at NOW. Starting with a newer
+                    // flick measures the clamp, not rendering: dozens of
+                    // callbacks legitimately produce one unchanged visual
+                    // value. Move a safe distance into history before the
+                    // marker so all four reported flicks exercise pixels in
+                    // both directions without touching either archive edge.
+                    try await self.driveStressFlick(sign: 1, pointsPerDelta: 36)
+                    while self.isScrolling {
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                    try await Task.sleep(for: .milliseconds(60))
+
                     ScrubFrameMetrics.log.notice(
                         "[afterray-ui-perf] autorun_started display=\(self.hostView?.window?.screen?.maximumFramesPerSecond ?? 0)Hz"
                     )
                     for flickIndex in 0..<4 {
                         let sign: CGFloat = reversesDirection && flickIndex.isMultiple(of: 2)
-                            ? -1
-                            : (reversesDirection ? 1 : -1)
-                        acceptPrecise(
-                            delta: sign * 8,
-                            phase: .began,
-                            at: CACurrentMediaTime()
-                        )
-                        for _ in 0..<18 {
-                            acceptPrecise(
-                                delta: sign * CGFloat(12 + flickIndex * 3),
-                                phase: .changed,
-                                at: CACurrentMediaTime()
-                            )
-                            try await Task.sleep(for: .milliseconds(8))
-                        }
-                        acceptPrecise(delta: 0, phase: .ended, at: CACurrentMediaTime())
+                            ? 1
+                            : (reversesDirection ? -1 : 1)
+                        try await self.driveStressFlick(sign: sign, pointsPerDelta: 15)
                         try await Task.sleep(for: .milliseconds(180))
                     }
                     self.stressDriverTask = nil
@@ -2374,6 +2733,26 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                     return
                 }
             }
+        }
+
+        private func driveStressFlick(
+            sign: CGFloat,
+            pointsPerDelta: CGFloat
+        ) async throws {
+            acceptPrecise(
+                delta: sign * 8,
+                phase: .began,
+                at: CACurrentMediaTime()
+            )
+            for _ in 0..<18 {
+                acceptPrecise(
+                    delta: sign * pointsPerDelta,
+                    phase: .changed,
+                    at: CACurrentMediaTime()
+                )
+                try await Task.sleep(for: .milliseconds(8))
+            }
+            acceptPrecise(delta: 0, phase: .ended, at: CACurrentMediaTime())
         }
 
         func attachDisplayLinkIfNeeded() {
@@ -2468,6 +2847,9 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             let delta = direct + glide
             if delta != 0 {
                 let handlerStart = CACurrentMediaTime()
+                TimelineCommitMetrics.shared.recordRequest(
+                    nominalInterval: link.targetTimestamp - now
+                )
                 onScroll(delta, pendingIsPrecise, false)
                 frameMetrics.record(
                     frameInterval: frameInterval,
@@ -2493,6 +2875,7 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 frameMetrics.finish(
                     settleDuration: CACurrentMediaTime() - settleStart
                 )
+                TimelineCommitMetrics.shared.scheduleFinish()
                 lastFrameTime = 0
                 link.isPaused = true
             }
@@ -2509,10 +2892,10 @@ private struct ScrubFrameMetrics {
     static let log = Logger(subsystem: "dev.afterray", category: "ui-perf")
 
     /// Environment for the lab, user default for the shipped app.
-    static var isEnabled: Bool {
+    static let isEnabled: Bool = {
         ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_LOG"] == "1"
             || UserDefaults.standard.bool(forKey: "AfterRayUIPerfLog")
-    }
+    }()
 
     let enabled: Bool
     /// The current display's frame duration, sampled from the link.
@@ -2578,6 +2961,101 @@ private struct ScrubFrameMetrics {
         ScrubFrameMetrics.log.notice("\(line, privacy: .public)")
         frameIntervals.removeAll(keepingCapacity: true)
         handlerDurations.removeAll(keepingCapacity: true)
+    }
+
+    private func percentile(_ sorted: [CFTimeInterval], _ fraction: Double) -> CFTimeInterval {
+        guard !sorted.isEmpty else { return 0 }
+        let index = min(Int((Double(sorted.count - 1) * fraction).rounded(.up)), sorted.count - 1)
+        return sorted[index]
+    }
+}
+
+/// Render-side companion to `ScrubFrameMetrics`. The request sampler lives at
+/// the display link; this one receives only values that reached the probe
+/// view's layer update, so its Hz is the useful guard against a 120Hz callback
+/// loop feeding a visibly slower SwiftUI tree.
+@MainActor
+private final class TimelineCommitMetrics {
+    static let shared = TimelineCommitMetrics()
+
+    private var isActive = false
+    private var nominalInterval: CFTimeInterval = 1.0 / 60.0
+    private var requests = 0
+    private var viewUpdates = 0
+    private var commitTimes: [CFTimeInterval] = []
+    private var finishTask: Task<Void, Never>?
+
+    func recordRequest(nominalInterval: CFTimeInterval) {
+        guard ScrubFrameMetrics.isEnabled else { return }
+        if finishTask != nil {
+            finishTask?.cancel()
+            finishTask = nil
+            emit()
+        }
+        if !isActive {
+            isActive = true
+            requests = 0
+            viewUpdates = 0
+            commitTimes.removeAll(keepingCapacity: true)
+        }
+        if nominalInterval > 0.001, nominalInterval < 0.1 {
+            self.nominalInterval = nominalInterval
+        }
+        requests += 1
+    }
+
+    func recordViewUpdate() {
+        guard ScrubFrameMetrics.isEnabled, isActive else { return }
+        viewUpdates += 1
+    }
+
+    func recordCommit() {
+        guard ScrubFrameMetrics.isEnabled, isActive else { return }
+        commitTimes.append(CACurrentMediaTime())
+    }
+
+    func scheduleFinish() {
+        guard ScrubFrameMetrics.isEnabled, isActive else { return }
+        finishTask?.cancel()
+        finishTask = Task { @MainActor [weak self] in
+            // The state write happens inside the display-link callback; give
+            // SwiftUI and Core Animation two 120Hz periods to commit it before
+            // closing the sample.
+            try? await Task.sleep(for: .milliseconds(20))
+            guard !Task.isCancelled, let self else { return }
+            self.finishTask = nil
+            self.emit()
+        }
+    }
+
+    private func emit() {
+        guard isActive else { return }
+        isActive = false
+        let intervals = zip(commitTimes, commitTimes.dropFirst())
+            .map { earlier, later in later - earlier }
+            .sorted()
+        let span = (commitTimes.last ?? 0) - (commitTimes.first ?? 0)
+        let renderHz = span > 0 && commitTimes.count > 1
+            ? Double(commitTimes.count - 1) / span
+            : 0
+        let late = intervals.lazy.filter { $0 > self.nominalInterval * 1.5 }.count
+        let dropped = intervals.lazy.filter { $0 > self.nominalInterval * 2 }.count
+        let line = String(
+            format: "[afterray-ui-render] display=%.0fHz requests=%d updates=%d commits=%d hz=%.1f interval_p95_ms=%.2f interval_max_ms=%.2f late=%d dropped=%d coalesced=%d",
+            1 / nominalInterval,
+            requests,
+            viewUpdates,
+            commitTimes.count,
+            renderHz,
+            percentile(intervals, 0.95) * 1_000,
+            (intervals.last ?? 0) * 1_000,
+            late,
+            dropped,
+            max(viewUpdates - commitTimes.count, 0)
+        )
+        print(line)
+        fflush(stdout)
+        ScrubFrameMetrics.log.notice("\(line, privacy: .public)")
     }
 
     private func percentile(_ sorted: [CFTimeInterval], _ fraction: Double) -> CFTimeInterval {

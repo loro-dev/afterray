@@ -95,6 +95,12 @@ public struct TimelineSpine: Equatable, Sendable {
 /// Short app-switch runs can be inflated to a minimum width, but that warp is
 /// part of this function. Playhead, colored runs, hits, and drag all use it.
 public struct TimelineLayout: Equatable, Sendable {
+    /// Struct copies keep this immutable marker, which gives SwiftUI's hot
+    /// equality path an O(1) answer. Independently built layouts still fall
+    /// back to exact field equality below, so this does not weaken semantics.
+    private final class EqualityToken: @unchecked Sendable {}
+
+    private let equalityToken = EqualityToken()
     public let moments: [RecallMoment]
     public let runs: [AppUsageRun]
     public let favorites: [TimelineFavorite]
@@ -106,6 +112,16 @@ public struct TimelineLayout: Equatable, Sendable {
     public static let idleGapThresholdMs: Int64 = 30_000
     public static let captureIntervalMs: Int64 = 10_000
     public static let maximumIdleVisualDurationMs: Int64 = 120_000
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        if lhs.equalityToken === rhs.equalityToken { return true }
+        return lhs.startMs == rhs.startMs
+            && lhs.endMs == rhs.endMs
+            && lhs.contentWidth == rhs.contentWidth
+            && lhs.runs == rhs.runs
+            && lhs.favorites == rhs.favorites
+            && lhs.moments == rhs.moments
+    }
 
     public init(
         moments: [RecallMoment],
@@ -763,6 +779,18 @@ enum RecallDisplayedFrame {
 enum RecallStillRequestPolicy {
     static func artifactID(for moment: RecallMoment, isMoving: Bool) -> String {
         isMoving ? moment.previewCacheKey : moment.displayCacheKey
+    }
+
+    static func artifactID(
+        playheadMs: Int64,
+        isLive: Bool,
+        isMoving: Bool,
+        moments: [RecallMoment]
+    ) -> String? {
+        guard !isLive,
+              let moment = RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
+        else { return nil }
+        return artifactID(for: moment, isMoving: isMoving)
     }
 }
 

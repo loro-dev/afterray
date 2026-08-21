@@ -177,6 +177,39 @@ a slot start and writes through `@State`. Adding a closure that captures
 something not in `==` would reintroduce stale behaviour silently.
 `DaySummaryPanelScrubTests` pins the frame-stability.
 
+### The seven-day window changes the equality budget
+
+The pointer-centred D-3...D+3 window raised the normal real-vault dataset from
+about 3,800 moments to about 26,000. That exposed a different per-frame linear
+cost: SwiftUI's synthesized `TimelineLayout.==` compared the complete
+`moments`, `runs`, and `favorites` arrays whenever the playhead changed. The
+layout itself was cached, but copying the same value through the graph still
+paid `RecallMoment.==` for the whole window. A Time Profiler trace named
+`TimelineLayout.__derived_struct_equals` directly.
+
+`TimelineLayout` now carries an immutable reference-identity token. Copies of
+one built layout compare that token in O(1); independently built layouts fall
+back to exact field and array equality, so equality semantics are unchanged.
+Tests pin both the independent-build case and a non-geometric moment-field
+change.
+
+The continuous playhead also cannot live in the root `RecallView` state. It is
+published by a leaf `RecallScrubState` observed only by the timeline, recalled
+picture, and timestamp. The root sees begin/end and the rare live/history edge
+transition. Prefetch, highlight, and text task ids stay constant for the whole
+gesture, so a new selected moment does not cancel and rebuild their task graph
+at display-link frequency.
+
+The picture has a separate two-tier rule. During motion it follows the
+transient moment with the existing 360px thumbnail, decoded through ImageIO;
+it does not request a full-resolution GOP frame or submit a full-size
+IOSurface. After motion, the thumbnail remains visible for a 250ms quiet period
+and until the exact frame settles. A reversal cancels the quiet-period task
+before VideoToolbox starts. This matters because cancelling the outer Swift
+task cannot interrupt a synchronous decode that is already inside
+VideoToolbox; starting that decode after the old 75ms interaction settle caused
+37-56ms gaps at the start of the next flick.
+
 ## Which display
 
 This machine has a 60Hz screen and a 120Hz screen, and the budget is 16.7ms on
@@ -217,6 +250,24 @@ contention, which is enough to invent a regression that is not there.
 `handler_p95_ms` in that log is our scroll callback alone (~0.06ms). When it is
 flat but the frame interval is not, the cost is downstream of the handler — in
 the view update — and only the trace will say where.
+
+Callback cadence is necessary but not sufficient. `AFTERRAY_UI_PERF_LOG=1`
+also mounts a 1x1, non-interactive `TimelineCommitProbe` beside the timeline.
+Its AppKit `updateLayer` reports `[afterray-ui-render]`: requests entering the
+display-link path, values accepted by SwiftUI, and values reaching a Core
+Animation update pass. Ordinary launches mount no probe. A run only proves the
+100Hz target when substantive moving segments have `requests = updates =
+commits` and the render-side Hz, not merely callback Hz, clears the threshold.
+
+On the production-shaped 26,600-row Visual Lab fixture, the leaf-state and
+O(1)-equality path measured 118.0-120.9 render commits/s. On a signed build 339
+against the real vault, the lightweight-thumbnail and 250ms exact-frame gate
+were then exercised in three fresh processes with four alternating flicks
+each. All twelve substantive render segments had equal request/update/commit
+counts and measured 105.4-120.4Hz; the synchronous scroll handler stayed near
+0.04-0.08ms p95. Earlier builds without the exact-frame quiet gate repeatedly
+produced 36-56ms gaps and 96-97Hz short segments, even though the handler was
+already below 0.1ms.
 
 **`make visual-lab-window-stress-profile`** covers the part the original 20K
 fixture did not: publication of a neighbouring day while inertia is active.

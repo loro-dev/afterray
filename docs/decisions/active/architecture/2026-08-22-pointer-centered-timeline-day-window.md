@@ -58,6 +58,23 @@ bounded.
 The lean read model is unchanged: timeline ranges omit OCR and transcript
 text; selected evidence still comes from `moment_get` and `evidence_ocr`.
 
+Continuous scrub presentation is leaf-scoped. The root recall surface observes
+only begin/end and the live/history edge; a dedicated scrub state publishes the
+per-frame playhead and frozen layout directly to the timeline, timestamp, and
+recalled-picture leaves. Copies of one prepared `TimelineLayout` compare by an
+immutable identity token in O(1), while independently built layouts retain
+exact equality. This is required because the seven-day window contains about
+26,000 moments on a real vault; synthesized array equality at 120Hz would turn
+the warm-data guarantee itself into a rendering regression.
+
+Pixel fidelity is staged around the same interaction boundary. While the
+pointer moves, the picture uses the moment's cached 360px thumbnail and keeps
+full-resolution GOP decode and IOSurface submission off the scrub path. The
+thumbnail remains until 250ms of quiet and until the exact frame settles. A new
+gesture cancels that promotion before it starts; cancellation after synchronous
+VideoToolbox decode has begun is not considered a sufficient performance
+control.
+
 ## Alternatives considered
 
 **Increase the edge distance.** More pixels do not stop direction reversals
@@ -78,7 +95,15 @@ the pointer always consumes an already-queried two-day cushion; a real cross-day
 refill does its O(n) merge and O(n log n) derived preparation off-main and
 publishes once. Empty queried days no longer cause false refills.
 
+Continuous playhead publication is O(1) with respect to the loaded window and
+does not invalidate the root overlay. The signed real-vault regression gate
+measures actual Core Animation layer updates, not just display-link callbacks;
+three fresh-process repetitions on a 120Hz display held every substantive
+segment above 100Hz.
+
 **Cost:** the store and view exchange coverage, revision, and a prepared spine
 as one logical snapshot. Sparse gaps can retain more than seven calendar days,
 though not more occupied rows solely because those days are empty. Protocol 16
-and the timeline-range payload are unchanged.
+and the timeline-range payload are unchanged. During motion the recalled image
+is deliberately a 360px preview; exact pixels are promoted after the user has
+been still for 250ms.

@@ -43,9 +43,14 @@ public final class RecallThumbnailCache {
             guard let data = try? await loader(momentID) else { return nil }
             return await Task.detached(priority: .utility) {
                 // The daemon serves JPEG when a thumbnail exists and raw IVF for
-                // moments packed before thumbnails did. `RecallFrameDecoder`
-                // already dispatches on the bytes, so both land here.
-                RecallFrameDecoder.decode(data)?.makeThumbnailImage()
+                // moments packed before thumbnails did. Decode the normal JPEG
+                // directly with ImageIO: routing a 360px UI thumbnail through
+                // the shared VideoToolbox session can stall the full-screen
+                // display layer during a 120Hz scrub for no quality benefit.
+                if RecallFrameDecoder.isJPEG(data) {
+                    return RecallFrameDecoder.decodeWithImageIO(data)
+                }
+                return RecallFrameDecoder.decode(data)?.makeThumbnailImage()
             }.value
         }
         inFlight[momentID] = task

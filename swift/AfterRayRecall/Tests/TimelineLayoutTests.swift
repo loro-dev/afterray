@@ -357,6 +357,73 @@ final class TimelineLayoutTests: XCTestCase {
         )
     }
 
+    func testMovingArtifactFollowsTheTransientPlayheadWithoutTheRootSelection() {
+        let moments = [
+            RecallMoment(id: "a", sessionId: "s", capturedAtMs: 0, imageArtifactId: "still-a"),
+            RecallMoment(id: "b", sessionId: "s", capturedAtMs: 10_000, imageArtifactId: "still-b"),
+        ]
+
+        XCTAssertEqual(
+            RecallStillRequestPolicy.artifactID(
+                playheadMs: 0,
+                isLive: false,
+                isMoving: true,
+                moments: moments
+            ),
+            "still-a"
+        )
+        XCTAssertEqual(
+            RecallStillRequestPolicy.artifactID(
+                playheadMs: 10_000,
+                isLive: false,
+                isMoving: true,
+                moments: moments
+            ),
+            "still-b"
+        )
+        XCTAssertNil(
+            RecallStillRequestPolicy.artifactID(
+                playheadMs: 10_000,
+                isLive: true,
+                isMoving: true,
+                moments: moments
+            )
+        )
+    }
+
+    func testExactFramePromotionWaitsThroughRapidScrubReversals() {
+        var gate = RecallExactFramePromotionGate()
+
+        XCTAssertEqual(gate.update(targetID: "gop:a#1", isMoving: false), .promoteNow("gop:a#1"))
+        gate.didPromote()
+        XCTAssertEqual(gate.update(targetID: "gop:a#1", isMoving: true), .hold)
+        XCTAssertEqual(
+            gate.update(targetID: "gop:b#4", isMoving: false),
+            .promoteAfterQuietPeriod("gop:b#4")
+        )
+
+        // A reversal arrives before the delayed promotion completes. The
+        // latest target must still wait; it must not inherit an immediate load
+        // from the abandoned target.
+        XCTAssertEqual(gate.update(targetID: "gop:b#4", isMoving: true), .hold)
+        XCTAssertEqual(
+            gate.update(targetID: "gop:c#7", isMoving: false),
+            .promoteAfterQuietPeriod("gop:c#7")
+        )
+        gate.didPromote()
+        XCTAssertEqual(gate.update(targetID: "gop:c#7", isMoving: false), .promoteNow("gop:c#7"))
+        XCTAssertEqual(RecallExactFramePromotionGate.quietPeriodMilliseconds, 250)
+    }
+
+    func testReturningLiveClearsTheExactFramePromotionGate() {
+        var gate = RecallExactFramePromotionGate()
+
+        XCTAssertEqual(gate.update(targetID: "gop:a#1", isMoving: true), .hold)
+        XCTAssertEqual(gate.update(targetID: nil, isMoving: false), .clear)
+        XCTAssertFalse(gate.hasUnsettledMotion)
+        XCTAssertEqual(gate.update(targetID: "gop:b#2", isMoving: false), .promoteNow("gop:b#2"))
+    }
+
     func testLeavingLiveMovesByTimelinePointsAndEnteringLiveSnapsToEnd() {
         let moments = [
             moment(id: "a", at: 0, app: "Safari", bundle: "safari"),
@@ -631,6 +698,37 @@ final class TimelineLayoutTests: XCTestCase {
         )
         let built = TimelineLayout(moments: moments, viewportWidth: 640, density: 0.9)
         XCTAssertEqual(replaced, built)
+    }
+
+    func testLayoutEqualityStillDetectsAChangedMomentOutsideRunGeometry() {
+        let moments = clusteredShortSwitchesThenLongRun()
+        var changed = moments
+        let original = changed[changed.count / 2]
+        changed[changed.count / 2] = RecallMoment(
+            id: original.id,
+            sessionId: original.sessionId,
+            capturedAtMs: original.capturedAtMs,
+            imageArtifactId: original.imageArtifactId,
+            isFavorite: original.isFavorite,
+            gop: original.gop,
+            stillOrigin: original.stillOrigin,
+            ocrText: original.ocrText,
+            transcriptText: original.transcriptText,
+            audioArtifactId: original.audioArtifactId,
+            audioStartedAtMs: original.audioStartedAtMs,
+            accessibilityArtifactId: original.accessibilityArtifactId,
+            applicationName: original.applicationName,
+            bundleIdentifier: original.bundleIdentifier,
+            windowTitle: "changed without moving a run",
+            url: original.url,
+            document: original.document
+        )
+
+        let first = TimelineLayout(moments: moments, viewportWidth: 640, density: 0.9)
+        let second = TimelineLayout(moments: changed, viewportWidth: 640, density: 0.9)
+
+        XCTAssertEqual(first.runs, second.runs, "the fixture must isolate layout equality")
+        XCTAssertNotEqual(first, second)
     }
 
     private func linearRun(containingMs ms: Int64, in runs: [AppUsageRun]) -> AppUsageRun? {
