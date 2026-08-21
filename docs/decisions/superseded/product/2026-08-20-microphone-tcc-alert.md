@@ -1,11 +1,10 @@
 # Decision: Microphone consent is the system TCC alert, not a Settings guide
 
-Status: active
+Status: superseded
 Area: capture
-Anchors:
-- apps/AfterRay/Sources/SystemPermissionCoordinator.swift @dec:microphone-tcc-alert
+Anchors: —
 Supersedes: —
-Superseded-by: —
+Superseded-by: ../../active/product/2026-08-21-explicit-optional-microphone-consent.md
 
 ## Problem
 

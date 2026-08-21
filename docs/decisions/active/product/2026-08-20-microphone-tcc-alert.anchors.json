@@ -1,4 +1,0 @@
-{
-  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
-  "apps/AfterRay/Sources/SystemPermissionCoordinator.swift::static func gateFollowUp(": "sha256:6ab26b01484c5933"
-}

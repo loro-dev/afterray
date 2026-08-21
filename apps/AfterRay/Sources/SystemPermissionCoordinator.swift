@@ -40,9 +40,9 @@ final class SystemPermissionCoordinator: ObservableObject {
                 guard let self else { return }
                 let wasRecordingAudio = self.recordsAudio
                 self.recordsAudio = AfterRayPreferences.recordAudio
-                // Turning audio on is the moment the user expects the mic
-                // prompt; without a request AfterRay never appears in the
-                // Microphone pane for them to grant.
+                // Turning audio on is an explicit user action, so it is an
+                // appropriate time to present the native microphone prompt.
+                // First-launch bootstrap deliberately does not request it.
                 if !wasRecordingAudio, self.recordsAudio, !self.isRequesting {
                     self.hasMicrophoneInput = self.microphoneInputAvailable()
                     if self.microphoneRequired {
@@ -91,15 +91,17 @@ final class SystemPermissionCoordinator: ObservableObject {
         isRequesting = true
         defer { isRequesting = false }
 
-        if !screenRecording, reserveAutomaticRequest(for: .screenRecording) {
+        if !screenRecording,
+           SystemPermissionPolicy.shouldRequestAutomatically(.screenRecording),
+           reserveAutomaticRequest(for: .screenRecording)
+        {
             screenRecording = CGRequestScreenCaptureAccess()
         }
 
-        if microphoneRequired {
-            microphone = await resolveMicrophoneAuthorization()
-        }
-
-        if !accessibility, reserveAutomaticRequest(for: .accessibility) {
+        if !accessibility,
+           SystemPermissionPolicy.shouldRequestAutomatically(.accessibility),
+           reserveAutomaticRequest(for: .accessibility)
+        {
             requestAccessibilityAccess()
         }
         refresh()
@@ -144,11 +146,9 @@ final class SystemPermissionCoordinator: ObservableObject {
     }
 
     /// macOS lists an app under Privacy & Security → Microphone only once the
-    /// consent prompt has been *answered*, so `.notDetermined` must always
-    /// re-ask — never gate it behind the automatic-request ledger. Granting
-    /// Screen Recording relaunches the app while the mic prompt is still open;
-    /// a ledger entry written before the answer left installs that could never
-    /// surface the prompt, or the Settings row, again.
+    /// consent prompt has been answered. Call this only after an explicit user
+    /// action; an unanswered prompt is never added to the automatic-request
+    /// ledger, so a later click can still present it.
     private func resolveMicrophoneAuthorization() async -> Bool {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -188,12 +188,22 @@ enum PermissionGateFollowUp: Equatable {
     case systemSettings
 }
 
+// @dec:explicit-optional-microphone-consent — docs/decisions/active/product/2026-08-21-explicit-optional-microphone-consent.md
 enum SystemPermissionPolicy {
+    /// Screen Recording and Accessibility are required for AfterRay's capture
+    /// pipeline and may prompt during bootstrap. Microphone consent is optional
+    /// and begins only from an explicit user action in AfterRay.
+    static func shouldRequestAutomatically(_ permission: RequiredPermission) -> Bool {
+        switch permission {
+        case .screenRecording, .accessibility: true
+        case .microphone: false
+        }
+    }
+
     static func microphoneRequired(recordsAudio: Bool, hasMicrophoneInput: Bool) -> Bool {
         recordsAudio && hasMicrophoneInput
     }
 
-    // @dec:microphone-tcc-alert — docs/decisions/active/product/2026-08-20-microphone-tcc-alert.md
     /// Screen Recording and Accessibility have no in-place grant, so the
     /// gate opens System Settings and shows the drag card. Microphone is
     /// standard TCC: `requestAccess` presents a native alert, and the app
