@@ -210,6 +210,18 @@ task cannot interrupt a synchronous decode that is already inside
 VideoToolbox; starting that decode after the old 75ms interaction settle caused
 37-56ms gaps at the start of the next flick.
 
+Do not pre-decode full-resolution neighbours after settle. A cancelled outer
+task cannot stop a detached VideoToolbox decode already in progress, so an
+apparently idle prefetch can survive into the next gesture. The exact settled
+frame is the only full-resolution promotion.
+
+Selection-only work has a separate 500ms quiet boundary. `moment_get` evidence
+is stored beside the selected moment instead of replacing a row in the lean
+timeline; it therefore does not increment the timeline revision or invalidate
+the prepared spine. Day summary, adjacent-day maintenance, and audio prefetch
+run in the same cancellable task, and the first movement frame cancels it. OCR,
+summary, and audio data are not needed to move the pointer.
+
 ## Which display
 
 This machine has a 60Hz screen and a 120Hz screen, and the budget is 16.7ms on
@@ -218,6 +230,12 @@ frames" on the first and 37-80fps on the second, minutes apart. **Always record
 which screen the window was on**; the perf line now reports `display=` and
 derives `budget=` from the display link rather than a constant, so a number is
 never quoted against the wrong target again.
+
+On ProMotion, `preferred=120` is not a 120Hz request when the allowed range is
+60...120Hz: the system may legally deliver a 16.7ms half-rate cadence. During
+an active scrub the display link therefore pins minimum, maximum, and preferred
+to the screen's native maximum (capped at 120Hz). It is paused as soon as the
+gesture and inertia settle, so the high-rate request has no idle cost.
 
 ## Measuring it
 
@@ -260,14 +278,17 @@ Animation update pass. Ordinary launches mount no probe. A run only proves the
 commits` and the render-side Hz, not merely callback Hz, clears the threshold.
 
 On the production-shaped 26,600-row Visual Lab fixture, the leaf-state and
-O(1)-equality path measured 118.0-120.9 render commits/s. On a signed build 339
-against the real vault, the lightweight-thumbnail and 250ms exact-frame gate
-were then exercised in three fresh processes with four alternating flicks
-each. All twelve substantive render segments had equal request/update/commit
-counts and measured 105.4-120.4Hz; the synchronous scroll handler stayed near
-0.04-0.08ms p95. Earlier builds without the exact-frame quiet gate repeatedly
-produced 36-56ms gaps and 96-97Hz short segments, even though the handler was
-already below 0.1ms.
+O(1)-equality path measured 118.0-120.9 render commits/s. A signed real-vault
+candidate then exposed two costs the fixture could not: neighbour GOP decoding
+surviving cancellation, and selected OCR detail invalidating the whole prepared
+timeline. After removing neighbour prefetch, isolating detail, deferring all
+selection-only work, and pinning the active ProMotion range, three fresh
+processes with four alternating flicks each measured
+113.3/114.9/117.9/118.2Hz, 104.7/116.7/115.8/117.6Hz, and
+111.3/117.3/115.4/116.6Hz. All twelve substantive segments had equal
+request/update/commit counts; the synchronous handler stayed at 0.055-0.080ms
+p95. Earlier candidates produced 37-56ms gaps or a 99.4Hz half-rate segment
+even though that handler was already below 0.1ms.
 
 **`make visual-lab-window-stress-profile`** covers the part the original 20K
 fixture did not: publication of a neighbouring day while inertia is active.

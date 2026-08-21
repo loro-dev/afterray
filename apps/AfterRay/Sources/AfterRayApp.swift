@@ -1411,7 +1411,19 @@ private struct AfterRayRootView: View {
             onPopOutHistory: { HistoryWindowController.shared.show() },
             onOpenSummarySlot: openSummarySlot,
             onVisibleDayChange: { dayMs in
-                Task { await store.loadDaySummary(dayMs: dayMs) }
+                await store.loadDaySummary(dayMs: dayMs)
+            },
+            onSelectionSettled: {
+                await store.hydrateSelectedEvidence()
+                guard !Task.isCancelled else { return }
+                await store.prefetchAdjacentTimelineDays()
+                guard !Task.isCancelled else { return }
+                audioPlayer.prefetch(
+                    artifactID: audioPrefetchKey.isEmpty ? nil : audioPrefetchKey
+                )
+            },
+            onScrubBegan: {
+                audioPlayer.prefetch(artifactID: nil)
             },
             searchSession: control.searchSession,
             thumbnailLoader: { momentID in
@@ -1497,13 +1509,6 @@ private struct AfterRayRootView: View {
         }
         .onChange(of: control.isRecording, initial: true) { _, isRecording in
             AfterRayMenuBar.shared.setRecording(isRecording)
-        }
-        .task(id: audioPrefetchKey) {
-            audioPlayer.prefetch(artifactID: audioPrefetchKey.isEmpty ? nil : audioPrefetchKey)
-        }
-        .task(id: store.selectedMoment?.id) {
-            await store.hydrateSelectedEvidence()
-            await store.prefetchAdjacentTimelineDays()
         }
         .task {
             await bootstrap()

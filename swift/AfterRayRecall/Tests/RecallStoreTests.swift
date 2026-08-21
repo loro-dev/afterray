@@ -30,13 +30,26 @@ final class RecallStoreTests: XCTestCase {
     }
 
     func testHydrateSelectedEvidenceFillsOcrFromMomentGet() async {
-        let store = RecallStore(daemon: FakeDaemon())
+        let daemon = FakeDaemon()
+        let store = RecallStore(daemon: daemon)
         await store.loadTimeline()
         XCTAssertNil(store.selectedMoment?.ocrText)
+        let timelineBefore = store.moments
+        let revisionBefore = store.timelineRevision
+        let spineBefore = store.timelineSpine
 
         await store.hydrateSelectedEvidence()
         XCTAssertEqual(store.selectedMoment?.id, "m2")
         XCTAssertEqual(store.selectedMoment?.ocrText, "ocr-m2")
+        XCTAssertEqual(store.moments, timelineBefore, "detail must not mutate the lean timeline")
+        XCTAssertEqual(store.timelineRevision, revisionBefore)
+        XCTAssertEqual(store.timelineSpine, spineBefore)
+
+        // A real moment may legitimately have no OCR or transcript. Presence
+        // of the detail snapshot, not non-nil text, prevents repeat I/O.
+        await store.hydrateSelectedEvidence()
+        let momentRequestIDs = await daemon.momentRequestIDs()
+        XCTAssertEqual(momentRequestIDs, ["m2"])
     }
 
     func testUnchangedPlayheadDoesNotPublish() async {
@@ -1023,6 +1036,7 @@ private actor FlakySummaryDaemon: RecallDaemonServing {
 private actor FakeDaemon: RecallDaemonServing {
     struct FavoriteCall: Equatable { let momentID: String; let favorite: Bool }
     var favoriteCalls: [FavoriteCall] = []
+    private var requestedMomentIDs: [String] = []
 
     func sessions() async throws -> [RecallSession] {
         [
@@ -1059,6 +1073,7 @@ private actor FakeDaemon: RecallDaemonServing {
     }
 
     func moment(id: String) async throws -> RecallMoment {
+        requestedMomentIDs.append(id)
         let base = try await timeline().first { $0.id == id }
             ?? RecallMoment(id: id, sessionId: "s1", capturedAtMs: 0)
         return RecallMoment(
@@ -1073,4 +1088,6 @@ private actor FakeDaemon: RecallDaemonServing {
     func setFavorite(momentID: String, favorite: Bool) async throws {
         favoriteCalls.append(.init(momentID: momentID, favorite: favorite))
     }
+
+    func momentRequestIDs() -> [String] { requestedMomentIDs }
 }

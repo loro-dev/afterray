@@ -20,6 +20,11 @@ public final class RecallStore: ObservableObject {
     @Published public private(set) var summaryHistoryHasMore = false
     @Published public private(set) var summaryHistoryTotalDays: Int?
     @Published public private(set) var isLoadingSummaryHistory = false
+    /// Detail-only fields for the current selection. Evidence must never be
+    /// written back into the 26K-row timeline array: doing so invalidates its
+    /// prepared spine and turns one `moment_get` into an O(n) search plus a
+    /// full layout rebuild just before the next scrub.
+    @Published private var selectedMomentDetail: RecallMoment? = nil
 
     private let daemon: any RecallDaemonServing
     private var sensitiveGeneration: UInt64 = 0
@@ -27,8 +32,8 @@ public final class RecallStore: ObservableObject {
     /// scalar instead of comparing a 20K-element array after every publish.
     public private(set) var timelineRevision: UInt64 = 0
     /// Geometry derived from `moments` on a worker before the rows publish.
-    /// Nil means a rare in-place detail mutation invalidated the prepared
-    /// value and the view should rebuild it once.
+    /// Nil means a rare in-place timeline mutation (currently favorite state)
+    /// invalidated the prepared value and the view should rebuild it once.
     public private(set) var timelineSpine: TimelineSpine?
     /// Replacing or recentering the local-day window invalidates an adjacent
     /// fetch. A routine refresh does not: it only enriches the same window,
@@ -70,7 +75,32 @@ public final class RecallStore: ObservableObject {
     }
 
     public var selectedMoment: RecallMoment? {
-        RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
+        guard let base = RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
+        else { return nil }
+        guard let detail = selectedMomentDetail, detail.id == base.id else { return base }
+        // Timeline geometry and favorite state remain authoritative in `base`.
+        // Only fields intentionally omitted from or optional in the lean index
+        // are overlaid from the selected-detail read model.
+        return RecallMoment(
+            id: base.id,
+            sessionId: base.sessionId,
+            capturedAtMs: base.capturedAtMs,
+            imageArtifactId: base.imageArtifactId ?? detail.imageArtifactId,
+            isFavorite: base.isFavorite,
+            gop: base.gop ?? detail.gop,
+            stillOrigin: base.stillOrigin,
+            ocrText: detail.ocrText,
+            transcriptText: detail.transcriptText,
+            audioArtifactId: detail.audioArtifactId ?? base.audioArtifactId,
+            audioStartedAtMs: detail.audioStartedAtMs ?? base.audioStartedAtMs,
+            accessibilityArtifactId: detail.accessibilityArtifactId
+                ?? base.accessibilityArtifactId,
+            applicationName: base.applicationName ?? detail.applicationName,
+            bundleIdentifier: base.bundleIdentifier ?? detail.bundleIdentifier,
+            windowTitle: base.windowTitle ?? detail.windowTitle,
+            url: base.url ?? detail.url,
+            document: base.document ?? detail.document
+        )
     }
 
     public var timelineDayCoverage: TimelineDayCoverage? {
@@ -515,20 +545,25 @@ public final class RecallStore: ObservableObject {
     /// `loadTimeline` establishes all seven days atomically; later calls
     /// normally add one outer day after the pointer crosses midnight.
     public func prefetchAdjacentTimelineDays() async {
+        guard !Task.isCancelled else { return }
         guard let range = loadedTimelineDayBounds else { return }
         let anchorMs = playheadMs > 0 ? playheadMs : range.start
         let required = TimelineWarmWindow.bounds(containingMs: anchorMs)
 
         while let loaded = loadedTimelineDayBounds, loaded.start > required.start {
+            guard !Task.isCancelled else { return }
             let previousStart = loaded.start
             _ = await extendTimeline(direction: .older)
+            guard !Task.isCancelled else { return }
             guard let expanded = loadedTimelineDayBounds, expanded.start < previousStart else {
                 break
             }
         }
         while let loaded = loadedTimelineDayBounds, loaded.end < required.end {
+            guard !Task.isCancelled else { return }
             let previousEnd = loaded.end
             _ = await extendTimeline(direction: .newer)
+            guard !Task.isCancelled else { return }
             guard let expanded = loadedTimelineDayBounds, expanded.end > previousEnd else {
                 break
             }
@@ -551,17 +586,24 @@ public final class RecallStore: ObservableObject {
         await loadTimeline(containingMs: ms, preservingSelection: false)
     }
 
-    /// Fills OCR/transcript on the selected index row via `moment_get`.
+    /// Fills OCR/transcript for the selected read model via `moment_get`.
+    /// The timeline array and prepared spine remain unchanged.
     public func hydrateSelectedEvidence() async {
-        guard let selected = selectedMoment else { return }
+        guard let selected = RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
+        else { return }
+        if selectedMomentDetail?.id == selected.id { return }
         if selected.ocrText != nil || selected.transcriptText != nil { return }
         let requestGeneration = sensitiveGeneration
         let momentID = selected.id
         do {
             let detail = try await daemon.moment(id: momentID)
-            guard sensitiveGeneration == requestGeneration else { return }
+            guard !Task.isCancelled,
+                  sensitiveGeneration == requestGeneration,
+                  RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)?.id == momentID
+            else { return }
             patchEvidence(detail)
         } catch {
+            guard !Task.isCancelled else { return }
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) { return }
         }
@@ -599,7 +641,7 @@ public final class RecallStore: ObservableObject {
         let requestGeneration = sensitiveGeneration
         do {
             let loaded = try await daemon.daySummary(dayMs: dayMs)
-            guard sensitiveGeneration == requestGeneration else { return }
+            guard !Task.isCancelled, sensitiveGeneration == requestGeneration else { return }
             daySummary = loaded
             loadedDayKey = key
             guard !loaded.day.isEmpty else { return }
@@ -612,8 +654,10 @@ public final class RecallStore: ObservableObject {
             summaryHistoryCursorMs = loaded.dayStartMs
             summaryHistoryHasMore = true
             isLoadingSummaryHistory = false
+            guard !Task.isCancelled else { return }
             await loadOlderSummaryHistory()
         } catch {
+            guard !Task.isCancelled else { return }
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) { return }
         }
@@ -631,9 +675,15 @@ public final class RecallStore: ObservableObject {
         isLoadingSummaryHistory = true
         let requestGeneration = summaryHistoryGeneration
         let sensitiveRequestGeneration = sensitiveGeneration
+        defer {
+            if summaryHistoryGeneration == requestGeneration {
+                isLoadingSummaryHistory = false
+            }
+        }
         do {
             let page = try await daemon.summaryHistory(beforeMs: beforeMs, limit: 7)
-            guard sensitiveGeneration == sensitiveRequestGeneration,
+            guard !Task.isCancelled,
+                  sensitiveGeneration == sensitiveRequestGeneration,
                   summaryHistoryGeneration == requestGeneration
             else { return }
             let knownDays = Set(summaryHistory.map(\.dayStartMs))
@@ -648,15 +698,13 @@ public final class RecallStore: ObservableObject {
                 summaryHistoryTotalDays = totalDays
             }
         } catch {
+            guard !Task.isCancelled else { return }
             guard sensitiveGeneration == sensitiveRequestGeneration,
                   summaryHistoryGeneration == requestGeneration
             else { return }
             if !Self.isDaemonConnectionError(error) {
                 summaryHistoryHasMore = false
             }
-        }
-        if summaryHistoryGeneration == requestGeneration {
-            isLoadingSummaryHistory = false
         }
     }
 
@@ -703,6 +751,7 @@ public final class RecallStore: ObservableObject {
 
     public func clearSensitiveState() {
         sensitiveGeneration &+= 1
+        selectedMomentDetail = nil
         sessions = []
         timelineSpine = nil
         timelineRevision &+= 1
@@ -860,10 +909,9 @@ public final class RecallStore: ObservableObject {
     }
 
     private func patchEvidence(_ detail: RecallMoment) {
-        guard let index = moments.firstIndex(where: { $0.id == detail.id }) else { return }
-        timelineSpine = nil
-        timelineRevision &+= 1
-        moments[index] = detail
+        guard RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)?.id == detail.id
+        else { return }
+        selectedMomentDetail = detail
     }
 
     private static func isDaemonConnectionError(_ error: Error) -> Bool {

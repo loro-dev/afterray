@@ -7,6 +7,6 @@
   "swift/AfterRayRecall/Sources/DaemonClient.swift::public func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment] {": "sha256:cf10b96f6d5eea5f",
   "swift/AfterRayRecall/Sources/DaemonClient.swift::public static let protocolVersion = 16": "sha256:1c6ee1887b92c504",
   "swift/AfterRayRecall/Sources/RecallStore.swift::public func loadTimeline(": "sha256:445d7e6b98991b98",
-  "swift/AfterRayRecall/Sources/RecallView.swift::public var onApproachTimelineEdge: ((TimelineExtendDirection, Int64) async -> Bool)?": "sha256:777c035dd5ae6639",
+  "swift/AfterRayRecall/Sources/RecallView.swift::public var onApproachTimelineEdge: ((TimelineExtendDirection, Int64) async -> Bool)?": "sha256:648274d84e03eb05",
   "swift/AfterRayRecall/Sources/TimelineLayout.swift::public struct TimelineDayCoverage: Equatable, Sendable {": "sha256:8d6377c169eddd51"
 }

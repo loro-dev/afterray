@@ -72,6 +72,22 @@ struct RecallExactFramePromotionGate {
     }
 }
 
+/// Requests the panel's highest useful refresh rate only while a scrub is
+/// active. A 60...120Hz range lets ProMotion legally settle at 60Hz even when
+/// every callback is cheap; because the link is paused at idle, pinning the
+/// active range does not turn this into a permanent high-refresh request.
+struct RecallScrubFrameRatePolicy {
+    static func range(maximumFramesPerSecond: Int) -> CAFrameRateRange {
+        let nativeMaximum = maximumFramesPerSecond > 0 ? maximumFramesPerSecond : 60
+        let activeRate = Float(min(nativeMaximum, 120))
+        return CAFrameRateRange(
+            minimum: activeRate,
+            maximum: activeRate,
+            preferred: activeRate
+        )
+    }
+}
+
 public struct RecallView: View {
     @Environment(\.afterRayCopy) private var copy
     @Environment(\.afterRayLocale) private var afterRayLocale
@@ -123,7 +139,13 @@ public struct RecallView: View {
     /// affordance (Visual Lab, snapshots).
     public var onPopOutHistory: (() -> Void)?
     public var onOpenSummarySlot: ((DaySlotSummary) -> Void)?
-    public var onVisibleDayChange: ((Int64) -> Void)?
+    public var onVisibleDayChange: ((Int64) async -> Void)?
+    /// Metadata, summary, and audio work owned by the app starts only after a
+    /// real quiet period. Keeping the async call inside this view's keyed task
+    /// lets the next gesture cancel it before it publishes into the root.
+    public var onSelectionSettled: (() async -> Void)?
+    /// Cancels app-owned speculative work at the first movement frame.
+    public var onScrubBegan: (() -> Void)?
     /// Non-nil puts the view in search mode: the bottom bar becomes a filmstrip
     /// of matched frames and travel snaps between them instead of wall clock.
     public var searchSession: RecallSearchSession?
@@ -160,6 +182,10 @@ public struct RecallView: View {
     @State private var searchScrollAccumulator: CGFloat = 0
     /// Trackpad travel needed to advance one filmstrip cell.
     private static let searchScrollPointsPerCell: CGFloat = 46
+    /// The 75ms interaction settle keeps controls responsive. Evidence,
+    /// summaries, and audio are not visible during movement and can wait long
+    /// enough to distinguish a real stop from a quick reversal.
+    private static let selectionQuietMilliseconds = 500
     @State private var highlightRegions: [OcrRegion] = []
     @State private var highlightMomentID: String?
     /// OCR boxes behind the selectable text layer, and the flag that mounts it.
@@ -202,7 +228,9 @@ public struct RecallView: View {
         onLoadOlderSummaryHistory: (() -> Void)? = nil,
         onPopOutHistory: (() -> Void)? = nil,
         onOpenSummarySlot: ((DaySlotSummary) -> Void)? = nil,
-        onVisibleDayChange: ((Int64) -> Void)? = nil,
+        onVisibleDayChange: ((Int64) async -> Void)? = nil,
+        onSelectionSettled: (() async -> Void)? = nil,
+        onScrubBegan: (() -> Void)? = nil,
         searchSession: RecallSearchSession? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
         ocrLoader: RecallOcrLoader? = nil,
@@ -243,6 +271,8 @@ public struct RecallView: View {
         self.onPopOutHistory = onPopOutHistory
         self.onOpenSummarySlot = onOpenSummarySlot
         self.onVisibleDayChange = onVisibleDayChange
+        self.onSelectionSettled = onSelectionSettled
+        self.onScrubBegan = onScrubBegan
         self.searchSession = searchSession
         self.thumbnailLoader = thumbnailLoader
         self.ocrLoader = ocrLoader
@@ -489,25 +519,17 @@ public struct RecallView: View {
         }
         .animation(.easeOut(duration: 0.18), value: showsDetails)
         .animation(.easeOut(duration: 0.18), value: daySummaryExpanded)
-        .task(id: selectionPrefetchTaskKey) {
-            // While the scrub coasts, the selected moment changes every
-            // frame; forty-artifact prefetch batches at that rate were pure
-            // main-thread churn. The visible still keeps updating through
-            // its own throttle; neighbours warm once motion settles.
+        .task(id: selectionQuietTaskKey) {
+            // The moving picture comes from 360px thumbnails. Pre-decoding
+            // neighbouring full-resolution GOP frames here kept VideoToolbox
+            // busy long after launch and made the next gesture hitch. Only the
+            // exact settled frame is promoted; non-visual work waits longer.
             guard !isScrubbing else { return }
-            // Give the newly requested exact Nth frame first access to the
-            // daemon and VideoToolbox before low-priority poster warming.
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: .milliseconds(Self.selectionQuietMilliseconds))
             guard !Task.isCancelled, !isScrubbing else { return }
-            prefetchAroundSelection()
-        }
-        // Waits for the settle like the prefetch above. Search results hop
-        // between days, so a single flick used to ask the daemon for a day
-        // summary — and the history pages behind it — once per cell, each
-        // answer rebuilding the whole summary document mid-scrub.
-        .task(id: "\(playheadDayKey):\(isScrubbing)") {
-            guard !isScrubbing else { return }
-            onVisibleDayChange?(renderedPlayheadMs)
+            await onSelectionSettled?()
+            guard !Task.isCancelled, !isScrubbing else { return }
+            await onVisibleDayChange?(renderedPlayheadMs)
         }
         .task(id: highlightTaskKey) {
             await loadHighlightRegions()
@@ -536,9 +558,9 @@ public struct RecallView: View {
     /// A guard inside a task body is too late: changing the id still cancels
     /// and recreates the task graph. During motion these keys stay byte-stable
     /// and change once to the settled selection at the end.
-    private var selectionPrefetchTaskKey: String {
+    private var selectionQuietTaskKey: String {
         guard !isScrubbing else { return "scrubbing" }
-        return "\(selectedMoment?.id ?? "-"):\(scrubState.movementDirection)"
+        return "\(selectedMoment?.id ?? "-")|\(playheadDayKey)"
     }
 
     private var highlightTaskKey: String {
@@ -957,6 +979,7 @@ public struct RecallView: View {
             scrubIsLive = isLive
         }
         isScrubbing = true
+        onScrubBegan?()
         RecallDecodedImageCache.shared.prioritizeScrubPreviews()
     }
 
@@ -1063,26 +1086,6 @@ public struct RecallView: View {
         )
     }
 
-    private func prefetchAroundSelection() {
-        guard !moments.isEmpty else { return }
-        let center = RecallPlayhead.resolveIndex(playheadMs: renderedPlayheadMs, moments: moments)
-            ?? moments.count - 1
-        var offsets = [0]
-        for distance in 1...8 {
-            offsets.append(distance * scrubState.movementDirection)
-            offsets.append(-distance * scrubState.movementDirection)
-        }
-        let artifactIDs = offsets.compactMap { offset -> String? in
-            let index = center + offset
-            return moments.indices.contains(index) ? moments[index].previewCacheKey : nil
-        }
-        var seen = Set<String>()
-        let uniqueArtifactIDs = artifactIDs.filter { seen.insert($0).inserted }
-        RecallDecodedImageCache.shared.prefetch(
-            artifactIDs: uniqueArtifactIDs,
-            loader: imageLoader
-        )
-    }
 }
 
 /// A still that has finished fading in and now owns the screen at full opacity.
@@ -1550,9 +1553,6 @@ private final class RecallDecodedImageCache {
 
     private let frames = NSCache<NSString, RecallDisplayFrame>()
     private var inFlight: [String: InFlight] = [:]
-    private var pendingPrefetches: [PrefetchRequest] = []
-    private var activePrefetches = 0
-    private let maximumConcurrentPrefetches = 1
     private var generation: UInt64 = 0
     private var nextInFlightToken: UInt64 = 0
 
@@ -1599,60 +1599,19 @@ private final class RecallDecodedImageCache {
         generation &+= 1
         inFlight.values.forEach { $0.task.cancel() }
         inFlight.removeAll()
-        pendingPrefetches.removeAll()
         frames.removeAllObjects()
     }
 
-    /// Drop queued neighbours and exact GOP loads as soon as the finger moves.
-    /// Raw daemon reads may still finish into their encrypted-data cache, but a
-    /// cancelled exact request is checked before it can occupy VideoToolbox.
+    /// Drop an exact GOP load as soon as the finger moves. Raw daemon reads may
+    /// still finish into their encrypted-data cache, but a cancelled request is
+    /// checked before it can occupy VideoToolbox. Neighbouring full-resolution
+    /// prefetch no longer exists; moving presentation uses thumbnails.
     func prioritizeScrubPreviews() {
-        pendingPrefetches.removeAll()
         let exactGopIDs = inFlight.keys.filter { $0.hasPrefix("gop:") }
         for artifactID in exactGopIDs {
             inFlight[artifactID]?.task.cancel()
             inFlight[artifactID] = nil
         }
-    }
-
-    func prefetch(
-        artifactIDs: [String],
-        loader: @escaping RecallImageLoader
-    ) {
-        pendingPrefetches = artifactIDs.compactMap { artifactID in
-            guard
-                cached(artifactID: artifactID) == nil,
-                inFlight[artifactID] == nil
-            else { return nil }
-            return PrefetchRequest(artifactID: artifactID, loader: loader)
-        }
-        pumpPrefetches()
-    }
-
-    private func pumpPrefetches() {
-        while activePrefetches < maximumConcurrentPrefetches, !pendingPrefetches.isEmpty {
-            let request = pendingPrefetches.removeFirst()
-            guard
-                cached(artifactID: request.artifactID) == nil,
-                inFlight[request.artifactID] == nil
-            else { continue }
-            activePrefetches += 1
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                _ = await frame(
-                    artifactID: request.artifactID,
-                    loader: request.loader,
-                    priority: .utility
-                )
-                activePrefetches -= 1
-                pumpPrefetches()
-            }
-        }
-    }
-
-    private struct PrefetchRequest {
-        let artifactID: String
-        let loader: RecallImageLoader
     }
 
     private struct InFlight {
@@ -2766,10 +2725,8 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                 displayLink = nil
             }
             guard let displayLink else { return }
-            displayLink.preferredFrameRateRange = CAFrameRateRange(
-                minimum: 60,
-                maximum: 120,
-                preferred: 120
+            displayLink.preferredFrameRateRange = RecallScrubFrameRatePolicy.range(
+                maximumFramesPerSecond: hostView?.window?.screen?.maximumFramesPerSecond ?? 60
             )
             displayLink.add(to: .main, forMode: .common)
             displayLink.isPaused = !isScrolling

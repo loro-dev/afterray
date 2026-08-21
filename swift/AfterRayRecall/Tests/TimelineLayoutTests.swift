@@ -415,6 +415,18 @@ final class TimelineLayoutTests: XCTestCase {
         XCTAssertEqual(RecallExactFramePromotionGate.quietPeriodMilliseconds, 250)
     }
 
+    func testActiveScrubPinsTheDisplayLinkToTheNativeRefreshRate() {
+        let promotion = RecallScrubFrameRatePolicy.range(maximumFramesPerSecond: 120)
+        XCTAssertEqual(promotion.minimum, 120)
+        XCTAssertEqual(promotion.maximum, 120)
+        XCTAssertEqual(promotion.preferred, 120)
+
+        let standard = RecallScrubFrameRatePolicy.range(maximumFramesPerSecond: 60)
+        XCTAssertEqual(standard.minimum, 60)
+        XCTAssertEqual(standard.maximum, 60)
+        XCTAssertEqual(standard.preferred, 60)
+    }
+
     func testReturningLiveClearsTheExactFramePromotionGate() {
         var gate = RecallExactFramePromotionGate()
 
