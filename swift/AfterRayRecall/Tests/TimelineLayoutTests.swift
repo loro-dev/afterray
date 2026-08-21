@@ -21,6 +21,37 @@ final class TimelineLayoutTests: XCTestCase {
         }
     }
 
+    func testEdgePrefetchStartsBeforeTheOlderBoundary() {
+        let layout = TimelineLayout(
+            moments: [
+                moment(id: "first", at: 0, app: "Xcode", bundle: "com.apple.dt.Xcode"),
+                moment(id: "last", at: 3_600_000, app: "Xcode", bundle: "com.apple.dt.Xcode"),
+            ],
+            viewportWidth: 1_000,
+            density: 0.12
+        )
+
+        XCTAssertEqual(
+            TimelineEdgePrefetch.direction(
+                playheadMs: layout.ms(x: 300),
+                isLive: false,
+                movementDirection: -1,
+                layout: layout,
+                viewportWidth: 1_000
+            ),
+            .older
+        )
+        XCTAssertNil(
+            TimelineEdgePrefetch.direction(
+                playheadMs: layout.ms(x: layout.contentWidth / 2),
+                isLive: false,
+                movementDirection: -1,
+                layout: layout,
+                viewportWidth: 1_000
+            )
+        )
+    }
+
     func testNeedleStaysInsideOwnRunWithManyShortAppSwitches() throws {
         let moments = clusteredShortSwitchesThenLongRun()
         let layout = TimelineLayout(moments: moments, viewportWidth: 1_000, density: 0.12)

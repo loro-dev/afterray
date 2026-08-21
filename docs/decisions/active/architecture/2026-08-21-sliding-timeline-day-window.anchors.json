@@ -1,11 +1,11 @@
 {
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
-  "apps/AfterRay/Sources/AfterRayApp.swift::onApproachTimelineEdge: { direction in": "sha256:06fd1cc29f344702",
+  "apps/AfterRay/Sources/AfterRayApp.swift::onApproachTimelineEdge: { direction in": "sha256:fec3f9788ef28c07",
   "crates/afterray-protocol/src/lib.rs::TimelineRange {": "sha256:908800a6073174e8",
   "crates/afterray-store/src/lib.rs::fn query_moment_index(": "sha256:19993048f33791fd",
   "crates/afterray-store/src/lib.rs::pub fn timeline_range_sync(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Moment>, StoreError> {": "sha256:b0913bf7603f939b",
   "swift/AfterRayRecall/Sources/DaemonClient.swift::public func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment] {": "sha256:cf10b96f6d5eea5f",
   "swift/AfterRayRecall/Sources/DaemonClient.swift::public static let protocolVersion = 16": "sha256:1c6ee1887b92c504",
   "swift/AfterRayRecall/Sources/RecallStore.swift::public func loadTimeline(": "sha256:953ece134a1b7bd6",
-  "swift/AfterRayRecall/Sources/RecallView.swift::public var onApproachTimelineEdge: ((TimelineExtendDirection) -> Void)?": "sha256:2711cb66aaf3e73a"
+  "swift/AfterRayRecall/Sources/RecallView.swift::public var onApproachTimelineEdge: ((TimelineExtendDirection) async -> Bool)?": "sha256:a49eb3fc0ae265c0"
 }

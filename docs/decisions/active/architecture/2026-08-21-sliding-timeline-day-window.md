@@ -58,7 +58,6 @@ speaks.
 cross midnight without a 64 MiB download. Empty days do not trap the
 playhead.
 
-**Cost:** the first gesture after launch can still clamp if the neighbour
-prefetch has not returned. Mid-scrub merges freeze the track layout until
-the gesture ends, so a day that arrives during a drag is reachable on the
-next one. Protocol 16 is unchanged.
+**Cost:** a neighbouring-day merge can remap the in-flight scrub once, but
+the fetch starts before the visible edge and the refreshed mapping lets that
+same gesture continue into the new day. Protocol 16 is unchanged.

@@ -76,9 +76,9 @@ public struct RecallView: View {
     public var ocrLoader: RecallOcrLoader?
     public var onSelectSearchFrame: ((Int) -> Void)?
     // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
-    /// Fired when travel hits the first or last loaded capture so the owner
-    /// can grow the playhead window by a neighbouring day.
-    public var onApproachTimelineEdge: ((TimelineExtendDirection) -> Void)?
+    /// Fetches a neighbouring day before travel reaches the loaded edge.
+    /// `true` means the window grew and the scrub layout may adopt it.
+    public var onApproachTimelineEdge: ((TimelineExtendDirection) async -> Bool)?
 
     @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
     @State private var searchDragOrigin: Int?
@@ -156,7 +156,7 @@ public struct RecallView: View {
         thumbnailLoader: RecallThumbnailLoader? = nil,
         ocrLoader: RecallOcrLoader? = nil,
         onSelectSearchFrame: ((Int) -> Void)? = nil,
-        onApproachTimelineEdge: ((TimelineExtendDirection) -> Void)? = nil
+        onApproachTimelineEdge: ((TimelineExtendDirection) async -> Bool)? = nil
     ) {
         self.moments = moments
         self._playheadMs = playheadMs
@@ -839,9 +839,9 @@ public struct RecallView: View {
             moments: moments
         )
         if delta < 0, stepped.playheadMs == moments.first?.capturedAtMs {
-            onApproachTimelineEdge?(.older)
+            requestTimelineExtend(.older)
         } else if delta > 0, !stepped.isLive, stepped.playheadMs == moments.last?.capturedAtMs {
-            onApproachTimelineEdge?(.newer)
+            requestTimelineExtend(.newer)
         }
         selectPlayhead(playheadMs: stepped.playheadMs, isLive: stepped.isLive)
     }
@@ -926,15 +926,29 @@ public struct RecallView: View {
 
     private func requestTimelineExtendIfNeeded(clampedMs: Int64, isLive: Bool) {
         // Compare against the unfrozen spine. The scrub layout is frozen so
-        // a neighbour merge cannot jump the drag origin; that frozen start/end
-        // would otherwise look like an edge for the whole gesture.
+        // a neighbour merge cannot jump the drag origin. Start the fetch with
+        // enough room for it to return before the old edge is visible.
         let live = liveTimelineLayout
-        if clampedMs <= live.startMs {
-            if isScrubbing, !requestedExtendDuringScrub.insert(.older).inserted { return }
-            onApproachTimelineEdge?(.older)
-        } else if !isLive, clampedMs >= live.endMs {
-            if isScrubbing, !requestedExtendDuringScrub.insert(.newer).inserted { return }
-            onApproachTimelineEdge?(.newer)
+        if let direction = TimelineEdgePrefetch.direction(
+            playheadMs: clampedMs,
+            isLive: isLive,
+            movementDirection: movementDirection,
+            layout: live,
+            viewportWidth: timelineViewportWidth
+        ) {
+            requestTimelineExtend(direction)
+        }
+    }
+
+    private func requestTimelineExtend(_ direction: TimelineExtendDirection) {
+        if isScrubbing, !requestedExtendDuringScrub.insert(direction).inserted { return }
+        guard let onApproachTimelineEdge else { return }
+        Task { @MainActor in
+            guard await onApproachTimelineEdge(direction), isScrubbing else { return }
+            // The fetch began before the clamp. Once it lands, adopt its
+            // mapping so a held trackpad gesture can enter the new day rather
+            // than needing a reverse swipe to start another one.
+            frozenScrubLayout = liveTimelineLayout
         }
     }
 

@@ -418,6 +418,35 @@ public struct TimelineLayout: Equatable, Sendable {
     }
 }
 
+/// Starts a bounded day fetch while a scrub still has room before the loaded
+/// edge. Waiting for `clamp()` to hit the edge leaves an unavoidable blank
+/// while the daemon request is in flight.
+enum TimelineEdgePrefetch {
+    static let minimumLeadPoints: CGFloat = 160
+    static let viewportFraction: CGFloat = 0.35
+
+    static func direction(
+        playheadMs: Int64,
+        isLive: Bool,
+        movementDirection: Int,
+        layout: TimelineLayout,
+        viewportWidth: CGFloat
+    ) -> TimelineExtendDirection? {
+        let lead = min(
+            max(minimumLeadPoints, viewportWidth * viewportFraction),
+            layout.contentWidth * 0.45
+        )
+        let x = layout.x(ms: playheadMs)
+        if movementDirection < 0, x <= lead {
+            return .older
+        }
+        if movementDirection > 0, !isLive, layout.contentWidth - x <= lead {
+            return .newer
+        }
+        return nil
+    }
+}
+
 /// Keeps one `TimelineLayout` alive across renders, rebuilding only what its
 /// inputs invalidate. Main thread only — it is held by a view's `@State` and
 /// read from `body`.

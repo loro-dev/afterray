@@ -1405,7 +1405,7 @@ private struct AfterRayRootView: View {
             onSelectSearchFrame: selectSearchFrame,
             // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
             onApproachTimelineEdge: { direction in
-                Task { await store.extendTimeline(direction: direction) }
+                await store.extendTimeline(direction: direction)
             }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
