@@ -30,8 +30,10 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// summary body (`details`) to the day summary and the export — additive on
 /// the wire, but a client that does not read it renders a v3 card as a title
 /// with nothing under it, and a silent empty panel is exactly the failure the
-/// strict handshake exists to turn into a loud one.
-pub const PROTOCOL_VERSION: u32 = 15;
+/// strict handshake exists to turn into a loud one. 16 adds `timeline_range`
+/// (a bounded local-day index, no OCR/transcript concat) so the overlay does
+/// not have to download the whole vault to paint a playhead.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +68,13 @@ pub enum Request {
     TimelineList,
     TimelineSince {
         since_ms: i64,
+    },
+    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    /// Inclusive `[from_ms, to_ms]` index of moments. The overlay holds a
+    /// sliding window of local days. Rows omit concatenated OCR and transcripts.
+    TimelineRange {
+        from_ms: i64,
+        to_ms: i64,
     },
     MomentsList {
         session_id: String,
@@ -1518,6 +1527,16 @@ mod tests {
     fn timeline_cursor_wire_shape_is_stable() {
         let json = serde_json::to_string(&Request::TimelineSince { since_ms: 42 }).unwrap();
         assert_eq!(json, r#"{"type":"timeline_since","since_ms":42}"#);
+    }
+
+    #[test]
+    fn timeline_range_wire_shape_is_stable() {
+        let json = serde_json::to_string(&Request::TimelineRange {
+            from_ms: 1,
+            to_ms: 2,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"timeline_range","from_ms":1,"to_ms":2}"#);
     }
 
     #[test]

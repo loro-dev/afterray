@@ -589,6 +589,7 @@ extension AfterRayCopy {
         hotKey: HotKey(
             spotlightConflict: "macOS 将 ⌘空格键 分配给“聚焦”，因此可能无法传到 AfterRay。",
             inputSourceConflict: "macOS 将 ⌃空格键 分配给输入法，因此可能无法传到 AfterRay。",
+            screenshotConflict: "这是 macOS 的截图快捷键。AfterRay 会从系统抢走它。",
             needsModifier: "请同时按住 ⌘、⌥ 或 ⌃，否则打字时也会触发。",
             commandAlone: { "\($0) 已被其他应用占用。请加上 ⇧、⌥ 或 ⌃ 作为你的快捷键。" },
             unsupportedKey: "这个键不能作为快捷键主键。请换一个。",

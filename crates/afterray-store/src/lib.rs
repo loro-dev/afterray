@@ -1144,133 +1144,41 @@ impl Vault {
 
     pub fn moments_sync(&self, session_id: &str) -> Result<Vec<Moment>, StoreError> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
-                    (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
-                    (SELECT group_concat(te.text, '\n')
-                       FROM text_evidence te
-                       JOIN audio_segments audio ON audio.id = te.audio_segment_id
-                      WHERE audio.session_id = m.session_id
-                        AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                        AND te.source = 'transcript'),
-                    (SELECT audio.audio_artifact_id
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    (SELECT audio.started_at_ms
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    m.accessibility_artifact_id,
-                    m.application_name,
-                    m.bundle_identifier,
-                    m.window_title,
-                    m.url,
-                    m.document,
-                    (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
-                    m.gop_index,
-                    m.still_origin,
-                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
-             FROM moments m WHERE m.session_id = ?1 ORDER BY m.captured_at_ms",
-        )?;
-        let rows = statement.query_map([session_id], moment_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        query_moments(
+            &connection,
+            "WHERE m.session_id = ?1 ORDER BY m.captured_at_ms",
+            params![session_id],
+        )
     }
 
     pub fn timeline_sync(&self) -> Result<Vec<Moment>, StoreError> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
-                    (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
-                    (SELECT group_concat(te.text, '\n')
-                       FROM text_evidence te
-                       JOIN audio_segments audio ON audio.id = te.audio_segment_id
-                      WHERE audio.session_id = m.session_id
-                        AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                        AND te.source = 'transcript'),
-                    (SELECT audio.audio_artifact_id
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    (SELECT audio.started_at_ms
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    m.accessibility_artifact_id,
-                    m.application_name,
-                    m.bundle_identifier,
-                    m.window_title,
-                    m.url,
-                    m.document,
-                    (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
-                    m.gop_index,
-                    m.still_origin,
-                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
-             FROM moments m ORDER BY m.captured_at_ms, m.id",
-        )?;
-        let rows = statement.query_map([], moment_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        query_moments(
+            &connection,
+            "ORDER BY m.captured_at_ms, m.id",
+            params![],
+        )
     }
 
     pub fn timeline_since_sync(&self, since_ms: i64) -> Result<Vec<Moment>, StoreError> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
-                    (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
-                    (SELECT group_concat(te.text, '\n')
-                       FROM text_evidence te
-                       JOIN audio_segments audio ON audio.id = te.audio_segment_id
-                      WHERE audio.session_id = m.session_id
-                        AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                        AND te.source = 'transcript'),
-                    (SELECT audio.audio_artifact_id
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    (SELECT audio.started_at_ms
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    m.accessibility_artifact_id,
-                    m.application_name,
-                    m.bundle_identifier,
-                    m.window_title,
-                    m.url,
-                    m.document,
-                    (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
-                    m.gop_index,
-                    m.still_origin,
-                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
-             FROM moments m
-             WHERE m.captured_at_ms >= ?1
-             ORDER BY m.captured_at_ms, m.id",
-        )?;
-        let rows = statement.query_map([since_ms], moment_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        query_moments(
+            &connection,
+            "WHERE m.captured_at_ms >= ?1 ORDER BY m.captured_at_ms, m.id",
+            params![since_ms],
+        )
+    }
+
+    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    /// Inclusive `[from_ms, to_ms]` playhead index. Omits concatenated OCR and
+    /// transcripts; those stay on `moment_by_id` / evidence reads.
+    pub fn timeline_range_sync(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Moment>, StoreError> {
+        let connection = self.readers.get();
+        query_moment_index(
+            &connection,
+            "WHERE m.captured_at_ms >= ?1 AND m.captured_at_ms <= ?2 ORDER BY m.captured_at_ms, m.id",
+            params![from_ms, to_ms],
+        )
     }
 
     pub fn insert_moment(
@@ -6035,6 +5943,100 @@ fn migrate_query_indexes(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+// @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+/// Playhead / list index: identity, time, app, still/GOP/audio pointers.
+/// `ocr_text` and `transcript_text` are always NULL here — concatenating them
+/// per row is what made `timeline_list` miss the unary deadline.
+fn query_moment_index(
+    connection: &Connection,
+    filter_sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<Moment>, StoreError> {
+    let sql = format!(
+        "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
+                NULL, NULL,
+                (SELECT audio.audio_artifact_id
+                   FROM audio_segments audio
+                  WHERE audio.session_id = m.session_id
+                    AND audio.started_at_ms <= m.captured_at_ms + 30000
+                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                    audio.started_at_ms DESC
+                  LIMIT 1),
+                (SELECT audio.started_at_ms
+                   FROM audio_segments audio
+                  WHERE audio.session_id = m.session_id
+                    AND audio.started_at_ms <= m.captured_at_ms + 30000
+                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                    audio.started_at_ms DESC
+                  LIMIT 1),
+                m.accessibility_artifact_id,
+                m.application_name,
+                m.bundle_identifier,
+                m.window_title,
+                m.url,
+                m.document,
+                (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
+                m.gop_index,
+                m.still_origin,
+                (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
+         FROM moments m {filter_sql}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params, moment_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Historical session/timeline reads retain their established evidence shape.
+/// Only the overlay's bounded `timeline_range` is a lean index.
+fn query_moments(
+    connection: &Connection,
+    filter_sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<Moment>, StoreError> {
+    let sql = format!(
+        "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
+                (SELECT group_concat(te.text, '\\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
+                (SELECT group_concat(te.text, '\\n')
+                   FROM text_evidence te
+                   JOIN audio_segments audio ON audio.id = te.audio_segment_id
+                  WHERE audio.session_id = m.session_id
+                    AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
+                    AND te.source = 'transcript'),
+                (SELECT audio.audio_artifact_id
+                   FROM audio_segments audio
+                  WHERE audio.session_id = m.session_id
+                    AND audio.started_at_ms <= m.captured_at_ms + 30000
+                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                    audio.started_at_ms DESC
+                  LIMIT 1),
+                (SELECT audio.started_at_ms
+                   FROM audio_segments audio
+                  WHERE audio.session_id = m.session_id
+                    AND audio.started_at_ms <= m.captured_at_ms + 30000
+                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
+                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
+                    audio.started_at_ms DESC
+                  LIMIT 1),
+                m.accessibility_artifact_id,
+                m.application_name,
+                m.bundle_identifier,
+                m.window_title,
+                m.url,
+                m.document,
+                (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
+                m.gop_index,
+                m.still_origin,
+                (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
+         FROM moments m {filter_sql}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params, moment_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
     Ok(Moment {
         id: row.get(0)?,
@@ -7369,6 +7371,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             [second.id.as_str()]
         );
+        assert_eq!(
+            vault
+                .timeline_range_sync(200, 210)
+                .unwrap()
+                .iter()
+                .map(|moment| moment.id.as_str())
+                .collect::<Vec<_>>(),
+            [second.id.as_str()]
+        );
+        assert!(vault.timeline_range_sync(111, 209).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeline_index_omits_ocr_and_transcript_text() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 110, "image/jpeg", b"frame")
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&moment.id),
+                None,
+                "ocr",
+                "secret screen text",
+                110,
+                None,
+                "test",
+                None,
+            )
+            .unwrap();
+
+        let listed = vault.timeline_range_sync(0, 1_000).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, moment.id);
+        assert_eq!(listed[0].ocr_text, None);
+        assert_eq!(listed[0].transcript_text, None);
+
+        let detailed = vault.moment_by_id(&moment.id).unwrap().unwrap();
+        assert_eq!(detailed.ocr_text.as_deref(), Some("secret screen text"));
     }
 
     #[test]

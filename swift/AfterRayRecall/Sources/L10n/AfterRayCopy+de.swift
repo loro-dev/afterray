@@ -589,6 +589,7 @@ extension AfterRayCopy {
         hotKey: HotKey(
             spotlightConflict: "macOS weist ⌘Leertaste Spotlight zu, daher erreicht sie AfterRay möglicherweise nicht.",
             inputSourceConflict: "macOS weist ⌃Leertaste den Eingabequellen zu, daher erreicht sie AfterRay möglicherweise nicht.",
+            screenshotConflict: "Das ist ein macOS-Bildschirmfoto-Kurzbefehl. AfterRay würde ihn dem System wegnehmen.",
             needsModifier: "Halten Sie zusätzlich ⌘, ⌥ oder ⌃ — sonst würde das beim Tippen auslösen.",
             commandAlone: { "\($0) gehört bereits anderen Apps. Fügen Sie ⇧, ⌥ oder ⌃ hinzu." },
             unsupportedKey: "Diese Taste kann keinen Kurzbefehl verankern. Versuchen Sie eine andere.",

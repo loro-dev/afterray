@@ -612,6 +612,7 @@ extension AfterRayCopy {
     public struct HotKey {
         public var spotlightConflict: String
         public var inputSourceConflict: String
+        public var screenshotConflict: String
         public var needsModifier: String
         public var commandAlone: (String) -> String
         public var unsupportedKey: String

@@ -79,6 +79,49 @@ final class RecallHotKeyTests: XCTestCase {
         )
     }
 
+    func testSystemConflictWarnsWhenTheShortcutIsAStockScreenshot() {
+        let screenshot = RecallHotKey(keyCode: 21, modifiers: [.shift, .command], keyLabel: "4")
+        XCTAssertEqual(
+            screenshot.systemConflictNote,
+            AfterRayCopy.english.hotKey.screenshotConflict
+        )
+        XCTAssertNil(
+            RecallHotKey(keyCode: 21, modifiers: [.command], keyLabel: "4").systemConflictNote
+        )
+    }
+
+    func testDefaultShortcutYieldsToScreenshotNumbersButNotToItself() {
+        let hotKey = RecallHotKey.default
+        XCTAssertTrue(
+            hotKey.shouldYieldToSystemScreenshot(keyCode: 20, modifiers: [.shift, .command])
+        )
+        XCTAssertTrue(
+            hotKey.shouldYieldToSystemScreenshot(keyCode: 21, modifiers: [.shift, .command])
+        )
+        XCTAssertTrue(
+            hotKey.shouldYieldToSystemScreenshot(keyCode: 23, modifiers: [.shift, .command])
+        )
+        XCTAssertTrue(
+            hotKey.shouldYieldToSystemScreenshot(keyCode: 22, modifiers: [.shift, .command])
+        )
+        XCTAssertFalse(
+            hotKey.shouldYieldToSystemScreenshot(keyCode: 49, modifiers: [.shift, .command])
+        )
+        XCTAssertFalse(
+            hotKey.shouldYieldToSystemScreenshot(keyCode: 21, modifiers: [.command])
+        )
+    }
+
+    func testAScreenshotBindingDoesNotYieldTheNumberItOwns() {
+        let bound = RecallHotKey(keyCode: 21, modifiers: [.shift, .command], keyLabel: "4")
+        XCTAssertFalse(
+            bound.shouldYieldToSystemScreenshot(keyCode: 21, modifiers: [.shift, .command])
+        )
+        XCTAssertTrue(
+            bound.shouldYieldToSystemScreenshot(keyCode: 20, modifiers: [.shift, .command])
+        )
+    }
+
     func testMenuKeyEquivalentSkipsKeysAppKitCannotDraw() {
         XCTAssertEqual(RecallHotKey.default.menuKeyEquivalent, " ")
         XCTAssertEqual(

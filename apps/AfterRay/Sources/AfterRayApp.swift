@@ -577,6 +577,10 @@ final class RecallOverlayController: RecallHotKeyBinding {
     private var resignKeyObserver: NSObjectProtocol?
     private var screenObserver: NSObjectProtocol?
     private var keyMonitor: Any?
+    private var screenshotYieldMonitors: [Any] = []
+    private var screenshotLaunchObserver: NSObjectProtocol?
+    private var screenshotTerminateObserver: NSObjectProtocol?
+    private var yieldingToScreenshot = false
 
     func start() {
         guard panel == nil else { return }
@@ -623,6 +627,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
         }
         registerHotKey()
         installKeyMonitor()
+        installScreenshotYield()
         installScreenObserver()
 
         // Keep the hosting tree alive so capture can bootstrap in the
@@ -655,9 +660,11 @@ final class RecallOverlayController: RecallHotKeyBinding {
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        removeScreenshotYield()
         hotKey = nil
         eventHandler = nil
         keyMonitor = nil
+        yieldingToScreenshot = false
         if let resignKeyObserver {
             NotificationCenter.default.removeObserver(resignKeyObserver)
         }
@@ -818,6 +825,123 @@ final class RecallOverlayController: RecallHotKeyBinding {
         }
     }
 
+    /// Carbon consumes ⇧⌘Space before Screenshot can use Space to enter
+    /// window mode. The chord must be unregistered on ⇧⌘3/4/5/6, not in the
+    /// hotkey handler — by then the Space is already gone.
+    private func installScreenshotYield() {
+        let noteCenter = NSWorkspace.shared.notificationCenter
+        screenshotLaunchObserver = noteCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { notification in
+            Task { @MainActor in
+                let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                    as? NSRunningApplication
+                guard ScreenshotUIProcess.isScreenshotApp(app?.bundleIdentifier) else { return }
+                RecallOverlayController.shared.beginYieldingToScreenshot()
+            }
+        }
+        screenshotTerminateObserver = noteCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { notification in
+            Task { @MainActor in
+                let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                    as? NSRunningApplication
+                let running = NSWorkspace.shared.runningApplications.map {
+                    (bundleIdentifier: $0.bundleIdentifier, processIdentifier: $0.processIdentifier)
+                }
+                guard ScreenshotUIProcess.shouldResumeAfterTermination(
+                    bundleIdentifier: app?.bundleIdentifier,
+                    processIdentifier: app?.processIdentifier,
+                    running: running
+                ) else { return }
+                RecallOverlayController.shared.endYieldingToScreenshot()
+            }
+        }
+
+        let onEvent = { (event: NSEvent) in
+            RecallOverlayController.shared.handleScreenshotYieldEvent(event)
+        }
+        if let local = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .flagsChanged],
+            handler: { event in
+                onEvent(event)
+                return event
+            }
+        ) {
+            screenshotYieldMonitors.append(local)
+        }
+        if let global = NSEvent.addGlobalMonitorForEvents(
+            matching: [.keyDown, .flagsChanged],
+            handler: onEvent
+        ) {
+            screenshotYieldMonitors.append(global)
+        }
+    }
+
+    private func removeScreenshotYield() {
+        for monitor in screenshotYieldMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        screenshotYieldMonitors = []
+        if let screenshotLaunchObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(screenshotLaunchObserver)
+        }
+        if let screenshotTerminateObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(screenshotTerminateObserver)
+        }
+        screenshotLaunchObserver = nil
+        screenshotTerminateObserver = nil
+    }
+
+    fileprivate func handleScreenshotYieldEvent(_ event: NSEvent) {
+        let modifiers = RecallHotKey.Modifiers(event.modifierFlags)
+        if event.type == .keyDown {
+            if RecallHotKeyStore.shared.hotKey.shouldYieldToSystemScreenshot(
+                keyCode: event.keyCode,
+                modifiers: modifiers
+            ) {
+                beginYieldingToScreenshot()
+            }
+            return
+        }
+        guard event.type == .flagsChanged, yieldingToScreenshot else { return }
+        // Screenshot selection survives releasing ⇧⌘. Only re-arm if the
+        // UI never appeared — otherwise Space would still be stolen.
+        let stillHolding = modifiers.contains(.command) || modifiers.contains(.shift)
+        guard !stillHolding, !screenshotUIIsRunning() else { return }
+        endYieldingToScreenshot()
+    }
+
+    // @dec:screenshot-hotkey-yield — docs/decisions/active/product/2026-08-21-screenshot-hotkey-yield.md
+    fileprivate func beginYieldingToScreenshot() {
+        if isVisible {
+            hide(returnFocus: true)
+        }
+        guard !yieldingToScreenshot else { return }
+        yieldingToScreenshot = true
+        if !RecallHotKeyStore.shared.isRecording {
+            hotKeyBindingSuspend()
+        }
+    }
+
+    fileprivate func endYieldingToScreenshot() {
+        guard yieldingToScreenshot else { return }
+        yieldingToScreenshot = false
+        if !RecallHotKeyStore.shared.isRecording {
+            hotKeyBindingResume()
+        }
+    }
+
+    fileprivate func screenshotUIIsRunning() -> Bool {
+        NSWorkspace.shared.runningApplications.contains {
+            ScreenshotUIProcess.isScreenshotApp($0.bundleIdentifier)
+        }
+    }
+
     fileprivate func shouldConsumeCloseKey(_ event: NSEvent) -> Bool {
         OverlayCloseKey.shouldDismiss(
             keyCode: event.keyCode,
@@ -830,6 +954,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 
     fileprivate func shouldConsumeAudioToggleKey(_ event: NSEvent) -> Bool {
+        guard !yieldingToScreenshot else { return false }
         guard panel?.isVisible == true, panel?.isKeyWindow == true else { return false }
         guard event.keyCode == 49 else { return false }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -866,6 +991,7 @@ final class RecallOverlayController: RecallHotKeyBinding {
     }
 
     func hotKeyBindingResume() {
+        guard !yieldingToScreenshot else { return }
         installHotKey(RecallHotKeyStore.shared.hotKey)
     }
 
@@ -1276,7 +1402,11 @@ private struct AfterRayRootView: View {
             ocrLoader: { momentID in
                 try await images.ocrEvidence(momentID: momentID)
             },
-            onSelectSearchFrame: selectSearchFrame
+            onSelectSearchFrame: selectSearchFrame,
+            // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+            onApproachTimelineEdge: { direction in
+                Task { await store.extendTimeline(direction: direction) }
+            }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
@@ -1352,6 +1482,10 @@ private struct AfterRayRootView: View {
         }
         .task(id: audioPrefetchKey) {
             audioPlayer.prefetch(artifactID: audioPrefetchKey.isEmpty ? nil : audioPrefetchKey)
+        }
+        .task(id: store.selectedMoment?.id) {
+            await store.hydrateSelectedEvidence()
+            await store.prefetchAdjacentTimelineDays()
         }
         .task {
             await bootstrap()
@@ -1467,7 +1601,11 @@ private struct AfterRayRootView: View {
                 }
             }
         } else {
-            store.select(playheadMs: slot.slotStartMs)
+            Task {
+                await store.ensureTimelineContains(ms: slot.slotStartMs)
+                store.select(playheadMs: slot.slotStartMs)
+                await store.prefetchAdjacentTimelineDays()
+            }
         }
     }
 
@@ -1521,6 +1659,7 @@ private struct AfterRayRootView: View {
         }
         guard !AfterRayTerminationState.shared.isTerminating else { return }
         await store.loadTimeline()
+        await store.prefetchAdjacentTimelineDays()
     }
 
     /// Every permission completion path converges here: returning from System
@@ -1629,6 +1768,14 @@ private struct AfterRayRootView: View {
         withTransaction(transaction) {
             store.selectLatestMoment()
             isLive = true
+        }
+        let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
+        Task {
+            await store.loadTimeline(
+                containingMs: nowMs,
+                preservingSelection: false
+            )
+            await store.prefetchAdjacentTimelineDays()
         }
     }
 

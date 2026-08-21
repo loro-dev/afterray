@@ -117,3 +117,48 @@ final class OverlayCloseKeyTests: XCTestCase {
         )
     }
 }
+
+final class ScreenshotUIProcessTests: XCTestCase {
+    func testRecognisesTheScreenshotUIBundles() {
+        XCTAssertTrue(ScreenshotUIProcess.isScreenshotApp("com.apple.screencaptureui"))
+        XCTAssertTrue(ScreenshotUIProcess.isScreenshotApp("com.apple.screenshot.launcher"))
+        XCTAssertTrue(ScreenshotUIProcess.isScreenshotApp("com.apple.Screenshot"))
+        XCTAssertFalse(ScreenshotUIProcess.isScreenshotApp("com.apple.finder"))
+        XCTAssertFalse(ScreenshotUIProcess.isScreenshotApp(nil))
+    }
+
+    func testResumesWhenTheLastScreenshotUIExits() {
+        XCTAssertTrue(
+            ScreenshotUIProcess.shouldResumeAfterTermination(
+                bundleIdentifier: "com.apple.screencaptureui",
+                processIdentifier: 11,
+                running: [
+                    (bundleIdentifier: "com.apple.screencaptureui", processIdentifier: 11),
+                    (bundleIdentifier: "com.apple.finder", processIdentifier: 2),
+                ]
+            )
+        )
+    }
+
+    func testStaysYieldedWhileAnotherScreenshotUIIsAlive() {
+        XCTAssertFalse(
+            ScreenshotUIProcess.shouldResumeAfterTermination(
+                bundleIdentifier: "com.apple.screencaptureui",
+                processIdentifier: 11,
+                running: [
+                    (bundleIdentifier: "com.apple.screenshot.launcher", processIdentifier: 12),
+                ]
+            )
+        )
+    }
+
+    func testIgnoresUnrelatedTerminations() {
+        XCTAssertFalse(
+            ScreenshotUIProcess.shouldResumeAfterTermination(
+                bundleIdentifier: "com.apple.finder",
+                processIdentifier: 2,
+                running: []
+            )
+        )
+    }
+}

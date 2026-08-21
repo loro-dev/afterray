@@ -38,6 +38,7 @@ pub fn cli_request_class(request: &Request) -> CliRequestClass {
         | Request::SessionsList
         | Request::TimelineList
         | Request::TimelineSince { .. }
+        | Request::TimelineRange { .. }
         | Request::MomentsList { .. }
         | Request::RecallWindow { .. }
         | Request::Search { .. }
@@ -107,6 +108,7 @@ pub fn redact_cli_response_data(request: &Request, data: &mut Value) {
         Request::MomentGet { .. } | Request::MomentAt { .. } => strip_moment_object(data),
         Request::TimelineList
         | Request::TimelineSince { .. }
+        | Request::TimelineRange { .. }
         | Request::MomentsList { .. }
         | Request::RecallWindow { .. } => {
             if let Some(items) = data.as_array_mut() {

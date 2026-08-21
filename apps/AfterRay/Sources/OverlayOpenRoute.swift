@@ -62,3 +62,33 @@ enum OverlayCloseKey {
         return keyCode == escapeKeyCode || isCommandW
     }
 }
+
+/// The processes macOS uses for ⇧⌘3 / ⇧⌘4 / ⇧⌘5. While any of them is
+/// running, AfterRay must not re-arm ⇧⌘Space — that Space is how window
+/// screenshot mode is entered.
+enum ScreenshotUIProcess {
+    static let bundleIDs: Set<String> = [
+        "com.apple.screencaptureui",
+        "com.apple.screenshot.launcher",
+        "com.apple.Screenshot",
+    ]
+
+    static func isScreenshotApp(_ bundleIdentifier: String?) -> Bool {
+        guard let bundleIdentifier else { return false }
+        return bundleIDs.contains(bundleIdentifier)
+    }
+
+    /// `didTerminate` can still list the dying process. Resume only when no
+    /// other screenshot UI is alive.
+    static func shouldResumeAfterTermination(
+        bundleIdentifier: String?,
+        processIdentifier: pid_t?,
+        running: [(bundleIdentifier: String?, processIdentifier: pid_t)]
+    ) -> Bool {
+        guard isScreenshotApp(bundleIdentifier) else { return false }
+        return !running.contains {
+            isScreenshotApp($0.bundleIdentifier)
+                && $0.processIdentifier != processIdentifier
+        }
+    }
+}

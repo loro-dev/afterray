@@ -1194,6 +1194,12 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             })
             .await
         }
+        Request::TimelineRange { from_ms, to_ms } => {
+            run_store(state, move |s| {
+                into_response(s.store.timeline_range_sync(from_ms, to_ms))
+            })
+            .await
+        }
         Request::MomentsList { session_id } => {
             run_store(state, move |s| {
                 into_response(s.store.moments_sync(&session_id))

@@ -61,7 +61,12 @@ public struct RecallHotKey: Equatable, Sendable, Codable {
         self.keyLabel = keyLabel
     }
 
-    /// ⇧⌘Space: reachable with one hand, and free on a stock macOS install.
+    /// ANSI key codes for the stock screenshot numbers: 3, 4, 5, 6.
+    public static let systemScreenshotNumberKeyCodes: Set<UInt16> = [20, 21, 23, 22]
+
+    /// ⇧⌘Space: reachable with one hand. It is not a stock macOS shortcut
+    /// on its own, but Carbon would steal the Space from the stock window-
+    /// screenshot sequence (⇧⌘4, then Space) unless the app yields first.
     public static let `default` = RecallHotKey(
         keyCode: 49,
         modifiers: [.shift, .command],
@@ -81,10 +86,32 @@ public struct RecallHotKey: Equatable, Sendable, Codable {
     }
 
     public func systemConflictNote(_ copy: AfterRayCopy) -> String? {
+        if isSystemScreenshotShortcut { return copy.hotKey.screenshotConflict }
         guard keyCode == 49 else { return nil }
         if modifiers == [.command] { return copy.hotKey.spotlightConflict }
         if modifiers == [.control] { return copy.hotKey.inputSourceConflict }
         return nil
+    }
+
+    public var isSystemScreenshotShortcut: Bool {
+        modifiers == [.shift, .command]
+            && Self.systemScreenshotNumberKeyCodes.contains(keyCode)
+    }
+
+    // @dec:screenshot-hotkey-yield — docs/decisions/active/product/2026-08-21-screenshot-hotkey-yield.md
+    /// `RegisterEventHotKey` consumes the chord before Screenshot sees it.
+    /// ⇧⌘Space is AfterRay's default, and also the second press of ⇧⌘4 then
+    /// Space. Seeing a screenshot number must drop the Carbon registration
+    /// before that Space arrives — unless AfterRay itself is bound to the
+    /// number, in which case Carbon already owns it.
+    public func shouldYieldToSystemScreenshot(
+        keyCode: UInt16,
+        modifiers: Modifiers
+    ) -> Bool {
+        guard modifiers == [.shift, .command],
+              Self.systemScreenshotNumberKeyCodes.contains(keyCode)
+        else { return false }
+        return keyCode != self.keyCode || self.modifiers != modifiers
     }
 
     /// Empty when the key has no menu representation, which keeps AppKit from

@@ -23,6 +23,8 @@ public protocol RecallDaemonServing: Sendable {
     func sessions() async throws -> [RecallSession]
     func timeline() async throws -> [RecallMoment]
     func timeline(sinceMs: Int64) async throws -> [RecallMoment]
+    /// Inclusive `[fromMs, toMs]` playhead index. Default filters `timeline()`.
+    func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment]
     func moments(sessionID: String) async throws -> [RecallMoment]
     func recallWindow(sessionID: String, centerMs: Int64, limit: Int) async throws -> [RecallMoment]
     func daySummary(dayMs: Int64) async throws -> DaySummary
@@ -42,6 +44,10 @@ public protocol RecallDaemonServing: Sendable {
 }
 
 public extension RecallDaemonServing {
+    func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment] {
+        try await timeline().filter { $0.capturedAtMs >= fromMs && $0.capturedAtMs <= toMs }
+    }
+
     func gopSegment(id _: String) async throws -> ArtifactPayload {
         throw DaemonClientError.rejected("gop segment reads are not available")
     }
@@ -221,7 +227,8 @@ public extension AfterRayDaemonServing {
 // @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
 // @dec:daemon-owns-the-vault — docs/decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    public static let protocolVersion = 15
+    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    public static let protocolVersion = 16
     /// Shutdown is a handoff, not a normal query. A wedged daemon must not hold
     /// application termination behind the ordinary 30-second unary deadline.
     public static let shutdownReceiveTimeout: TimeInterval = 1.5
@@ -244,6 +251,14 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     public func timeline(sinceMs: Int64) async throws -> [RecallMoment] {
         try await request(
             WireRequest(type: "timeline_since", sinceMs: sinceMs),
+            as: [RecallMoment].self
+        )
+    }
+
+    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    public func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment] {
+        try await request(
+            WireRequest(type: "timeline_range", fromMs: fromMs, toMs: toMs),
             as: [RecallMoment].self
         )
     }

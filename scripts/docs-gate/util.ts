@@ -15,6 +15,9 @@ const SKIP = new Set([
   '.afterray-dev',
   '.scratch',
   'vendor',
+  '.claude',
+  '.delta',
+  '.ref-libs',
 ])
 
 export interface Finding {

@@ -589,6 +589,7 @@ extension AfterRayCopy {
         hotKey: HotKey(
             spotlightConflict: "macOS asigna ⌘Espacio a Spotlight, así que puede que no llegue a AfterRay.",
             inputSourceConflict: "macOS asigna ⌃Espacio a las fuentes de entrada, así que puede que no llegue a AfterRay.",
+            screenshotConflict: "Es un atajo de captura de macOS. AfterRay se lo quitaría al sistema.",
             needsModifier: "Mantén también ⌘, ⌥ o ⌃; si no, se dispararía al escribir.",
             commandAlone: { "\($0) ya pertenece a otras apps. Añade ⇧, ⌥ o ⌃ para que sea tuya." },
             unsupportedKey: "Esa tecla no puede anclar un atajo. Prueba otra.",

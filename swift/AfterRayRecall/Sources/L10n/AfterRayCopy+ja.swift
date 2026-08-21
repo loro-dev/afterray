@@ -589,6 +589,7 @@ extension AfterRayCopy {
         hotKey: HotKey(
             spotlightConflict: "macOSは⌘スペースをSpotlightに割り当てているため、AfterRayに届かないことがあります。",
             inputSourceConflict: "macOSは⌃スペースを入力ソースに割り当てているため、AfterRayに届かないことがあります。",
+            screenshotConflict: "macOSのスクリーンショット用ショートカットです。AfterRayがシステムから奪ってしまいます。",
             needsModifier: "⌘、⌥、⌃のいずれかを同時に押してください。そうしないと入力中にも反応します。",
             commandAlone: { "\($0) はほかのAppが使っています。⇧、⌥、⌃を加えて専用にしてください。" },
             unsupportedKey: "このキーはショートカットの主キーにできません。別のキーを試してください。",

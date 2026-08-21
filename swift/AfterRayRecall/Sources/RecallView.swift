@@ -75,6 +75,10 @@ public struct RecallView: View {
     public var thumbnailLoader: RecallThumbnailLoader?
     public var ocrLoader: RecallOcrLoader?
     public var onSelectSearchFrame: ((Int) -> Void)?
+    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    /// Fired when travel hits the first or last loaded capture so the owner
+    /// can grow the playhead window by a neighbouring day.
+    public var onApproachTimelineEdge: ((TimelineExtendDirection) -> Void)?
 
     @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
     @State private var searchDragOrigin: Int?
@@ -98,6 +102,14 @@ public struct RecallView: View {
     @AppStorage(DaySummaryLayout.expandedStorageKey) private var daySummaryExpanded = true
     @State private var settledStill: SettledStill?
     @State private var searchScrollAccumulator: CGFloat = 0
+    /// Layout snapshot for the current scrub. Neighbour days may merge in
+    /// while the gesture is live; freezing x-mapping keeps the drag origin
+    /// from jumping when `visualTotalMs` changes.
+    @State private var frozenScrubLayout: TimelineLayout?
+    /// One neighbour fetch per edge per gesture. The frozen layout stays
+    /// parked on the old start/end, so without this a held drag would keep
+    /// walking older days until the seven-day cap.
+    @State private var requestedExtendDuringScrub: Set<TimelineExtendDirection> = []
     /// Trackpad travel needed to advance one filmstrip cell.
     private static let searchScrollPointsPerCell: CGFloat = 46
     @State private var highlightRegions: [OcrRegion] = []
@@ -143,7 +155,8 @@ public struct RecallView: View {
         searchSession: RecallSearchSession? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
         ocrLoader: RecallOcrLoader? = nil,
-        onSelectSearchFrame: ((Int) -> Void)? = nil
+        onSelectSearchFrame: ((Int) -> Void)? = nil,
+        onApproachTimelineEdge: ((TimelineExtendDirection) -> Void)? = nil
     ) {
         self.moments = moments
         self._playheadMs = playheadMs
@@ -180,6 +193,7 @@ public struct RecallView: View {
         self.thumbnailLoader = thumbnailLoader
         self.ocrLoader = ocrLoader
         self.onSelectSearchFrame = onSelectSearchFrame
+        self.onApproachTimelineEdge = onApproachTimelineEdge
     }
 
     private var selectedAudioIsActive: Bool {
@@ -211,7 +225,10 @@ public struct RecallView: View {
     /// playhead setter, and `body`. Building it there meant sorting and
     /// scanning every capture of the day three times a frame.
     private var timelineLayout: TimelineLayout {
-        layoutCache.layout(
+        if isScrubbing, let frozenScrubLayout {
+            return frozenScrubLayout
+        }
+        return layoutCache.layout(
             moments: moments,
             viewportWidth: max(timelineViewportWidth, 1),
             density: tuning.timelineDensity * Double(timelineZoom)
@@ -227,7 +244,7 @@ public struct RecallView: View {
                 RecallPalette.background.ignoresSafeArea()
             }
 
-            if !moments.isEmpty || renderedIsLive {
+            if !moments.isEmpty || renderedIsLive || summaryHistory.contains(where: { !$0.day.isEmpty }) {
                 recallContent
             } else if case .failed(let message) = loadState {
                 FailureView(message: message, onReload: onReload)
@@ -821,6 +838,11 @@ public struct RecallView: View {
             delta: delta,
             moments: moments
         )
+        if delta < 0, stepped.playheadMs == moments.first?.capturedAtMs {
+            onApproachTimelineEdge?(.older)
+        } else if delta > 0, !stepped.isLive, stepped.playheadMs == moments.last?.capturedAtMs {
+            onApproachTimelineEdge?(.newer)
+        }
         selectPlayhead(playheadMs: stepped.playheadMs, isLive: stepped.isLive)
     }
 
@@ -848,6 +870,12 @@ public struct RecallView: View {
         // of the run loop; a selection must not survive even one frame of
         // travel, or it sits over text it no longer describes.
         textSelection.clearSelection()
+        frozenScrubLayout = layoutCache.layout(
+            moments: moments,
+            viewportWidth: max(timelineViewportWidth, 1),
+            density: tuning.timelineDensity * Double(timelineZoom)
+        )
+        requestedExtendDuringScrub = []
         if holdsPlayhead {
             scrubPlayheadMs = playheadMs
             scrubIsLive = isLive
@@ -867,6 +895,7 @@ public struct RecallView: View {
         }
         scrubPlayheadMs = clampedMs
         scrubIsLive = nextLive
+        requestTimelineExtendIfNeeded(clampedMs: clampedMs, isLive: nextLive)
     }
 
     private func finishScrubbing() {
@@ -881,7 +910,31 @@ public struct RecallView: View {
             scrubPlayheadMs = nil
             scrubIsLive = nil
             isScrubbing = false
+            frozenScrubLayout = nil
+            requestedExtendDuringScrub = []
             followPulse += 1
+        }
+    }
+
+    private var liveTimelineLayout: TimelineLayout {
+        layoutCache.layout(
+            moments: moments,
+            viewportWidth: max(timelineViewportWidth, 1),
+            density: tuning.timelineDensity * Double(timelineZoom)
+        )
+    }
+
+    private func requestTimelineExtendIfNeeded(clampedMs: Int64, isLive: Bool) {
+        // Compare against the unfrozen spine. The scrub layout is frozen so
+        // a neighbour merge cannot jump the drag origin; that frozen start/end
+        // would otherwise look like an edge for the whole gesture.
+        let live = liveTimelineLayout
+        if clampedMs <= live.startMs {
+            if isScrubbing, !requestedExtendDuringScrub.insert(.older).inserted { return }
+            onApproachTimelineEdge?(.older)
+        } else if !isLive, clampedMs >= live.endMs {
+            if isScrubbing, !requestedExtendDuringScrub.insert(.newer).inserted { return }
+            onApproachTimelineEdge?(.newer)
         }
     }
 

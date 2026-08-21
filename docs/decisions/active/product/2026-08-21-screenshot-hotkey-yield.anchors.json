@@ -1,0 +1,5 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "apps/AfterRay/Sources/AfterRayApp.swift::fileprivate func beginYieldingToScreenshot() {": "sha256:fbc46659e02d3410",
+  "swift/AfterRayRecall/Sources/RecallHotKey.swift::public func shouldYieldToSystemScreenshot(": "sha256:0c3edcc3a9677a9f"
+}

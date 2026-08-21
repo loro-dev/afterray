@@ -589,6 +589,7 @@ extension AfterRayCopy {
         hotKey: HotKey(
             spotlightConflict: "macOS가 ⌘스페이스 바를 Spotlight에 할당하므로 AfterRay에 전달되지 않을 수 있습니다.",
             inputSourceConflict: "macOS가 ⌃스페이스 바를 입력 소스에 할당하므로 AfterRay에 전달되지 않을 수 있습니다.",
+            screenshotConflict: "macOS 스크린샷 단축키입니다. AfterRay가 시스템에서 가로챕니다.",
             needsModifier: "⌘, ⌥ 또는 ⌃를 함께 누르십시오. 그렇지 않으면 입력 중에도 실행됩니다.",
             commandAlone: { "\($0)은(는) 다른 앱이 사용합니다. ⇧, ⌥ 또는 ⌃를 더해 전용으로 만드십시오." },
             unsupportedKey: "이 키는 단축키의 기본 키로 쓸 수 없습니다. 다른 키를 시도하십시오.",

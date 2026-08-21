@@ -1,5 +1,11 @@
 import Foundation
 
+/// Which end of the loaded playhead window to grow.
+public enum TimelineExtendDirection: Hashable, Sendable {
+    case older
+    case newer
+}
+
 @MainActor
 public final class RecallStore: ObservableObject {
     @Published public private(set) var sessions: [RecallSession] = []
@@ -23,9 +29,24 @@ public final class RecallStore: ObservableObject {
     /// Prepared with the timeline off-main. Recomputing the median capture
     /// interval inside every selection made the final scrub commit O(n log n).
     private var timelineBounds: (startMs: Int64, endMs: Int64) = (0, 1)
+    /// Inclusive-start / exclusive-end span of local days currently represented
+    /// by `moments`, including probed empty days. Unlike `timelineBounds`, this
+    /// must not collapse to `(0, 1)` when there are no captures because the
+    /// live poll still needs a bounded query.
+    private var loadedTimelineDayBounds: (start: Int64, end: Int64)?
+    private var timelineHasOlder = true
+    private var timelineHasNewer = true
+    private var inFlightExtend: Set<TimelineExtendDirection> = []
     private var loadedDayKey: String?
     private var summaryHistoryCursorMs: Int64?
     private var summaryHistoryGeneration: UInt64 = 0
+
+    /// Days of lean index the overlay may hold. Enough to scrub across a
+    /// week; small enough that the warped playhead spine stays cheap.
+    public static let maxLoadedTimelineDays = 7
+    /// Empty local days to walk through when the previous/next calendar day
+    /// has no captures.
+    public static let emptyDaySkipLimit = 31
 
     public init(daemon: any RecallDaemonServing) {
         self.daemon = daemon
@@ -35,63 +56,111 @@ public final class RecallStore: ObservableObject {
         RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
     }
 
-    public func loadTimeline(preservingSelection: Bool = false) async {
+    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    public func loadTimeline(
+        containingMs requestedMs: Int64? = nil,
+        preservingSelection: Bool = false
+    ) async {
         let requestGeneration = sensitiveGeneration
+        let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
+        let anchorMs = requestedMs
+            ?? (playheadMs > 0 ? playheadMs : nowMs)
+        let bounds = DaySummaryLayout.dayBounds(ms: anchorMs)
+        // History cards are an independent read model. Start them before the
+        // playhead request so a slow/failed range cannot hold the panel empty.
+        async let summaryLoad: Void = loadDaySummary(dayMs: anchorMs, force: true)
         do {
-            let loadedSessions = try await daemon.sessions().sorted { $0.startedAtMs < $1.startedAtMs }
-            let rawMoments = try await daemon.timeline()
+            let loadedSessions = (try? await daemon.sessions())?.sorted { $0.startedAtMs < $1.startedAtMs } ?? []
+            let rawMoments = try await daemon.timeline(fromMs: bounds.start, toMs: bounds.end - 1)
             let prepared = await Self.prepareTimeline(rawMoments)
             guard sensitiveGeneration == requestGeneration else { return }
             sessions = loadedSessions
             apply(prepared, preservingSelection: preservingSelection)
-            await loadDaySummary(dayMs: playheadMs, force: true)
+            loadedTimelineDayBounds = bounds
+            inFlightExtend.removeAll()
+            timelineHasOlder = true
+            timelineHasNewer = bounds.end < DaySummaryLayout.dayBounds(ms: nowMs).end
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
-            if Self.isDaemonConnectionError(error) {
+            if Self.isDaemonConnectionError(error), case .failed = loadState {
+                await summaryLoad
                 return
             }
-            moments = []
-            timelineRevision &+= 1
-            capturedAtMsByMomentID = [:]
-            timelineBounds = (0, 1)
-            applyPlayhead(0)
-            daySummary = .empty
-            loadedDayKey = nil
+            if !Self.isDaemonConnectionError(error) {
+                moments = []
+                timelineRevision &+= 1
+                capturedAtMsByMomentID = [:]
+                timelineBounds = (0, 1)
+                applyPlayhead(0)
+                loadedTimelineDayBounds = nil
+                timelineHasOlder = true
+                timelineHasNewer = true
+                inFlightExtend.removeAll()
+                loadedDayKey = nil
+            }
             loadState = .failed(message: error.localizedDescription)
         }
+        await summaryLoad
     }
 
-    /// Refreshes a small overlap window so recently completed OCR/AX work can
-    /// replace existing moments without rescanning the entire encrypted vault.
+    /// Refreshes the newest loaded captures so recently completed OCR/AX work
+    /// can replace existing moments without scanning the vault. Older days
+    /// already in the window stay in memory.
     public func refreshTimeline(preservingSelection: Bool = true) async {
         guard !moments.isEmpty else {
-            await loadTimeline(preservingSelection: preservingSelection)
+            guard let bounds = loadedTimelineDayBounds else {
+                await loadTimeline(preservingSelection: preservingSelection)
+                return
+            }
+            await refreshTimeline(
+                fromMs: bounds.start,
+                toMs: bounds.end - 1,
+                replacingFromMs: bounds.start,
+                preservingSelection: preservingSelection
+            )
             return
         }
 
         let overlapStart = max(moments.count - 20, 0)
         let sinceMs = moments[overlapStart].capturedAtMs
+        let bounds = loadedTimelineDayBounds
+            ?? DaySummaryLayout.dayBounds(ms: moments[overlapStart].capturedAtMs)
+        await refreshTimeline(
+            fromMs: sinceMs,
+            toMs: bounds.end - 1,
+            replacingFromMs: sinceMs,
+            preservingSelection: preservingSelection
+        )
+    }
+
+    private func refreshTimeline(
+        fromMs: Int64,
+        toMs: Int64,
+        replacingFromMs: Int64,
+        preservingSelection: Bool
+    ) async {
         let requestRevision = timelineRevision
         let requestGeneration = sensitiveGeneration
         do {
-            let rawUpdated = try await daemon.timeline(sinceMs: sinceMs)
+            let rawUpdated = try await daemon.timeline(fromMs: fromMs, toMs: toMs)
             guard sensitiveGeneration == requestGeneration,
                   timelineRevision == requestRevision
             else { return }
-            guard !rawUpdated.isEmpty else { return }
             let current = moments
             guard let prepared = await Task.detached(priority: .userInitiated, operation: {
-                Self.mergeTimeline(current: current, sinceMs: sinceMs, updated: rawUpdated)
+                Self.mergeTimeline(current: current, sinceMs: replacingFromMs, updated: rawUpdated)
             }).value else { return }
             guard sensitiveGeneration == requestGeneration,
                   timelineRevision == requestRevision
             else { return }
             apply(prepared, preservingSelection: preservingSelection)
-            await loadDaySummary(dayMs: playheadMs, force: true)
+            let summaryMs = playheadMs > 0 ? playheadMs : fromMs
+            await loadDaySummary(dayMs: summaryMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
                 if case .failed = loadState { return }
+                loadState = .failed(message: error.localizedDescription)
                 return
             }
             loadState = .failed(message: error.localizedDescription)
@@ -108,6 +177,16 @@ public final class RecallStore: ObservableObject {
         let prepared = await Self.prepareTimeline(rawMoments)
         guard sensitiveGeneration == requestGeneration else { return }
         apply(prepared, selecting: momentID, preservingSelection: preservingSelection)
+        if let first = prepared.moments.first, let last = prepared.moments.last {
+            let start = DaySummaryLayout.dayBounds(ms: first.capturedAtMs).start
+            let end = DaySummaryLayout.dayBounds(ms: last.capturedAtMs).end
+            loadedTimelineDayBounds = (start, end)
+            let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
+            timelineHasOlder = true
+            timelineHasNewer = end < DaySummaryLayout.dayBounds(ms: nowMs).end
+        } else {
+            loadedTimelineDayBounds = nil
+        }
         await loadDaySummary(dayMs: playheadMs, force: true)
     }
 
@@ -153,22 +232,169 @@ public final class RecallStore: ObservableObject {
         await openMoment(id: hit.momentId)
     }
 
-    /// Reloads the timeline and parks the playhead on `momentID`.
-    ///
-    /// The full reload is the point: a search hit is routinely outside the
-    /// window currently in memory.
+    /// Loads the local day that contains `momentID` and parks the playhead on it.
     public func openMoment(id momentID: String) async {
+        if selectLoaded(momentID: momentID) {
+            await hydrateSelectedEvidence()
+            return
+        }
         let requestGeneration = sensitiveGeneration
         do {
-            let rawMoments = try await daemon.timeline()
+            let detail = try await daemon.moment(id: momentID)
+            await ensureTimelineContains(ms: detail.capturedAtMs)
+            guard sensitiveGeneration == requestGeneration else { return }
+            if selectLoaded(momentID: momentID) {
+                patchEvidence(detail)
+                await loadDaySummary(dayMs: detail.capturedAtMs, force: true)
+                await hydrateSelectedEvidence()
+                return
+            }
+            let bounds = DaySummaryLayout.dayBounds(ms: detail.capturedAtMs)
+            let rawMoments = try await daemon.timeline(fromMs: bounds.start, toMs: bounds.end - 1)
             let prepared = await Self.prepareTimeline(rawMoments)
             guard sensitiveGeneration == requestGeneration else { return }
             apply(prepared, selecting: momentID)
-            await loadDaySummary(dayMs: playheadMs, force: true)
+            loadedTimelineDayBounds = bounds
+            let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
+            timelineHasOlder = true
+            timelineHasNewer = bounds.end < DaySummaryLayout.dayBounds(ms: nowMs).end
+            patchEvidence(detail)
+            await loadDaySummary(dayMs: detail.capturedAtMs, force: true)
+        } catch {
+            guard sensitiveGeneration == requestGeneration else { return }
+            if Self.isDaemonConnectionError(error) {
+                loadState = .failed(message: error.localizedDescription)
+                return
+            }
+            loadState = .failed(message: error.localizedDescription)
+        }
+    }
+
+    /// Grows the playhead window by one occupied neighbour in `direction`.
+    /// Empty local days are skipped so a gap between captures is still one
+    /// scrub, not a dead end.
+    @discardableResult
+    public func extendTimeline(direction: TimelineExtendDirection) async -> Bool {
+        let requestGeneration = sensitiveGeneration
+        let requestRevision = timelineRevision
+        guard inFlightExtend.insert(direction).inserted else { return false }
+        defer { inFlightExtend.remove(direction) }
+        guard let range = loadedTimelineDayBounds else { return false }
+
+        let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
+        let today = DaySummaryLayout.dayBounds(ms: nowMs)
+        var probeMs: Int64
+        switch direction {
+        case .older:
+            guard timelineHasOlder else { return false }
+            probeMs = range.start - 1
+        case .newer:
+            guard timelineHasNewer else { return false }
+            if range.end >= today.end {
+                timelineHasNewer = false
+                return false
+            }
+            probeMs = range.end
+        }
+
+        var skippedEmpty = 0
+        while skippedEmpty <= Self.emptyDaySkipLimit {
+            guard sensitiveGeneration == requestGeneration,
+                  timelineRevision == requestRevision
+            else { return false }
+            let bounds = DaySummaryLayout.dayBounds(ms: probeMs)
+            if let covered = loadedTimelineDayBounds,
+               bounds.start >= covered.start,
+               bounds.end <= covered.end
+            {
+                return false
+            }
+            if direction == .newer, bounds.start >= today.end {
+                timelineHasNewer = false
+                return false
+            }
+            do {
+                let raw = try await daemon.timeline(fromMs: bounds.start, toMs: bounds.end - 1)
+                guard sensitiveGeneration == requestGeneration,
+                      timelineRevision == requestRevision
+                else { return false }
+                if raw.isEmpty {
+                    skippedEmpty += 1
+                    expandLoadedRange(toInclude: bounds)
+                    switch direction {
+                    case .older: probeMs = bounds.start - 1
+                    case .newer: probeMs = bounds.end
+                    }
+                    continue
+                }
+                let added = await Self.prepareTimeline(raw)
+                guard sensitiveGeneration == requestGeneration,
+                      timelineRevision == requestRevision
+                else { return false }
+                let merged = Self.mergePrepared(current: moments, added: added.moments)
+                apply(merged, preservingSelection: true)
+                expandLoadedRange(toInclude: bounds)
+                evictDistantDays(aroundMs: playheadMs > 0 ? playheadMs : bounds.start)
+                return true
+            } catch {
+                guard sensitiveGeneration == requestGeneration else { return false }
+                if Self.isDaemonConnectionError(error), case .failed = loadState {
+                    return false
+                }
+                loadState = .failed(message: error.localizedDescription)
+                return false
+            }
+        }
+        switch direction {
+        case .older: timelineHasOlder = false
+        case .newer: timelineHasNewer = false
+        }
+        return false
+    }
+
+    /// Ensures the window already includes one occupied neighbour on each
+    /// side of the playhead's day, so the next scrub can cross midnight.
+    public func prefetchAdjacentTimelineDays() async {
+        guard let range = loadedTimelineDayBounds else { return }
+        let anchorMs = playheadMs > 0 ? playheadMs : range.start
+        let playheadDay = DaySummaryLayout.dayBounds(ms: anchorMs)
+        if playheadDay.start <= range.start {
+            _ = await extendTimeline(direction: .older)
+        }
+        if playheadDay.end >= range.end {
+            _ = await extendTimeline(direction: .newer)
+        }
+    }
+
+    /// Makes sure `ms` is inside the loaded span. Adjacent days merge;
+    /// a jump of more than one local day recentres the window.
+    public func ensureTimelineContains(ms: Int64) async {
+        let bounds = DaySummaryLayout.dayBounds(ms: ms)
+        if covers(ms: ms) { return }
+        if let range = loadedTimelineDayBounds, isCalendarAdjacent(bounds, to: range) {
+            let direction: TimelineExtendDirection = bounds.end <= range.start ? .older : .newer
+            while !covers(ms: ms) {
+                let progressed = await extendTimeline(direction: direction)
+                if !progressed { break }
+            }
+            if covers(ms: ms) { return }
+        }
+        await loadTimeline(containingMs: ms, preservingSelection: false)
+    }
+
+    /// Fills OCR/transcript on the selected index row via `moment_get`.
+    public func hydrateSelectedEvidence() async {
+        guard let selected = selectedMoment else { return }
+        if selected.ocrText != nil || selected.transcriptText != nil { return }
+        let requestGeneration = sensitiveGeneration
+        let momentID = selected.id
+        do {
+            let detail = try await daemon.moment(id: momentID)
+            guard sensitiveGeneration == requestGeneration else { return }
+            patchEvidence(detail)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) { return }
-            loadState = .failed(message: error.localizedDescription)
         }
     }
 
@@ -207,6 +433,7 @@ public final class RecallStore: ObservableObject {
             guard sensitiveGeneration == requestGeneration else { return }
             daySummary = loaded
             loadedDayKey = key
+            guard !loaded.day.isEmpty else { return }
 
             let initializesHistory = summaryHistory.isEmpty
             upsertSummaryHistory(loaded)
@@ -308,6 +535,10 @@ public final class RecallStore: ObservableObject {
         timelineRevision &+= 1
         capturedAtMsByMomentID = [:]
         timelineBounds = (0, 1)
+        loadedTimelineDayBounds = nil
+        timelineHasOlder = true
+        timelineHasNewer = true
+        inFlightExtend.removeAll()
         applyPlayhead(0)
         daySummary = .empty
         summaryHistory = []
@@ -318,6 +549,73 @@ public final class RecallStore: ObservableObject {
         isLoadingSummaryHistory = false
         loadedDayKey = nil
         loadState = .ready
+    }
+
+    private func covers(ms: Int64) -> Bool {
+        guard let range = loadedTimelineDayBounds else { return false }
+        return ms >= range.start && ms < range.end
+    }
+
+    private func isCalendarAdjacent(
+        _ bounds: (start: Int64, end: Int64),
+        to range: (start: Int64, end: Int64)
+    ) -> Bool {
+        bounds.end == range.start || bounds.start == range.end
+    }
+
+    private func expandLoadedRange(toInclude bounds: (start: Int64, end: Int64)) {
+        if let range = loadedTimelineDayBounds {
+            loadedTimelineDayBounds = (min(range.start, bounds.start), max(range.end, bounds.end))
+        } else {
+            loadedTimelineDayBounds = bounds
+        }
+    }
+
+    private func loadedDayCount() -> Int {
+        guard let range = loadedTimelineDayBounds else { return 0 }
+        var count = 0
+        var cursor = range.start
+        while cursor < range.end {
+            count += 1
+            cursor = DaySummaryLayout.dayBounds(ms: cursor).end
+            if count > 366 { break }
+        }
+        return count
+    }
+
+    private func evictDistantDays(aroundMs: Int64) {
+        let playheadDay = DaySummaryLayout.dayBounds(ms: aroundMs)
+        while loadedDayCount() > Self.maxLoadedTimelineDays, let range = loadedTimelineDayBounds {
+            let startDay = DaySummaryLayout.dayBounds(ms: range.start)
+            let lastDayStart = DaySummaryLayout.dayBounds(ms: range.end - 1).start
+            if startDay.start == lastDayStart { break }
+            let dropStart: Bool
+            if playheadDay.start <= startDay.start {
+                dropStart = false
+            } else if playheadDay.end >= range.end {
+                dropStart = true
+            } else {
+                dropStart = abs(playheadDay.start - startDay.start) >= abs(range.end - playheadDay.end)
+            }
+            if dropStart {
+                let newStart = startDay.end
+                loadedTimelineDayBounds = (newStart, range.end)
+                dropMoments(before: newStart)
+                timelineHasOlder = true
+            } else {
+                loadedTimelineDayBounds = (range.start, lastDayStart)
+                dropMoments(from: lastDayStart)
+                timelineHasNewer = true
+            }
+        }
+    }
+
+    private func dropMoments(before ms: Int64) {
+        apply(Self.prepareTimelineSync(moments.filter { $0.capturedAtMs >= ms }), preservingSelection: true)
+    }
+
+    private func dropMoments(from ms: Int64) {
+        apply(Self.prepareTimelineSync(moments.filter { $0.capturedAtMs < ms }), preservingSelection: true)
     }
 
     private func applyPlayhead(_ ms: Int64) {
@@ -373,6 +671,19 @@ public final class RecallStore: ObservableObject {
         )
     }
 
+    nonisolated private static func mergePrepared(
+        current: [RecallMoment],
+        added: [RecallMoment]
+    ) -> PreparedTimeline {
+        var byID: [String: RecallMoment] = Dictionary(
+            uniqueKeysWithValues: current.map { ($0.id, $0) }
+        )
+        for moment in added {
+            byID[moment.id] = moment
+        }
+        return prepareTimelineSync(Array(byID.values))
+    }
+
     nonisolated private static func mergeTimeline(
         current: [RecallMoment],
         sinceMs: Int64,
@@ -384,6 +695,11 @@ public final class RecallStore: ObservableObject {
         var merged = Array(current.prefix(prefixCount))
         merged.append(contentsOf: sortedUpdate)
         return prepareSortedTimeline(merged)
+    }
+
+    private func patchEvidence(_ detail: RecallMoment) {
+        guard let index = moments.firstIndex(where: { $0.id == detail.id }) else { return }
+        moments[index] = detail
     }
 
     private static func isDaemonConnectionError(_ error: Error) -> Bool {
