@@ -280,6 +280,7 @@ second background step clears the recovery manifest or `afterrayd` can start.
 | `AFTERRAY_LLM_N_CTX` | llama.cpp context length | `8192` |
 | `AFTERRAY_LLM_MAX_TOKENS` | Generation cap | `512` |
 | `AFTERRAY_CODESIGN_IDENTITY` | Signing identity for dev and release builds | First `Developer ID Application` identity |
+| `AFTERRAY_CODESIGN_REFERENCE_APP` | App whose designated requirement a Developer ID test package must preserve | — |
 | `AFTERRAY_NOTARY_PROFILE` | `notarytool` keychain profile used by `make release` | — |
 
 `make dev` preserves an explicit `AFTERRAY_DATA_DIR` across watch-mode app

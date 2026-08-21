@@ -1,0 +1,4 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "apps/AfterRay/Sources/AfterRayApp.swift::enum AfterRayMain {": "sha256:189fbf4a3cd4e850"
+}

@@ -2,6 +2,10 @@
 
 set -Eeuo pipefail
 
+# Release artifacts contain no secrets and must remain readable after being
+# copied to another account or machine, regardless of the caller's umask.
+umask 022
+
 usage() {
   printf '%s\n' \
     'Usage: scripts/build-release.sh [--local | --skip-notarization] [--allow-dirty]' \
@@ -22,6 +26,7 @@ usage() {
     '' \
     'Environment:' \
     '  AFTERRAY_CODESIGN_IDENTITY  Developer ID Application name or SHA-1; auto-detected if unset' \
+    '  AFTERRAY_CODESIGN_REFERENCE_APP  signed app whose designated requirement must match' \
     '  AFTERRAY_NOTARY_PROFILE     notarytool Keychain profile; required for the default mode'
 }
 
@@ -153,6 +158,21 @@ resolve_developer_id_identity() {
   done <<<"$identities"
 }
 
+read_designated_requirement() {
+  local code="$1"
+  local requirement_output
+  requirement_output="$(codesign -d -r- "$code" 2>&1)" || return
+  awk '
+    /^designated => / {
+      sub(/^designated => /, "")
+      print
+      found = 1
+      exit
+    }
+    END { if (!found) exit 1 }
+  ' <<<"$requirement_output"
+}
+
 resolve_sign_update() {
   if [[ -n "${AFTERRAY_SPARKLE_SIGN_UPDATE:-}" ]]; then
     printf '%s\n' "$AFTERRAY_SPARKLE_SIGN_UPDATE"
@@ -193,6 +213,19 @@ else
   notarized='false'
 fi
 
+codesign_reference_app="${AFTERRAY_CODESIGN_REFERENCE_APP:-}"
+reference_designated_requirement=''
+if [[ -n "$codesign_reference_app" ]]; then
+  [[ "$mode" != 'local' ]] \
+    || die 'a local ad-hoc package cannot match a Developer ID reference app'
+  [[ -d "$codesign_reference_app" ]] \
+    || die 'AFTERRAY_CODESIGN_REFERENCE_APP is not an application bundle'
+  codesign --verify --strict "$codesign_reference_app" \
+    || die 'AFTERRAY_CODESIGN_REFERENCE_APP has an invalid signature'
+  reference_designated_requirement="$(read_designated_requirement "$codesign_reference_app")" \
+    || die 'could not read designated requirement from AFTERRAY_CODESIGN_REFERENCE_APP'
+fi
+
 artifact_stem="AfterRay-${version}${artifact_suffix}-arm64"
 output_root="$release_dir/$artifact_stem"
 app_bundle="$output_root/AfterRay.app"
@@ -211,6 +244,19 @@ mkdir -p "$release_dir"
 rm -rf -- "$output_root"
 rm -f -- "$dmg_path" "$checksum_path" "$manifest_path" "$update_archive_path"
 temp_root="$(mktemp -d /tmp/afterray-release.XXXXXX)"
+
+# See docs/decisions/active/process/2026-08-22-local-release-library-validation.md.
+app_entitlements="$automation_entitlements"
+if [[ "$mode" == 'local' ]]; then
+  # Ad-hoc signatures have no shared Team ID. Keep Hardened Runtime parity,
+  # but let this explicitly unpublishable host load its separately signed
+  # Sparkle framework. Developer ID builds retain library validation.
+  app_entitlements="$temp_root/Local.entitlements"
+  install -m 0600 "$automation_entitlements" "$app_entitlements"
+  "$plist_buddy" \
+    -c 'Add :com.apple.security.cs.disable-library-validation bool true' \
+    "$app_entitlements"
+fi
 
 swift_cache="$repo_root/.afterray-dev/release-swift-cache"
 mkdir -p "$swift_cache/clang" "$swift_cache/swiftpm"
@@ -388,7 +434,11 @@ sign_executable() {
   codesign "${signing_args[@]}" "$executable" >/dev/null
 }
 
-step "Signing nested executables (${codesign_identity})"
+if [[ "$mode" == 'local' ]]; then
+  step 'Signing nested executables (ad-hoc)'
+else
+  step 'Signing nested executables (Developer ID)'
+fi
 # Sparkle signs from the inside out and explicitly without --deep: Autoupdate
 # and Updater.app are separate executables that Gatekeeper evaluates on their
 # own when they replace the running app.
@@ -405,7 +455,7 @@ for binary in "${bundle_binaries[@]:1}"; do
     sign_executable "$binary"
   fi
 done
-sign_executable "$app_bundle" "$automation_entitlements"
+sign_executable "$app_bundle" "$app_entitlements"
 
 step 'Verifying code signatures and Hardened Runtime'
 for binary in "${bundle_binaries[@]}"; do
@@ -428,6 +478,27 @@ for sparkle_component in \
     || die "Hardened Runtime flag is missing: $sparkle_component"
 done
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
+if [[ -n "$reference_designated_requirement" ]]; then
+  step 'Verifying stable designated requirement'
+  built_designated_requirement="$(read_designated_requirement "$app_bundle")" \
+    || die 'could not read designated requirement from the packaged app'
+  [[ "$built_designated_requirement" == "$reference_designated_requirement" ]] \
+    || die 'packaged app designated requirement differs from the reference app; refusing a TCC-resetting artifact'
+fi
+app_signature_entitlements="$(codesign -d --entitlements :- "$app_bundle" 2>/dev/null)"
+if [[ "$mode" == 'local' ]]; then
+  [[ "$app_signature_entitlements" == *'com.apple.security.cs.disable-library-validation'* ]] \
+    || die 'local app is missing the entitlement required to load ad-hoc nested code'
+else
+  [[ "$app_signature_entitlements" != *'com.apple.security.cs.disable-library-validation'* ]] \
+    || die 'publishable app unexpectedly disables library validation'
+fi
+
+# `codesign --verify` checks each signature in isolation. Only dyld enforces
+# the host/framework Team-ID relationship that can otherwise crash before
+# `main`. This probe exits before NSApplication or any user data is opened.
+step 'Probing packaged app dynamic loading'
+AFTERRAY_PACKAGING_DYLD_PROBE=1 "$app_bundle/Contents/MacOS/AfterRay"
 
 # Notarize the application before it goes into the DMG, so the ticket
 # travels with what the user actually keeps. Stapling only the DMG leaves

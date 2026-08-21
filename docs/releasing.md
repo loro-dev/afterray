@@ -139,15 +139,27 @@ make release-local
 
 It permits a dirty worktree and produces an explicitly named
 `AfterRay-<version>-local-arm64.dmg`. This artifact is ad-hoc signed, is not
-notarized, and must not be published.
+notarized, and must not be published. Ad-hoc code has no shared Developer ID
+Team ID, so only this local host carries
+`com.apple.security.cs.disable-library-validation`; production and
+Developer-ID test builds retain normal library validation. Every packaging
+mode executes a pre-main dynamic-loader probe after signing, because
+`codesign --verify` alone cannot prove that the host may load Sparkle.
+Its designated requirement is deliberately different from a published app,
+so installing it over a production copy does not preserve Screen Recording or
+Microphone consent. Do not hand a `-local` artifact to an installed-app tester.
 
-To test Developer ID signing before notarization, run:
+For a permission-sensitive installed-app test, use the same Developer ID as the
+last published app and make that app the explicit requirement reference:
 
 ```sh
-./scripts/build-release.sh --skip-notarization
+AFTERRAY_CODESIGN_IDENTITY='<identity used by the reference app>' \
+AFTERRAY_CODESIGN_REFERENCE_APP='dist/AfterRay-<previous>-arm64/AfterRay.app' \
+./scripts/build-release.sh --skip-notarization --allow-dirty
 ```
 
-That output contains `-unnotarized` in its filename and is also not publishable.
+The build fails before packaging if the designated requirements differ. Its
+output contains `-unnotarized` in the filename and is also not publishable.
 
 ## Automatic updates
 

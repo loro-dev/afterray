@@ -39,9 +39,17 @@ private final class RecallOverlayLayout: ObservableObject {
 /// no Edit menu, `performKeyEquivalent` returns false and the keystroke dies
 /// before it can reach the field editor. Settings is an AppKit window
 /// (`AfterRaySettingsController`), so the `Settings` scene bought nothing.
+// @dec:local-release-library-validation — docs/decisions/active/process/2026-08-22-local-release-library-validation.md
 @main
 enum AfterRayMain {
     static func main() {
+        // The release pipeline executes the fully signed binary to make dyld
+        // validate every linked framework. Exit before AppKit or user state is
+        // initialized; a missing or runtime-invalid framework fails before this
+        // branch can run.
+        if ProcessInfo.processInfo.environment["AFTERRAY_PACKAGING_DYLD_PROBE"] == "1" {
+            return
+        }
         let app = NSApplication.shared
         MainActor.assumeIsolated {
             app.delegate = AfterRayAppDelegate.shared
@@ -1881,7 +1889,7 @@ private struct PermissionPanel: View {
             }
             .padding(28)
             .frame(width: 500)
-            .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(Color.black, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(.white.opacity(0.13), lineWidth: 1)

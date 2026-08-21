@@ -28,10 +28,10 @@ Shell/Swift tooling for the dev loop, signed + notarized releases, Sparkle publi
 - Sparkle compares only `CFBundleVersion` = `git rev-list --count HEAD` (build-release.sh:117, override `AFTERRAY_BUILD_NUMBER`); stamped into the assembled bundle only — never hand-edit the source plist.
 - `Info.plist` `CFBundleShortVersionString` must equal `[workspace.package].version` in `Cargo.toml`, and bundle id must be `dev.afterray.app` — the release dies otherwise (build-release.sh:122-136).
 - arm64-only (build-release.sh:96); every shipped binary is `lipo`-verified.
-- Signing is inside-out, never `--deep`; Sparkle's `Autoupdate`/`Updater.app` are signed individually (build-release.sh:379+). Sparkle XPCServices/Headers are pruned from the embedded framework — the app is not sandboxed.
+- Sign inside-out, never `--deep`. Sign Sparkle's `Autoupdate`/`Updater.app` separately and prune unused XPCServices/Headers. Every bundle runs a pre-main dyld probe; only local ad-hoc hosts disable library validation.
 - The Sparkle update zip is built from the *stapled* bundle — the notarization ticket must be in the archive or offline first-launch fails Gatekeeper.
 - A release tag is created only after the public appcast contains the matching version and build; tags never move.
-- Dev builds need a stable signing identity or TCC (Screen Recording) permission resets on every rebuild (run-v0.sh:183+); ad-hoc fallback uses a fixed identifier + designated requirement.
+- Dev builds need a stable signing identity or TCC resets. Permission-sensitive DMGs use unnotarized Developer ID signing plus an explicit reference app; never hand off an ad-hoc `-local` DMG.
 - Script style: `set -Eeuo pipefail`, exit 64 for usage errors, guard every `rm -rf` with a path-prefix check.
 
 ## Commands
