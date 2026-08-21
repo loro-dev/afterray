@@ -59,5 +59,6 @@ cross midnight without a 64 MiB download. Empty days do not trap the
 playhead.
 
 **Cost:** a neighbouring-day merge can remap the in-flight scrub once, but
-the fetch starts before the visible edge and the refreshed mapping lets that
-same gesture continue into the new day. Protocol 16 is unchanged.
+the fetch starts one visible viewport before the edge and the refreshed
+mapping lets that same gesture continue into the new day. Protocol 16 is
+unchanged.

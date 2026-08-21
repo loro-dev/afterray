@@ -423,7 +423,9 @@ public struct TimelineLayout: Equatable, Sendable {
 /// while the daemon request is in flight.
 enum TimelineEdgePrefetch {
     static let minimumLeadPoints: CGFloat = 160
-    static let viewportFraction: CGFloat = 0.35
+    /// Keep a full visible viewport of lead time for the daemon round trip.
+    /// A shorter margin can still land after the user reaches the old edge.
+    static let viewportFraction: CGFloat = 1
 
     static func direction(
         playheadMs: Int64,
@@ -434,7 +436,7 @@ enum TimelineEdgePrefetch {
     ) -> TimelineExtendDirection? {
         let lead = min(
             max(minimumLeadPoints, viewportWidth * viewportFraction),
-            layout.contentWidth * 0.45
+            layout.contentWidth
         )
         let x = layout.x(ms: playheadMs)
         if movementDirection < 0, x <= lead {

@@ -33,7 +33,10 @@ final class TimelineLayoutTests: XCTestCase {
 
         XCTAssertEqual(
             TimelineEdgePrefetch.direction(
-                playheadMs: layout.ms(x: 300),
+                // 0.9 visible screens remain before the older edge. This must
+                // already fetch; waiting until the final 0.35 screen was too
+                // late for a live daemon round trip.
+                playheadMs: layout.ms(x: 900),
                 isLive: false,
                 movementDirection: -1,
                 layout: layout,
@@ -43,7 +46,7 @@ final class TimelineLayoutTests: XCTestCase {
         )
         XCTAssertNil(
             TimelineEdgePrefetch.direction(
-                playheadMs: layout.ms(x: layout.contentWidth / 2),
+                playheadMs: layout.ms(x: 1_050),
                 isLive: false,
                 movementDirection: -1,
                 layout: layout,
