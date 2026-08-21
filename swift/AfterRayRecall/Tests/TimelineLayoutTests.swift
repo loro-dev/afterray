@@ -22,37 +22,106 @@ final class TimelineLayoutTests: XCTestCase {
     }
 
     func testEdgePrefetchStartsBeforeTheOlderBoundary() {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
         let layout = TimelineLayout(
-            moments: [
-                moment(id: "first", at: 0, app: "Xcode", bundle: "com.apple.dt.Xcode"),
-                moment(id: "last", at: 3_600_000, app: "Xcode", bundle: "com.apple.dt.Xcode"),
-            ],
+            moments: (-4...3).map { offset in
+                let day = testLocalDay(offsetBy: offset, from: today)
+                return moment(
+                    id: "d\(offset)",
+                    at: day.start + 43_200_000,
+                    app: "Xcode",
+                    bundle: "com.apple.dt.Xcode"
+                )
+            },
             viewportWidth: 1_000,
             density: 0.12
         )
+        let centerMs = today.start + 43_200_000
+        let distanceToOlderEdge = layout.x(ms: centerMs)
 
         XCTAssertEqual(
             TimelineEdgePrefetch.direction(
-                // 0.9 visible screens remain before the older edge. This must
-                // already fetch; waiting until the final 0.35 screen was too
-                // late for a live daemon round trip.
-                playheadMs: layout.ms(x: 900),
+                playheadMs: centerMs,
                 isLive: false,
                 movementDirection: -1,
                 layout: layout,
-                viewportWidth: 1_000
+                // The edge is just inside one full visible viewport.
+                viewportWidth: distanceToOlderEdge + 1
             ),
             .older
         )
         XCTAssertNil(
             TimelineEdgePrefetch.direction(
-                playheadMs: layout.ms(x: 1_050),
+                playheadMs: centerMs,
                 isLive: false,
                 movementDirection: -1,
                 layout: layout,
-                viewportWidth: 1_000
+                // More than one full viewport remains.
+                viewportWidth: distanceToOlderEdge - 1
             )
         )
+    }
+
+    func testEdgePrefetchShiftsReserveBeforeCrossingMidnight() {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let layout = TimelineLayout(
+            moments: (-3...3).map { offset in
+                let day = testLocalDay(offsetBy: offset, from: today)
+                return moment(
+                    id: "d\(offset)",
+                    at: day.start + 43_200_000,
+                    app: "Xcode",
+                    bundle: "com.apple.dt.Xcode"
+                )
+            },
+            viewportWidth: 1_000,
+            density: 0.12
+        )
+        XCTAssertEqual(
+            TimelineEdgePrefetch.direction(
+                playheadMs: today.start + 43_200_000,
+                isLive: false,
+                movementDirection: -1,
+                layout: layout,
+                viewportWidth: 1
+            ),
+            .older
+        )
+        XCTAssertEqual(
+            TimelineEdgePrefetch.direction(
+                playheadMs: today.start + 43_200_000,
+                isLive: false,
+                movementDirection: 1,
+                layout: layout,
+                viewportWidth: 1
+            ),
+            .newer
+        )
+    }
+
+    func testExpandedWindowReplacesFrozenScrubLayout() {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let yesterday = DaySummaryLayout.dayBounds(ms: today.start - 1)
+        let todayMoment = moment(
+            id: "today",
+            at: today.start + 43_200_000,
+            app: "Xcode",
+            bundle: "com.apple.dt.Xcode"
+        )
+        let yesterdayMoment = moment(
+            id: "yesterday",
+            at: yesterday.start + 43_200_000,
+            app: "Xcode",
+            bundle: "com.apple.dt.Xcode"
+        )
+        let frozen = TimelineLayout(moments: [todayMoment], viewportWidth: 1_000, density: 0.12)
+        let expanded = [yesterdayMoment, todayMoment]
+
+        XCTAssertTrue(TimelineEdgePrefetch.expandsFrozenWindow(frozen, with: expanded))
+        XCTAssertEqual(frozen.clamp(yesterdayMoment.capturedAtMs), todayMoment.capturedAtMs)
+
+        let adopted = TimelineLayout(moments: expanded, viewportWidth: 1_000, density: 0.12)
+        XCTAssertEqual(adopted.clamp(yesterdayMoment.capturedAtMs), yesterdayMoment.capturedAtMs)
     }
 
     func testNeedleStaysInsideOwnRunWithManyShortAppSwitches() throws {
@@ -517,6 +586,23 @@ final class TimelineLayoutTests: XCTestCase {
                 bundle: "lody"
             )
         }
+    }
+
+    private func testLocalDay(
+        offsetBy offset: Int,
+        from origin: (start: Int64, end: Int64)
+    ) -> (start: Int64, end: Int64) {
+        var day = origin
+        if offset < 0 {
+            for _ in offset..<0 {
+                day = DaySummaryLayout.dayBounds(ms: day.start - 1)
+            }
+        } else if offset > 0 {
+            for _ in 0..<offset {
+                day = DaySummaryLayout.dayBounds(ms: day.end)
+            }
+        }
+        return day
     }
 
     private func clusteredShortSwitchesThenLongRun() -> [RecallMoment] {

@@ -418,6 +418,33 @@ public struct TimelineLayout: Equatable, Sendable {
     }
 }
 
+/// Calendar-day coverage that must be present before a playhead window is
+/// published. Two days on either side are the interaction invariant; one
+/// additional day on each side is the refill reserve. When the pointer crosses
+/// midnight, that reserve keeps the invariant intact while the next outer day
+/// loads away from the visible path.
+enum TimelineWarmWindow {
+    static let guaranteedRadiusDays = 2
+    static let refillReserveDays = 1
+    static let preloadRadiusDays = guaranteedRadiusDays + refillReserveDays
+
+    static func bounds(containingMs ms: Int64) -> (start: Int64, end: Int64) {
+        var day = DaySummaryLayout.dayBounds(ms: ms)
+        var start = day.start
+        var end = day.end
+        for _ in 0..<preloadRadiusDays {
+            day = DaySummaryLayout.dayBounds(ms: start - 1)
+            start = day.start
+        }
+        day = DaySummaryLayout.dayBounds(ms: ms)
+        for _ in 0..<preloadRadiusDays {
+            day = DaySummaryLayout.dayBounds(ms: end)
+            end = day.end
+        }
+        return (start, end)
+    }
+}
+
 /// Starts a bounded day fetch while a scrub still has room before the loaded
 /// edge. Waiting for `clamp()` to hit the edge leaves an unavoidable blank
 /// while the daemon request is in flight.
@@ -434,6 +461,25 @@ enum TimelineEdgePrefetch {
         layout: TimelineLayout,
         viewportWidth: CGFloat
     ) -> TimelineExtendDirection? {
+        // Shift the reserve toward the next calendar day as soon as travel has
+        // a direction. Waiting until the pointer has already crossed midnight
+        // spends part of the reserve before the refill even starts.
+        let playheadDay = DaySummaryLayout.dayBounds(ms: playheadMs)
+        let nextDayMs = movementDirection < 0 ? playheadDay.start - 1 : playheadDay.end
+        let required = TimelineWarmWindow.bounds(containingMs: nextDayMs)
+        if movementDirection < 0,
+           let first = layout.moments.first,
+           DaySummaryLayout.dayBounds(ms: first.capturedAtMs).start > required.start
+        {
+            return .older
+        }
+        if movementDirection > 0, !isLive,
+           let last = layout.moments.last,
+           DaySummaryLayout.dayBounds(ms: last.capturedAtMs).end < required.end
+        {
+            return .newer
+        }
+
         let lead = min(
             max(minimumLeadPoints, viewportWidth * viewportFraction),
             layout.contentWidth
@@ -446,6 +492,20 @@ enum TimelineEdgePrefetch {
             return .newer
         }
         return nil
+    }
+
+    /// A neighbour can arrive from launch prefetch or a different request
+    /// while a scrub still holds its old layout. Only a real boundary growth
+    /// needs a fresh snapshot; detail hydration inside the same window must
+    /// not make the pointer jump.
+    static func expandsFrozenWindow(
+        _ frozen: TimelineLayout,
+        with updatedMoments: [RecallMoment]
+    ) -> Bool {
+        guard let first = updatedMoments.first, let last = updatedMoments.last else {
+            return false
+        }
+        return first.capturedAtMs < frozen.startMs || last.capturedAtMs > frozen.endMs
     }
 }
 

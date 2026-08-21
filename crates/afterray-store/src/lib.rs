@@ -5952,25 +5952,14 @@ fn query_moment_index(
     filter_sql: &str,
     params: impl rusqlite::Params,
 ) -> Result<Vec<Moment>, StoreError> {
+    // Pick the overlapping audio row once, then read both fields from that
+    // row. Two scalar copies of this overlap/order query made every timeline
+    // moment build the same temporary sort twice.
     let sql = format!(
         "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
                 NULL, NULL,
-                (SELECT audio.audio_artifact_id
-                   FROM audio_segments audio
-                  WHERE audio.session_id = m.session_id
-                    AND audio.started_at_ms <= m.captured_at_ms + 30000
-                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                    audio.started_at_ms DESC
-                  LIMIT 1),
-                (SELECT audio.started_at_ms
-                   FROM audio_segments audio
-                  WHERE audio.session_id = m.session_id
-                    AND audio.started_at_ms <= m.captured_at_ms + 30000
-                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                    audio.started_at_ms DESC
-                  LIMIT 1),
+                audio.audio_artifact_id,
+                audio.started_at_ms,
                 m.accessibility_artifact_id,
                 m.application_name,
                 m.bundle_identifier,
@@ -5981,7 +5970,17 @@ fn query_moment_index(
                 m.gop_index,
                 m.still_origin,
                 (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
-         FROM moments m {filter_sql}"
+         FROM moments m
+         LEFT JOIN audio_segments audio ON audio.id = (
+             SELECT candidate.id
+               FROM audio_segments candidate
+              WHERE candidate.session_id = m.session_id
+                AND candidate.started_at_ms <= m.captured_at_ms + 30000
+                AND candidate.ended_at_ms >= m.captured_at_ms - 30000
+              ORDER BY CASE candidate.track WHEN 'system' THEN 0 ELSE 1 END,
+                candidate.started_at_ms DESC
+              LIMIT 1
+         ) {filter_sql}"
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params, moment_from_row)?;
@@ -7412,6 +7411,48 @@ mod tests {
 
         let detailed = vault.moment_by_id(&moment.id).unwrap().unwrap();
         assert_eq!(detailed.ocr_text.as_deref(), Some("secret screen text"));
+    }
+
+    #[test]
+    fn timeline_index_prefers_system_audio_for_overlapping_segments() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_500, "image/jpeg", b"frame")
+            .unwrap();
+        let microphone = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                900,
+                2_100,
+                "audio/mp4",
+                b"microphone",
+            )
+            .unwrap();
+        let system = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                1_000,
+                2_000,
+                "audio/mp4",
+                b"system",
+            )
+            .unwrap();
+
+        let listed = vault.timeline_range_sync(1_500, 1_500).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_ne!(
+            listed[0].audio_artifact_id.as_deref(),
+            Some(microphone.audio_artifact_id.as_str())
+        );
+        assert_eq!(
+            listed[0].audio_artifact_id.as_deref(),
+            Some(system.audio_artifact_id.as_str())
+        );
+        assert_eq!(listed[0].audio_started_at_ms, Some(system.started_at_ms));
+        assert_eq!(listed[0].id, moment.id);
     }
 
     #[test]

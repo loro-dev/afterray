@@ -25,14 +25,28 @@ summary panel.
 
 List RPCs return a **lean index**: identity, time, app, still/GOP pointers,
 audio pointers. They do not concatenate `ocr_text` or `transcript_text`.
-`timeline_range` is the overlay's list read. Launch and NOW fetch the
-playhead's local day; the store then prefetches one occupied neighbour on
-each side. Scrubbing into the first or last loaded capture extends that
-window, skipping empty local days so a gap is still one travel, not a dead
-end. The window is at most seven local days; days farthest from the playhead
-drop off. A jump of more than one calendar day recentres rather than filling
-the gap. `moment_get` and `evidence_ocr` remain the only paths that carry
-original screen text.
+`timeline_range` is the overlay's list read. Launch, NOW, and a recenter do
+one atomic range read for the playhead day plus three local days on either side.
+The inner two days on each side are the interaction invariant; the outer day
+is refill reserve. The seven-day window is published only after that read is
+prepared, so entering an adjacent day never depends on an edge request.
+Once travel has a direction, the outer reserve shifts toward the next calendar
+day before the pointer crosses midnight, while the two-day guarantee remains
+present. Empty local days are still probed and remembered so
+a gap is one travel, not a dead end. The window stays at most seven local days;
+the day on the opposite side of travel drops off. A jump beyond the loaded span
+recentres rather than filling the gap. `moment_get` and `evidence_ocr` remain
+the only paths that carry original screen text.
+
+While a scrub is live, its frozen layout is replaced only when the published
+window grows past one of that snapshot's boundaries. This admits a neighbour
+that arrived from either the scrub request or launch prefetch without making
+ordinary detail hydration move the pointer. A routine refresh rebases an
+in-flight neighbour merge onto the current window; only a clear or recenter
+cancels that merge. Concurrent callers for the same outer day join one fetch
+instead of treating the second caller as a failed prefetch. Wheel and pointer
+drags enter the same scrub initializer, which snapshots that layout before
+marking the interaction live.
 
 Day summaries stay an independent read model. A failed index read is a
 visible error, not an empty first day. Returning to NOW explicitly requests
@@ -54,11 +68,12 @@ speaks.
 
 ## Consequences
 
-**Bought:** overlay launch stays proportional to one day; scrubbing can
-cross midnight without a 64 MiB download. Empty days do not trap the
-playhead.
+**Bought:** overlay launch remains a bounded range read; the playhead always
+starts with two prepared local days on either side plus a one-day refill
+reserve; directional travel shifts that reserve before the guarantee is
+consumed. Empty days do not trap the playhead.
 
-**Cost:** a neighbouring-day merge can remap the in-flight scrub once, but
-the fetch starts one visible viewport before the edge and the refreshed
-mapping lets that same gesture continue into the new day. Protocol 16 is
-unchanged.
+**Cost:** initial publication reads up to seven days rather than one, trading a
+larger fixed launch read for zero adjacent-day dependency during interaction.
+A later outer-day merge can remap the in-flight scrub once, but the refreshed
+mapping lets that same gesture continue. Protocol 16 is unchanged.

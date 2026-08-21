@@ -1,5 +1,5 @@
 {
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
   "crates/afterray-protocol/src/socket.rs::pub fn default_socket_path() -> std::io::Result<PathBuf> {": "sha256:a319d43761f5dcdb",
-  "swift/AfterRayRecall/Sources/DaemonClient.swift::public actor UnixSocketDaemonClient: AfterRayDaemonServing {": "sha256:680a1535d58a537a"
+  "swift/AfterRayRecall/Sources/DaemonClient.swift::public actor UnixSocketDaemonClient: AfterRayDaemonServing {": "sha256:801191ea4647b3d7"
 }

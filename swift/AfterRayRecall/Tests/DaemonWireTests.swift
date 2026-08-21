@@ -57,6 +57,19 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(json["to_ms"] as? Int, 2)
     }
 
+    func testUnaryResponseDecodesTimelineDataWithoutAnIntermediateObject() throws {
+        let json = #"{"protocol_version":16,"ok":true,"data":[{"id":"m1","session_id":"s1","captured_at_ms":123,"image_artifact_id":"a1","is_favorite":false}]}"#
+        let response = try JSONDecoder().decode(
+            DaemonResponse<[RecallMoment]>.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(response.protocolVersion, 16)
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(response.data?.map(\.id), ["m1"])
+        XCTAssertNil(response.error)
+    }
+
     func testDaySummaryRequestMatchesRustShape() throws {
         let data = try JSONEncoder().encode(WireRequest(type: "day_summary", dayMs: 1_786_698_000_000))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

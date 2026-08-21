@@ -600,23 +600,21 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
             )
         }.value
 
-        guard
-            let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-            let version = object["protocol_version"] as? Int,
-            let ok = object["ok"] as? Bool
-        else { throw DaemonClientError.invalidResponse }
-
-        guard version == Self.protocolVersion else {
-            throw DaemonClientError.protocolMismatch(version)
-        }
-        guard ok else {
-            throw DaemonClientError.rejected(object["error"] as? String ?? "Unknown daemon error")
+        let response: DaemonResponse<T>
+        do {
+            response = try JSONDecoder().decode(DaemonResponse<T>.self, from: responseData)
+        } catch {
+            throw DaemonClientError.invalidResponse
         }
 
-        if let dataObject = object["data"] {
-            let nested = try JSONSerialization.data(withJSONObject: dataObject)
-            return try JSONDecoder().decode(T.self, from: nested)
+        guard response.protocolVersion == Self.protocolVersion else {
+            throw DaemonClientError.protocolMismatch(response.protocolVersion)
         }
+        guard response.ok else {
+            throw DaemonClientError.rejected(response.error ?? "Unknown daemon error")
+        }
+
+        if let data = response.data { return data }
         if allowEmptyObject, let empty = EmptyResponse() as? T { return empty }
         throw DaemonClientError.missingData
     }
@@ -767,6 +765,23 @@ struct WireRequest: Encodable, Equatable {
 
 struct EmptyResponse: Codable {
     init() {}
+}
+
+/// The daemon's one-line unary response. Decode the typed payload directly:
+/// routing a multi-megabyte timeline through `Any` and serializing `data`
+/// again doubled the parsing and copying on every adjacent-day fetch.
+struct DaemonResponse<Payload: Decodable>: Decodable {
+    let protocolVersion: Int
+    let ok: Bool
+    let data: Payload?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case ok
+        case data
+        case error
+    }
 }
 
 final class StreamSocket: @unchecked Sendable {

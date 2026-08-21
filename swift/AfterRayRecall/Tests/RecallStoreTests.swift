@@ -81,7 +81,7 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(requestCount, 2)
     }
 
-    func testLoadTimelineRequestsADayRangeNotTheFullArchive() async {
+    func testLoadTimelineRequestsABoundedWarmRangeNotTheFullArchive() async {
         let daemon = RangeCountingDaemon()
         let store = RecallStore(daemon: daemon)
 
@@ -110,7 +110,7 @@ final class RecallStoreTests: XCTestCase {
 
         await store.loadTimeline(containingMs: requestedMs)
 
-        let bounds = DaySummaryLayout.dayBounds(ms: requestedMs)
+        let bounds = TimelineWarmWindow.bounds(containingMs: requestedMs)
         let ranges = await daemon.ranges()
         XCTAssertEqual(ranges, [.init(fromMs: bounds.start, toMs: bounds.end - 1)])
     }
@@ -312,12 +312,12 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.summaryHistory, [today, yesterday, middle, selectedOlder])
     }
 
-    func testExtendOlderMergesPreviousOccupiedDay() async {
+    func testExtendOlderMergesTheNextOccupiedDayBeyondTheWarmWindow() async {
         let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
-        let yesterday = DaySummaryLayout.dayBounds(ms: today.start - 1)
+        let fourDaysAgo = localDay(offsetBy: -4, from: today)
         let todayMoment = moment("today", at: today.start + 43_200_000)
-        let yesterdayMoment = moment("yesterday", at: yesterday.start + 43_200_000)
-        let daemon = MultiDayTimelineDaemon(moments: [yesterdayMoment, todayMoment])
+        let olderMoment = moment("older", at: fourDaysAgo.start + 43_200_000)
+        let daemon = MultiDayTimelineDaemon(moments: [olderMoment, todayMoment])
         let store = RecallStore(daemon: daemon)
 
         await store.loadTimeline(containingMs: todayMoment.capturedAtMs)
@@ -325,32 +325,98 @@ final class RecallStoreTests: XCTestCase {
 
         let extendedOlder = await store.extendTimeline(direction: .older)
         XCTAssertTrue(extendedOlder)
-        XCTAssertEqual(store.moments.map(\.id), ["yesterday", "today"])
-        store.select(playheadMs: yesterdayMoment.capturedAtMs)
-        XCTAssertEqual(store.selectedMoment?.id, "yesterday")
+        XCTAssertEqual(store.moments.map(\.id), ["older", "today"])
+        store.select(playheadMs: olderMoment.capturedAtMs)
+        XCTAssertEqual(store.selectedMoment?.id, "older")
+    }
+
+    func testRefreshDoesNotDiscardAnInFlightOlderExtension() async {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let fourDaysAgo = localDay(offsetBy: -4, from: today)
+        let todayMoment = moment("today", at: today.start + 43_200_000)
+        let olderMoment = moment("older", at: fourDaysAgo.start + 43_200_000)
+        let refreshedToday = RecallMoment(
+            id: todayMoment.id,
+            sessionId: todayMoment.sessionId,
+            capturedAtMs: todayMoment.capturedAtMs,
+            imageArtifactId: todayMoment.imageArtifactId,
+            applicationName: "Refreshed Today"
+        )
+        let daemon = MultiDayTimelineDaemon(
+            moments: [olderMoment, todayMoment],
+            delayedRangeStartMs: fourDaysAgo.start,
+            refreshedRangeStartMs: todayMoment.capturedAtMs,
+            refreshedMoments: [refreshedToday]
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.loadTimeline(containingMs: todayMoment.capturedAtMs)
+        let extending = Task { @MainActor in
+            await store.extendTimeline(direction: .older)
+        }
+        await daemon.waitForDelayedRangeRequest()
+
+        await store.refreshTimeline()
+        await daemon.releaseDelayedRange()
+        let extended = await extending.value
+        XCTAssertTrue(extended)
+        XCTAssertEqual(store.moments.map(\.id), ["older", "today"])
+        XCTAssertEqual(store.moments.last?.applicationName, "Refreshed Today")
+    }
+
+    func testConcurrentOlderWarmRequestsJoinTheSameFetch() async {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let fourDaysAgo = localDay(offsetBy: -4, from: today)
+        let todayMoment = moment("today", at: today.start + 43_200_000)
+        let olderMoment = moment("older", at: fourDaysAgo.start + 43_200_000)
+        let daemon = MultiDayTimelineDaemon(
+            moments: [olderMoment, todayMoment],
+            delayedRangeStartMs: fourDaysAgo.start
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.loadTimeline(containingMs: todayMoment.capturedAtMs)
+        let first = Task { @MainActor in
+            await store.extendTimeline(direction: .older)
+        }
+        await daemon.waitForDelayedRangeRequest()
+        let joined = Task { @MainActor in
+            await store.extendTimeline(direction: .older)
+        }
+        await Task.yield()
+        await daemon.releaseDelayedRange()
+
+        let firstResult = await first.value
+        let joinedResult = await joined.value
+        XCTAssertTrue(firstResult)
+        XCTAssertTrue(joinedResult)
+        XCTAssertEqual(store.moments.map(\.id), ["older", "today"])
+        let rangeCount = await daemon.recordedRanges().count
+        XCTAssertEqual(rangeCount, 2)
     }
 
     func testExtendNewerMergesTheNextOccupiedDay() async {
         let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
-        let yesterday = DaySummaryLayout.dayBounds(ms: today.start - 1)
-        let todayMoment = moment("today", at: today.start + 43_200_000)
-        let yesterdayMoment = moment("yesterday", at: yesterday.start + 43_200_000)
-        let daemon = MultiDayTimelineDaemon(moments: [yesterdayMoment, todayMoment])
+        let center = localDay(offsetBy: -8, from: today)
+        let fourDaysLater = localDay(offsetBy: 4, from: center)
+        let centerMoment = moment("center", at: center.start + 43_200_000)
+        let newerMoment = moment("newer", at: fourDaysLater.start + 43_200_000)
+        let daemon = MultiDayTimelineDaemon(moments: [centerMoment, newerMoment])
         let store = RecallStore(daemon: daemon)
 
-        await store.loadTimeline(containingMs: yesterdayMoment.capturedAtMs)
-        XCTAssertEqual(store.moments.map(\.id), ["yesterday"])
+        await store.loadTimeline(containingMs: centerMoment.capturedAtMs)
+        XCTAssertEqual(store.moments.map(\.id), ["center"])
         let extendedNewer = await store.extendTimeline(direction: .newer)
         XCTAssertTrue(extendedNewer)
-        XCTAssertEqual(store.moments.map(\.id), ["yesterday", "today"])
+        XCTAssertEqual(store.moments.map(\.id), ["center", "newer"])
     }
 
     func testExtendOlderSkipsAnEmptyLocalDay() async {
         let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
-        let yesterday = DaySummaryLayout.dayBounds(ms: today.start - 1)
-        let twoDaysAgo = DaySummaryLayout.dayBounds(ms: yesterday.start - 1)
+        let fourDaysAgo = localDay(offsetBy: -4, from: today)
+        let fiveDaysAgo = localDay(offsetBy: -5, from: today)
         let todayMoment = moment("today", at: today.start + 43_200_000)
-        let olderMoment = moment("older", at: twoDaysAgo.start + 43_200_000)
+        let olderMoment = moment("older", at: fiveDaysAgo.start + 43_200_000)
         let daemon = MultiDayTimelineDaemon(moments: [olderMoment, todayMoment])
         let store = RecallStore(daemon: daemon)
 
@@ -360,29 +426,43 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.moments.map(\.id), ["older", "today"])
         let ranges = await daemon.recordedRanges()
         XCTAssertEqual(ranges.count, 3)
-        XCTAssertEqual(ranges[0], .init(fromMs: today.start, toMs: today.end - 1))
-        XCTAssertEqual(ranges[1], .init(fromMs: yesterday.start, toMs: yesterday.end - 1))
-        XCTAssertEqual(ranges[2], .init(fromMs: twoDaysAgo.start, toMs: twoDaysAgo.end - 1))
+        let warm = TimelineWarmWindow.bounds(containingMs: todayMoment.capturedAtMs)
+        XCTAssertEqual(ranges[0], .init(fromMs: warm.start, toMs: warm.end - 1))
+        XCTAssertEqual(ranges[1], .init(fromMs: fourDaysAgo.start, toMs: fourDaysAgo.end - 1))
+        XCTAssertEqual(ranges[2], .init(fromMs: fiveDaysAgo.start, toMs: fiveDaysAgo.end - 1))
     }
 
-    func testPrefetchStopsAfterOneOccupiedNeighbour() async {
+    func testWarmWindowLoadsSevenDaysAtomicallyAndReplenishesBeforeGuaranteeIsConsumed() async {
         let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
-        let yesterday = DaySummaryLayout.dayBounds(ms: today.start - 1)
-        let twoDaysAgo = DaySummaryLayout.dayBounds(ms: yesterday.start - 1)
-        let daemon = MultiDayTimelineDaemon(moments: [
-            moment("older", at: twoDaysAgo.start + 43_200_000),
-            moment("yesterday", at: yesterday.start + 43_200_000),
-            moment("today", at: today.start + 43_200_000),
-        ])
+        let center = localDay(offsetBy: -8, from: today)
+        let daemon = MultiDayTimelineDaemon(
+            moments: (-4...3).map { offset in
+                let day = localDay(offsetBy: offset, from: center)
+                return moment("d\(offset)", at: day.start + 43_200_000)
+            }
+        )
         let store = RecallStore(daemon: daemon)
 
-        await store.loadTimeline(containingMs: today.start + 43_200_000)
+        await store.loadTimeline(containingMs: center.start + 43_200_000)
+        XCTAssertEqual(store.moments.map(\.id), ["d-3", "d-2", "d-1", "d0", "d1", "d2", "d3"])
+        let initialRanges = await daemon.recordedRanges()
+        let warm = TimelineWarmWindow.bounds(containingMs: center.start + 43_200_000)
+        XCTAssertEqual(initialRanges, [.init(fromMs: warm.start, toMs: warm.end - 1)])
+
+        let previousDay = localDay(offsetBy: -1, from: center)
+        store.select(playheadMs: previousDay.start + 43_200_000)
         await store.prefetchAdjacentTimelineDays()
-        XCTAssertEqual(store.moments.map(\.id), ["yesterday", "today"])
+        XCTAssertEqual(store.moments.map(\.id), ["d-4", "d-3", "d-2", "d-1", "d0", "d1", "d2"])
         await store.prefetchAdjacentTimelineDays()
-        XCTAssertEqual(store.moments.map(\.id), ["yesterday", "today"])
-        let rangeCount = await daemon.recordedRanges().count
-        XCTAssertEqual(rangeCount, 2)
+        let replenishedRanges = await daemon.recordedRanges()
+        XCTAssertEqual(replenishedRanges.count, 2)
+        XCTAssertEqual(
+            replenishedRanges[1],
+            .init(
+                fromMs: localDay(offsetBy: -4, from: center).start,
+                toMs: localDay(offsetBy: -4, from: center).end - 1
+            )
+        )
     }
 
     func testLoadedWindowEvictsTheFarSide() async {
@@ -431,6 +511,23 @@ private func moment(_ id: String, at capturedAtMs: Int64) -> RecallMoment {
     RecallMoment(id: id, sessionId: "s1", capturedAtMs: capturedAtMs, imageArtifactId: "a-\(id)")
 }
 
+private func localDay(
+    offsetBy offset: Int,
+    from origin: (start: Int64, end: Int64)
+) -> (start: Int64, end: Int64) {
+    var day = origin
+    if offset < 0 {
+        for _ in offset..<0 {
+            day = DaySummaryLayout.dayBounds(ms: day.start - 1)
+        }
+    } else if offset > 0 {
+        for _ in 0..<offset {
+            day = DaySummaryLayout.dayBounds(ms: day.end)
+        }
+    }
+    return day
+}
+
 private func summaryDay(_ day: String, startingAt dayStartMs: Int64) -> DaySummary {
     DaySummary(day: day, dayStartMs: dayStartMs, dayEndMs: dayStartMs + 99, slots: [])
 }
@@ -442,13 +539,42 @@ private actor MultiDayTimelineDaemon: RecallDaemonServing {
     }
 
     private let stored: [RecallMoment]
+    private let delayedRangeStartMs: Int64?
+    private let refreshedRangeStartMs: Int64?
+    private let refreshedMoments: [RecallMoment]?
     private var ranges: [Range] = []
+    private var delayedRangeStarted = false
+    private var delayedRangeWaiter: CheckedContinuation<Void, Never>?
+    private var delayedRangeReleaseWaiter: CheckedContinuation<Void, Never>?
+    private var delayedRangeWasReleased = false
 
-    init(moments: [RecallMoment]) {
+    init(
+        moments: [RecallMoment],
+        delayedRangeStartMs: Int64? = nil,
+        refreshedRangeStartMs: Int64? = nil,
+        refreshedMoments: [RecallMoment]? = nil
+    ) {
         stored = moments
+        self.delayedRangeStartMs = delayedRangeStartMs
+        self.refreshedRangeStartMs = refreshedRangeStartMs
+        self.refreshedMoments = refreshedMoments
     }
 
     func recordedRanges() -> [Range] { ranges }
+
+    func waitForDelayedRangeRequest() async {
+        guard delayedRangeStartMs != nil, !delayedRangeStarted else { return }
+        await withCheckedContinuation { delayedRangeWaiter = $0 }
+    }
+
+    func releaseDelayedRange() {
+        if let delayedRangeReleaseWaiter {
+            self.delayedRangeReleaseWaiter = nil
+            delayedRangeReleaseWaiter.resume()
+        } else {
+            delayedRangeWasReleased = true
+        }
+    }
 
     func sessions() async throws -> [RecallSession] {
         [RecallSession(id: "s1", startedAtMs: stored.map(\.capturedAtMs).min() ?? 0)]
@@ -462,7 +588,18 @@ private actor MultiDayTimelineDaemon: RecallDaemonServing {
 
     func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment] {
         ranges.append(.init(fromMs: fromMs, toMs: toMs))
-        return stored.filter { $0.capturedAtMs >= fromMs && $0.capturedAtMs <= toMs }
+        if fromMs == delayedRangeStartMs, !delayedRangeStarted {
+            delayedRangeStarted = true
+            delayedRangeWaiter?.resume()
+            delayedRangeWaiter = nil
+            if delayedRangeWasReleased {
+                delayedRangeWasReleased = false
+            } else {
+                await withCheckedContinuation { delayedRangeReleaseWaiter = $0 }
+            }
+        }
+        let source = fromMs == refreshedRangeStartMs ? (refreshedMoments ?? stored) : stored
+        return source.filter { $0.capturedAtMs >= fromMs && $0.capturedAtMs <= toMs }
     }
 
     func moments(sessionID _: String) async throws -> [RecallMoment] { stored }

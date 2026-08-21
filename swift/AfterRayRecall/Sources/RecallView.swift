@@ -106,9 +106,9 @@ public struct RecallView: View {
     /// while the gesture is live; freezing x-mapping keeps the drag origin
     /// from jumping when `visualTotalMs` changes.
     @State private var frozenScrubLayout: TimelineLayout?
-    /// One neighbour fetch per edge per gesture. The frozen layout stays
-    /// parked on the old start/end, so without this a held drag would keep
-    /// walking older days until the seven-day cap.
+    /// One outstanding fetch per direction and loaded boundary. Publishing a
+    /// new outer day clears that direction so a single long gesture can
+    /// replenish the next warm day without issuing a request every frame.
     @State private var requestedExtendDuringScrub: Set<TimelineExtendDirection> = []
     /// Trackpad travel needed to advance one filmstrip cell.
     private static let searchScrollPointsPerCell: CGFloat = 46
@@ -422,6 +422,9 @@ public struct RecallView: View {
                 finishScrubbing()
             }
         }
+        .onChange(of: moments) { _, updatedMoments in
+            adoptExpandedFrozenLayout(updatedMoments)
+        }
         .onMoveCommand(perform: handleMoveCommand)
         .onKeyPress(.space) {
             guard !renderedIsLive, let moment = selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else {
@@ -722,10 +725,12 @@ public struct RecallView: View {
                     return
                 }
                 if dragOrigin == nil, searchDragOrigin == nil {
-                    isScrubbing = true
+                    // Start through the shared initializer. Setting
+                    // `isScrubbing` first makes `beginScrubbing` return early,
+                    // leaving a pointer drag without its frozen layout.
+                    beginScrubbing(holdsPlayhead: searchSession == nil)
                 }
                 if let searchSession {
-                    beginScrubbing(holdsPlayhead: false)
                     // Search results are discrete, so a drag walks whole cells
                     // rather than scrubbing continuously through time.
                     let origin = searchDragOrigin ?? searchSession.selectedIndex
@@ -739,7 +744,6 @@ public struct RecallView: View {
                     return
                 }
                 if dragOrigin == nil {
-                    beginScrubbing()
                     dragOrigin = (renderedPlayheadMs, renderedIsLive)
                 }
                 guard let origin = dragOrigin else { return }
@@ -926,8 +930,11 @@ public struct RecallView: View {
 
     private func requestTimelineExtendIfNeeded(clampedMs: Int64, isLive: Bool) {
         // Compare against the unfrozen spine. The scrub layout is frozen so
-        // a neighbour merge cannot jump the drag origin. Start the fetch with
-        // enough room for it to return before the old edge is visible.
+        // a neighbour merge cannot jump the drag origin. Replenish the outer
+        // reserve as soon as travel has a direction, before crossing midnight
+        // and while the guaranteed two-day cushion is still present; one
+        // viewport is the fallback trigger if a sparse window still approaches
+        // its edge.
         let live = liveTimelineLayout
         if let direction = TimelineEdgePrefetch.direction(
             playheadMs: clampedMs,
@@ -944,12 +951,30 @@ public struct RecallView: View {
         if isScrubbing, !requestedExtendDuringScrub.insert(direction).inserted { return }
         guard let onApproachTimelineEdge else { return }
         Task { @MainActor in
-            guard await onApproachTimelineEdge(direction), isScrubbing else { return }
-            // The fetch began before the clamp. Once it lands, adopt its
-            // mapping so a held trackpad gesture can enter the new day rather
-            // than needing a reverse swipe to start another one.
-            frozenScrubLayout = liveTimelineLayout
+            guard await onApproachTimelineEdge(direction) else { return }
+            // The callback publishes `moments`; `onChange(of: moments)`
+            // adopts that fresh input. This Task captured the old View value,
+            // so rebuilding from `liveTimelineLayout` here would freeze the
+            // scrub on the pre-merge day until the gesture ended.
         }
+    }
+
+    private func adoptExpandedFrozenLayout(_ updatedMoments: [RecallMoment]) {
+        guard isScrubbing,
+              let frozenScrubLayout,
+              TimelineEdgePrefetch.expandsFrozenWindow(frozenScrubLayout, with: updatedMoments)
+        else { return }
+        if let first = updatedMoments.first, first.capturedAtMs < frozenScrubLayout.startMs {
+            requestedExtendDuringScrub.remove(.older)
+        }
+        if let last = updatedMoments.last, last.capturedAtMs > frozenScrubLayout.endMs {
+            requestedExtendDuringScrub.remove(.newer)
+        }
+        self.frozenScrubLayout = layoutCache.layout(
+            moments: updatedMoments,
+            viewportWidth: max(timelineViewportWidth, 1),
+            density: tuning.timelineDensity * Double(timelineZoom)
+        )
     }
 
     private func prefetchAroundSelection() {
