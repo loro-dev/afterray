@@ -245,6 +245,23 @@ hardened runtime, so Instruments attaches. A release build is hardened and
 would have to be re-signed with `get-task-allow` first — do not add that to
 `Automation.entitlements`, which release shares.
 
+For a signed release candidate, launch the installed app through LaunchServices
+with the opt-in driver instead of synthesising HID input:
+
+```sh
+open \
+  --env AFTERRAY_UI_PERF_LOG=1 \
+  --env AFTERRAY_UI_PERF_AUTORUN=1 \
+  --env AFTERRAY_UI_PERF_AUTORUN_REVERSE=1 \
+  --env AFTERRAY_UI_PERF_AUTORUN_DELAY_MS=3000 \
+  /Applications/AfterRay.app
+```
+
+Quit the existing process first so LaunchServices creates a process with those
+variables. The app orders the otherwise parked overlay front only for this
+explicit run, then the driver uses the real display link, store, daemon, and
+vault. Read the result with `make perf-log`; ordinary launches remain parked.
+
 One trap that cost an hour: `print` to a pipe is block-buffered, and a
 profiling run ends by killing the process at its time limit, so the perf line
 was written and discarded. `ScrubFrameMetrics.finish` now `fflush`es. Anything

@@ -138,6 +138,13 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()
         RecallOverlayController.shared.start()
+        // A hidden panel does not receive display-link ticks. The existing
+        // in-process scrub driver therefore has to order the real overlay
+        // front when a release candidate is launched explicitly for perf.
+        // Normal launches never carry this opt-in environment variable.
+        if ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_AUTORUN"] == "1" {
+            RecallOverlayController.shared.show()
+        }
         AfterRayCliInstall.refreshIfStale()
         OnboardingController.shared.showIfNeeded()
     }
