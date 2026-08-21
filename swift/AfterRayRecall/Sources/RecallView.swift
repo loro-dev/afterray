@@ -2332,9 +2332,24 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             stressDriverTask?.cancel()
             stressDriverTask = Task { @MainActor [weak self] in
                 do {
+                    // The shipped overlay builds its hosting tree while the
+                    // panel is parked. Starting the delay there makes the
+                    // release autorun finish before a display link can tick,
+                    // even though the Visual Lab (whose window starts
+                    // visible) works. Wait for the same state a real gesture
+                    // requires before emitting the first synthetic delta.
+                    while let self,
+                          self.hostView?.window?.isVisible != true || self.displayLink == nil
+                    {
+                        self.attachDisplayLinkIfNeeded()
+                        try await Task.sleep(for: .milliseconds(50))
+                    }
+                    guard let self else { return }
                     try await Task.sleep(for: .milliseconds(delayMilliseconds))
+                    ScrubFrameMetrics.log.notice(
+                        "[afterray-ui-perf] autorun_started display=\(self.hostView?.window?.screen?.maximumFramesPerSecond ?? 0)Hz"
+                    )
                     for flickIndex in 0..<4 {
-                        guard let self else { return }
                         let sign: CGFloat = reversesDirection && flickIndex.isMultiple(of: 2)
                             ? -1
                             : (reversesDirection ? 1 : -1)
@@ -2354,7 +2369,7 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
                         acceptPrecise(delta: 0, phase: .ended, at: CACurrentMediaTime())
                         try await Task.sleep(for: .milliseconds(180))
                     }
-                    self?.stressDriverTask = nil
+                    self.stressDriverTask = nil
                 } catch {
                     return
                 }
