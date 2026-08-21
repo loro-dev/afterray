@@ -5,7 +5,7 @@ Area: recall-ui
 Anchors:
 - —
 Supersedes: —
-Superseded-by: ../../active/architecture/2026-08-21-sliding-timeline-day-window.md
+Superseded-by: 2026-08-21-sliding-timeline-day-window.md
 
 ## Problem
 

@@ -1353,6 +1353,9 @@ private struct AfterRayRootView: View {
     var body: some View {
         RecallView(
             moments: store.moments,
+            timelineRevision: store.timelineRevision,
+            timelineSpine: store.timelineSpine,
+            timelineDayCoverage: store.timelineDayCoverage,
             playheadMs: Binding(
                 get: { store.playheadMs },
                 set: { store.select(playheadMs: $0) }
@@ -1411,9 +1414,9 @@ private struct AfterRayRootView: View {
                 try await images.ocrEvidence(momentID: momentID)
             },
             onSelectSearchFrame: selectSearchFrame,
-            // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
-            onApproachTimelineEdge: { direction in
-                await store.extendTimeline(direction: direction)
+            // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
+            onApproachTimelineEdge: { direction, anchorMs in
+                await store.extendTimeline(direction: direction, aroundMs: anchorMs)
             }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -23,7 +23,13 @@ public final class RecallStore: ObservableObject {
 
     private let daemon: any RecallDaemonServing
     private var sensitiveGeneration: UInt64 = 0
-    private var timelineRevision: UInt64 = 0
+    /// Changes exactly when the timeline rows change. The view uses this
+    /// scalar instead of comparing a 20K-element array after every publish.
+    public private(set) var timelineRevision: UInt64 = 0
+    /// Geometry derived from `moments` on a worker before the rows publish.
+    /// Nil means a rare in-place detail mutation invalidated the prepared
+    /// value and the view should rebuild it once.
+    public private(set) var timelineSpine: TimelineSpine?
     /// Replacing or recentering the local-day window invalidates an adjacent
     /// fetch. A routine refresh does not: it only enriches the same window,
     /// and must not make a neighbour disappear while a scrub is in flight.
@@ -42,18 +48,19 @@ public final class RecallStore: ObservableObject {
     private var timelineHasNewer = true
     private struct InFlightTimelineExtend {
         let id: UInt64
+        let direction: TimelineExtendDirection
         let windowGeneration: UInt64
         let task: Task<Bool, Never>
     }
     private var nextTimelineExtendID: UInt64 = 0
-    private var inFlightExtend: [TimelineExtendDirection: InFlightTimelineExtend] = [:]
+    private var inFlightExtend: InFlightTimelineExtend?
     private var loadedDayKey: String?
     private var summaryHistoryCursorMs: Int64?
     private var summaryHistoryGeneration: UInt64 = 0
 
-    /// Days of lean index the overlay may hold. Enough to scrub across a
-    /// week; small enough that the warped playhead spine stays cheap.
-    public static let maxLoadedTimelineDays = 7
+    /// Occupied local-day data in the normal warm window. Sparse empty-day
+    /// spans may cover more calendar days without adding timeline rows.
+    public static let maxLoadedTimelineDays = TimelineWarmWindow.preloadRadiusDays * 2 + 1
     /// Empty local days to walk through when the previous/next calendar day
     /// has no captures.
     public static let emptyDaySkipLimit = 31
@@ -66,7 +73,11 @@ public final class RecallStore: ObservableObject {
         RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
     }
 
-    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    public var timelineDayCoverage: TimelineDayCoverage? {
+        loadedTimelineDayBounds.map { TimelineDayCoverage(start: $0.start, end: $0.end) }
+    }
+
+    // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
     public func loadTimeline(
         containingMs requestedMs: Int64? = nil,
         preservingSelection: Bool = false
@@ -94,10 +105,10 @@ public final class RecallStore: ObservableObject {
                   timelineWindowGeneration == requestWindowGeneration
             else { return }
             sessions = loadedSessions
-            apply(prepared, preservingSelection: preservingSelection)
             loadedTimelineDayBounds = bounds
             timelineHasOlder = true
             timelineHasNewer = bounds.end < DaySummaryLayout.dayBounds(ms: nowMs).end
+            apply(prepared, preservingSelection: preservingSelection)
         } catch {
             guard sensitiveGeneration == requestGeneration,
                   timelineWindowGeneration == requestWindowGeneration
@@ -107,8 +118,9 @@ public final class RecallStore: ObservableObject {
                 return
             }
             if !Self.isDaemonConnectionError(error) {
-                moments = []
                 timelineRevision &+= 1
+                timelineSpine = nil
+                moments = []
                 capturedAtMsByMomentID = [:]
                 timelineBounds = (0, 1)
                 applyPlayhead(0)
@@ -199,7 +211,6 @@ public final class RecallStore: ObservableObject {
         guard sensitiveGeneration == requestGeneration,
               timelineWindowGeneration == requestWindowGeneration
         else { return }
-        apply(prepared, selecting: momentID, preservingSelection: preservingSelection)
         if let first = prepared.moments.first, let last = prepared.moments.last {
             let start = DaySummaryLayout.dayBounds(ms: first.capturedAtMs).start
             let end = DaySummaryLayout.dayBounds(ms: last.capturedAtMs).end
@@ -210,6 +221,7 @@ public final class RecallStore: ObservableObject {
         } else {
             loadedTimelineDayBounds = nil
         }
+        apply(prepared, selecting: momentID, preservingSelection: preservingSelection)
         await loadDaySummary(dayMs: playheadMs, force: true)
     }
 
@@ -224,8 +236,9 @@ public final class RecallStore: ObservableObject {
         let preservedMomentID = preservingSelection ? selectedMoment?.id : nil
         let preservedPlayheadMs = playheadMs
         let loaded = prepared.moments
-        moments = loaded
+        timelineSpine = prepared.spine
         timelineRevision &+= 1
+        moments = loaded
         // Walking search results asks "where is this id?" on every scroll tick,
         // and the timeline is the whole archive — scanning it per tick is the
         // one part of stepping that grew with how long AfterRay had been
@@ -276,11 +289,11 @@ public final class RecallStore: ObservableObject {
             let rawMoments = try await daemon.timeline(fromMs: bounds.start, toMs: bounds.end - 1)
             let prepared = await Self.prepareTimeline(rawMoments)
             guard sensitiveGeneration == requestGeneration else { return }
-            apply(prepared, selecting: momentID)
             loadedTimelineDayBounds = bounds
             let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
             timelineHasOlder = true
             timelineHasNewer = bounds.end < DaySummaryLayout.dayBounds(ms: nowMs).end
+            apply(prepared, selecting: momentID)
             patchEvidence(detail)
             await loadDaySummary(dayMs: detail.capturedAtMs, force: true)
         } catch {
@@ -297,13 +310,30 @@ public final class RecallStore: ObservableObject {
     /// Empty local days are skipped so a gap between captures is still one
     /// scrub, not a dead end.
     @discardableResult
-    public func extendTimeline(direction: TimelineExtendDirection) async -> Bool {
+    public func extendTimeline(
+        direction: TimelineExtendDirection,
+        aroundMs anchorMs: Int64? = nil
+    ) async -> Bool {
         let requestSensitiveGeneration = sensitiveGeneration
         let windowGeneration = timelineWindowGeneration
-        if let existing = inFlightExtend[direction],
+        let resolvedAnchorMs = anchorMs ?? (playheadMs > 0 ? playheadMs : loadedTimelineDayBounds?.start ?? 0)
+        if let existing = inFlightExtend,
            existing.windowGeneration == windowGeneration
         {
-            return await existing.task.value
+            let result = await existing.task.value
+            if inFlightExtend?.id == existing.id {
+                inFlightExtend = nil
+            }
+            let required = TimelineDayCoverage.warmWindow(containingMs: resolvedAnchorMs)
+            if let coverage = timelineDayCoverage {
+                let stillMissing = direction == .older
+                    ? coverage.start > required.start
+                    : coverage.end < required.end
+                if existing.direction != direction || stillMissing {
+                    return await extendTimeline(direction: direction, aroundMs: resolvedAnchorMs)
+                }
+            }
+            return result
         }
         nextTimelineExtendID &+= 1
         let requestID = nextTimelineExtendID
@@ -311,24 +341,27 @@ public final class RecallStore: ObservableObject {
             guard let self else { return false }
             return await self.performTimelineExtend(
                 direction: direction,
+                anchorMs: resolvedAnchorMs,
                 requestGeneration: requestSensitiveGeneration,
                 requestWindowGeneration: windowGeneration
             )
         }
-        inFlightExtend[direction] = InFlightTimelineExtend(
+        inFlightExtend = InFlightTimelineExtend(
             id: requestID,
+            direction: direction,
             windowGeneration: windowGeneration,
             task: task
         )
         let result = await task.value
-        if inFlightExtend[direction]?.id == requestID {
-            inFlightExtend.removeValue(forKey: direction)
+        if inFlightExtend?.id == requestID {
+            inFlightExtend = nil
         }
         return result
     }
 
     private func performTimelineExtend(
         direction: TimelineExtendDirection,
+        anchorMs: Int64,
         requestGeneration: UInt64,
         requestWindowGeneration: UInt64
     ) async -> Bool {
@@ -339,26 +372,39 @@ public final class RecallStore: ObservableObject {
 
         let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
         let today = DaySummaryLayout.dayBounds(ms: nowMs)
-        var probeMs: Int64
+        let required = TimelineDayCoverage.warmWindow(containingMs: anchorMs)
+        var nextBounds: TimelineDayCoverage
         switch direction {
         case .older:
             guard timelineHasOlder else { return false }
-            probeMs = range.start - 1
+            if range.start > required.start {
+                nextBounds = TimelineDayCoverage(start: required.start, end: range.start)
+            } else {
+                let day = DaySummaryLayout.dayBounds(ms: range.start - 1)
+                nextBounds = TimelineDayCoverage(start: day.start, end: day.end)
+            }
         case .newer:
             guard timelineHasNewer else { return false }
             if range.end >= today.end {
                 timelineHasNewer = false
                 return false
             }
-            probeMs = range.end
+            let requiredEnd = min(required.end, today.end)
+            if range.end < requiredEnd {
+                nextBounds = TimelineDayCoverage(start: range.end, end: requiredEnd)
+            } else {
+                let day = DaySummaryLayout.dayBounds(ms: range.end)
+                nextBounds = TimelineDayCoverage(start: day.start, end: day.end)
+            }
         }
 
+        var probedCoverage = nextBounds
         var skippedEmpty = 0
         while skippedEmpty <= Self.emptyDaySkipLimit {
             guard sensitiveGeneration == requestGeneration,
                   timelineWindowGeneration == requestWindowGeneration
             else { return false }
-            let bounds = DaySummaryLayout.dayBounds(ms: probeMs)
+            let bounds = nextBounds
             if let covered = loadedTimelineDayBounds,
                bounds.start >= covered.start,
                bounds.end <= covered.end
@@ -374,16 +420,23 @@ public final class RecallStore: ObservableObject {
                 guard sensitiveGeneration == requestGeneration,
                       timelineWindowGeneration == requestWindowGeneration
                 else { return false }
+                probedCoverage = TimelineDayCoverage(
+                    start: min(probedCoverage.start, bounds.start),
+                    end: max(probedCoverage.end, bounds.end)
+                )
                 if raw.isEmpty {
                     skippedEmpty += 1
-                    expandLoadedRange(toInclude: bounds)
                     switch direction {
-                    case .older: probeMs = bounds.start - 1
-                    case .newer: probeMs = bounds.end
+                    case .older:
+                        let day = DaySummaryLayout.dayBounds(ms: bounds.start - 1)
+                        nextBounds = TimelineDayCoverage(start: day.start, end: day.end)
+                    case .newer:
+                        let day = DaySummaryLayout.dayBounds(ms: bounds.end)
+                        nextBounds = TimelineDayCoverage(start: day.start, end: day.end)
                     }
                     continue
                 }
-                let added = await Self.prepareTimeline(raw)
+                let added = await Self.sortedMoments(raw)
                 guard sensitiveGeneration == requestGeneration,
                       timelineWindowGeneration == requestWindowGeneration
                 else { return false }
@@ -393,21 +446,38 @@ public final class RecallStore: ObservableObject {
                 while true {
                     let current = moments
                     let mergeRevision = timelineRevision
+                    let currentCoverage = timelineDayCoverage ?? probedCoverage
+                    let availableCoverage = TimelineDayCoverage(
+                        start: min(currentCoverage.start, probedCoverage.start),
+                        end: max(currentCoverage.end, probedCoverage.end)
+                    )
+                    let retainedCoverage = TimelineWarmWindow.retainedCoverage(
+                        available: availableCoverage,
+                        containingMs: anchorMs,
+                        including: TimelineDayCoverage(start: bounds.start, end: bounds.end)
+                    )
                     let merged = await Task.detached(priority: .userInitiated, operation: {
-                        Self.mergePrepared(current: current, added: added.moments)
+                        Self.mergeAndTrimPrepared(
+                            current: current,
+                            added: added,
+                            retaining: retainedCoverage
+                        )
                     }).value
                     guard sensitiveGeneration == requestGeneration,
                           timelineWindowGeneration == requestWindowGeneration
                     else { return false }
                     guard timelineRevision == mergeRevision else { continue }
+                    loadedTimelineDayBounds = (
+                        retainedCoverage.start,
+                        retainedCoverage.end
+                    )
+                    if retainedCoverage.start > availableCoverage.start {
+                        timelineHasOlder = true
+                    }
+                    if retainedCoverage.end < availableCoverage.end {
+                        timelineHasNewer = true
+                    }
                     apply(merged, preservingSelection: true)
-                    expandLoadedRange(toInclude: bounds)
-                    // During a scrub the store's settled playhead is one turn
-                    // behind the transient pointer. Bias eviction toward the
-                    // requested edge so the day we just warmed is not dropped
-                    // immediately from a full seven-day window.
-                    let evictionAnchorMs = direction == .older ? bounds.start : bounds.end - 1
-                    evictDistantDays(aroundMs: evictionAnchorMs)
                     return true
                 }
             } catch {
@@ -418,6 +488,20 @@ public final class RecallStore: ObservableObject {
                 loadState = .failed(message: error.localizedDescription)
                 return false
             }
+        }
+        guard sensitiveGeneration == requestGeneration,
+              timelineWindowGeneration == requestWindowGeneration
+        else { return false }
+        // Every probe was empty. Coverage still advances: otherwise the same
+        // known-empty calendar span looks cold again on the next gesture even
+        // though there are no rows (and therefore no layout) to publish.
+        if let currentCoverage = timelineDayCoverage {
+            loadedTimelineDayBounds = (
+                min(currentCoverage.start, probedCoverage.start),
+                max(currentCoverage.end, probedCoverage.end)
+            )
+        } else {
+            loadedTimelineDayBounds = (probedCoverage.start, probedCoverage.end)
         }
         switch direction {
         case .older: timelineHasOlder = false
@@ -598,11 +682,15 @@ public final class RecallStore: ObservableObject {
         else { return }
         let momentID = selected.id
         let previous = selected.isFavorite
+        timelineSpine = nil
+        timelineRevision &+= 1
         moments[index].isFavorite.toggle()
         do {
             try await daemon.setFavorite(momentID: momentID, favorite: !previous)
         } catch {
             guard let index = moments.firstIndex(where: { $0.id == momentID }) else { return }
+            timelineSpine = nil
+            timelineRevision &+= 1
             moments[index].isFavorite = previous
             if Self.isDaemonConnectionError(error) { return }
             loadState = .failed(message: error.localizedDescription)
@@ -616,8 +704,9 @@ public final class RecallStore: ObservableObject {
     public func clearSensitiveState() {
         sensitiveGeneration &+= 1
         sessions = []
-        moments = []
+        timelineSpine = nil
         timelineRevision &+= 1
+        moments = []
         capturedAtMsByMomentID = [:]
         timelineBounds = (0, 1)
         loadedTimelineDayBounds = nil
@@ -647,61 +736,6 @@ public final class RecallStore: ObservableObject {
         bounds.end == range.start || bounds.start == range.end
     }
 
-    private func expandLoadedRange(toInclude bounds: (start: Int64, end: Int64)) {
-        if let range = loadedTimelineDayBounds {
-            loadedTimelineDayBounds = (min(range.start, bounds.start), max(range.end, bounds.end))
-        } else {
-            loadedTimelineDayBounds = bounds
-        }
-    }
-
-    private func loadedDayCount() -> Int {
-        guard let range = loadedTimelineDayBounds else { return 0 }
-        var count = 0
-        var cursor = range.start
-        while cursor < range.end {
-            count += 1
-            cursor = DaySummaryLayout.dayBounds(ms: cursor).end
-            if count > 366 { break }
-        }
-        return count
-    }
-
-    private func evictDistantDays(aroundMs: Int64) {
-        let playheadDay = DaySummaryLayout.dayBounds(ms: aroundMs)
-        while loadedDayCount() > Self.maxLoadedTimelineDays, let range = loadedTimelineDayBounds {
-            let startDay = DaySummaryLayout.dayBounds(ms: range.start)
-            let lastDayStart = DaySummaryLayout.dayBounds(ms: range.end - 1).start
-            if startDay.start == lastDayStart { break }
-            let dropStart: Bool
-            if playheadDay.start <= startDay.start {
-                dropStart = false
-            } else if playheadDay.end >= range.end {
-                dropStart = true
-            } else {
-                dropStart = abs(playheadDay.start - startDay.start) >= abs(range.end - playheadDay.end)
-            }
-            if dropStart {
-                let newStart = startDay.end
-                loadedTimelineDayBounds = (newStart, range.end)
-                dropMoments(before: newStart)
-                timelineHasOlder = true
-            } else {
-                loadedTimelineDayBounds = (range.start, lastDayStart)
-                dropMoments(from: lastDayStart)
-                timelineHasNewer = true
-            }
-        }
-    }
-
-    private func dropMoments(before ms: Int64) {
-        apply(Self.prepareTimelineSync(moments.filter { $0.capturedAtMs >= ms }), preservingSelection: true)
-    }
-
-    private func dropMoments(from ms: Int64) {
-        apply(Self.prepareTimelineSync(moments.filter { $0.capturedAtMs < ms }), preservingSelection: true)
-    }
-
     private func applyPlayhead(_ ms: Int64) {
         let next = moments.isEmpty
             ? 0
@@ -722,6 +756,7 @@ public final class RecallStore: ObservableObject {
         let moments: [RecallMoment]
         let capturedAtMsByMomentID: [String: Int64]
         let bounds: (startMs: Int64, endMs: Int64)
+        let spine: TimelineSpine
     }
 
     nonisolated private static func prepareTimeline(
@@ -735,34 +770,77 @@ public final class RecallStore: ObservableObject {
     nonisolated private static func prepareTimelineSync(
         _ moments: [RecallMoment]
     ) -> PreparedTimeline {
-        let sorted = moments.sorted { left, right in
+        let sorted = sortMomentsSync(moments)
+        return prepareSortedTimeline(sorted)
+    }
+
+    nonisolated private static func sortedMoments(
+        _ moments: [RecallMoment]
+    ) async -> [RecallMoment] {
+        await Task.detached(priority: .userInitiated) {
+            sortMomentsSync(moments)
+        }.value
+    }
+
+    nonisolated private static func sortMomentsSync(
+        _ moments: [RecallMoment]
+    ) -> [RecallMoment] {
+        moments.sorted { left, right in
             if left.capturedAtMs == right.capturedAtMs { return left.id < right.id }
             return left.capturedAtMs < right.capturedAtMs
         }
-        return prepareSortedTimeline(sorted)
     }
 
     nonisolated private static func prepareSortedTimeline(
         _ sorted: [RecallMoment]
     ) -> PreparedTimeline {
+        let bounds = TimelineLayout.timeBounds(moments: sorted)
         return PreparedTimeline(
             moments: sorted,
             capturedAtMsByMomentID: Dictionary(
                 sorted.lazy.map { ($0.id, $0.capturedAtMs) },
                 uniquingKeysWith: { first, _ in first }
             ),
-            bounds: TimelineLayout.timeBounds(moments: sorted)
+            bounds: bounds,
+            spine: TimelineSpine(moments: sorted, bounds: bounds)
         )
     }
 
-    nonisolated private static func mergePrepared(
+    /// Adjacent day rows are already sorted and disjoint from the current
+    /// window, so the common path is two filters plus one ordered append: O(n),
+    /// with the median interval and spine then prepared on this worker. The
+    /// overlap fallback keeps refresh/extension races correct without putting
+    /// a dictionary and sort back on the MainActor.
+    nonisolated private static func mergeAndTrimPrepared(
         current: [RecallMoment],
-        added: [RecallMoment]
+        added: [RecallMoment],
+        retaining coverage: TimelineDayCoverage
     ) -> PreparedTimeline {
+        let retainedCurrent = current.filter {
+            $0.capturedAtMs >= coverage.start && $0.capturedAtMs < coverage.end
+        }
+        let retainedAdded = added.filter {
+            $0.capturedAtMs >= coverage.start && $0.capturedAtMs < coverage.end
+        }
+        if retainedCurrent.isEmpty { return prepareSortedTimeline(retainedAdded) }
+        if retainedAdded.isEmpty { return prepareSortedTimeline(retainedCurrent) }
+        if let addedLast = retainedAdded.last,
+           let currentFirst = retainedCurrent.first,
+           addedLast.capturedAtMs < currentFirst.capturedAtMs
+        {
+            return prepareSortedTimeline(retainedAdded + retainedCurrent)
+        }
+        if let currentLast = retainedCurrent.last,
+           let addedFirst = retainedAdded.first,
+           currentLast.capturedAtMs < addedFirst.capturedAtMs
+        {
+            return prepareSortedTimeline(retainedCurrent + retainedAdded)
+        }
+
         var byID: [String: RecallMoment] = Dictionary(
-            uniqueKeysWithValues: current.map { ($0.id, $0) }
+            uniqueKeysWithValues: retainedCurrent.map { ($0.id, $0) }
         )
-        for moment in added {
+        for moment in retainedAdded {
             byID[moment.id] = moment
         }
         return prepareTimelineSync(Array(byID.values))
@@ -783,6 +861,8 @@ public final class RecallStore: ObservableObject {
 
     private func patchEvidence(_ detail: RecallMoment) {
         guard let index = moments.firstIndex(where: { $0.id == detail.id }) else { return }
+        timelineSpine = nil
+        timelineRevision &+= 1
         moments[index] = detail
     }
 

@@ -58,17 +58,34 @@ public struct TimelineFavorite: Equatable, Identifiable, Sendable {
 /// drawn, so keeping this separate lets a zoom drag re-place runs without
 /// re-scanning and re-sorting every moment.
 public struct TimelineSpine: Equatable, Sendable {
+    struct FavoriteSeed: Equatable, Sendable {
+        let id: String
+        let capturedAtMs: Int64
+    }
+
     let startMs: Int64
     let endMs: Int64
     let raw: [TimelineLayout.RawRun]
+    let favoriteSeeds: [FavoriteSeed]
     let visualTotalMs: Int64
 
     public init(moments: [RecallMoment]) {
         let bounds = TimelineLayout.timeBounds(moments: moments)
+        self.init(moments: moments, bounds: bounds)
+    }
+
+    init(
+        moments: [RecallMoment],
+        bounds: (startMs: Int64, endMs: Int64)
+    ) {
         startMs = bounds.startMs
         endMs = bounds.endMs
         let runs = TimelineLayout.makeRuns(moments: moments, endMs: bounds.endMs)
         raw = runs
+        favoriteSeeds = moments.compactMap { moment in
+            guard moment.isFavorite else { return nil }
+            return FavoriteSeed(id: moment.id, capturedAtMs: moment.capturedAtMs)
+        }
         visualTotalMs = max(runs.reduce(Int64(0)) { $0 + $1.visualDurationMs }, 1)
     }
 }
@@ -150,7 +167,7 @@ public struct TimelineLayout: Equatable, Sendable {
         runs = placed
         contentWidth = max(cursor, 1)
         favorites = Self.placeFavorites(
-            moments: moments,
+            seeds: spine.favoriteSeeds,
             runs: placed,
             startMs: spine.startMs,
             endMs: spine.endMs,
@@ -159,24 +176,21 @@ public struct TimelineLayout: Equatable, Sendable {
     }
 
     private static func placeFavorites(
-        moments: [RecallMoment],
+        seeds: [TimelineSpine.FavoriteSeed],
         runs: [AppUsageRun],
         startMs: Int64,
         endMs: Int64,
         contentWidth: CGFloat
     ) -> [TimelineFavorite] {
-        moments.reduce(into: [TimelineFavorite]()) { marks, moment in
-            guard moment.isFavorite else { return }
-            marks.append(
-                TimelineFavorite(
-                    id: moment.id,
-                    x: x(
-                        ms: moment.capturedAtMs,
-                        runs: runs,
-                        startMs: startMs,
-                        endMs: endMs,
-                        contentWidth: contentWidth
-                    )
+        seeds.map { seed in
+            TimelineFavorite(
+                id: seed.id,
+                x: x(
+                    ms: seed.capturedAtMs,
+                    runs: runs,
+                    startMs: startMs,
+                    endMs: endMs,
+                    contentWidth: contentWidth
                 )
             )
         }
@@ -418,6 +432,30 @@ public struct TimelineLayout: Equatable, Sendable {
     }
 }
 
+// @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
+/// Local-calendar days that have already been queried, including empty days.
+/// Capture timestamps alone cannot represent an empty day, so the view needs
+/// this explicit coverage to decide whether the two-day scrub cushion is warm.
+public struct TimelineDayCoverage: Equatable, Sendable {
+    public let start: Int64
+    public let end: Int64
+
+    public init(start: Int64, end: Int64) {
+        precondition(end > start, "timeline day coverage must not be empty")
+        self.start = start
+        self.end = end
+    }
+
+    public static func warmWindow(containingMs ms: Int64) -> Self {
+        let bounds = TimelineWarmWindow.bounds(containingMs: ms)
+        return Self(start: bounds.start, end: bounds.end)
+    }
+
+    func contains(_ other: Self) -> Bool {
+        start <= other.start && end >= other.end
+    }
+}
+
 /// Calendar-day coverage that must be present before a playhead window is
 /// published. Two days on either side are the interaction invariant; one
 /// additional day on each side is the refill reserve. When the pointer crosses
@@ -429,19 +467,65 @@ enum TimelineWarmWindow {
     static let preloadRadiusDays = guaranteedRadiusDays + refillReserveDays
 
     static func bounds(containingMs ms: Int64) -> (start: Int64, end: Int64) {
+        bounds(containingMs: ms, radiusDays: preloadRadiusDays)
+    }
+
+    static func guaranteedBounds(containingMs ms: Int64) -> (start: Int64, end: Int64) {
+        bounds(containingMs: ms, radiusDays: guaranteedRadiusDays)
+    }
+
+    private static func bounds(
+        containingMs ms: Int64,
+        radiusDays: Int
+    ) -> (start: Int64, end: Int64) {
         var day = DaySummaryLayout.dayBounds(ms: ms)
         var start = day.start
         var end = day.end
-        for _ in 0..<preloadRadiusDays {
+        for _ in 0..<radiusDays {
             day = DaySummaryLayout.dayBounds(ms: start - 1)
             start = day.start
         }
         day = DaySummaryLayout.dayBounds(ms: ms)
-        for _ in 0..<preloadRadiusDays {
+        for _ in 0..<radiusDays {
             day = DaySummaryLayout.dayBounds(ms: end)
             end = day.end
         }
         return (start, end)
+    }
+
+    /// Keeps the normal seven-day window around the transient pointer. If an
+    /// empty-day walk found the next occupied day beyond that reserve, retain
+    /// that fetched edge too; empty calendar days add no layout rows and must
+    /// not make sparse history unreachable.
+    static func retainedCoverage(
+        available: TimelineDayCoverage,
+        containingMs anchorMs: Int64,
+        including fetched: TimelineDayCoverage
+    ) -> TimelineDayCoverage {
+        let desired = TimelineDayCoverage.warmWindow(containingMs: anchorMs)
+        let guaranteed = guaranteedBounds(containingMs: anchorMs)
+        var start: Int64
+        var end: Int64
+        if fetched.start < desired.start {
+            start = fetched.start
+            end = min(available.end, guaranteed.end)
+        } else if fetched.end > desired.end {
+            start = max(available.start, guaranteed.start)
+            end = fetched.end
+        } else {
+            start = max(available.start, desired.start)
+            end = min(available.end, desired.end)
+        }
+        if start >= end {
+            start = fetched.start
+            end = fetched.end
+        }
+        start = min(start, fetched.start)
+        end = max(end, fetched.end)
+        return TimelineDayCoverage(
+            start: max(start, available.start),
+            end: min(end, available.end)
+        )
     }
 }
 
@@ -458,28 +542,29 @@ enum TimelineEdgePrefetch {
         playheadMs: Int64,
         isLive: Bool,
         movementDirection: Int,
-        layout: TimelineLayout,
+        layout: TimelineLayout?,
+        coverage: TimelineDayCoverage? = nil,
         viewportWidth: CGFloat
     ) -> TimelineExtendDirection? {
-        // Shift the reserve toward the next calendar day as soon as travel has
-        // a direction. Waiting until the pointer has already crossed midnight
-        // spends part of the reserve before the refill even starts.
-        let playheadDay = DaySummaryLayout.dayBounds(ms: playheadMs)
-        let nextDayMs = movementDirection < 0 ? playheadDay.start - 1 : playheadDay.end
-        let required = TimelineWarmWindow.bounds(containingMs: nextDayMs)
-        if movementDirection < 0,
-           let first = layout.moments.first,
-           DaySummaryLayout.dayBounds(ms: first.capturedAtMs).start > required.start
-        {
-            return .older
-        }
-        if movementDirection > 0, !isLive,
-           let last = layout.moments.last,
-           DaySummaryLayout.dayBounds(ms: last.capturedAtMs).end < required.end
-        {
-            return .newer
+        // Direction alone is not a cache miss. The old implementation shifted
+        // the whole seven-day window on the first left/right delta, so every
+        // reversal fetched, sorted and republished thousands of rows while the
+        // pointer was still in the middle of an already-warm day.
+        if let coverage {
+            let required = TimelineDayCoverage.warmWindow(containingMs: playheadMs)
+            if movementDirection < 0, coverage.start > required.start {
+                return .older
+            }
+            if movementDirection > 0, !isLive, coverage.end < required.end {
+                return .newer
+            }
+            return nil
         }
 
+        // Static previews do not own explicit query coverage. Preserve their
+        // geometric edge trigger, but production always takes the O(1)
+        // calendar-coverage path above.
+        guard let layout else { return nil }
         let lead = min(
             max(minimumLeadPoints, viewportWidth * viewportFraction),
             layout.contentWidth
@@ -518,6 +603,7 @@ enum TimelineEdgePrefetch {
 public final class TimelineLayoutCache {
     private var moments: [RecallMoment] = []
     private var spine: TimelineSpine?
+    private var revision: UInt64?
     private var viewportWidth: CGFloat = -1
     private var density: Double = -1
     private var placed: TimelineLayout?
@@ -531,10 +617,16 @@ public final class TimelineLayoutCache {
 
     public func layout(
         moments: [RecallMoment],
+        preparedSpine: TimelineSpine? = nil,
+        revision: UInt64? = nil,
         viewportWidth: CGFloat,
         density: Double
     ) -> TimelineLayout {
-        let spine = spine(for: moments)
+        let spine = spine(
+            for: moments,
+            preparedSpine: preparedSpine,
+            revision: revision
+        )
         if let placed, viewportWidth == self.viewportWidth, density == self.density {
             return placed
         }
@@ -554,13 +646,21 @@ public final class TimelineLayoutCache {
     /// `Array ==` short-circuits on shared storage, so the steady state — the
     /// same captures frame after frame — costs a pointer comparison. The
     /// store only republishes when something actually changed.
-    private func spine(for moments: [RecallMoment]) -> TimelineSpine {
-        if let spine, self.moments == moments { return spine }
-        let built = TimelineSpine(moments: moments)
+    private func spine(
+        for moments: [RecallMoment],
+        preparedSpine: TimelineSpine?,
+        revision: UInt64?
+    ) -> TimelineSpine {
+        if let revision, let spine, self.revision == revision { return spine }
+        if revision == nil, let spine, self.moments == moments { return spine }
+        let built = preparedSpine ?? TimelineSpine(moments: moments)
         self.moments = moments
+        self.revision = revision
         spine = built
         placed = nil
-        scans += 1
+        if preparedSpine == nil {
+            scans += 1
+        }
         return built
     }
 }

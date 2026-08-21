@@ -227,7 +227,7 @@ public extension AfterRayDaemonServing {
 // @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
 // @dec:daemon-owns-the-vault — docs/decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
-    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
     public static let protocolVersion = 16
     /// Shutdown is a handoff, not a normal query. A wedged daemon must not hold
     /// application termination behind the ordinary 30-second unary deadline.
@@ -255,7 +255,7 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         )
     }
 
-    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
     public func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment] {
         try await request(
             WireRequest(type: "timeline_range", fromMs: fromMs, toMs: toMs),

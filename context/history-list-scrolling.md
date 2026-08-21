@@ -218,6 +218,26 @@ contention, which is enough to invent a regression that is not there.
 flat but the frame interval is not, the cost is downstream of the handler — in
 the view update — and only the trace will say where.
 
+**`make visual-lab-window-stress-profile`** covers the part the original 20K
+fixture did not: publication of a neighbouring day while inertia is active.
+The old `--stress` view passed no `onApproachTimelineEdge` callback, so its
+~119Hz result proved only that an unchanged layout was cheap. It could not
+exercise the production hitch.
+
+The window fixture holds 3,800 lean rows per local day. Its initial D-3...D+3
+query therefore publishes 26,600 rows, matching the shape of a real seven-day
+vault window. It starts 30 minutes before midnight, alternates four flicks so
+the pointer crosses the boundary in both directions, waits 60ms for each mock
+range request, and routes the result through the real `RecallStore` merge,
+trim, prepared-spine, and `RecallView` adoption path. On the 120Hz display after
+the pointer-centred refill change, three four-segment reps measured
+120.0/108.6/120.0/117.4Hz, 120.0/111.1/120.0/118.9Hz, and — on the final code —
+106.0/114.3/120.0/120.0Hz. Unified logs confirmed one 26,600-row initial range
+and four 3,800-row neighbour ranges. Worst p95 interval was 20.83ms and handler
+p95 stayed near 0.1ms. Every segment cleared the 100Hz regression threshold.
+This is a repeatable code-path gate, not a substitute for `make profile-app` on
+the real vault.
+
 **`make profile-app`** — attach to the running app on the real vault, which is
 what the fixtures are not. Start it with `make dev`, run the target, scrub
 during the window. No entitlement work: the dev bundle is ad-hoc signed with no

@@ -1169,7 +1169,7 @@ impl Vault {
         )
     }
 
-    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
     /// Inclusive `[from_ms, to_ms]` playhead index. Omits concatenated OCR and
     /// transcripts; those stay on `moment_by_id` / evidence reads.
     pub fn timeline_range_sync(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Moment>, StoreError> {
@@ -5943,7 +5943,7 @@ fn migrate_query_indexes(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-// @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+// @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
 /// Playhead / list index: identity, time, app, still/GOP/audio pointers.
 /// `ocr_text` and `transcript_text` are always NULL here — concatenating them
 /// per row is what made `timeline_list` miss the unary deadline.

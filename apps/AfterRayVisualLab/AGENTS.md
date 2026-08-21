@@ -8,12 +8,14 @@ Interactive UI development harness for the recall surfaces (root `Package.swift`
   - default: recall timeline; `--settings` settings chrome; `--chat` chat panel; `--compute` compute dashboard (`--archiving` for the CPU-lane fixture); `--onboarding` onboarding
   - `--models` opens settings on the models page; `--stream` makes the chat scenario stream tokens
   - `--stress` opens the 20K GOP timeline used for scroll/frame-budget profiling
+  - `--window-stress` opens a production-shaped 26.6K-row seven-day window; automated runs cross midnight, reverse, and fetch a delayed neighbour through the real `RecallStore`
 
 ## Run
 
 - `make visual-lab` — recall surface
 - `make visual-lab-stress` — interactive 20K GOP timeline
 - `make visual-lab-stress-profile` — release 20K GOP timeline with four repeatable flicks; prints display-link cadence and synchronous handler p95/max after inertia settles
+- `make visual-lab-window-stress-profile` — release seven-day timeline with alternating flicks and a 60ms neighbour fetch; this is the regression gate for mid-scrub window publication
 - `make settings-lab` — `--settings --models`
 - `make chat-lab` — `--chat`
 - `make compute-lab` — `--compute`

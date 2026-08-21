@@ -62,8 +62,9 @@ final class TimelineLayoutTests: XCTestCase {
         )
     }
 
-    func testEdgePrefetchShiftsReserveBeforeCrossingMidnight() {
+    func testEdgePrefetchDoesNotShiftReserveForDirectionAlone() {
         let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let coverage = TimelineDayCoverage.warmWindow(containingMs: today.start + 43_200_000)
         let layout = TimelineLayout(
             moments: (-3...3).map { offset in
                 let day = testLocalDay(offsetBy: offset, from: today)
@@ -77,25 +78,81 @@ final class TimelineLayoutTests: XCTestCase {
             viewportWidth: 1_000,
             density: 0.12
         )
-        XCTAssertEqual(
+        XCTAssertNil(
             TimelineEdgePrefetch.direction(
                 playheadMs: today.start + 43_200_000,
                 isLive: false,
                 movementDirection: -1,
                 layout: layout,
-                viewportWidth: 1
-            ),
-            .older
+                coverage: coverage,
+                // Explicit query coverage is authoritative even if sparse
+                // captures make the geometric edge look close.
+                viewportWidth: layout.contentWidth
+            )
         )
-        XCTAssertEqual(
+        XCTAssertNil(
             TimelineEdgePrefetch.direction(
                 playheadMs: today.start + 43_200_000,
                 isLive: false,
                 movementDirection: 1,
                 layout: layout,
-                viewportWidth: 1
+                coverage: coverage,
+                viewportWidth: layout.contentWidth
+            )
+        )
+    }
+
+    func testEdgePrefetchRefillsOnlyAfterPointerEntersAdjacentDay() {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let yesterday = testLocalDay(offsetBy: -1, from: today)
+        let coverage = TimelineDayCoverage.warmWindow(containingMs: today.start + 43_200_000)
+
+        XCTAssertEqual(
+            TimelineEdgePrefetch.direction(
+                playheadMs: yesterday.start + 43_200_000,
+                isLive: false,
+                movementDirection: -1,
+                layout: nil,
+                coverage: coverage,
+                viewportWidth: 1_000
             ),
-            .newer
+            .older
+        )
+
+        let replenished = TimelineDayCoverage.warmWindow(
+            containingMs: yesterday.start + 43_200_000
+        )
+        XCTAssertNil(
+            TimelineEdgePrefetch.direction(
+                playheadMs: yesterday.start + 43_200_000,
+                isLive: false,
+                movementDirection: 1,
+                layout: nil,
+                coverage: replenished,
+                viewportWidth: 1_000
+            )
+        )
+    }
+
+    func testExplicitCoveragePreventsEmptyBoundaryFromRefetching() {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let loneMoment = moment(
+            id: "today",
+            at: today.start + 43_200_000,
+            app: "Xcode",
+            bundle: "com.apple.dt.Xcode"
+        )
+        let layout = TimelineLayout(moments: [loneMoment], viewportWidth: 1_000, density: 0.12)
+
+        XCTAssertNil(
+            TimelineEdgePrefetch.direction(
+                playheadMs: loneMoment.capturedAtMs,
+                isLive: false,
+                movementDirection: -1,
+                layout: layout,
+                coverage: .warmWindow(containingMs: loneMoment.capturedAtMs),
+                viewportWidth: layout.contentWidth
+            )
         )
     }
 
@@ -532,6 +589,33 @@ final class TimelineLayoutTests: XCTestCase {
         XCTAssertEqual(extended.moments.count, grown.count)
         XCTAssertGreaterThan(extended.runs.count, resized.runs.count)
         XCTAssertEqual(cache.scans, 2, "new captures must invalidate the spine")
+    }
+
+    func testCacheAdoptsPreparedSpineWithoutMainThreadScan() {
+        let moments = evenlySpacedMoments(count: 20_000)
+        let cache = TimelineLayoutCache()
+        let spine = TimelineSpine(moments: moments)
+
+        let layout = cache.layout(
+            moments: moments,
+            preparedSpine: spine,
+            revision: 41,
+            viewportWidth: 1_000,
+            density: 0.12
+        )
+        for _ in 0..<300 {
+            _ = cache.layout(
+                moments: moments,
+                preparedSpine: spine,
+                revision: 41,
+                viewportWidth: 1_000,
+                density: 0.12
+            )
+        }
+
+        XCTAssertEqual(layout.moments.count, 20_000)
+        XCTAssertEqual(cache.scans, 0, "the store-prepared spine must bypass a view-thread scan")
+        XCTAssertEqual(cache.placements, 1)
     }
 
     /// Re-placing a spine at a new width is the zoom path. It must land on the

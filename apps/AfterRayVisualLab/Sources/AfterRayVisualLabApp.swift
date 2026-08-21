@@ -175,30 +175,35 @@ private struct VisualLabView: View {
         }
     }
 
+    @ViewBuilder
     private var recallLab: some View {
-        HSplitView {
-            RecallView(
-                moments: moments,
-                playheadMs: $playheadMs,
-                loadState: scenario.loadState,
-                tuning: tuning,
-                imageLoader: MockArtifactFactory.loader,
-                onToggleFavorite: toggleFavorite,
-                onToggleAudio: { _ in },
-                onOpenSettings: {},
-                recordingState: labRecordingState,
-                onToggleRecording: { labRecordingState = Self.nextLabRecordingState(labRecordingState) },
-                daySummary: labDaySummary,
-                summaryHistory: summaryStressHistory,
-                searchSession: searchSession,
-                thumbnailLoader: MockSearchData.thumbnailLoader,
-                ocrLoader: MockSearchData.ocrLoader,
-                onSelectSearchFrame: selectSearchFrame
-            )
-            .frame(minWidth: 760)
+        if CommandLine.arguments.contains("--window-stress") {
+            TimelineWindowStressLab()
+        } else {
+            HSplitView {
+                RecallView(
+                    moments: moments,
+                    playheadMs: $playheadMs,
+                    loadState: scenario.loadState,
+                    tuning: tuning,
+                    imageLoader: MockArtifactFactory.loader,
+                    onToggleFavorite: toggleFavorite,
+                    onToggleAudio: { _ in },
+                    onOpenSettings: {},
+                    recordingState: labRecordingState,
+                    onToggleRecording: { labRecordingState = Self.nextLabRecordingState(labRecordingState) },
+                    daySummary: labDaySummary,
+                    summaryHistory: summaryStressHistory,
+                    searchSession: searchSession,
+                    thumbnailLoader: MockSearchData.thumbnailLoader,
+                    ocrLoader: MockSearchData.ocrLoader,
+                    onSelectSearchFrame: selectSearchFrame
+                )
+                .frame(minWidth: 760)
 
-            tuningPanel
-                .frame(minWidth: 250, idealWidth: 280, maxWidth: 320)
+                tuningPanel
+                    .frame(minWidth: 250, idealWidth: 280, maxWidth: 320)
+            }
         }
     }
 

@@ -26,6 +26,11 @@ public struct RecallView: View {
     @Environment(\.afterRayCopy) private var copy
     @Environment(\.afterRayLocale) private var afterRayLocale
     public let moments: [RecallMoment]
+    /// Store-prepared layout input. Production passes all three values from
+    /// the same publication; static labs may leave them nil.
+    public let timelineRevision: UInt64?
+    public let timelineSpine: TimelineSpine?
+    public let timelineDayCoverage: TimelineDayCoverage?
     @Binding public var playheadMs: Int64
     @Binding public var isLive: Bool
     public let loadState: RecallLoadState
@@ -75,10 +80,10 @@ public struct RecallView: View {
     public var thumbnailLoader: RecallThumbnailLoader?
     public var ocrLoader: RecallOcrLoader?
     public var onSelectSearchFrame: ((Int) -> Void)?
-    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
-    /// Fetches a neighbouring day before travel reaches the loaded edge.
+    // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
+    /// Fetches missing warmth after the transient pointer enters a new day.
     /// `true` means the window grew and the scrub layout may adopt it.
-    public var onApproachTimelineEdge: ((TimelineExtendDirection) async -> Bool)?
+    public var onApproachTimelineEdge: ((TimelineExtendDirection, Int64) async -> Bool)?
 
     @State private var dragOrigin: (playheadMs: Int64, isLive: Bool)?
     @State private var searchDragOrigin: Int?
@@ -122,6 +127,9 @@ public struct RecallView: View {
 
     public init(
         moments: [RecallMoment],
+        timelineRevision: UInt64? = nil,
+        timelineSpine: TimelineSpine? = nil,
+        timelineDayCoverage: TimelineDayCoverage? = nil,
         playheadMs: Binding<Int64>,
         isLive: Binding<Bool> = .constant(false),
         loadState: RecallLoadState = .ready,
@@ -156,9 +164,12 @@ public struct RecallView: View {
         thumbnailLoader: RecallThumbnailLoader? = nil,
         ocrLoader: RecallOcrLoader? = nil,
         onSelectSearchFrame: ((Int) -> Void)? = nil,
-        onApproachTimelineEdge: ((TimelineExtendDirection) async -> Bool)? = nil
+        onApproachTimelineEdge: ((TimelineExtendDirection, Int64) async -> Bool)? = nil
     ) {
         self.moments = moments
+        self.timelineRevision = timelineRevision
+        self.timelineSpine = timelineSpine
+        self.timelineDayCoverage = timelineDayCoverage
         self._playheadMs = playheadMs
         self._isLive = isLive
         self.loadState = loadState
@@ -230,6 +241,8 @@ public struct RecallView: View {
         }
         return layoutCache.layout(
             moments: moments,
+            preparedSpine: timelineSpine,
+            revision: timelineRevision,
             viewportWidth: max(timelineViewportWidth, 1),
             density: tuning.timelineDensity * Double(timelineZoom)
         )
@@ -422,8 +435,8 @@ public struct RecallView: View {
                 finishScrubbing()
             }
         }
-        .onChange(of: moments) { _, updatedMoments in
-            adoptExpandedFrozenLayout(updatedMoments)
+        .onChange(of: timelineRevision) { _, _ in
+            adoptExpandedFrozenLayout(moments)
         }
         .onMoveCommand(perform: handleMoveCommand)
         .onKeyPress(.space) {
@@ -843,9 +856,9 @@ public struct RecallView: View {
             moments: moments
         )
         if delta < 0, stepped.playheadMs == moments.first?.capturedAtMs {
-            requestTimelineExtend(.older)
+            requestTimelineExtend(.older, anchorMs: stepped.playheadMs)
         } else if delta > 0, !stepped.isLive, stepped.playheadMs == moments.last?.capturedAtMs {
-            requestTimelineExtend(.newer)
+            requestTimelineExtend(.newer, anchorMs: stepped.playheadMs)
         }
         selectPlayhead(playheadMs: stepped.playheadMs, isLive: stepped.isLive)
     }
@@ -876,6 +889,8 @@ public struct RecallView: View {
         textSelection.clearSelection()
         frozenScrubLayout = layoutCache.layout(
             moments: moments,
+            preparedSpine: timelineSpine,
+            revision: timelineRevision,
             viewportWidth: max(timelineViewportWidth, 1),
             density: tuning.timelineDensity * Double(timelineZoom)
         )
@@ -923,6 +938,8 @@ public struct RecallView: View {
     private var liveTimelineLayout: TimelineLayout {
         layoutCache.layout(
             moments: moments,
+            preparedSpine: timelineSpine,
+            revision: timelineRevision,
             viewportWidth: max(timelineViewportWidth, 1),
             density: tuning.timelineDensity * Double(timelineZoom)
         )
@@ -935,27 +952,30 @@ public struct RecallView: View {
         // and while the guaranteed two-day cushion is still present; one
         // viewport is the fallback trigger if a sparse window still approaches
         // its edge.
-        let live = liveTimelineLayout
         if let direction = TimelineEdgePrefetch.direction(
             playheadMs: clampedMs,
             isLive: isLive,
             movementDirection: movementDirection,
-            layout: live,
+            layout: timelineDayCoverage == nil ? liveTimelineLayout : nil,
+            coverage: timelineDayCoverage,
             viewportWidth: timelineViewportWidth
         ) {
-            requestTimelineExtend(direction)
+            requestTimelineExtend(direction, anchorMs: clampedMs)
         }
     }
 
-    private func requestTimelineExtend(_ direction: TimelineExtendDirection) {
+    private func requestTimelineExtend(
+        _ direction: TimelineExtendDirection,
+        anchorMs: Int64
+    ) {
         if isScrubbing, !requestedExtendDuringScrub.insert(direction).inserted { return }
         guard let onApproachTimelineEdge else { return }
         Task { @MainActor in
-            guard await onApproachTimelineEdge(direction) else { return }
-            // The callback publishes `moments`; `onChange(of: moments)`
-            // adopts that fresh input. This Task captured the old View value,
-            // so rebuilding from `liveTimelineLayout` here would freeze the
-            // scrub on the pre-merge day until the gesture ended.
+            guard await onApproachTimelineEdge(direction, anchorMs) else { return }
+            // The callback publishes a new scalar revision with the moments;
+            // that onChange adopts the fresh prepared spine. This Task captured
+            // the old View value, so rebuilding here would freeze the scrub on
+            // the pre-merge day until the gesture ended.
         }
     }
 
@@ -972,6 +992,8 @@ public struct RecallView: View {
         }
         self.frozenScrubLayout = layoutCache.layout(
             moments: updatedMoments,
+            preparedSpine: timelineSpine,
+            revision: timelineRevision,
             viewportWidth: max(timelineViewportWidth, 1),
             density: tuning.timelineDensity * Double(timelineZoom)
         )
@@ -2306,20 +2328,24 @@ private struct ScrollWheelMonitor: NSViewRepresentable {
             }
             let delayMilliseconds = Int(environment["AFTERRAY_UI_PERF_AUTORUN_DELAY_MS"] ?? "")
                 ?? 750
+            let reversesDirection = environment["AFTERRAY_UI_PERF_AUTORUN_REVERSE"] == "1"
             stressDriverTask?.cancel()
             stressDriverTask = Task { @MainActor [weak self] in
                 do {
                     try await Task.sleep(for: .milliseconds(delayMilliseconds))
                     for flickIndex in 0..<4 {
                         guard let self else { return }
+                        let sign: CGFloat = reversesDirection && flickIndex.isMultiple(of: 2)
+                            ? -1
+                            : (reversesDirection ? 1 : -1)
                         acceptPrecise(
-                            delta: -8,
+                            delta: sign * 8,
                             phase: .began,
                             at: CACurrentMediaTime()
                         )
                         for _ in 0..<18 {
                             acceptPrecise(
-                                delta: CGFloat(-12 - flickIndex * 3),
+                                delta: sign * CGFloat(12 + flickIndex * 3),
                                 phase: .changed,
                                 at: CACurrentMediaTime()
                             )

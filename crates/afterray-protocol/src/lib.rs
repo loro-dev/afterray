@@ -69,7 +69,7 @@ pub enum Request {
     TimelineSince {
         since_ms: i64,
     },
-    // @dec:sliding-timeline-day-window — docs/decisions/active/architecture/2026-08-21-sliding-timeline-day-window.md
+    // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
     /// Inclusive `[from_ms, to_ms]` index of moments. The overlay holds a
     /// sliding window of local days. Rows omit concatenated OCR and transcripts.
     TimelineRange {

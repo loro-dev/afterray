@@ -395,6 +395,58 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(rangeCount, 2)
     }
 
+    func testOppositeWarmRequestsSerializeAndKeepCoverageContiguous() async {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let center = localDay(offsetBy: -8, from: today)
+        let olderDay = localDay(offsetBy: -4, from: center)
+        let previousDay = localDay(offsetBy: -1, from: center)
+        let nextDay = localDay(offsetBy: 1, from: center)
+        let daemon = MultiDayTimelineDaemon(
+            moments: (-4...4).map { offset in
+                let day = localDay(offsetBy: offset, from: center)
+                return moment("d\(offset)", at: day.start + 43_200_000)
+            },
+            delayedRangeStartMs: olderDay.start
+        )
+        let store = RecallStore(daemon: daemon)
+
+        await store.loadTimeline(containingMs: center.start + 43_200_000)
+        let older = Task { @MainActor in
+            await store.extendTimeline(
+                direction: .older,
+                aroundMs: previousDay.start + 43_200_000
+            )
+        }
+        await daemon.waitForDelayedRangeRequest()
+        let newer = Task { @MainActor in
+            await store.extendTimeline(
+                direction: .newer,
+                aroundMs: nextDay.start + 43_200_000
+            )
+        }
+        await Task.yield()
+        let rangesWhileOlderIsDelayed = await daemon.recordedRanges()
+        XCTAssertEqual(
+            rangesWhileOlderIsDelayed.count,
+            2,
+            "the opposite range must wait instead of racing a stale coverage snapshot"
+        )
+
+        await daemon.releaseDelayedRange()
+        let olderResult = await older.value
+        let newerResult = await newer.value
+        XCTAssertTrue(olderResult)
+        XCTAssertTrue(newerResult)
+        let guaranteed = TimelineWarmWindow.guaranteedBounds(
+            containingMs: nextDay.start + 43_200_000
+        )
+        let coverage = try? XCTUnwrap(store.timelineDayCoverage)
+        XCTAssertLessThanOrEqual(coverage?.start ?? .max, guaranteed.start)
+        XCTAssertGreaterThanOrEqual(coverage?.end ?? .min, guaranteed.end)
+        let finalRanges = await daemon.recordedRanges()
+        XCTAssertEqual(finalRanges.count, 3)
+    }
+
     func testExtendNewerMergesTheNextOccupiedDay() async {
         let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
         let center = localDay(offsetBy: -8, from: today)
@@ -463,6 +515,77 @@ final class RecallStoreTests: XCTestCase {
                 toMs: localDay(offsetBy: -4, from: center).end - 1
             )
         )
+    }
+
+    func testNeighbourRefillPublishesOnePreparedSevenDaySnapshot() async {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let center = localDay(offsetBy: -8, from: today)
+        let daemon = MultiDayTimelineDaemon(
+            moments: (-4...3).map { offset in
+                let day = localDay(offsetBy: offset, from: center)
+                return moment("d\(offset)", at: day.start + 43_200_000)
+            }
+        )
+        let store = RecallStore(daemon: daemon)
+        let previousDay = localDay(offsetBy: -1, from: center)
+
+        await store.loadTimeline(containingMs: center.start + 43_200_000)
+        var publishedIDs: [[String]] = []
+        let token = store.$moments.dropFirst().sink { publishedIDs.append($0.map(\.id)) }
+
+        let extended = await store.extendTimeline(
+            direction: .older,
+            aroundMs: previousDay.start + 43_200_000
+        )
+
+        XCTAssertTrue(extended)
+        XCTAssertEqual(
+            publishedIDs,
+            [["d-4", "d-3", "d-2", "d-1", "d0", "d1", "d2"]],
+            "merge and far-side eviction must arrive as one timeline publication"
+        )
+        XCTAssertEqual(
+            store.timelineDayCoverage,
+            .warmWindow(containingMs: previousDay.start + 43_200_000)
+        )
+        XCTAssertEqual(store.timelineSpine, TimelineSpine(moments: store.moments))
+        _ = token
+    }
+
+    func testFastJumpRefillsTwoDayInvariantWithOneBulkPublication() async {
+        let today = DaySummaryLayout.dayBounds(ms: Int64(Date.now.timeIntervalSince1970 * 1_000))
+        let center = localDay(offsetBy: -8, from: today)
+        let daemon = MultiDayTimelineDaemon(
+            moments: (-6...3).map { offset in
+                let day = localDay(offsetBy: offset, from: center)
+                return moment("d\(offset)", at: day.start + 43_200_000)
+            }
+        )
+        let store = RecallStore(daemon: daemon)
+        let fastJumpDay = localDay(offsetBy: -3, from: center)
+
+        await store.loadTimeline(containingMs: center.start + 43_200_000)
+        var publications = 0
+        let token = store.$moments.dropFirst().sink { _ in publications += 1 }
+        let extended = await store.extendTimeline(
+            direction: .older,
+            aroundMs: fastJumpDay.start + 43_200_000
+        )
+
+        let guaranteed = TimelineWarmWindow.guaranteedBounds(
+            containingMs: fastJumpDay.start + 43_200_000
+        )
+        let coverage = try? XCTUnwrap(store.timelineDayCoverage)
+        XCTAssertTrue(extended)
+        XCTAssertEqual(publications, 1)
+        XCTAssertLessThanOrEqual(coverage?.start ?? .max, guaranteed.start)
+        XCTAssertGreaterThanOrEqual(coverage?.end ?? .min, guaranteed.end)
+        let ranges = await daemon.recordedRanges()
+        XCTAssertEqual(ranges.count, 2, "all missing warm days should share one range request")
+        XCTAssertEqual(ranges[1].fromMs, TimelineWarmWindow.bounds(
+            containingMs: fastJumpDay.start + 43_200_000
+        ).start)
+        _ = token
     }
 
     func testLoadedWindowEvictsTheFarSide() async {

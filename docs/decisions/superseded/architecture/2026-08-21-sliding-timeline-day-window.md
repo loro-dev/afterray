@@ -1,16 +1,11 @@
 # Decision: The playhead holds a sliding window of lean local-day indexes
 
-Status: active
+Status: superseded
 Area: recall-ui
 Anchors:
-- crates/afterray-store/src/lib.rs @dec:sliding-timeline-day-window
-- crates/afterray-protocol/src/lib.rs @dec:sliding-timeline-day-window
-- swift/AfterRayRecall/Sources/RecallStore.swift @dec:sliding-timeline-day-window
-- swift/AfterRayRecall/Sources/DaemonClient.swift @dec:sliding-timeline-day-window
-- swift/AfterRayRecall/Sources/RecallView.swift @dec:sliding-timeline-day-window
-- apps/AfterRay/Sources/AfterRayApp.swift @dec:sliding-timeline-day-window
-Supersedes: ../../superseded/architecture/2026-08-21-lean-timeline-read-model.md
-Superseded-by: —
+- —
+Supersedes: 2026-08-21-lean-timeline-read-model.md
+Superseded-by: ../../active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
 
 ## Problem
 
@@ -32,11 +27,11 @@ is refill reserve. The seven-day window is published only after that read is
 prepared, so entering an adjacent day never depends on an edge request.
 Once travel has a direction, the outer reserve shifts toward the next calendar
 day before the pointer crosses midnight, while the two-day guarantee remains
-present. Empty local days are still probed and remembered so
-a gap is one travel, not a dead end. The window stays at most seven local days;
-the day on the opposite side of travel drops off. A jump beyond the loaded span
-recentres rather than filling the gap. `moment_get` and `evidence_ocr` remain
-the only paths that carry original screen text.
+present. Empty local days are still probed and remembered so a gap is one
+travel, not a dead end. The window stays at most seven local days; the day on
+the opposite side of travel drops off. A jump beyond the loaded span recentres
+rather than filling the gap. `moment_get` and `evidence_ocr` remain the only
+paths that carry original screen text.
 
 While a scrub is live, its frozen layout is replaced only when the published
 window grows past one of that snapshot's boundaries. This admits a neighbour
@@ -48,32 +43,27 @@ instead of treating the second caller as a failed prefetch. Wheel and pointer
 drags enter the same scrub initializer, which snapshots that layout before
 marking the interaction live.
 
-Day summaries stay an independent read model. A failed index read is a
-visible error, not an empty first day. Returning to NOW explicitly requests
-today's local-day range.
+Day summaries stay an independent read model. A failed index read is a visible
+error, not an empty first day. Returning to NOW explicitly requests today's
+local-day range.
 
 ## Alternatives considered
 
-**Keep the one-day clamp and only jump from the summary list.** That is the
-superseded decision working as designed. The playhead is the product's
-continuous time control; crossing midnight has to work there.
+**Keep the one-day clamp and only jump from the summary list.** The playhead is
+the product's continuous time control; crossing midnight has to work there.
 
 **Reload the full lean archive.** The JSON-line cap and the warped playhead
 spine both grow with vault age. The overlay still has no reason to hold every
 day.
 
 **A centre-plus-limit `recall_window`.** That API still materialises a whole
-session. The playhead's unit is the local day the history panel already
-speaks.
+session. The playhead's unit is the local day the history panel already speaks.
 
 ## Consequences
 
-**Bought:** overlay launch remains a bounded range read; the playhead always
-starts with two prepared local days on either side plus a one-day refill
-reserve; directional travel shifts that reserve before the guarantee is
-consumed. Empty days do not trap the playhead.
+**Bought:** overlay launch remains a bounded range read; the playhead starts
+with two prepared local days on either side plus one refill day.
 
-**Cost:** initial publication reads up to seven days rather than one, trading a
-larger fixed launch read for zero adjacent-day dependency during interaction.
-A later outer-day merge can remap the in-flight scrub once, but the refreshed
-mapping lets that same gesture continue. Protocol 16 is unchanged.
+**Cost:** changing direction moved the reserve even when the pointer remained
+in the same day. Each reversal could fetch a day, rebuild the full window, and
+publish during active inertia. That cost is why this decision was superseded.

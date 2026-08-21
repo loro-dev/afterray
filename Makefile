@@ -1,4 +1,4 @@
-.PHONY: check check-i18n test docs-sync verify test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile settings-lab chat-lab compute-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
+.PHONY: check check-i18n test docs-sync verify test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile visual-lab-window-stress visual-lab-window-stress-profile settings-lab chat-lab compute-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
 
 # `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
 # `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
@@ -38,13 +38,14 @@ docs-sync:
 # A concurrency or I/O test does not fail; it fails sometimes. One green run
 # proves nothing about a test that races, which is how a capture helper that
 # passed one run in five reached main. `make test-repeat N=10` runs the suite
-# until it breaks, and `TEST=` narrows it to the one under suspicion.
+# until it breaks, and `TEST=` narrows it to the one under suspicion. XCTest
+# filters use `Suite/test` and route to SwiftPM; Rust's filters have no slash.
 N ?= 5
 TEST ?=
 test-repeat:
 	@for run in $$(seq 1 $(N)); do \
 		printf -- '--- run %s/%s\n' "$$run" "$(N)"; \
-		cargo test --workspace $(if $(TEST),-- $(TEST),) || exit $$?; \
+		$(if $(findstring /,$(TEST)),swift test --filter '$(TEST)',cargo test --workspace $(if $(TEST),-- $(TEST),)) || exit $$?; \
 	done
 	@printf -- '%s consecutive runs passed\n' "$(N)"
 
@@ -78,6 +79,12 @@ visual-lab-stress:
 
 visual-lab-stress-profile:
 	AFTERRAY_UI_PERF_LOG=1 AFTERRAY_UI_PERF_AUTORUN=1 swift run -c release afterray-visual-lab -- --stress
+
+visual-lab-window-stress:
+	swift run afterray-visual-lab -- --window-stress
+
+visual-lab-window-stress-profile:
+	AFTERRAY_UI_PERF_LOG=1 AFTERRAY_UI_PERF_AUTORUN=1 AFTERRAY_UI_PERF_AUTORUN_REVERSE=1 AFTERRAY_UI_PERF_AUTORUN_DELAY_MS=1500 swift run -c release afterray-visual-lab -- --window-stress
 
 # Record an Instruments trace of a timeline scrub. The scrub is synthesised
 # through the production input path (AFTERRAY_UI_PERF_AUTORUN), so two runs are
