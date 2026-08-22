@@ -138,13 +138,10 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
         AfterRayMenuBar.shared.install()
         observeSystemSessionSecurityEvents()
         RecallOverlayController.shared.start()
-        // A hidden panel does not receive display-link ticks. The existing
-        // in-process scrub driver therefore has to order the real overlay
-        // front when a release candidate is launched explicitly for perf.
-        // Normal launches never carry this opt-in environment variable.
-        if ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_AUTORUN"] == "1" {
-            RecallOverlayController.shared.show()
-        }
+        // A hidden panel does not receive display-link ticks. The opt-in perf
+        // run orders it front from `bootstrap()` only after permission
+        // reconciliation and the initial warm timeline are complete; showing
+        // it here races the bootstrap's required permission-sheet hide/show.
         AfterRayCliInstall.refreshIfStale()
         OnboardingController.shared.showIfNeeded()
     }
@@ -634,6 +631,13 @@ final class RecallOverlayController: RecallHotKeyBinding {
             queue: .main
         ) { _ in
             Task { @MainActor in
+                // Automation is launched from another foreground app. If
+                // that harness retakes key focus before the delayed driver
+                // starts, the panel would park and its display link would
+                // never tick. This opt-in process is dedicated to the scrub
+                // run; normal launches keep the resign-to-hide behaviour.
+                guard ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_AUTORUN"] != "1"
+                else { return }
                 // A status-bar overlay covers every normal window. Losing key
                 // means the user moved on — keep covering and Esc / the hotkey
                 // have nothing they can reach.
@@ -1683,6 +1687,13 @@ private struct AfterRayRootView: View {
         guard !AfterRayTerminationState.shared.isTerminating else { return }
         await store.loadTimeline()
         await store.prefetchAdjacentTimelineDays()
+        // The in-process scrub driver waits for this real overlay and display
+        // link. Normal launches never carry the opt-in environment variable.
+        // Keeping the first show after bootstrap also keeps permission checks
+        // from parking the panel after the driver has already started.
+        if ProcessInfo.processInfo.environment["AFTERRAY_UI_PERF_AUTORUN"] == "1" {
+            RecallOverlayController.shared.show()
+        }
     }
 
     /// Every permission completion path converges here: returning from System

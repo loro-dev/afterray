@@ -129,10 +129,10 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         return id
     }
 
-    /// Cheap image used while the playhead is moving. Every moment in a GOP
-    /// deliberately shares one key so the daemon fetches and VideoToolbox
-    /// decodes the poster only once. A loose still is already independently
-    /// decodable, so its preview and exact key are identical.
+    /// Stable full-resolution image used while the playhead is moving. Every
+    /// moment in a GOP deliberately shares one key so the daemon fetches and
+    /// VideoToolbox decodes its poster only once. A loose still is already
+    /// independently decodable, so its preview and exact key are identical.
     public var previewCacheKey: String {
         if let gop { return "gop-poster:\(gop.segmentId)#\(gop.keyframeIndex)" }
         return displayCacheKey

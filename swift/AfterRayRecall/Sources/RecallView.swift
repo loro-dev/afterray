@@ -38,7 +38,7 @@ private final class RecallScrubState: ObservableObject {
 }
 
 /// Pure state machine for deciding when the expensive exact frame may replace
-/// the scrub thumbnail. Keeping the decision separate makes rapid
+/// the scrub preview. Keeping the decision separate makes rapid
 /// move/stop/move sequences deterministic and testable; SwiftUI owns only the
 /// cancellable quiet-period sleep around the returned action.
 struct RecallExactFramePromotionGate {
@@ -69,6 +69,39 @@ struct RecallExactFramePromotionGate {
 
     mutating func didPromote() {
         hasUnsettledMotion = false
+    }
+}
+
+/// Keeps the last full-resolution scrub preview above the exact-frame player
+/// while the latter passes through its quiet period and finishes decoding.
+/// A stale completion must never uncover an older exact frame underneath.
+struct RecallScrubPreviewRetention: Equatable {
+    private(set) var artifactID: String?
+
+    mutating func remember(_ artifactID: String) {
+        self.artifactID = artifactID
+    }
+
+    mutating func clear() {
+        artifactID = nil
+    }
+
+    func activeArtifactID(isMoving: Bool, desiredPreviewID: String?) -> String? {
+        isMoving ? desiredPreviewID : artifactID
+    }
+
+    @discardableResult
+    mutating func releaseIfCurrent(
+        settledID: String,
+        desiredExactID: String?,
+        isMoving: Bool
+    ) -> Bool {
+        guard artifactID != nil,
+              !isMoving,
+              settledID == desiredExactID
+        else { return false }
+        artifactID = nil
+        return true
     }
 }
 
@@ -350,7 +383,6 @@ public struct RecallView: View {
                 committedIsLive: isLive,
                 isMoving: isScrubbing,
                 loader: imageLoader,
-                thumbnailLoader: thumbnailLoader,
                 onSettled: { settledStill = $0 }
             )
 
@@ -520,10 +552,10 @@ public struct RecallView: View {
         .animation(.easeOut(duration: 0.18), value: showsDetails)
         .animation(.easeOut(duration: 0.18), value: daySummaryExpanded)
         .task(id: selectionQuietTaskKey) {
-            // The moving picture comes from 360px thumbnails. Pre-decoding
-            // neighbouring full-resolution GOP frames here kept VideoToolbox
-            // busy long after launch and made the next gesture hitch. Only the
-            // exact settled frame is promoted; non-visual work waits longer.
+            // The moving picture has one serial full-resolution poster player.
+            // Pre-decoding neighbouring GOP frames here kept VideoToolbox busy
+            // long after launch and made the next gesture hitch. Only the exact
+            // settled frame is promoted; non-visual work waits longer.
             guard !isScrubbing else { return }
             try? await Task.sleep(for: .milliseconds(Self.selectionQuietMilliseconds))
             guard !Task.isCancelled, !isScrubbing else { return }
@@ -1140,11 +1172,12 @@ private struct ImmersiveArtifactImage: View {
 }
 
 /// The recalled picture follows the transient playhead without making the
-/// complete overlay observe display-link ticks. While moving it overlays the
-/// existing 360px thumbnail instead of decoding a full-resolution GOP poster;
-/// the exact player stays mounted underneath and advances only after settle.
-/// This keeps VideoToolbox and full-size IOSurface submission off the 120Hz
-/// composition path without freezing the picture during a scrub.
+/// complete overlay observe display-link ticks. While moving it displays a
+/// full-resolution GOP poster (or the original loose still) through one
+/// bounded latest-wins player. The exact Nth-frame player stays mounted
+/// underneath and advances only after settle. The preview remains above it
+/// until that exact frame is actually visible, so performance never creates a
+/// blurry full-screen intermediate or a flash back to an older frame.
 private struct ScrubArtifactImage: View {
     let moments: [RecallMoment]
     @ObservedObject var scrubState: RecallScrubState
@@ -1153,12 +1186,12 @@ private struct ScrubArtifactImage: View {
     let committedIsLive: Bool
     let isMoving: Bool
     let loader: RecallImageLoader
-    let thumbnailLoader: RecallThumbnailLoader?
     let onSettled: (SettledStill) -> Void
 
     @State private var lastSettled: SettledStill?
     @State private var promotedExactArtifactID: String?
     @State private var exactPromotionGate = RecallExactFramePromotionGate()
+    @State private var previewRetention = RecallScrubPreviewRetention()
 
     private struct ExactPromotionKey: Equatable {
         let artifactID: String?
@@ -1186,15 +1219,16 @@ private struct ScrubArtifactImage: View {
         ExactPromotionKey(artifactID: desiredExactArtifactID, isMoving: isMoving)
     }
 
-    private var showsThumbnail: Bool {
-        guard thumbnailLoader != nil, transientMoment != nil else { return false }
-        if isMoving { return true }
-        return lastSettled?.id != desiredExactArtifactID
-    }
-
-    private var fallbackPreviewArtifactID: String? {
+    private var desiredScrubPreviewArtifactID: String? {
         guard isMoving, let transientMoment else { return nil }
         return RecallStillRequestPolicy.artifactID(for: transientMoment, isMoving: true)
+    }
+
+    private var activeScrubPreviewArtifactID: String? {
+        previewRetention.activeArtifactID(
+            isMoving: isMoving,
+            desiredPreviewID: desiredScrubPreviewArtifactID
+        )
     }
 
     var body: some View {
@@ -1206,18 +1240,19 @@ private struct ScrubArtifactImage: View {
                     animatesTransition: true,
                     onSettled: { still in
                         lastSettled = still
+                        previewRetention.releaseIfCurrent(
+                            settledID: still.id,
+                            desiredExactID: desiredExactArtifactID,
+                            isMoving: isMoving
+                        )
                         if !isMoving { onSettled(still) }
                     }
                 )
             }
 
-            if showsThumbnail, let thumbnailLoader, let momentID = transientMoment?.id {
-                ScrubThumbnailImage(momentID: momentID, loader: thumbnailLoader)
-            } else if isMoving, let fallbackPreviewArtifactID {
-                // Static previews may not provide the daemon thumbnail seam.
-                // Keep their old bounded GOP-poster path functional.
+            if let activeScrubPreviewArtifactID {
                 ImmersiveArtifactImage(
-                    artifactID: fallbackPreviewArtifactID,
+                    artifactID: activeScrubPreviewArtifactID,
                     loader: loader,
                     animatesTransition: false
                 )
@@ -1231,7 +1266,7 @@ private struct ScrubArtifactImage: View {
             switch action {
             case .hold:
                 // The currently displayed exact frame remains underneath the
-                // moving thumbnail. The gate remembers that the next idle
+                // moving preview. The gate remembers that the next idle
                 // target must pass through the quiet period.
                 return
             case .clear:
@@ -1254,94 +1289,33 @@ private struct ScrubArtifactImage: View {
                 exactPromotionGate.didPromote()
             }
         }
+        .onAppear {
+            if let desiredScrubPreviewArtifactID {
+                previewRetention.remember(desiredScrubPreviewArtifactID)
+            }
+        }
+        .onChange(of: desiredScrubPreviewArtifactID) { _, newID in
+            if let newID { previewRetention.remember(newID) }
+        }
         .onChange(of: isMoving) { _, moving in
             // A loose still has the same preview and exact key, so the player
             // does not emit another settle event when motion ends. Forward the
             // leaf-owned result now; the root needs it only for settled OCR.
-            if !moving, let lastSettled { onSettled(lastSettled) }
+            guard !moving else { return }
+            if desiredExactArtifactID == nil { previewRetention.clear() }
+            if let lastSettled {
+                previewRetention.releaseIfCurrent(
+                    settledID: lastSettled.id,
+                    desiredExactID: desiredExactArtifactID,
+                    isMoving: false
+                )
+                onSettled(lastSettled)
+            }
         }
         .onChange(of: desiredExactArtifactID) { _, newID in
-            if newID == nil { lastSettled = nil }
-        }
-    }
-}
-
-private struct ScrubThumbnailImage: View {
-    let momentID: String
-    let loader: RecallThumbnailLoader
-
-    @StateObject private var player = RecallScrubThumbnailPlayer()
-
-    var body: some View {
-        Group {
-            if let image = player.image {
-                Image(decorative: image, scale: 1)
-                    .resizable()
-                    .interpolation(.medium)
-                    .aspectRatio(contentMode: .fit)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .allowsHitTesting(false)
-        .onAppear { player.request(momentID: momentID, loader: loader) }
-        .onChange(of: momentID) { _, newID in
-            player.request(momentID: newID, loader: loader)
-        }
-        .onDisappear { player.invalidate() }
-    }
-}
-
-/// At most one thumbnail request is owned by the full-screen preview. Rapid
-/// playhead changes only replace `requestedID`; they cannot fan out one daemon
-/// read/decode task per display-link tick.
-@MainActor
-private final class RecallScrubThumbnailPlayer: ObservableObject {
-    @Published private(set) var image: CGImage?
-
-    private var requestedID: String?
-    private var loader: RecallThumbnailLoader?
-    private var loadTask: Task<Void, Never>?
-    private var generation: UInt64 = 0
-
-    func request(momentID: String, loader: @escaping RecallThumbnailLoader) {
-        self.loader = loader
-        guard requestedID != momentID else { return }
-        requestedID = momentID
-        if let cached = RecallThumbnailCache.shared.cached(momentID: momentID) {
-            image = cached
-        }
-        startNextIfNeeded()
-    }
-
-    func invalidate() {
-        generation &+= 1
-        loadTask?.cancel()
-        loadTask = nil
-        requestedID = nil
-        loader = nil
-    }
-
-    private func startNextIfNeeded() {
-        guard loadTask == nil, let requestedID, let loader else { return }
-        if let cached = RecallThumbnailCache.shared.cached(momentID: requestedID) {
-            image = cached
-            return
-        }
-        let targetID = requestedID
-        let requestGeneration = generation
-        loadTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let loaded = await RecallThumbnailCache.shared.image(
-                momentID: targetID,
-                loader: loader
-            )
-            guard !Task.isCancelled, requestGeneration == self.generation else { return }
-            self.loadTask = nil
-            if self.requestedID == targetID, let loaded {
-                self.image = loaded
-            }
-            if self.requestedID != targetID {
-                self.startNextIfNeeded()
+            if newID == nil {
+                lastSettled = nil
+                if !isMoving { previewRetention.clear() }
             }
         }
     }
@@ -1604,8 +1578,9 @@ private final class RecallDecodedImageCache {
 
     /// Drop an exact GOP load as soon as the finger moves. Raw daemon reads may
     /// still finish into their encrypted-data cache, but a cancelled request is
-    /// checked before it can occupy VideoToolbox. Neighbouring full-resolution
-    /// prefetch no longer exists; moving presentation uses thumbnails.
+    /// checked before it can occupy VideoToolbox. The moving presentation has
+    /// its own serial full-resolution poster pipeline; neighbouring previews
+    /// are never fanned out speculatively.
     func prioritizeScrubPreviews() {
         let exactGopIDs = inFlight.keys.filter { $0.hasPrefix("gop:") }
         for artifactID in exactGopIDs {

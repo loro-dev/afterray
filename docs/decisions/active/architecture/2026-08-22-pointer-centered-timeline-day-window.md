@@ -71,16 +71,18 @@ exact equality. This is required because the seven-day window contains about
 26,000 moments on a real vault; synthesized array equality at 120Hz would turn
 the warm-data guarantee itself into a rendering regression.
 
-Pixel fidelity is staged around the same interaction boundary. While the
-pointer moves, the picture uses the moment's cached 360px thumbnail and keeps
-full-resolution GOP decode and IOSurface submission off the scrub path. The
-thumbnail remains until 250ms of quiet and until the exact frame settles. A new
-gesture cancels that promotion before it starts; cancellation after synchronous
-VideoToolbox decode has begun is not considered a sufficient performance
-control. Full-resolution neighbour prefetch is not performed: it could leave a
-decode running after cancellation and compete with a later scrub. Evidence,
-summary, adjacent-day maintenance, and audio prefetch wait for 500ms of quiet;
-the next gesture cancels their shared task before it can publish.
+Pixel fidelity is not reduced at the interaction boundary. While the pointer
+moves, one serial latest-wins player shows a full-resolution poster shared by
+the current GOP, or the original full-resolution loose still. It never fans
+out one daemon read, VideoToolbox decode, or IOSurface submission per display
+tick. The sharp preview remains until 250ms of quiet and until the exact Nth
+frame settles underneath it. A new gesture cancels that exact promotion before
+it starts; cancellation after synchronous VideoToolbox decode has begun is not
+considered a sufficient performance control. Full-resolution neighbour
+prefetch is not performed: it could leave a decode running after cancellation
+and compete with a later scrub. Evidence, summary, adjacent-day maintenance,
+and audio prefetch wait for 500ms of quiet; the next gesture cancels their
+shared task before it can publish.
 
 While movement is active, the display link requests one fixed rate equal to the
 current screen's native maximum, capped at 120Hz. A 60...120Hz range allowed
@@ -110,15 +112,16 @@ publishes once. Empty queried days no longer cause false refills.
 Continuous playhead publication is O(1) with respect to the loaded window and
 does not invalidate the root overlay. The signed real-vault regression gate
 measures actual Core Animation layer updates, not just display-link callbacks;
-after removing competing selection work and pinning the active ProMotion range,
-three fresh-process repetitions on a 120Hz display held every substantive
-segment above 100Hz (104.7-118.2Hz), with request, state-update, and layer-commit
-counts equal in every segment.
+after removing competing selection work, pinning the active ProMotion range,
+and restoring full-resolution moving posters, three fresh-process repetitions
+on a 120Hz display held every substantive segment above 100Hz (104.3-119.3Hz),
+with request, state-update, and layer-commit counts equal in every segment.
 
 **Cost:** the store and view exchange coverage, revision, and a prepared spine
 as one logical snapshot. Sparse gaps can retain more than seven calendar days,
 though not more occupied rows solely because those days are empty. Protocol 16
 and the timeline-range payload are unchanged. During motion the recalled image
-is deliberately a 360px preview; exact pixels are promoted after the user has
-been still for 250ms. Selection metadata may appear after the longer 500ms
-quiet boundary rather than competing with movement.
+is a full-resolution GOP poster rather than the exact Nth frame; the exact
+frame is promoted after the user has been still for 250ms. Selection metadata
+may appear after the longer 500ms quiet boundary rather than competing with
+movement.

@@ -415,6 +415,55 @@ final class TimelineLayoutTests: XCTestCase {
         XCTAssertEqual(RecallExactFramePromotionGate.quietPeriodMilliseconds, 250)
     }
 
+    func testFullResolutionScrubPreviewStaysUntilCurrentExactFrameSettles() {
+        var retention = RecallScrubPreviewRetention()
+        retention.remember("gop-poster:segment#0")
+
+        XCTAssertEqual(
+            retention.activeArtifactID(isMoving: false, desiredPreviewID: nil),
+            "gop-poster:segment#0"
+        )
+        XCTAssertFalse(
+            retention.releaseIfCurrent(
+                settledID: "gop:segment#2",
+                desiredExactID: "gop:segment#9",
+                isMoving: false
+            )
+        )
+        XCTAssertEqual(retention.artifactID, "gop-poster:segment#0")
+
+        XCTAssertTrue(
+            retention.releaseIfCurrent(
+                settledID: "gop:segment#9",
+                desiredExactID: "gop:segment#9",
+                isMoving: false
+            )
+        )
+        XCTAssertNil(retention.artifactID)
+    }
+
+    func testNewScrubPreviewWinsAndStaleExactCannotUncoverIt() {
+        var retention = RecallScrubPreviewRetention()
+        retention.remember("gop-poster:old#0")
+
+        XCTAssertEqual(
+            retention.activeArtifactID(
+                isMoving: true,
+                desiredPreviewID: "gop-poster:new#0"
+            ),
+            "gop-poster:new#0"
+        )
+        retention.remember("gop-poster:new#0")
+        XCTAssertFalse(
+            retention.releaseIfCurrent(
+                settledID: "gop:old#4",
+                desiredExactID: "gop:old#4",
+                isMoving: true
+            )
+        )
+        XCTAssertEqual(retention.artifactID, "gop-poster:new#0")
+    }
+
     func testActiveScrubPinsTheDisplayLinkToTheNativeRefreshRate() {
         let promotion = RecallScrubFrameRatePolicy.range(maximumFramesPerSecond: 120)
         XCTAssertEqual(promotion.minimum, 120)

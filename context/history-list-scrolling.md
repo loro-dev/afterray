@@ -200,20 +200,23 @@ transition. Prefetch, highlight, and text task ids stay constant for the whole
 gesture, so a new selected moment does not cancel and rebuild their task graph
 at display-link frequency.
 
-The picture has a separate two-tier rule. During motion it follows the
-transient moment with the existing 360px thumbnail, decoded through ImageIO;
-it does not request a full-resolution GOP frame or submit a full-size
-IOSurface. After motion, the thumbnail remains visible for a 250ms quiet period
-and until the exact frame settles. A reversal cancels the quiet-period task
-before VideoToolbox starts. This matters because cancelling the outer Swift
-task cannot interrupt a synchronous decode that is already inside
-VideoToolbox; starting that decode after the old 75ms interaction settle caused
-37-56ms gaps at the start of the next flick.
+The picture has a separate two-tier rule without reducing visual fidelity.
+During motion it follows the transient moment with one full-resolution poster
+per GOP, or the original full-resolution image for a loose still. One serial,
+latest-wins player bounds daemon reads, VideoToolbox work, and IOSurface
+submission instead of starting one task per display tick. After motion, that
+sharp preview remains visible for a 250ms quiet period and until the exact Nth
+frame settles underneath it. A reversal cancels the quiet-period task before
+the exact decode starts. This matters because cancelling the outer Swift task
+cannot interrupt a synchronous decode already inside VideoToolbox; starting
+that decode after the old 75ms interaction settle caused 37-56ms gaps at the
+start of the next flick.
 
 Do not pre-decode full-resolution neighbours after settle. A cancelled outer
 task cannot stop a detached VideoToolbox decode already in progress, so an
-apparently idle prefetch can survive into the next gesture. The exact settled
-frame is the only full-resolution promotion.
+apparently idle prefetch can survive into the next gesture. The moving player
+loads only its current/latest GOP poster; the exact settled frame is the only
+full-resolution Nth-frame promotion.
 
 Selection-only work has a separate 500ms quiet boundary. `moment_get` evidence
 is stored beside the selected moment instead of replacing a row in the lean
@@ -282,11 +285,12 @@ O(1)-equality path measured 118.0-120.9 render commits/s. A signed real-vault
 candidate then exposed two costs the fixture could not: neighbour GOP decoding
 surviving cancellation, and selected OCR detail invalidating the whole prepared
 timeline. After removing neighbour prefetch, isolating detail, deferring all
-selection-only work, and pinning the active ProMotion range, three fresh
+selection-only work, pinning the active ProMotion range, and restoring the
+moving picture to a serial full-resolution GOP-poster path, three fresh
 processes with four alternating flicks each measured
-113.3/114.9/117.9/118.2Hz, 104.7/116.7/115.8/117.6Hz, and
-111.3/117.3/115.4/116.6Hz. All twelve substantive segments had equal
-request/update/commit counts; the synchronous handler stayed at 0.055-0.080ms
+104.3/113.4/114.9/118.8Hz, 111.5/109.5/113.1/119.3Hz, and
+111.9/113.1/113.1/119.3Hz. All twelve substantive segments had equal
+request/update/commit counts; the synchronous handler stayed at 0.065-0.104ms
 p95. Earlier candidates produced 37-56ms gaps or a 99.4Hz half-rate segment
 even though that handler was already below 0.1ms.
 
@@ -330,9 +334,14 @@ open \
 ```
 
 Quit the existing process first so LaunchServices creates a process with those
-variables. The app orders the otherwise parked overlay front only for this
-explicit run, then the driver uses the real display link, store, daemon, and
-vault. Read the result with `make perf-log`; ordinary launches remain parked.
+variables. After permission reconciliation and the initial warm timeline load,
+the app orders the otherwise parked overlay front only for this explicit run;
+the driver then uses the real display link, store, daemon, and vault. Waiting
+until bootstrap finishes is required because bootstrap temporarily parks the
+overlay around macOS permission checks. The opt-in run also keeps the overlay
+visible if the launching harness retakes key focus before the delayed driver
+starts; ordinary launches retain the normal resign-to-hide behaviour. Read the
+result with `make perf-log`; ordinary launches remain parked.
 
 One trap that cost an hour: `print` to a pipe is block-buffered, and a
 profiling run ends by killing the process at its time limit, so the perf line
