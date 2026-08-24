@@ -3,7 +3,7 @@
   "apps/AfterRay/Sources/AfterRayApp.swift::final class AfterRayTerminationState {": "sha256:090f29cebcff6984",
   "apps/AfterRay/Sources/DaemonSupervisor.swift::final class DaemonSupervisor {": "sha256:dcf3b93004fdd624",
   "crates/afterray-models/src/queue.rs::pub async fn shutdown(&self) -> usize {": "sha256:35da49f4fa3cd079",
-  "crates/afterray-platform-macos/src/lib.rs::pub async fn stop_capture(&self) -> Result<(), CaptureError> {": "sha256:290fc334e898cc93",
+  "crates/afterray-platform-macos/src/lib.rs::pub async fn stop_capture(&self) -> Result<(), CaptureError> {": "sha256:53f772faa3b5433d",
   "crates/afterrayd/src/main.rs::impl AppState {": "sha256:73685ecd40e350f8",
   "swift/AfterRayRecall/Sources/DaemonClient.swift::public actor UnixSocketDaemonClient: AfterRayDaemonServing {": "sha256:0a358168de8d3905"
 }
