@@ -1,6 +1,6 @@
 # Capture pipeline: screen → vault → search/recall
 
-Verified against code 2026-08-17.
+Verified against code 2026-08-24.
 
 End-to-end map of how a captured frame becomes searchable, summarizable history. Follow the stages in order; each stage lists the owning file and the symbols that matter. Owners: `apps/AfterRayCaptureShim` (capture), `crates/afterray-platform-macos` (shim process), `crates/afterrayd` (scheduling + import + background passes), `crates/afterray-store` (vault + indexes), `crates/afterray-models` / `crates/afterray-infer` + Swift workers (OCR/ASR/embedding/LLM).
 
@@ -17,13 +17,14 @@ End-to-end map of how a captured frame becomes searchable, summarizable history.
 ## 2. Shim process ownership — afterray-platform-macos
 
 - `crates/afterray-platform-macos/src/lib.rs:151 MacOsCaptureBackend` spawns and owns the shim child: writes commands to stdin, reads the `CaptureEvent` stream from stdout, bounded channel (128) for backpressure, single-consumer `next_event` (lib.rs:285).
-- Stop gives the shim process a short window to finalize and then kills + reaps it. stdout EOF wakes the consumer, but without a preceding protocol `stopped` it is an `UnexpectedEof` failure, never a synthetic graceful stop. After exit 0, the finite stdout reader and consumer both drain without local deadlines, including when the capacity-128 channel is backpressured by a slow import; only a forced/failed helper gets short reader and consumer recovery windows. A terminal `failed`/reader error is held until the backend finishes bounded stop/kill/reap; final artifacts, input batches, and warnings are delivered first, while that generation's `stopped` or repeated terminal errors are discarded, so a restart inherits neither a live child nor stale events ([shutdown lifecycle](shutdown-lifecycle.md)).
+- Stop gives the shim process a short window to finalize and then kills + reaps it. stdout EOF wakes the consumer, but without a preceding protocol `stopped` it is an `UnexpectedEof` failure, never a synthetic graceful stop. After exit 0, the finite stdout reader and consumer both drain without local deadlines, including when the capacity-128 channel is backpressured by a slow import; only a forced/failed helper gets short reader and consumer recovery windows. A terminal `failed`/reader error is held until the backend finishes bounded stop/kill/reap; final artifacts, input batches, and warnings are delivered first, while that generation's `stopped` or repeated terminal errors are discarded. The daemon then joins or cancels the old sole consumer and clears any remainder before releasing its helper-lifecycle gate, so a restart inherits neither a live child nor stale events ([shutdown lifecycle](shutdown-lifecycle.md)).
 - `ArtifactKind` (lib.rs:108): `screen | system_audio | microphone | accessibility | accessibility_edge`.
 - `power.rs` — `on_ac_power` / `battery_fraction` / `seconds_since_user_input` / `load_per_core` probes; these feed the daemon's fail-closed gates (T2, GOP packing). They return `None` on failure, never a guess.
 - This is the only workspace crate allowed `#![allow(unsafe_code)]`.
 
 ## 3. Import — afterrayd
 
+- `CaptureLifecycle` serializes ordinary start, stop, and settings-driven restart through the previous consumer's terminal event, required imports, session close, and leftover-event cleanup. A wake-side `record_start` may observe logical idle while sleep-side `record_stop` is still draining, but it cannot spawn the replacement helper until that drain finishes. Shutdown is the deliberate exception: the daemon is already draining and rejecting new RPC work, so it may interrupt a slow startup.
 - Capture scheduler: a tokio task spawned in `start_capture_runtime`, default 10s via `AFTERRAY_CAPTURE_INTERVAL_SECONDS`. It sleeps until `last_capture_ms + interval` rather than on a fixed interval, because the heartbeat is the **fallback**: an `input_events` batch may pull a capture forward (`event_capture_is_due`, throttled to `max(10s, interval)` since the last request), and sleeping from the atomic every capture already writes re-phases the heartbeat with no channel between the two tasks. Cadence unchanged, phase follows interaction ([plan §1](../docs/event-capture-v2-plan.md)).
 - Both paths go through `fire_capture_tick`, the only door to `capture_screen`: `capture_paused` (`CaptureSetPaused` — the app raises it whenever its overlay is frontmost; the session, shim and audio keep running, unlike `RecordStop`), `capture_busy` claimed by compare-exchange, and `recording_active`. A held tick moves nothing, so the caller decides when to ask again.
 - `main.rs:1553 consume_capture_events` → `main.rs:1616 import_artifact`:

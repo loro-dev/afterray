@@ -555,6 +555,22 @@ impl MacOsCaptureBackend {
         Some(event)
     }
 
+    /// Removes events left by a stopped helper after its sole consumer has
+    /// completed or been cancelled.
+    ///
+    /// The daemon calls this while its capture lifecycle gate excludes a new
+    /// helper. It is deliberately separate from [`Self::stop_capture`]: final
+    /// artifacts must remain available until the old session's consumer has
+    /// either imported them or exhausted its failed-helper recovery budget.
+    pub async fn discard_stopped_generation_events(&self) -> usize {
+        let mut events = self.events_rx.lock().await;
+        let mut discarded = 0;
+        while events.try_recv().is_ok() {
+            discarded += 1;
+        }
+        discarded
+    }
+
     // @dec:bounded-shutdown — docs/decisions/active/architecture/2026-08-20-bounded-shutdown.md
     /// Stops capture, finalizes open audio segments, and waits for the helper.
     ///
@@ -611,10 +627,11 @@ impl MacOsCaptureBackend {
         } else {
             let Ok(reader_result) = timeout(READER_DRAIN_TIMEOUT, &mut process.reader).await else {
                 process.reader.abort();
-                // `abort` only schedules cancellation. Await the handle inside
-                // the same failed-reader bound so it cannot enqueue an event
-                // from this generation after a replacement helper starts.
-                let _ = timeout(READER_DRAIN_TIMEOUT, &mut process.reader).await;
+                // `abort` only schedules cancellation. Join it before returning
+                // so this generation can never enqueue after a replacement
+                // helper starts. The reader has only cancellation-safe Tokio
+                // I/O/channel awaits, so the bounded work ended at `abort`.
+                let _ = process.reader.await;
                 if stop_error.is_none() {
                     stop_error = Some(CaptureError::StopTimeout);
                 }
@@ -914,7 +931,7 @@ mod tests {
         let shim = temporary.path().join("failed-and-stuck-shim.sh");
         std::fs::write(
             &shim,
-            "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{\"event\":\"ready\",\"display_id\":1,\"width\":100,\"height\":100}'\nprintf '%s\\n' '{\"event\":\"failed\",\"code\":\"stream_stopped\",\"message\":\"display went away\"}'\nwhile :; do :; done\n",
+            "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{\"event\":\"ready\",\"display_id\":1,\"width\":100,\"height\":100}'\nprintf '%s\\n' '{\"event\":\"failed\",\"code\":\"stream_stopped\",\"message\":\"display went away\"}'\nexec sleep 3600\n",
         )
         .unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -952,7 +969,7 @@ mod tests {
         let shim = temporary.path().join("backpressured-failed-shim.sh");
         let event_count = EVENT_BUFFER_CAPACITY + 2;
         let script = format!(
-            "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{{\"event\":\"ready\",\"display_id\":1,\"width\":100,\"height\":100}}'\nprintf '%s\\n' '{{\"event\":\"failed\",\"code\":\"stream_stopped\",\"message\":\"display went away\"}}'\ni=0\nwhile [ \"$i\" -lt {event_count} ]; do\n  printf '%s\\n' '{{\"event\":\"warning\",\"code\":\"test\",\"message\":\"queued\"}}'\n  i=$((i + 1))\ndone\nwhile :; do :; done\n"
+            "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{{\"event\":\"ready\",\"display_id\":1,\"width\":100,\"height\":100}}'\nprintf '%s\\n' '{{\"event\":\"failed\",\"code\":\"stream_stopped\",\"message\":\"display went away\"}}'\ni=0\nwhile [ \"$i\" -lt {event_count} ]; do\n  printf '%s\\n' '{{\"event\":\"warning\",\"code\":\"test\",\"message\":\"queued\"}}'\n  i=$((i + 1))\ndone\nexec sleep 3600\n"
         );
         std::fs::write(&shim, script).unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
