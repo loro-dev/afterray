@@ -700,7 +700,7 @@ mod tests {
         let shim = temporary.path().join("stuck-shim.sh");
         std::fs::write(
             &shim,
-            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nwhile :; do :; done\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nexec sleep 3600\n",
         )
         .unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
