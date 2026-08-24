@@ -34,11 +34,15 @@ cancel path (`set_running` fails on a Cancelled job) releases the permit, while 
 admission would strand it.
 
 Interactive LLM work bypasses the lane entirely, as it bypasses the compute governor: a
-chat reply the user is watching never queues behind background work. Leased agent-loop
-rounds bypass it too — they are the same user-facing stream — and they must: a leased
-round waiting on the lane deadlocks against a plain background job that already holds
-the lane, because the loop's own lease hold keeps that job out of the LLM gate, so
-neither can ever advance. Remote LLM endpoints
+chat reply the user is watching never queues behind background work. Leased background
+rounds — the T2 summariser's real shape, every round submitted as
+`Background { lease: Some(id) }` under one `hold_llm_lease()` — ride the lane like any
+other background GPU work. That is only safe because the lane mirrors the LLM gate's
+lease holds: while a hold is active, plain background work is not admitted and parks at
+the lane holding nothing, so it cannot wedge the loop's next round at the LLM gate while
+holding the GPU permit the round needs — the deadlock the first version of this design
+shipped (the lease-hold test hung) and the naïve fix reintroduced by exempting leased
+rounds instead (which silently exempted the real T2 path). Remote LLM endpoints
 (Ollama, OpenAI-compatible) do not touch the local GPU; `LlmRouterAdapter` answers
 `uses_local_gpu` from the live provider setting, per job, so switching providers takes
 effect without a restart. `AFTERRAY_GPU_LANE=0` at daemon launch restores the old
@@ -65,9 +69,14 @@ covers every current and future submitter.
 
 Background GPU work takes longer to drain under load: jobs spend time pending in the lane
 where they previously ran concurrently, and the compute dashboard shows them as pending in
-their capability. While an interactive chat or agent loop holds the LLM lane, a background
-LLM pass holding the GPU lane waits with it, so all background GPU work yields to the
-active user — which is the intent, not a side effect.
+their capability. While an interactive chat holds the LLM lane, a background LLM pass
+holding the GPU lane waits with it, so all background GPU work yields to the active
+user — which is the intent, not a side effect.
+
+While a T2 pass holds its lease, other plain background GPU work (transcriptions, another
+summary) waits out the whole multi-round pass at the lane, exactly the priority the LLM
+gate already gave the loop's rounds at LLM scope. OCR is exempt from the hold and still
+interleaves between rounds: capture must not fall behind because a summary is running.
 
 Per-capability concurrency limits still apply but are dominated by the lane's single
 permit (embeddings are configured at 2 and now effectively run one at a time). The

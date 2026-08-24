@@ -75,8 +75,11 @@ what runs *together*. That is the model queue's job
 adapter touches the local GPU — OCR, ASR, embeddings, background LLM passes —
 takes a single shared permit before its capability slot, so a transcription and
 a 200-second summary never run at the same time. OCR rides its own class ahead
-of the durable-backlog work; interactive chat, leased agent-loop rounds, and
-remote LLM endpoints bypass the lane entirely. The GPU slot is taken *before*
+of the durable-backlog work; only interactive chat and remote LLM endpoints
+bypass the lane. Leased background rounds (the T2 summariser's real shape)
+ride it too — the gate mirrors the LLM gate's lease holds, so a plain
+background job excluded by a hold parks at the lane holding nothing and cannot
+deadlock the loop at the LLM gate. The GPU slot is taken *before*
 the capability slot so a queued background summary never holds the LLM lane
 hostage against an incoming chat. Decision and alternatives:
 [docs/decisions/active/architecture/2026-08-24-gpu-lane-serialization.md](../docs/decisions/active/architecture/2026-08-24-gpu-lane-serialization.md).
