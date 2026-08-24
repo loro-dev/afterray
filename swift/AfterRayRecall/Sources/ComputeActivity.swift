@@ -273,7 +273,7 @@ public struct ComputeTask: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
-/// A model process that stays loaded between jobs.
+/// A model process that stays loaded briefly between jobs.
 public struct ComputeResidentModel: Codable, Equatable, Sendable, Identifiable {
     public let packId: String
     public let name: String

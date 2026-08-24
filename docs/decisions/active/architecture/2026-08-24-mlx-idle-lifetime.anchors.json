@@ -1,0 +1,6 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterray-models/src/persistent_mlx.rs::pub async fn unload_if_idle(&self, idle_timeout: Duration) -> bool {": "sha256:f09299434fd06671",
+  "crates/afterrayd/src/compute.rs::pub(crate) const T2_MIN_IDLE_SECONDS: f64 = 120.0;": "sha256:768da1b6a58bbbe6",
+  "crates/afterrayd/src/main.rs::fn spawn_mlx_idle_reaper(state: Arc<AppState>) {": "sha256:78975f132e9a6f5a"
+}

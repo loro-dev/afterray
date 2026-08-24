@@ -80,6 +80,7 @@ struct Runtime {
     worker: Option<WorkerProcess>,
     generation: u64,
     next_spawn: Option<Instant>,
+    last_request_finished: Option<Instant>,
 }
 
 struct WorkerProcess {
@@ -103,6 +104,7 @@ impl PersistentMlxAdapter {
                 worker: None,
                 generation: 0,
                 next_spawn: None,
+                last_request_finished: None,
             }),
             child: Mutex::new(None),
             health: Arc::new(Mutex::new(MlxWorkerHealth::default())),
@@ -141,6 +143,7 @@ impl PersistentMlxAdapter {
         if let Some(mut runtime) = runtime {
             runtime.worker = None;
             runtime.next_spawn = None;
+            runtime.last_request_finished = None;
             self.stop_child().await;
             self.set_health(ModelPackState::NotDownloaded, None, None, None);
         } else {
@@ -155,6 +158,33 @@ impl PersistentMlxAdapter {
             .shutdown_cancellation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Cancellation::default();
+    }
+
+    // @dec:mlx-idle-lifetime — docs/decisions/active/architecture/2026-08-24-mlx-idle-lifetime.md
+    /// Stops a resident worker after it has gone unused for `idle_timeout`.
+    ///
+    /// Returns `true` when a worker was stopped. The same mutex guards
+    /// generation and this check, so an active request cannot be mistaken for
+    /// idle and a request arriving at the boundary either reuses the worker or
+    /// reloads it after this method finishes.
+    pub async fn unload_if_idle(&self, idle_timeout: Duration) -> bool {
+        let mut runtime = self.inner.lock().await;
+        let should_unload = runtime.worker.is_some()
+            && runtime
+                .last_request_finished
+                .is_some_and(|finished| finished.elapsed() >= idle_timeout);
+        if !should_unload {
+            return false;
+        }
+
+        runtime.worker = None;
+        runtime.next_spawn = None;
+        runtime.last_request_finished = None;
+        self.stop_child().await;
+        // The verified pack is still installed; only its process and resident
+        // allocations are gone.
+        self.set_health(ModelPackState::Ready, None, None, None);
+        true
     }
 
     /// Executes one complete prompt through the resident MLX model process.
@@ -224,6 +254,9 @@ impl PersistentMlxAdapter {
             && error.retryable()
         {
             self.fail_worker(&mut runtime, error.to_string()).await;
+        }
+        if runtime.worker.is_some() {
+            runtime.last_request_finished = Some(Instant::now());
         }
         result.map(|(text, usage)| match usage {
             Some(usage) => ModelOutput::llm_with_usage(text, usage),
@@ -459,6 +492,7 @@ impl PersistentMlxAdapter {
 
     async fn fail_worker(&self, runtime: &mut Runtime, error: String) {
         runtime.worker = None;
+        runtime.last_request_finished = None;
         self.stop_child().await;
         runtime.next_spawn = Some(Instant::now() + self.config.restart_backoff);
         self.set_health(ModelPackState::Failed, None, None, Some(error));
@@ -753,6 +787,63 @@ done
         assert_eq!(first, second);
         assert!(matches!(adapter.health().state, ModelPackState::Ready));
         adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_worker_unloads_and_reloads_on_the_next_request() {
+        let adapter = test_adapter(LOOP_WORKER);
+        adapter
+            .execute_streaming("job-1", &prompt("one"), None, Cancellation::default())
+            .await
+            .unwrap();
+        let first_generation = adapter.inner.lock().await.generation;
+
+        assert!(!adapter.unload_if_idle(Duration::from_secs(60)).await);
+        assert!(adapter.health().pid.is_some());
+        assert!(adapter.unload_if_idle(Duration::ZERO).await);
+        assert!(adapter.health().pid.is_none());
+        assert!(matches!(adapter.health().state, ModelPackState::Ready));
+
+        adapter
+            .execute_streaming("job-2", &prompt("two"), None, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(adapter.inner.lock().await.generation, first_generation + 1);
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_unload_waits_for_an_active_generation() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"kind":"load"'*) printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
+    *'"kind":"generate"'*)
+      sleep 0.1
+      printf '{"v":2,"kind":"final","request_id":"%s","text":"ok"}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        let adapter = Arc::new(test_adapter(script));
+        let task_adapter = Arc::clone(&adapter);
+        let task = tokio::spawn(async move {
+            task_adapter
+                .execute_streaming("active", &prompt("wait"), None, Cancellation::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(adapter.health().state, ModelPackState::InUse) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fake worker should start generation");
+
+        assert!(adapter.unload_if_idle(Duration::ZERO).await);
+        assert_eq!(task.await.unwrap().unwrap(), ModelOutput::llm("ok"));
+        assert!(adapter.health().pid.is_none());
     }
 
     #[tokio::test]

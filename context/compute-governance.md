@@ -1,6 +1,6 @@
 # Compute governance: who decides that local work may run
 
-Verified against code 2026-08-17.
+Verified against code 2026-08-24.
 
 AfterRay computes constantly on the user's own machine: screen text, transcripts,
 search vectors, slot summaries, AV1 compression. This article is the map of what
@@ -19,7 +19,7 @@ Before this existed, the answer was scattered and the app's story was not true:
 | Screen text (OCR, Apple Vision) | `ProcessAdapter` child, per capture (~10s) | none | mode `off` only |
 | Transcription (Qwen3-ASR) | `ProcessAdapter` child, 60s sweeper | none | governor; throttled to 300s on battery |
 | Search index (embeddings) | `ProcessAdapter` child, per evidence row | none | governor |
-| Summaries (T2, local LLM) | persistent MLX worker, 5-min sweeper | AC + ≥30% battery + ≥30s idle + load/core ≤0.7 | same, via the governor |
+| Summaries (T2, local LLM) | persistent MLX worker, 5-min sweeper | AC + ≥30% battery + ≥30s idle + load/core ≤0.7 | governor: AC + ≥30% battery + ≥120s idle + load/core ≤0.7; worker unloads after 120s unused |
 | Archive compression (rav1e) | thread **inside** the daemon | `AFTERRAY_GOP_REQUIRE_AC`, default **off** | governor only (`require_ac` removed) |
 
 So "AfterRay stops computing on battery" described one of five workloads, and the
@@ -31,7 +31,7 @@ all-core AV1 encode with nothing in the UI to say so.
 `crates/afterrayd/src/compute.rs` — `ComputeGovernor::decide(workload,
 conditions, now_ms)` is the single gate. It returns `Ok(())` or a `GateRefusal`
 carrying a `ComputeGateCode` and a `reason` string that **names the measurement**
-("battery at 18% is below 30%", "in use 4s ago, needs 30s"), never a policy
+("battery at 18% is below 30%", "in use 4s ago, needs 120s"), never a policy
 label. That string is the most valuable thing in the dashboard: it answers "why
 has nothing been summarised?", which no percentage can.
 
@@ -149,7 +149,7 @@ machine actually wants.
   amount of forcing will make a sweeper that never started do work.
 - **The explanation is generated, not written.** `ComputeThresholds` travels on
   the wire, so the Info popover's "starts automatically when: plugged in ·
-  battery above 30% · idle for 30s · load below 0.70/core" is built from the
+  battery above 30% · idle for 120s · load below 0.70/core" is built from the
   numbers the gate actually compares against, each paired with the live reading
   and marked met or unmet. Hardcoding those numbers in the UI would let the
   explanation drift from the behaviour, which is worse than no explanation.
@@ -179,7 +179,10 @@ the costs that genuinely are attributable to a pid:
   encoder honestly reads 400%, which is the case the panel exists to explain.
 - Resident models get their own section. A loaded MLX pack holds several GB of
   unified memory whether or not it is generating, and that explains more "my Mac
-  got slow" than any percentage.
+  got slow" than any percentage. The daemon checks the adapters every five
+  seconds and ends a managed MLX worker after 120 seconds without a completed
+  request. Ending the process releases model weights, Metal allocator state and
+  any request cache; the next request cold-loads the selected pack.
 
 ## How the report is assembled
 

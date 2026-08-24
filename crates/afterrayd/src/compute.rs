@@ -30,15 +30,11 @@ use std::time::{Duration, Instant};
 /// Charge below which summaries wait even on AC — a laptop plugged in at 8% is
 /// still recovering, and a local model is the last thing it needs.
 pub(crate) const T2_MIN_BATTERY: f64 = 0.30;
-/// How long the machine must have been untouched. Long enough not to fire
-/// between two keystrokes, short enough to find a gap in a working morning.
-///
-/// Two minutes never opened. On a day of continuous work the idle time hovered
-/// under a minute for hours and four slots went unsummarised — the sweeper
-/// logged the same refusal every five minutes from 08:00 on. The load check
-/// below is the one that actually predicts whether the user will feel a model
-/// start; this one only needs to rule out a pause mid-sentence.
-pub(crate) const T2_MIN_IDLE_SECONDS: f64 = 30.0;
+// @dec:mlx-idle-lifetime — docs/decisions/active/architecture/2026-08-24-mlx-idle-lifetime.md
+/// How long the machine must have been untouched before an automatic summary
+/// may load the local model. This keeps ordinary pauses in active work from
+/// turning into several gigabytes of resident model memory.
+pub(crate) const T2_MIN_IDLE_SECONDS: f64 = 120.0;
 /// One-minute load average per core. Above this something else already wants
 /// the machine, and the user will feel a local model piling on.
 pub(crate) const T2_MAX_LOAD_PER_CORE: f64 = 0.7;
@@ -653,6 +649,23 @@ mod tests {
     #[test]
     fn ideal_conditions_allow_t2() {
         assert!(t2_may_run(IDEAL).is_ok());
+    }
+
+    #[test]
+    fn t2_requires_two_complete_minutes_without_user_input() {
+        let refusal = t2_may_run(MachineConditions {
+            idle_seconds: T2_MIN_IDLE_SECONDS - 0.001,
+            ..IDEAL
+        })
+        .unwrap_err();
+        assert_eq!(refusal.code, ComputeGateCode::InUse);
+        assert!(
+            t2_may_run(MachineConditions {
+                idle_seconds: T2_MIN_IDLE_SECONDS,
+                ..IDEAL
+            })
+            .is_ok()
+        );
     }
 
     #[test]
