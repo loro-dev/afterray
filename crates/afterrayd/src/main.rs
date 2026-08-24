@@ -262,6 +262,7 @@ async fn async_main() -> anyhow::Result<()> {
         capture,
         models,
         recording: Mutex::new(RecordingRuntime::default()),
+        capture_lifecycle: CaptureLifecycle::default(),
         download: std::sync::Mutex::new(None),
         download_queue: std::sync::Mutex::new(Vec::new()),
         download_active: AtomicBool::new(false),
@@ -683,6 +684,10 @@ async fn drain_capture_consumer(
         Ok(result) => capture_consumer_join_result(result),
         Err(_) => {
             consumer.abort();
+            // Aborting only schedules cancellation. Join it before a wake-side
+            // start can create another helper, or this old consumer can still
+            // win the shared event receiver and steal the new `Ready`.
+            let _ = consumer.await;
             eprintln!(
                 "{operation}: failed capture helper's event consumer timed out after {} ms and was cancelled",
                 FAILED_HELPER_DRAIN_BUDGET.as_millis()
@@ -714,6 +719,12 @@ struct AppState {
     capture: Arc<MacOsCaptureBackend>,
     models: ModelQueue,
     recording: Mutex<RecordingRuntime>,
+    /// Serializes ordinary start/stop RPCs through the old consumer's final
+    /// event. `record_stop` publishes logical idle before required drain work,
+    /// so a wake-side start must wait here rather than attach a new helper to
+    /// the same event receiver. Shutdown bypasses this gate: app termination
+    /// already forbids new work and must be able to interrupt a slow startup.
+    capture_lifecycle: CaptureLifecycle,
     download: std::sync::Mutex<Option<ModelDownloadProgress>>,
     download_queue: std::sync::Mutex<Vec<afterray_models::PackSpec>>,
     download_active: AtomicBool,
@@ -938,6 +949,17 @@ struct RecordingRuntime {
     captured_frame: bool,
     scheduler: Option<JoinHandle<()>>,
     event_consumer: Option<JoinHandle<CaptureConsumerOutcome>>,
+}
+
+#[derive(Default)]
+struct CaptureLifecycle {
+    gate: Mutex<()>,
+}
+
+impl CaptureLifecycle {
+    async fn enter(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
 }
 
 fn recording_state_of(runtime: &RecordingRuntime) -> RecordingState {
@@ -1555,6 +1577,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
 }
 
 async fn record_start(state: &Arc<AppState>) -> Response {
+    let _capture_lifecycle = state.capture_lifecycle.enter().await;
     let _ = run_store(state, |s| s.store.end_open_idle_spans(now_ms())).await;
     let mut recording = state.recording.lock().await;
     if let Some(id) = &recording.active_session_id {
@@ -1579,6 +1602,10 @@ async fn record_start(state: &Arc<AppState>) -> Response {
     drop(recording);
     if let Err(error) = start_capture_runtime(state, session.id.clone()).await {
         eprintln!("record_start: capture runtime failed: {error}");
+        let discarded = state.capture.discard_stopped_generation_events().await;
+        if discarded > 0 {
+            eprintln!("record_start: discarded {discarded} failed startup event(s)");
+        }
         let session_id = session.id.clone();
         let _ = run_store(state, move |s| {
             s.store.end_session_sync(&session_id, now_ms())
@@ -1784,6 +1811,7 @@ fn event_capture_is_due(
 }
 
 async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
+    let _capture_lifecycle = state.capture_lifecycle.enter().await;
     let (session_id, consumer) = {
         let mut recording = state.recording.lock().await;
         let Some(session_id) = recording.active_session_id.clone() else {
@@ -1797,6 +1825,10 @@ async fn restart_capture_runtime(state: &Arc<AppState>) -> Result<(), String> {
     let capture_result = state.capture.stop_capture().await;
     let consumer_error =
         drain_capture_consumer(consumer, capture_result.is_err(), "capture restart").await;
+    let discarded = state.capture.discard_stopped_generation_events().await;
+    if discarded > 0 {
+        eprintln!("capture restart: discarded {discarded} stale generation event(s)");
+    }
     match capture_result {
         Ok(()) | Err(CaptureError::NotRunning) => {}
         Err(error) => return Err(error.to_string()),
@@ -2606,8 +2638,13 @@ fn migrate_api_key_to_keychain(
 }
 
 async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
-    let stop_started = Instant::now();
     let is_shutdown = reason == Some("shutdown");
+    let _capture_lifecycle = if is_shutdown {
+        None
+    } else {
+        Some(state.capture_lifecycle.enter().await)
+    };
+    let stop_started = Instant::now();
     let reason = reason.unwrap_or("pause").to_owned();
     let (session_id, scheduler, consumer) = {
         let mut recording = state.recording.lock().await;
@@ -2664,6 +2701,10 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
         session_close,
     )
     .await;
+    let discarded = state.capture.discard_stopped_generation_events().await;
+    if discarded > 0 {
+        eprintln!("record_stop: discarded {discarded} stale generation event(s)");
+    }
     if is_shutdown {
         eprintln!(
             "shutdown: capture/session close completed in {} ms",
@@ -5908,6 +5949,127 @@ mod tests {
 
         assert_eq!(error, "capture event consumer timed out");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_failure_and_wake_start_cannot_cross_capture_generations() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let shim = temporary.path().join("stop-failure-wake-shim.sh");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{\"event\":\"ready\",\"display_id\":1,\"width\":100,\"height\":100}'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *capture_screen*) printf '%s\\n' '{\"event\":\"failed\",\"code\":\"stream_stopped\",\"message\":\"display went away\"}' ;;\n    *stop*)\n      printf '%s\\n' '{\"event\":\"artifact\",\"kind\":\"system_audio\",\"path\":\"/tmp/final.m4a\",\"content_type\":\"audio/mp4\",\"started_at_ms\":1,\"ended_at_ms\":2,\"byte_count\":3}'\n      printf '%s\\n' '{\"event\":\"stopped\"}'\n      exit 0\n      ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend =
+            MacOsCaptureBackend::new(CaptureConfig::new(&shim, temporary.path().join("capture")));
+
+        backend.start_capture().await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), backend.next_event()).await,
+            Ok(Some(Ok(CaptureEvent::Ready { .. })))
+        ));
+        backend.capture_screen("trigger-failure").await.unwrap();
+
+        let (artifact_seen_tx, artifact_seen_rx) = tokio::sync::oneshot::channel();
+        let (finish_old_tx, finish_old_rx) = tokio::sync::oneshot::channel();
+        let consumer_backend = Arc::clone(&backend);
+        let old_consumer = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut artifact_seen_tx = Some(artifact_seen_tx);
+            let mut finish_old_rx = Some(finish_old_rx);
+            loop {
+                let event = consumer_backend
+                    .next_event()
+                    .await
+                    .expect("old generation should reach its terminal failure")
+                    .expect("old generation should emit protocol events");
+                match event {
+                    CaptureEvent::Artifact { .. } => {
+                        seen.push("artifact");
+                        artifact_seen_tx
+                            .take()
+                            .expect("only one tail artifact is expected")
+                            .send(())
+                            .unwrap();
+                        finish_old_rx
+                            .take()
+                            .expect("only one tail artifact is expected")
+                            .await
+                            .unwrap();
+                    }
+                    CaptureEvent::Failed { .. } => {
+                        seen.push("failed");
+                        break;
+                    }
+                    other => panic!("unexpected old-generation event: {other:?}"),
+                }
+            }
+            seen
+        });
+
+        let lifecycle = Arc::new(CaptureLifecycle::default());
+        let old_finished = Arc::new(AtomicBool::new(false));
+        let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+        let stop_lifecycle = Arc::clone(&lifecycle);
+        let stop_backend = Arc::clone(&backend);
+        let stop_finished = Arc::clone(&old_finished);
+        let stop = tokio::spawn(async move {
+            let _gate = stop_lifecycle.enter().await;
+            idle_tx.send(()).unwrap();
+            let _ = stop_backend.stop_capture().await;
+            let seen = old_consumer.await.expect("old consumer should not panic");
+            let discarded = stop_backend.discard_stopped_generation_events().await;
+            stop_finished.store(true, Ordering::Release);
+            (seen, discarded)
+        });
+
+        let wake_lifecycle = Arc::clone(&lifecycle);
+        let wake_backend = Arc::clone(&backend);
+        let wake_seen_stop = Arc::clone(&old_finished);
+        let (wake_attempted_tx, wake_attempted_rx) = tokio::sync::oneshot::channel();
+        let (wake_entered_tx, mut wake_entered_rx) = tokio::sync::oneshot::channel();
+        let wake = tokio::spawn(async move {
+            idle_rx.await.unwrap();
+            wake_attempted_tx.send(()).unwrap();
+            let _gate = wake_lifecycle.enter().await;
+            let _ = wake_entered_tx.send(());
+            assert!(
+                wake_seen_stop.load(Ordering::Acquire),
+                "wake-side start entered before the old consumer finished"
+            );
+            wake_backend.start_capture().await.unwrap();
+            wake_backend.next_event().await
+        });
+
+        artifact_seen_rx.await.unwrap();
+        wake_attempted_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut wake_entered_rx)
+                .await
+                .is_err(),
+            "wake-side start entered while the old consumer still held its tail"
+        );
+        finish_old_tx.send(()).unwrap();
+
+        let (stop, wake) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(stop, wake) })
+                .await
+                .expect("stop/failure/wake sequence must stay bounded");
+        wake_entered_rx.await.unwrap();
+        let (seen, discarded) = stop.expect("stop task should not panic");
+        assert_eq!(seen, vec!["artifact", "failed"]);
+        assert_eq!(discarded, 0);
+        assert!(matches!(
+            wake.expect("wake task should not panic"),
+            Some(Ok(CaptureEvent::Ready { .. }))
+        ));
+
+        let _ = backend.stop_capture().await;
+        backend.discard_stopped_generation_events().await;
     }
 
     #[tokio::test]
