@@ -340,6 +340,7 @@ async fn async_main() -> anyhow::Result<()> {
         }));
     spawn_gop_packer(Arc::clone(&state));
     spawn_slot_summarizer(Arc::clone(&state));
+    spawn_mlx_idle_reaper(Arc::clone(&state));
     spawn_text_df_maintainer(Arc::clone(&state));
     spawn_asr_sweeper(Arc::clone(&state));
 
@@ -4638,6 +4639,40 @@ fn spawn_slot_summarizer(state: Arc<AppState>) {
             }
         }
         eprintln!("slot.t2 sweeper: stopped");
+    });
+    lifecycle_state.lifecycle.track_task(task);
+}
+
+const MLX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MLX_IDLE_REAPER_PERIOD: Duration = Duration::from_secs(5);
+
+// @dec:mlx-idle-lifetime — docs/decisions/active/architecture/2026-08-24-mlx-idle-lifetime.md
+fn spawn_mlx_idle_reaper(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    let lifecycle_state = Arc::clone(&state);
+    let task = tokio::spawn(async move {
+        let mut timer = tokio::time::interval(MLX_IDLE_REAPER_PERIOD);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = timer.tick() => {
+                    for (pack_id, adapter) in &state.mlx_adapters {
+                        if adapter.unload_if_idle(MLX_IDLE_TIMEOUT).await {
+                            eprintln!(
+                                "mlx worker: unloaded {pack_id} after {}s without a request",
+                                MLX_IDLE_TIMEOUT.as_secs()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("mlx worker idle reaper: stopped");
     });
     lifecycle_state.lifecycle.track_task(task);
 }

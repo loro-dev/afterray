@@ -72,3 +72,7 @@ cancels the old active generation before tearing down its worker.
 **Cost:** every request prefills its complete prompt. The dependency temporarily
 uses a commit revision rather than a release tag, so upgrades must explicitly
 check whether a tagged release contains the fix and rerun the real-model test.
+
+Worker residency is narrowed by [Managed MLX workers load on demand and exit
+after two idle minutes](2026-08-24-mlx-idle-lifetime.md); request isolation,
+windowed prefill and bounded shutdown remain governed here.

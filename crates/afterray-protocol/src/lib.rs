@@ -641,7 +641,7 @@ pub struct ComputeTask {
     pub footprint_bytes: Option<u64>,
 }
 
-/// A model process that stays loaded between jobs.
+/// A model process that stays loaded briefly between jobs.
 ///
 /// Worth its own section: a resident MLX pack holds gigabytes of unified
 /// memory whether or not it is generating, which explains far more "my Mac got
@@ -726,7 +726,7 @@ pub struct ComputeStatusReport {
 fn default_compute_thresholds() -> ComputeThresholds {
     ComputeThresholds {
         summary_min_battery_fraction: 0.30,
-        summary_min_idle_seconds: 30.0,
+        summary_min_idle_seconds: 120.0,
         summary_max_load_per_core: 0.7,
         force_window_seconds: 1800,
     }
@@ -1640,7 +1640,7 @@ mod tests {
         assert_eq!(report.summary_typical_ms, None);
         // The thresholds default to the gate's real numbers, so an older
         // daemon's report still explains the trigger rather than showing zeroes.
-        assert!((report.thresholds.summary_min_idle_seconds - 30.0).abs() < f64::EPSILON);
+        assert!((report.thresholds.summary_min_idle_seconds - 120.0).abs() < f64::EPSILON);
         assert!((report.thresholds.summary_max_load_per_core - 0.7).abs() < f64::EPSILON);
     }
 

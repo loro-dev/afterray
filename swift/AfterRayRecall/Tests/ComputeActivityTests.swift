@@ -227,7 +227,7 @@ final class ComputeActivityTests: XCTestCase {
           "machine": {"on_ac": false, "idle_seconds": 2.0},
           "thresholds": {
             "summary_min_battery_fraction": 0.3,
-            "summary_min_idle_seconds": 30.0,
+            "summary_min_idle_seconds": 120.0,
             "summary_max_load_per_core": 0.7,
             "force_window_seconds": 1800
           },
@@ -298,7 +298,7 @@ final class ComputeActivityTests: XCTestCase {
         )
         let conditions = status.automaticConditions(for: .summary)
         let idle = try? XCTUnwrap(conditions.first { $0.label.contains("Idle") })
-        XCTAssertEqual(idle?.met, false, "4s idle against a 30s threshold")
+        XCTAssertEqual(idle?.met, false, "4s idle against a 120s threshold")
         XCTAssertEqual(idle?.detail, "last input 4s ago")
         XCTAssertTrue(conditions.first { $0.label == "Plugged in" }?.met == true)
         XCTAssertTrue(conditions.first { $0.label.contains("Battery") }?.met == true)
