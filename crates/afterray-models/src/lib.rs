@@ -314,6 +314,16 @@ pub trait ModelAdapter: Send + Sync {
     fn worker_pid(&self, _job_id: &str) -> Option<u32> {
         None
     }
+
+    /// Whether executing `input` occupies the local GPU.
+    ///
+    /// The model queue serializes background local-GPU work across
+    /// capabilities (OCR, ASR, embeddings, background LLM). Adapters backed
+    /// by a remote endpoint answer `false` so their jobs neither hold that
+    /// lane nor are held by it.
+    fn uses_local_gpu(&self, _input: &ModelInput) -> bool {
+        true
+    }
 }
 
 /// Builds adapters for all V0 capabilities from one compatible worker binary.

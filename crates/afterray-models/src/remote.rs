@@ -229,6 +229,12 @@ impl ModelAdapter for LlmRouterAdapter {
         }
     }
 
+    /// Read per job, on purpose: the provider is a runtime setting, and a
+    /// switch to a remote endpoint must free the GPU lane without a restart.
+    fn uses_local_gpu(&self, _input: &ModelInput) -> bool {
+        matches!(self.snapshot().provider, LlmProvider::MlxLocal)
+    }
+
     async fn execute(
         &self,
         job_id: &str,
