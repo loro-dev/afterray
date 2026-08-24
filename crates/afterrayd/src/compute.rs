@@ -38,6 +38,17 @@ pub(crate) const T2_MIN_IDLE_SECONDS: f64 = 120.0;
 /// One-minute load average per core. Above this something else already wants
 /// the machine, and the user will feel a local model piling on.
 pub(crate) const T2_MAX_LOAD_PER_CORE: f64 = 0.7;
+/// Machine-wide GPU utilization above which summaries wait. The load average
+/// sees only CPU: a game, a local LLM, or a video export elsewhere on the
+/// machine is exactly what it misses, and a 200-second model pass piling on
+/// is what the user feels.
+pub(crate) const T2_MAX_GPU_UTILIZATION: f64 = 0.5;
+/// How fresh the newest GPU reading must be, and the span the gate averages
+/// over — the daemon samples at 1 Hz, so this is the last fifteen samples.
+const GPU_WINDOW_MS: i64 = 15_000;
+/// GPU readings kept. A few more than fit the window, so a sample landing
+/// just after a gate check never shortens the average's span.
+const GPU_SAMPLES: usize = 15;
 
 /// Summary passes kept for the dashboard's "how much longer?" estimate.
 ///
@@ -189,6 +200,9 @@ pub(crate) struct ComputeLimits {
     pub(crate) summaries_disabled_by_env: bool,
     /// `AFTERRAY_GOP_ARCHIVE=0`.
     pub(crate) archive_disabled_by_env: bool,
+    /// `AFTERRAY_GPU_PROBE=0` — the GPU gate on summaries is skipped, and the
+    /// daemon never started its sampler.
+    pub(crate) gpu_probe_disabled_by_env: bool,
 }
 
 /// The live decision-maker. Cheap to consult: a gate check is a few uncontended
@@ -211,6 +225,12 @@ pub(crate) struct ComputeGovernor {
     /// when a user who just updated the app might be wondering why their fans
     /// are up.
     summaries: std::sync::Mutex<std::collections::VecDeque<ComputeRun>>,
+    /// Recent machine GPU readings, oldest first, as `(epoch_ms, fraction)`.
+    /// Fed at 1 Hz by the daemon's sampler task; the summary gate averages
+    /// the newest window of them. Nothing records a reading the probe could
+    /// not produce — an unanswered probe lets the window go stale, which the
+    /// gate reads as "unknown", not "idle".
+    gpu_samples: std::sync::Mutex<std::collections::VecDeque<(i64, f64)>>,
 }
 
 impl ComputeGovernor {
@@ -222,6 +242,7 @@ impl ComputeGovernor {
             samples: std::sync::Mutex::new(HashMap::new()),
             forced_until_ms: std::sync::Mutex::new(HashMap::new()),
             summaries: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            gpu_samples: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -319,6 +340,21 @@ impl ComputeGovernor {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Records one machine GPU reading from the sampler. Call only with a
+    /// value the probe actually returned — a failed probe records nothing, so
+    /// the window ages out and the gate falls back to "unavailable" instead
+    /// of trusting a stale or invented number.
+    pub(crate) fn record_gpu_utilization(&self, now_ms: i64, value: f64) {
+        let mut samples = self
+            .gpu_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        samples.push_back((now_ms, value));
+        while samples.len() > GPU_SAMPLES {
+            samples.pop_front();
+        }
     }
 
     pub(crate) fn mode(&self) -> ComputeMode {
@@ -424,6 +460,56 @@ impl ComputeGovernor {
         None
     }
 
+    // @dec:gpu-utilization-gate — docs/decisions/active/architecture/2026-08-24-gpu-utilization-gate.md
+    /// The machine-GPU check summaries run after the CPU gate. The load
+    /// average sees only CPU work; a game, a local LLM, or a video export
+    /// elsewhere on the machine is exactly what it misses.
+    ///
+    /// Fail-closed like the load average: the newest reading must be no older
+    /// than the window, and the average over the window must sit under the
+    /// threshold. An empty or stale window means the probe is not answering,
+    /// which is not permission.
+    fn summary_gpu_may_run(&self, now_ms: i64) -> GateDecision {
+        if self.limits.gpu_probe_disabled_by_env {
+            return Ok(());
+        }
+        let samples = self
+            .gpu_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let newest_is_fresh = samples
+            .back()
+            .is_some_and(|(at, _)| now_ms.saturating_sub(*at) <= GPU_WINDOW_MS);
+        if !newest_is_fresh {
+            return Err(GateRefusal::new(
+                ComputeGateCode::Unavailable,
+                "GPU utilization unavailable",
+            ));
+        }
+        let mut total = 0.0;
+        let mut count = 0_usize;
+        for (at, value) in samples.iter().rev() {
+            if now_ms.saturating_sub(*at) > GPU_WINDOW_MS {
+                break;
+            }
+            total += value;
+            count += 1;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "sample counts are tiny")]
+        let average = total / count as f64;
+        if average > T2_MAX_GPU_UTILIZATION {
+            return Err(GateRefusal::new(
+                ComputeGateCode::MachineBusy,
+                format!(
+                    "GPU at {:.0}% (15s avg) is above {:.0}%",
+                    average * 100.0,
+                    T2_MAX_GPU_UTILIZATION * 100.0
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether `workload` may start right now.
     ///
     /// `conditions` is passed in rather than probed here so one report can
@@ -449,7 +535,8 @@ impl ComputeGovernor {
         match workload {
             // Both of these are the reason a machine feels slow: a 200-second
             // local model pass, and an all-core AV1 encode.
-            ComputeWorkload::Summary => t2_may_run(conditions),
+            ComputeWorkload::Summary => t2_may_run(conditions)
+                .and_then(|()| self.summary_gpu_may_run(now_ms)),
             ComputeWorkload::Archive => {
                 if conditions.on_ac {
                     Ok(())
@@ -863,6 +950,7 @@ mod tests {
             governor.paused_until_ms(now + 61_000).is_none(),
             "an elapsed deadline reads as not paused, with nobody clearing it"
         );
+        record_steady_gpu(&governor, now + 61_000, 0.1);
         assert!(
             governor
                 .decide(ComputeWorkload::Summary, IDEAL, now + 61_000)
@@ -909,6 +997,7 @@ mod tests {
             ComputeLimits {
                 summaries_disabled_by_env: true,
                 archive_disabled_by_env: true,
+                gpu_probe_disabled_by_env: false,
             },
         );
         let on_battery = MachineConditions {
@@ -1112,6 +1201,7 @@ mod tests {
             ComputeLimits {
                 summaries_disabled_by_env: true,
                 archive_disabled_by_env: false,
+                gpu_probe_disabled_by_env: false,
             },
         );
         assert!(
@@ -1139,6 +1229,7 @@ mod tests {
             ComputeLimits {
                 summaries_disabled_by_env: true,
                 archive_disabled_by_env: false,
+                gpu_probe_disabled_by_env: false,
             },
         );
         governor.force_now(ComputeWorkload::Summary, 0);
@@ -1306,5 +1397,122 @@ mod tests {
             ComputeWorkload::Summary
         );
         assert_eq!(ComputeWorkload::Archive.lane(), ComputeLane::Cpu);
+    }
+
+    /// Fifteen fresh readings at `value`, ending at `now` — what the 1 Hz
+    /// sampler leaves behind on a machine holding a steady GPU load.
+    fn record_steady_gpu(governor: &ComputeGovernor, now: i64, value: f64) {
+        for back in (0..i64::try_from(GPU_SAMPLES).unwrap()).rev() {
+            governor.record_gpu_utilization(now - back * 1_000, value);
+        }
+    }
+
+    #[test]
+    fn a_quiet_gpu_allows_summaries() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        record_steady_gpu(&governor, now, 0.2);
+        assert!(governor.decide(ComputeWorkload::Summary, IDEAL, now).is_ok());
+    }
+
+    /// The reason reaches the panel, so it names the measurement: how busy
+    /// the GPU is, over which span, against which threshold.
+    #[test]
+    fn a_busy_gpu_holds_summaries_and_says_how_busy() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        record_steady_gpu(&governor, now, 0.8);
+        let refusal = governor
+            .decide(ComputeWorkload::Summary, IDEAL, now)
+            .unwrap_err();
+        assert_eq!(refusal.code, ComputeGateCode::MachineBusy);
+        assert!(
+            refusal.reason.contains("GPU at 80%") && refusal.reason.contains("50%"),
+            "{}",
+            refusal.reason
+        );
+        // Only summaries read the GPU window; the CPU-bound archive path
+        // has no GPU to contend for.
+        assert!(
+            governor
+                .decide(ComputeWorkload::Archive, IDEAL, now)
+                .is_ok()
+        );
+    }
+
+    /// Fail-closed like the load average: an unanswered probe is not
+    /// permission. The window goes stale when the sampler stops recording —
+    /// the probe failing, or the daemon just started.
+    #[test]
+    fn a_stale_or_empty_gpu_window_holds_summaries() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        let refusal = governor
+            .decide(ComputeWorkload::Summary, IDEAL, now)
+            .unwrap_err();
+        assert_eq!(refusal.code, ComputeGateCode::Unavailable);
+        assert_eq!(refusal.reason, "GPU utilization unavailable");
+
+        governor.record_gpu_utilization(now - GPU_WINDOW_MS - 1_000, 0.1);
+        let refusal = governor
+            .decide(ComputeWorkload::Summary, IDEAL, now)
+            .unwrap_err();
+        assert_eq!(
+            refusal.code,
+            ComputeGateCode::Unavailable,
+            "a window whose newest reading is stale is no reading at all"
+        );
+    }
+
+    #[test]
+    fn the_env_switch_skips_the_gpu_check_entirely() {
+        let governor = ComputeGovernor::new(
+            ComputeMode::Full,
+            0,
+            ComputeLimits {
+                summaries_disabled_by_env: false,
+                archive_disabled_by_env: false,
+                gpu_probe_disabled_by_env: true,
+            },
+        );
+        assert!(
+            governor
+                .decide(ComputeWorkload::Summary, IDEAL, 0)
+                .is_ok(),
+            "with the probe switched off, no sampler ever ran and the gate must not wait for one"
+        );
+    }
+
+    /// "Run now" is newer information than any machine reading, GPU included:
+    /// the forced override returns before the workload checks.
+    #[test]
+    fn run_now_overrides_the_gpu_gate_too() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        record_steady_gpu(&governor, now, 0.9);
+        assert!(
+            governor
+                .decide(ComputeWorkload::Summary, IDEAL, now)
+                .is_err()
+        );
+        governor.force_now(ComputeWorkload::Summary, now);
+        assert!(
+            governor
+                .decide(ComputeWorkload::Summary, IDEAL, now)
+                .is_ok()
+        );
+    }
+
+    /// The window is bounded: a sampler running all day must not grow the
+    /// governor's memory, and the gate only ever averages the fresh span.
+    #[test]
+    fn the_gpu_window_is_bounded() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        for index in 0..(GPU_SAMPLES * 2) {
+            governor.record_gpu_utilization(now + i64::try_from(index).unwrap() * 1_000, 0.1);
+        }
+        let samples = governor.gpu_samples.lock().unwrap();
+        assert_eq!(samples.len(), GPU_SAMPLES);
     }
 }
