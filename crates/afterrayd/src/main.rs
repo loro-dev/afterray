@@ -216,10 +216,16 @@ async fn async_main() -> anyhow::Result<()> {
         "afterray-mlx-vlm-worker",
         ".build/release/afterray-mlx-vlm-worker",
     );
+    let mlx_asr_worker_path = resolve_helper_path(
+        "AFTERRAY_MLX_ASR_WORKER",
+        "asr/afterray-mlx-asr-worker",
+        "apps/AfterRayMlxAsrWorker/.build/release/afterray-mlx-asr-worker",
+    );
     let (adapters, llm_token_sink, mlx_adapters) = local_model_adapters(
         native_worker_path,
         worker_path,
         mlx_worker_path,
+        mlx_asr_worker_path,
         Arc::clone(&llm_config),
     );
     let models = ModelQueue::new(
@@ -447,10 +453,12 @@ async fn shutdown_signal() {
     }
 }
 
+// @dec:mlx-asr-runtime — docs/decisions/active/architecture/2026-08-25-mlx-asr-runtime.md
 fn local_model_adapters(
     native_worker: PathBuf,
     general_worker: PathBuf,
     mlx_worker: PathBuf,
+    mlx_asr_worker: PathBuf,
     llm_config: Arc<std::sync::Mutex<LlmRuntimeConfig>>,
 ) -> (
     Vec<Arc<dyn ModelAdapter>>,
@@ -473,6 +481,17 @@ fn local_model_adapters(
         .with_mlx(QWEN35_4B_MLX_PACK_ID, Arc::clone(&mlx_4b))
         .with_mlx(QWEN35_9B_MLX_PACK_ID, Arc::clone(&mlx_9b));
     let token_sink = llm.token_sink();
+    let asr_model_dir = spec_by_id("asr")
+        .map(|spec| spec.path)
+        .unwrap_or_else(|| model_directory().join("Qwen3-ASR-1.7B-MLX-4bit"));
+    let mut mlx_asr_config = ProcessAdapterConfig::new(
+        "qwen3-asr-mlx",
+        ModelCapability::Asr,
+        mlx_asr_worker,
+    );
+    mlx_asr_config
+        .env
+        .insert("AFTERRAY_ASR_MODEL".into(), asr_model_dir.display().to_string());
     (
         vec![
             Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
@@ -480,11 +499,7 @@ fn local_model_adapters(
                 ModelCapability::Ocr,
                 native_worker,
             ))) as Arc<dyn ModelAdapter>,
-            Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
-                "qwen3-asr",
-                ModelCapability::Asr,
-                general_worker.clone(),
-            ))),
+            Arc::new(ProcessAdapter::new(mlx_asr_config)),
             Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
                 "llama-embedding",
                 ModelCapability::Embedding,

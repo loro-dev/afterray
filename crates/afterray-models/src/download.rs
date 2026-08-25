@@ -267,6 +267,10 @@ pub async fn download_pack_with_cancellation(
                 &mut on_progress,
             )
             .await?;
+            if pack.id == "asr" {
+                crate::asr_pack::prepare_qwen3_asr(pack.path.as_path(), revision, files)
+                    .map_err(DownloadError::message)?;
+            }
         }
     }
     Ok(())

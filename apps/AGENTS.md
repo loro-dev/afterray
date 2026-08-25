@@ -15,6 +15,7 @@ Targets of the **root** `Package.swift` (built with plain `swift build`):
 Standalone SwiftPM package, **not** part of the root package (own `Package.swift`, own `.build/`):
 
 - [AfterRayCaptureShim/](AfterRayCaptureShim/AGENTS.md) — ScreenCaptureKit boundary for the Rust daemon; build with `make capture-shim`
+- [AfterRayMlxAsrWorker/](AfterRayMlxAsrWorker/AGENTS.md) — standalone one-shot MLX Qwen3 ASR helper; its dependency graph and Metal library are isolated from the VLM worker
 
 ## Watch out
 

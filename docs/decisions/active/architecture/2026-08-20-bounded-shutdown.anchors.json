@@ -1,7 +1,7 @@
 {
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
   "apps/AfterRay/Sources/AfterRayApp.swift::final class AfterRayTerminationState {": "sha256:090f29cebcff6984",
-  "apps/AfterRay/Sources/DaemonSupervisor.swift::final class DaemonSupervisor {": "sha256:dcf3b93004fdd624",
+  "apps/AfterRay/Sources/DaemonSupervisor.swift::final class DaemonSupervisor {": "sha256:5ae77acac518c4f0",
   "crates/afterray-models/src/queue.rs::pub async fn shutdown(&self) -> usize {": "sha256:35da49f4fa3cd079",
   "crates/afterray-platform-macos/src/lib.rs::pub async fn stop_capture(&self) -> Result<(), CaptureError> {": "sha256:06181862fdae98dd",
   "crates/afterrayd/src/main.rs::impl AppState {": "sha256:73685ecd40e350f8",

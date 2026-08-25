@@ -70,6 +70,10 @@ ditto "$mount_point/AfterRay.app" "$dragged_app"
 hdiutil detach "$mount_point" >/dev/null
 [[ -f "$dragged_app/Contents/Helpers/mlx.metallib" ]] \
   || die 'dragged app is missing the MLX Metal library'
+[[ -x "$dragged_app/Contents/Helpers/asr/afterray-mlx-asr-worker" ]] \
+  || die 'dragged app is missing the MLX ASR worker'
+[[ -f "$dragged_app/Contents/Helpers/asr/mlx.metallib" ]] \
+  || die 'dragged app is missing the MLX ASR Metal library'
 xcrun stapler validate "$dragged_app"
 xattr -w com.apple.quarantine '0081;00000000;Safari;' "$dragged_app"
 spctl --assess --type execute --verbose=2 "$dragged_app"

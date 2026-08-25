@@ -1,0 +1,4 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterrayd/src/main.rs::fn local_model_adapters(": "sha256:caa9f512b563a3e3"
+}

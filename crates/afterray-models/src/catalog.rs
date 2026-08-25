@@ -12,9 +12,9 @@ pub const QWEN35_9B_MLX_REVISION: &str = "938d8919941c6e7efd3c7150eff7fe9d12afa6
 pub const QWEN35_9B_MLX_EXPECTED_BYTES: u64 = 5_977_071_067;
 pub const QWEN35_9B_MLX_PACK_ID: &str = "llm_qwen35_9b_mlx4";
 
-pub const QWEN3_ASR_REPOSITORY: &str = "Qwen/Qwen3-ASR-1.7B";
-pub const QWEN3_ASR_REVISION: &str = "7278e1e70fe206f11671096ffdd38061171dd6e5";
-pub const QWEN3_ASR_EXPECTED_BYTES: u64 = 4_703_114_308;
+pub const QWEN3_ASR_REPOSITORY: &str = "mlx-community/Qwen3-ASR-1.7B-4bit";
+pub const QWEN3_ASR_REVISION: &str = "78a389c776a5483b2d0d4ea5494e11012e0d6159";
+pub const QWEN3_ASR_EXPECTED_BYTES: u64 = 1_607_630_579;
 pub const QWEN3_ALIGNER_PACK_ID: &str = "asr_aligner";
 pub const QWEN3_ALIGNER_REPOSITORY: &str = "Qwen/Qwen3-ForcedAligner-0.6B";
 pub const QWEN3_ALIGNER_REVISION: &str = "c7cbfc2048c462b0d63a45797104fc9db3ad62b7";
@@ -104,6 +104,13 @@ impl PackSpec {
                 let bytes = directory_size(&self.path);
                 let revision = pin.as_ref().map_or("custom", |pin| pin.revision.as_str());
                 let files = pin.as_ref().map_or(&[][..], |pin| pin.files.as_slice());
+                match crate::asr_pack::verify_qwen3_asr_prepared(&self.path, revision, files) {
+                    Ok(()) => (true, bytes, ModelPackState::Ready, None),
+                    Err(error) => (false, bytes, ModelPackState::Failed, Some(error)),
+                }
+            }
+            PackSource::HuggingFacePinnedSnapshot { revision, files, .. } if self.id == "asr" => {
+                let bytes = directory_size(&self.path);
                 match crate::asr_pack::verify_qwen3_asr_prepared(&self.path, revision, files) {
                     Ok(()) => (true, bytes, ModelPackState::Ready, None),
                     Err(error) => (false, bytes, ModelPackState::Failed, Some(error)),
@@ -202,15 +209,7 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
     // An env override points at content this catalog knows nothing about, so
     // the pin — and with it verification — only applies to the default source.
     let asr_repository = env_or("AFTERRAY_ASR_REPOSITORY", QWEN3_ASR_REPOSITORY);
-    let asr_pin = (asr_repository == QWEN3_ASR_REPOSITORY).then(|| SnapshotPin {
-        revision: QWEN3_ASR_REVISION.into(),
-        files: qwen3_asr_manifest(),
-    });
-    let asr_expected = if asr_pin.is_some() {
-        QWEN3_ASR_EXPECTED_BYTES
-    } else {
-        4_200_000_000
-    };
+    let asr_pinned = asr_repository == QWEN3_ASR_REPOSITORY;
     let embedding_repository = env_or("AFTERRAY_EMBEDDING_REPOSITORY", NOMIC_EMBED_REPOSITORY);
     let embedding_file = env_or("AFTERRAY_EMBEDDING_FILE", NOMIC_EMBED_FILE);
     let embedding_pinned =
@@ -222,13 +221,18 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
             id: "asr".into(),
             name: "Qwen3 ASR".into(),
             capability: "asr".into(),
-            path: env_or_join("AFTERRAY_ASR_MODEL", directory, "Qwen3-ASR-1.7B"),
+            path: env_or_join("AFTERRAY_ASR_MODEL", directory, "Qwen3-ASR-1.7B-MLX-4bit"),
             required: true,
-            note: format!("{asr_repository} · official safetensors · ZH/EN/JA · Rust/Candle"),
-            expected_bytes: asr_expected,
-            source: PackSource::HuggingFaceSnapshot {
-                repository: asr_repository,
-                pin: asr_pin,
+            note: format!("{asr_repository} · MLX 4-bit · ZH/EN/JA · Apple Silicon"),
+            expected_bytes: if asr_pinned { QWEN3_ASR_EXPECTED_BYTES } else { 1_600_000_000 },
+            source: if asr_pinned {
+                PackSource::HuggingFacePinnedSnapshot {
+                    repository: asr_repository,
+                    revision: QWEN3_ASR_REVISION.into(),
+                    files: qwen3_asr_manifest(),
+                }
+            } else {
+                PackSource::HuggingFaceSnapshot { repository: asr_repository, pin: None }
             },
         },
         PackSpec {
@@ -289,22 +293,10 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
 }
 
 /// Everything `Qwen/Qwen3-ASR-1.7B` ships at [`QWEN3_ASR_REVISION`] — the same
-/// set the unpinned listing used to return, so behaviour only gains the hash
-/// check. LFS hashes come from Hugging Face's own LFS records; the small JSON
-/// and tokenizer files were fetched at that commit and hashed directly.
+/// Exact MLX Qwen3-ASR 1.7B 4-bit snapshot at [`QWEN3_ASR_REVISION`].
 #[must_use]
 pub fn qwen3_asr_manifest() -> Vec<ManifestFile> {
     const FILES: &[(&str, u64, &str)] = &[
-        (
-            ".gitattributes",
-            1_519,
-            "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
-        ),
-        (
-            "README.md",
-            57_456,
-            "5058416891bc47a2051557765997e8c42f8eb78a0e33c3e775bd17d4b0ba4d50",
-        ),
         (
             "chat_template.json",
             1_161,
@@ -312,8 +304,8 @@ pub fn qwen3_asr_manifest() -> Vec<ManifestFile> {
         ),
         (
             "config.json",
-            6_194,
-            "2e74a751548b8ad7d7526d29365ad8144c345d8b412b1152d25dc6698452712f",
+            7_188,
+            "539c6c9d482349066e2e740241e39896f3bf4de0866c245f6539c85dbb19d93c",
         ),
         (
             "generation_config.json",
@@ -326,19 +318,14 @@ pub fn qwen3_asr_manifest() -> Vec<ManifestFile> {
             "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
         ),
         (
-            "model-00001-of-00002.safetensors",
-            4_220_320_824,
-            "a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6",
-        ),
-        (
-            "model-00002-of-00002.safetensors",
-            478_200_688,
-            "6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc",
+            "model.safetensors",
+            1_603_081_617,
+            "9848eaf7a5c1589c671b35035ac27b72e248dd0c604eacae547e7e403d29db45",
         ),
         (
             "model.safetensors.index.json",
-            64_821,
-            "f994739fe38e5210b9e3e8ce6c6307315e2ceac3cb630e7b7414d69dce520f60",
+            78_968,
+            "2612ab715223843b3dec0742737bc85f50914ca1484ade45955f99b4e012f2bb",
         ),
         (
             "preprocessor_config.json",
@@ -799,16 +786,16 @@ mod tests {
         let catalog = catalog_in(Path::new("/tmp/afterray-models"));
 
         let asr = catalog.iter().find(|pack| pack.id == "asr").unwrap();
-        let PackSource::HuggingFaceSnapshot { pin: Some(pin), .. } = &asr.source else {
+        let PackSource::HuggingFacePinnedSnapshot { revision, files, .. } = &asr.source else {
             panic!("the default asr pack must carry a pin");
         };
-        assert_eq!(pin.revision, QWEN3_ASR_REVISION);
+        assert_eq!(revision, QWEN3_ASR_REVISION);
         assert_eq!(
-            pin.files.iter().map(|file| file.bytes).sum::<u64>(),
+            files.iter().map(|file| file.bytes).sum::<u64>(),
             asr.expected_bytes,
             "expected_bytes must equal the manifest total or progress lies"
         );
-        assert!(pin.files.iter().all(|file| file.sha256.len() == 64));
+        assert!(files.iter().all(|file| file.sha256.len() == 64));
         assert_eq!(asr.revision(), Some(QWEN3_ASR_REVISION));
 
         let aligner = catalog
@@ -912,7 +899,7 @@ mod tests {
         );
         assert!(matches!(
             catalog[0].source,
-            PackSource::HuggingFaceSnapshot { .. }
+            PackSource::HuggingFacePinnedSnapshot { .. }
         ));
         assert!(matches!(
             catalog[1].source,

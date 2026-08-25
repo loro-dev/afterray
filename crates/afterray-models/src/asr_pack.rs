@@ -116,6 +116,16 @@ pub fn prepare_configured_qwen3_asr(path: &Path) -> Result<(), String> {
         crate::catalog::PackSource::HuggingFaceSnapshot { pin: None, .. } => {
             prepare_qwen3_asr(path, "custom", &[])
         }
+        crate::catalog::PackSource::HuggingFacePinnedSnapshot {
+            revision, files, ..
+        } => {
+            if verify_qwen3_asr_prepared(path, &revision, &files).is_ok() {
+                return Ok(());
+            }
+            crate::download::verify_files(path, &files)
+                .map_err(|error| format!("ASR snapshot verification failed: {error}"))?;
+            prepare_qwen3_asr(path, &revision, &files)
+        }
         _ => Err("configured ASR pack has an unsupported source".into()),
     }
 }

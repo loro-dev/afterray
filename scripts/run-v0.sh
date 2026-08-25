@@ -59,6 +59,7 @@ app_bin="$repo_root/.build/debug/afterray-app"
 native_model_worker="$repo_root/.build/release/afterray-native-model-worker"
 mlx_model_worker="$repo_root/.build/release/afterray-mlx-vlm-worker"
 mlx_metallib="$repo_root/.build/release/mlx.metallib"
+mlx_asr_package="$repo_root/apps/AfterRayMlxAsrWorker"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
 swift_cache="$repo_root/.afterray-dev/swift-cache"
 
@@ -140,6 +141,14 @@ swift build \
   --package-path "$repo_root" \
   --configuration release \
   --product afterray-mlx-vlm-worker
+swift build \
+  --package-path "$mlx_asr_package" \
+  --configuration release \
+  --product afterray-mlx-asr-worker
+mlx_asr_bin_dir="$(swift build --package-path "$mlx_asr_package" --configuration release --show-bin-path)"
+mlx_asr_worker="$mlx_asr_bin_dir/afterray-mlx-asr-worker"
+mlx_asr_metallib="$mlx_asr_bin_dir/mlx.metallib"
+cp "$mlx_metallib" "$mlx_asr_metallib"
 [[ -f "$mlx_metallib" ]] || {
   printf 'MLX Metal library not found after worker build: %s\n' "$mlx_metallib" >&2
   exit 1
@@ -172,6 +181,9 @@ cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
 cp "$mlx_model_worker" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
 cp "$mlx_metallib" "$app_bundle/Contents/Helpers/mlx.metallib"
+mkdir -p "$app_bundle/Contents/Helpers/asr"
+cp "$mlx_asr_worker" "$app_bundle/Contents/Helpers/asr/afterray-mlx-asr-worker"
+cp "$mlx_asr_metallib" "$app_bundle/Contents/Helpers/asr/mlx.metallib"
 cp "$model_worker" "$app_bundle/Contents/Helpers/afterray-model-worker"
 chmod +x "$app_bundle/Contents/MacOS/AfterRay" "$app_bundle/Contents/Helpers/"*
 chmod 0644 "$app_bundle/Contents/Helpers/mlx.metallib"
@@ -216,6 +228,8 @@ codesign \
   "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/asr/afterray-mlx-asr-worker" >/dev/null
+codesign --force --options runtime --sign "$codesign_identity" "$app_bundle/Contents/Helpers/asr/mlx.metallib" >/dev/null
 codesign \
   --force \
   --options runtime \
