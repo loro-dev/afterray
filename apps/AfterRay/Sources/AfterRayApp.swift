@@ -321,7 +321,8 @@ private final class AfterRayMenuBar: NSObject {
     private var statusItem: NSStatusItem?
     private var pauseItem: NSMenuItem?
     private var computeItem: NSMenuItem?
-    private var isRecording = false
+    private var recordingState: DaemonRecordingState?
+    private var isChangingRecording = false
     private var shortcut = RecallHotKeyStore.shared.hotKey
     private var preferenceObserver: NSObjectProtocol?
 
@@ -437,8 +438,8 @@ private final class AfterRayMenuBar: NSObject {
         statusItem = nil
     }
 
-    func setRecording(_ isRecording: Bool) {
-        self.isRecording = isRecording
+    func setRecordingState(_ recordingState: DaemonRecordingState?) {
+        self.recordingState = recordingState
         refresh()
     }
 
@@ -463,19 +464,20 @@ private final class AfterRayMenuBar: NSObject {
 
     @objc private func toggleCapture() {
         Task {
-            guard !AfterRayTerminationState.shared.isTerminating else { return }
-            let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
-            do {
-                if isRecording {
-                    _ = try await daemon.recordStop(reason: "menu")
-                    isRecording = false
-                } else {
-                    _ = try await daemon.recordStart()
-                    isRecording = true
-                }
+            guard !AfterRayTerminationState.shared.isTerminating,
+                  !isChangingRecording
+            else { return }
+            isChangingRecording = true
+            refresh()
+            defer {
+                isChangingRecording = false
                 refresh()
-            } catch {
-                AfterRayLog.error(error.localizedDescription, source: "menu")
+            }
+            let control = AfterRayServices.shared.control
+            let changed = await control.toggleRecording()
+            recordingState = control.status?.recordingState
+            if !changed, let message = control.message {
+                AfterRayLog.error(message, source: "menu")
             }
         }
     }
@@ -502,11 +504,16 @@ private final class AfterRayMenuBar: NSObject {
         guard let button = statusItem?.button else { return }
         statusItem?.isVisible = true
         button.image = Self.icon()
-        button.alphaValue = isRecording ? 1 : 0.46
+        let captureIsActive = switch recordingState {
+        case .waiting, .recording, .stopping: true
+        case .idle, .failed, nil: false
+        }
+        button.alphaValue = captureIsActive ? 1 : 0.46
         let copy = AfterRayLocalization.shared.copy
-        let state = isRecording ? copy.menu.recording : copy.menu.paused
+        let state = captureIsActive ? copy.menu.recording : copy.menu.paused
         button.toolTip = copy.menu.tooltip(state, shortcut.displayString)
-        pauseItem?.title = isRecording ? copy.menu.pauseCapture : copy.menu.resumeCapture
+        pauseItem?.title = captureIsActive ? copy.menu.pauseCapture : copy.menu.resumeCapture
+        pauseItem?.isEnabled = !isChangingRecording && recordingState != .stopping
     }
 
     private static func icon() -> NSImage {
@@ -1515,8 +1522,8 @@ private struct AfterRayRootView: View {
         .onChange(of: isLive) { _, live in
             if live { audioPlayer.stop() }
         }
-        .onChange(of: control.isRecording, initial: true) { _, isRecording in
-            AfterRayMenuBar.shared.setRecording(isRecording)
+        .onChange(of: control.status?.recordingState, initial: true) { _, recordingState in
+            AfterRayMenuBar.shared.setRecordingState(recordingState)
         }
         .task {
             await bootstrap()

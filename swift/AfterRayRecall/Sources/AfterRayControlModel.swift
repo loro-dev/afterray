@@ -29,7 +29,7 @@ public final class AfterRayControlModel: ObservableObject {
         }
     }
     public var canToggleRecording: Bool {
-        !isChangingRecording && status?.recordingState != .stopping
+        !isChangingRecording
     }
 
     public func refreshStatus() async {
@@ -74,6 +74,12 @@ public final class AfterRayControlModel: ObservableObject {
         isChangingRecording = true
         defer { isChangingRecording = false }
         do {
+            // Menu-bar and overlay actions share this model, but the daemon can
+            // also change state after lock/sleep or another surface's command.
+            // Refresh before choosing start versus stop so a stale UI snapshot
+            // can never send the same command twice and strand capture paused.
+            status = try await daemon.status()
+            guard status?.recordingState != .stopping else { return false }
             if isCaptureSessionActive {
                 _ = try await daemon.recordStop(reason: "pause")
             } else {

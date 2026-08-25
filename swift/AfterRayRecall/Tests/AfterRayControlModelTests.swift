@@ -20,6 +20,56 @@ final class AfterRayControlModelTests: XCTestCase {
         XCTAssertEqual(commands, ["start", "stop"])
     }
 
+    func testToggleRefreshesStaleRecordingStateBeforeChoosingTheCommand() async {
+        let daemon = ControlDaemon()
+        await daemon.setRecordingState(.recording)
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+
+        // Capture was stopped elsewhere after this model last refreshed. The
+        // next click must start from the daemon's idle state, not issue stop a
+        // second time from the stale local snapshot.
+        await daemon.setRecordingState(.idle)
+        let changed = await model.toggleRecording()
+
+        XCTAssertTrue(changed)
+        XCTAssertTrue(model.isRecording)
+        let commands = await daemon.recordCommands
+        XCTAssertEqual(commands, ["start"])
+    }
+
+    func testToggleRefreshesStaleIdleStateBeforeChoosingTheCommand() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+
+        // The inverse race matters too: capture started from another surface,
+        // so the stale idle model must stop that live session instead of
+        // sending a duplicate start.
+        await daemon.setRecordingState(.recording)
+        let changed = await model.toggleRecording()
+
+        XCTAssertTrue(changed)
+        XCTAssertFalse(model.isRecording)
+        let commands = await daemon.recordCommands
+        XCTAssertEqual(commands, ["stop"])
+    }
+
+    func testToggleDoesNotStayDisabledByAStaleStoppingState() async {
+        let daemon = ControlDaemon()
+        await daemon.setRecordingState(.stopping)
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+
+        await daemon.setRecordingState(.idle)
+        let changed = await model.toggleRecording()
+
+        XCTAssertTrue(changed)
+        XCTAssertTrue(model.isRecording)
+        let commands = await daemon.recordCommands
+        XCTAssertEqual(commands, ["start"])
+    }
+
     func testWaitingIsNotRecordingButSessionIsActive() async {
         let daemon = ControlDaemon()
         await daemon.setRecordingState(.waiting)
