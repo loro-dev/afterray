@@ -1,0 +1,4 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "swift/AfterRayRecall/Sources/SummaryHistoryStore.swift::public final class SummaryHistoryStore: ObservableObject {": "sha256:e98a229b69fbf5d1"
+}
