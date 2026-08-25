@@ -4,14 +4,15 @@ Offscreen PNG snapshot tool for the recall surfaces (root `Package.swift` execut
 
 ## Key file
 
-- `Sources/main.swift:19` `SnapshotRunner.main` — renders every `SnapshotScene.all` entry (`main.swift:46`) to `<name>.png`
+- `Sources/main.swift:19` `SnapshotRunner.main` — renders `SnapshotScene.all` (or `--only <prefix>`) to `<name>.png`
 - Forced `.darkAqua` appearance (`main.swift:25`) — the overlay only ever runs dark; without this, unstyled labels render black on black
 - Window parked far offscreen at (-30000, -30000) (`main.swift:58`) so views lay out and `.task` blocks run without appearing on a display
 
 ## Run
 
 - `make snapshots` — writes to `/tmp/afterray-snapshots`; override with `make snapshots OUT=/tmp/x`
-- Equivalent: `swift run afterray-visual-snapshots <out-dir>`
+- `make audio-chrome-snapshots` — only `audio-chrome-*` scenes (pure `AudioMomentChromeStage`, no `RecallView`)
+- Equivalent: `swift run afterray-visual-snapshots -- <out-dir> [--only audio-chrome]`
 
 ## Watch out
 

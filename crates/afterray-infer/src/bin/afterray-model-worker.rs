@@ -77,6 +77,7 @@ fn output_preview(output: &ModelOutput) -> String {
             }
             _ => format!("{} chars", text.chars().count()),
         },
+        ModelOutput::Alignment { cues } => format!("{} aligned cues", cues.len()),
         ModelOutput::Embedding { vector } => format!("{} dims", vector.len()),
     }
 }

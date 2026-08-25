@@ -1,3 +1,5 @@
 # Known remaining shipped chrome. New hits must go through AfterRayCopy.
 # Columns: path<TAB>collapsed-literal<TAB>reason
 # Shrink this file; do not grow it except for a documented exception.
+
+swift/AfterRayRecall/Sources/RecallView.swift	search|\(searchSelectedIndex)|\(searchSelectedMomentID ?? 	internal task identity, never rendered

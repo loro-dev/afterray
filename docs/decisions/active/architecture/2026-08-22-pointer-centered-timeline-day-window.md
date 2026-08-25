@@ -80,9 +80,10 @@ frame settles underneath it. A new gesture cancels that exact promotion before
 it starts; cancellation after synchronous VideoToolbox decode has begun is not
 considered a sufficient performance control. Full-resolution neighbour
 prefetch is not performed: it could leave a decode running after cancellation
-and compete with a later scrub. Evidence, summary, adjacent-day maintenance,
-and audio prefetch wait for 500ms of quiet; the next gesture cancels their
-shared task before it can publish.
+and compete with a later scrub. Evidence, summary, and adjacent-day maintenance
+wait for 500ms of quiet; the next gesture cancels their shared task before it
+can publish. Audio artifacts remain explicit-play only and are never selection
+prefetch.
 
 While movement is active, the display link requests one fixed rate equal to the
 current screen's native maximum, capped at 120Hz. A 60...120Hz range allowed
@@ -119,8 +120,9 @@ with request, state-update, and layer-commit counts equal in every segment.
 
 **Cost:** the store and view exchange coverage, revision, and a prepared spine
 as one logical snapshot. Sparse gaps can retain more than seven calendar days,
-though not more occupied rows solely because those days are empty. Protocol 16
-and the timeline-range payload are unchanged. During motion the recalled image
+though not more occupied rows solely because those days are empty. Protocol 17
+keeps the bounded timeline-range shape and adds exact audio segment bounds.
+During motion the recalled image
 is a full-resolution GOP poster rather than the exact Nth frame; the exact
 frame is promoted after the user has been still for 250ms. Selection metadata
 may appear after the longer 500ms quiet boundary rather than competing with

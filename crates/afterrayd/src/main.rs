@@ -15,10 +15,10 @@ use afterray_models::{
     Cancellation, DownloadError, JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink,
     ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, OcrRegion,
     PersistentMlxAdapter, PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig,
-    QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REVISION,
-    QueueConfig, download_packs_with_cancellation, huggingface_mirror_to_persist, library,
-    model_directory, probe_llm, qwen35_9b_mlx_manifest, qwen35_mlx_manifest,
-    reclaim_abandoned_downloads, remove_pack, spec_by_id, specs_for_download,
+    QWEN3_ALIGNER_PACK_ID, QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID,
+    QWEN35_9B_MLX_REVISION, QueueConfig, TranscriptCue, download_packs_with_cancellation,
+    huggingface_mirror_to_persist, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
+    qwen35_mlx_manifest, reclaim_abandoned_downloads, remove_pack, spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
     ArtifactKind, CaptureConfig, CaptureError, CaptureEvent, InputEventRecord, MacOsCaptureBackend,
@@ -1725,9 +1725,8 @@ async fn start_capture_runtime(state: &Arc<AppState>, session_id: String) -> Res
 
     let event_state = Arc::clone(state);
     let consumer_session = session_id.clone();
-    let event_consumer = tokio::spawn(async move {
-        consume_capture_events(event_state, consumer_session).await
-    });
+    let event_consumer =
+        tokio::spawn(async move { consume_capture_events(event_state, consumer_session).await });
     let mut recording = state.recording.lock().await;
     if recording.active_session_id.as_deref() != Some(session_id.as_str()) {
         scheduler.abort();
@@ -2710,7 +2709,11 @@ async fn record_stop(state: &Arc<AppState>, reason: Option<&str>) -> Response {
     let (consumer_error, _, store_result) = finish_recording_after_helper_stop(
         consumer,
         capture_error.is_some(),
-        if is_shutdown { "shutdown" } else { "record_stop" },
+        if is_shutdown {
+            "shutdown"
+        } else {
+            "record_stop"
+        },
         memory_flush,
         session_close,
     )
@@ -2904,8 +2907,7 @@ async fn handle_capture_event(state: &Arc<AppState>, session_id: &str, event: Ca
                 {
                     eprintln!("capture input events store failed: {error}");
                     if let Some((from_ms, to_ms)) = span {
-                        record_signal_gap(state, from_ms, to_ms, "input_events_store_failed")
-                            .await;
+                        record_signal_gap(state, from_ms, to_ms, "input_events_store_failed").await;
                     }
                 }
             }
@@ -4324,7 +4326,7 @@ async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, Stri
     .await
     .map_err(|error| error.to_string())?;
     let Some(claimed) = claimed else {
-        return Ok(false);
+        return run_one_audio_alignment(state).await;
     };
     let segment = claimed.segment;
     let path = match materialize_audio_for_asr(state, &segment).await {
@@ -4359,11 +4361,13 @@ async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, Stri
                 }
                 let stored_segment = segment.clone();
                 let stored_text = text.clone();
+                let stored_language = language.clone();
                 let adapter = snapshot.adapter.clone();
                 let evidence_id = run_store(state, move |state| {
                     state.store.complete_audio_transcription(
                         &stored_segment,
                         &stored_text,
+                        stored_language.as_deref(),
                         &adapter,
                         now_ms(),
                     )
@@ -4390,6 +4394,152 @@ async fn run_one_audio_transcription(state: &Arc<AppState>) -> Result<bool, Stri
         return Err(format!("{} failed: {error}", segment.id));
     }
     Ok(true)
+}
+
+// @dec:forced-aligned-audio-transcript-cues — docs/decisions/active/product/2026-08-24-forced-aligned-audio-transcript-cues.md
+async fn run_one_audio_alignment(state: &Arc<AppState>) -> Result<bool, String> {
+    // Pending transcripts are durable and can wait. Do not claim work or
+    // decrypt an audio artifact until the optional aligner is actually on
+    // disk; the download completion path wakes this sweeper explicitly.
+    if !subtitle_aligner_is_present() {
+        return Ok(false);
+    }
+    let claimed = run_store(state, |state| state.store.claim_audio_alignment(now_ms()))
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(claimed) = claimed else {
+        return Ok(false);
+    };
+    let segment = claimed.segment;
+    let path = match materialize_audio_for_asr(state, &segment).await {
+        Ok(path) => path,
+        Err(error) => {
+            fail_claimed_alignment(state, &segment.id, claimed.attempts, &error).await;
+            eprintln!("subtitle alignment {} failed: {error}", segment.id);
+            return Ok(true);
+        }
+    };
+    let language = alignment_language_or_infer(claimed.language.as_deref(), &claimed.transcript);
+    let outcome = async {
+        let job = state
+            .models
+            .submit(ModelInput::Align {
+                audio_path: path.clone(),
+                text: claimed.transcript,
+                language,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let snapshot = state
+            .models
+            .wait(&job)
+            .await
+            .map_err(|error| error.to_string())?;
+        match snapshot.output {
+            Some(ModelOutput::Alignment { cues }) => {
+                let stored_segment = segment.clone();
+                let adapter = snapshot.adapter.clone();
+                let duration_ms = stored_segment
+                    .ended_at_ms
+                    .saturating_sub(stored_segment.started_at_ms);
+                let cues = bound_alignment_cues_to_segment(cues, duration_ms)?;
+                run_store(state, move |state| {
+                    state
+                        .store
+                        .complete_audio_alignment(&stored_segment, &cues, &adapter, now_ms())
+                })
+                .await
+                .map_err(|error| error.to_string())
+            }
+            Some(_) => Err(format!(
+                "subtitle alignment job {} returned a non-alignment output",
+                snapshot.id
+            )),
+            None => Err(snapshot.last_error.unwrap_or_else(|| {
+                format!(
+                    "subtitle alignment job {} ended {:?}",
+                    snapshot.id, snapshot.state
+                )
+            })),
+        }
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&path).await;
+    if let Err(error) = outcome {
+        fail_claimed_alignment(state, &segment.id, claimed.attempts, &error).await;
+        eprintln!("subtitle alignment {} failed: {error}", segment.id);
+    }
+    // Text was durable before this independent refinement began. Whether the
+    // aligner succeeded or entered backoff, this item was consumed and the
+    // sweeper should continue with the rest of the queue.
+    Ok(true)
+}
+
+fn subtitle_aligner_is_present() -> bool {
+    spec_by_id(QWEN3_ALIGNER_PACK_ID).is_some_and(|pack| pack.inspect().present)
+}
+
+/// Container/codec padding can make decoded PCM a few milliseconds longer
+/// than the exact capture interval in the vault. Clipping a final cue is safe;
+/// moving overlapping or wholly out-of-range text would manufacture timing
+/// evidence the aligner did not produce.
+fn bound_alignment_cues_to_segment(
+    cues: Vec<TranscriptCue>,
+    duration_ms: i64,
+) -> Result<Vec<TranscriptCue>, String> {
+    if duration_ms <= 0 {
+        return Err("audio segment has no positive duration".into());
+    }
+    if cues.is_empty() {
+        return Err("subtitle alignment returned no cues for a non-empty transcript".into());
+    }
+    let mut bounded: Vec<TranscriptCue> = Vec::with_capacity(cues.len());
+    for mut cue in cues {
+        let previous_end_ms = bounded.last().map_or(0, |previous| previous.end_offset_ms);
+        if cue.start_offset_ms < 0
+            || cue.start_offset_ms < previous_end_ms
+            || cue.start_offset_ms >= duration_ms
+        {
+            return Err(format!(
+                "alignment cue {} starts outside its trustworthy interval",
+                cue.ordinal
+            ));
+        }
+        cue.ordinal = u32::try_from(bounded.len()).unwrap_or(u32::MAX);
+        cue.end_offset_ms = cue.end_offset_ms.min(duration_ms);
+        if cue.end_offset_ms <= cue.start_offset_ms {
+            return Err(format!(
+                "alignment cue {} has no positive trustworthy interval",
+                cue.ordinal
+            ));
+        }
+        bounded.push(cue);
+    }
+    Ok(bounded)
+}
+
+fn alignment_language_or_infer(language: Option<&str>, transcript: &str) -> String {
+    if let Some(language) = language.filter(|language| !language.trim().is_empty()) {
+        return language.to_owned();
+    }
+    if transcript
+        .chars()
+        .any(|character| matches!(u32::from(character), 0x3040..=0x30ff))
+    {
+        "Japanese".to_owned()
+    } else if transcript
+        .chars()
+        .any(|character| matches!(u32::from(character), 0xac00..=0xd7af))
+    {
+        "Korean".to_owned()
+    } else if transcript
+        .chars()
+        .any(|character| matches!(u32::from(character), 0x3400..=0x9fff))
+    {
+        "Chinese".to_owned()
+    } else {
+        "English".to_owned()
+    }
 }
 
 async fn materialize_audio_for_asr(
@@ -4446,6 +4596,28 @@ async fn fail_claimed_audio(state: &Arc<AppState>, segment_id: &str, attempts: u
     .await
     {
         eprintln!("asr backlog: could not persist failure: {store_error}");
+    }
+}
+
+async fn fail_claimed_alignment(
+    state: &Arc<AppState>,
+    segment_id: &str,
+    attempts: u32,
+    error: &str,
+) {
+    let delay_minutes = 1_i64 << attempts.min(afterray_store::AUDIO_BACKOFF_SATURATION_ATTEMPTS);
+    let now = now_ms();
+    let next = now.saturating_add(delay_minutes * 60 * 1_000);
+    let segment_id = segment_id.to_owned();
+    let error = error.to_owned();
+    if let Err(store_error) = run_store(state, move |state| {
+        state
+            .store
+            .fail_audio_alignment(&segment_id, &error, next, now)
+    })
+    .await
+    {
+        eprintln!("subtitle alignment: could not persist failure: {store_error}");
     }
 }
 
@@ -5610,9 +5782,14 @@ async fn run_model_downloads(state: Arc<AppState>) {
             state.download_changed.notify_waiters();
             return;
         }
-        if pack.id == "asr" {
-            let requeued = run_store(&state, |state| {
-                state.store.retry_failed_audio_transcriptions(now_ms())
+        if matches!(pack.id.as_str(), "asr" | "asr_aligner") {
+            let pack_id = pack.id.clone();
+            let requeued = run_store(&state, move |state| {
+                if pack_id == "asr_aligner" {
+                    state.store.retry_failed_audio_alignments(now_ms())
+                } else {
+                    state.store.retry_failed_audio_transcriptions(now_ms())
+                }
             })
             .await;
             match requeued {
@@ -5883,18 +6060,15 @@ mod tests {
 
         let (memory_flushed, session_closed) = tokio::time::timeout(
             Duration::from_secs(6),
-            finish_required_recording_close(
-                async { "memory flushed" },
-                async move {
-                    // This stands in for slow vault maintenance plus
-                    // end_session_sync after the active session was taken. It
-                    // deliberately exceeds the retired four-second aggregate
-                    // timeout: required close must still run to completion.
-                    tokio::time::sleep(Duration::from_millis(4_100)).await;
-                    completed_after_close.store(true, Ordering::Release);
-                    "session closed"
-                },
-            ),
+            finish_required_recording_close(async { "memory flushed" }, async move {
+                // This stands in for slow vault maintenance plus
+                // end_session_sync after the active session was taken. It
+                // deliberately exceeds the retired four-second aggregate
+                // timeout: required close must still run to completion.
+                tokio::time::sleep(Duration::from_millis(4_100)).await;
+                completed_after_close.store(true, Ordering::Release);
+                "session closed"
+            }),
         )
         .await
         .expect("the test guard should not expire");
@@ -7038,6 +7212,7 @@ mod tests {
             .complete_audio_transcription(
                 &elsewhere,
                 "an earlier meeting",
+                Some("English"),
                 "test-asr",
                 settled - 60_000,
             )
@@ -7077,6 +7252,7 @@ mod tests {
             .complete_audio_transcription(
                 &pending,
                 "we agreed to ship on Friday",
+                Some("English"),
                 "test-asr",
                 settled,
             )
@@ -7085,6 +7261,62 @@ mod tests {
             slots_ready_for_t2(&vault, interval_ms, settled, 1).ready,
             vec![slot_start_ms],
         );
+    }
+
+    #[test]
+    fn alignment_language_prefers_asr_metadata_then_infers_old_transcripts() {
+        assert_eq!(alignment_language_or_infer(Some("fr"), "ignored"), "fr");
+        assert_eq!(alignment_language_or_infer(None, "你好。"), "Chinese");
+        assert_eq!(
+            alignment_language_or_infer(None, "こんにちは。"),
+            "Japanese"
+        );
+        assert_eq!(alignment_language_or_infer(None, "안녕하세요."), "Korean");
+        assert_eq!(alignment_language_or_infer(None, "Hello."), "English");
+    }
+
+    #[test]
+    fn alignment_cues_are_bounded_to_the_exact_vault_segment() {
+        let cue = |ordinal, text: &str, start_offset_ms, end_offset_ms| TranscriptCue {
+            ordinal,
+            text: text.into(),
+            start_offset_ms,
+            end_offset_ms,
+            timing_kind: afterray_protocol::TranscriptTimingKind::Aligned,
+        };
+        let bounded = bound_alignment_cues_to_segment(
+            vec![cue(4, "First", 100, 900), cue(5, "second", 900, 1_080)],
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].ordinal, 0);
+        assert_eq!(bounded[1].ordinal, 1);
+        assert_eq!(bounded[1].text, "second");
+        assert_eq!(bounded[1].start_offset_ms, 900);
+        assert_eq!(bounded[1].end_offset_ms, 1_000);
+    }
+
+    #[test]
+    fn alignment_cues_reject_false_retiming() {
+        let cue = |ordinal, text: &str, start_offset_ms, end_offset_ms| TranscriptCue {
+            ordinal,
+            text: text.into(),
+            start_offset_ms,
+            end_offset_ms,
+            timing_kind: afterray_protocol::TranscriptTimingKind::Aligned,
+        };
+        assert!(
+            bound_alignment_cues_to_segment(
+                vec![cue(0, "First", 100, 900), cue(1, "overlap", 850, 950)],
+                1_000,
+            )
+            .is_err()
+        );
+        assert!(
+            bound_alignment_cues_to_segment(vec![cue(0, "outside", 1_000, 1_100)], 1_000).is_err()
+        );
+        assert!(bound_alignment_cues_to_segment(Vec::new(), 1_000).is_err());
     }
 
     /// Past the cap the same vault stops waiting — otherwise a machine whose
@@ -7141,6 +7373,7 @@ mod tests {
             .complete_audio_transcription(
                 &alive,
                 "an earlier meeting",
+                Some("English"),
                 "test-asr",
                 expired - 60_000,
             )

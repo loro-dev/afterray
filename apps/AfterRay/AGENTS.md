@@ -14,7 +14,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 ## Invariants
 
 - **Use AppKit `AfterRayMain`, never a SwiftUI `App`:** an `LSUIElement` SwiftUI scene replaces the Edit menu and silently breaks native editing shortcuts.
-- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 16, which must match `afterray-protocol`.
+- The app never opens the database or touches encryption keys — all data flows through `UnixSocketDaemonClient` over protocol 18, which must match `afterray-protocol`.
 - On lock/sleep, `.afterRaySystemSessionWillSuspend` clears store/control/chat, closes chat, and clears image/thumbnail/preview caches. Hook every decrypted-content cache into this.
 - Overlay keeps its tree: `orderOut`; `present()` only `orderFront`s; move only to a new screen; post `DidOpen` next turn; first paint activates; hide parks NOW; host stays non-opaque.
 - **⇧⌘Space yields to screenshots.** Unregister Carbon on ⇧⌘3/4/5/6 *before* Space; do not handle this in the hotkey callback. Details: [screenshot-hotkey-yield](../../docs/decisions/active/product/2026-08-21-screenshot-hotkey-yield.md).

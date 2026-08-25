@@ -9,7 +9,8 @@
 use afterray_core::{CoreError, Store};
 use afterray_protocol::{
     ActivitySpan, ArtifactPayload, AudioSegment, AudioTrack, Conversation, ConversationMessage,
-    DEFAULT_STORAGE_LIMIT_BYTES, Memory, Moment, SearchHit, Session,
+    DEFAULT_STORAGE_LIMIT_BYTES, Memory, Moment, SearchHit, Session, TranscriptCue,
+    TranscriptTimingKind,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -76,25 +77,25 @@ pub type TranscriptLine = (i64, String, String);
 pub type MomentAt = (String, i64);
 
 pub use slot::{
-    AppFact, CURRENT_SLOT_DURATION_MS, DaySlot, DaySummary, GapEntry, MentionKind, PrevCard,
-    Revisit, RunRow, LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, SLOT_DURATION_CHOICES_MINUTES,
-    SLOT_DURATION_MS, SLOT_SUMMARY_SCHEMA_VERSION, SlotBounds, SlotCard, SlotEvidence,
-    SlotExportFacts, SlotFacts, SlotMention, SlotMomentRow, SlotSegment, SlotState,
-    SlotSummaryExport, SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT, T2_SYSTEM_PROMPT_V2,
-    T2_SYSTEM_PROMPT_V3, T2Card, T2CardV2, T2CardV3, T2Entity, T2GroundingReport, T2Thread,
-    T2VerifyReport, TimelineEntry, V2_SLOT_SUMMARY_SCHEMA_VERSION, assemble_day_summary,
-    attach_entity_candidates, build_slot_card, build_slot_card_with_end, dedup_key_of,
-    details_sections, extract_json_object, ground_t2_details, legacy_segments, local_day_bounds,
-    local_day_for, match_slot_mention, next_legacy_slot_boundary, parse_t2_card, parse_t2_card_v2,
-    parse_t2_card_v3, render_t2_prompt, render_t2_system_prompt, shorten_place, slot_bounds_for,
-    slot_bounds_in,
-    slot_clock_label, slot_duration_ms_for_minutes, slot_start_for, verify_t2_card,
+    AppFact, CURRENT_SLOT_DURATION_MS, DaySlot, DaySummary, GapEntry,
+    LEGACY_SLOT_SUMMARY_SCHEMA_VERSION, MentionKind, PrevCard, Revisit, RunRow,
+    SLOT_DURATION_CHOICES_MINUTES, SLOT_DURATION_MS, SLOT_SUMMARY_SCHEMA_VERSION, SlotBounds,
+    SlotCard, SlotEvidence, SlotExportFacts, SlotFacts, SlotMention, SlotMomentRow, SlotSegment,
+    SlotState, SlotSummaryExport, SlotSummaryState, StoredSlotOverlay, T2_SYSTEM_PROMPT,
+    T2_SYSTEM_PROMPT_V2, T2_SYSTEM_PROMPT_V3, T2Card, T2CardV2, T2CardV3, T2Entity,
+    T2GroundingReport, T2Thread, T2VerifyReport, TimelineEntry, V2_SLOT_SUMMARY_SCHEMA_VERSION,
+    assemble_day_summary, attach_entity_candidates, build_slot_card, build_slot_card_with_end,
+    dedup_key_of, details_sections, extract_json_object, ground_t2_details, legacy_segments,
+    local_day_bounds, local_day_for, match_slot_mention, next_legacy_slot_boundary, parse_t2_card,
+    parse_t2_card_v2, parse_t2_card_v3, render_t2_prompt, render_t2_system_prompt, shorten_place,
+    slot_bounds_for, slot_bounds_in, slot_clock_label, slot_duration_ms_for_minutes,
+    slot_start_for, verify_t2_card,
 };
 
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 27;
 
 // @dec:size-driven-retention — docs/decisions/active/architecture/2026-08-20-size-driven-retention.md
 /// How long a runtime marker in the event stream lives.
@@ -242,6 +243,14 @@ pub struct ClaimedAudioTranscription {
     pub attempts: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClaimedAudioAlignment {
+    pub segment: AudioSegment,
+    pub transcript: String,
+    pub language: Option<String>,
+    pub attempts: u32,
+}
+
 /// Which audio segments the transcription sweeper may claim, as one predicate
 /// over `audio_segments a`. `?1` is now, in epoch-ms.
 ///
@@ -260,6 +269,21 @@ const AUDIO_CLAIMABLE_PREDICATE: &str = "a.transcription_state IN ('pending', 'f
                          WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
                     )";
 
+/// Which already-transcribed segments may be forced-aligned now. Alignment is
+/// a refinement of durable transcript evidence, never a prerequisite for it:
+/// old vaults and a temporarily unavailable aligner keep readable text while
+/// this queue catches up independently.
+const AUDIO_ALIGNMENT_CLAIMABLE_PREDICATE: &str = "a.alignment_state IN ('pending', 'failed')
+                    AND a.alignment_next_attempt_ms <= ?1
+                    AND EXISTS (
+                        SELECT 1 FROM text_evidence te
+                         WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM transcript_cues tc
+                         WHERE tc.audio_segment_id = a.id
+                    )";
+
 /// Which audio segments still owe a transcript, as one predicate over
 /// `audio_segments a`. Takes no parameters.
 ///
@@ -275,7 +299,8 @@ const AUDIO_CLAIMABLE_PREDICATE: &str = "a.transcription_state IN ('pending', 'f
 /// muted track — and writes no evidence row. On the `NOT EXISTS` half alone
 /// every silent segment would read as untranscribed forever, and a summary
 /// waiting on one would wait out its whole cap on every quiet slot.
-const AUDIO_UNTRANSCRIBED_PREDICATE: &str = "a.transcription_state IN ('pending', 'failed', 'running')
+const AUDIO_UNTRANSCRIBED_PREDICATE: &str =
+    "a.transcription_state IN ('pending', 'failed', 'running')
                     AND NOT EXISTS (
                         SELECT 1 FROM text_evidence te
                          WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
@@ -410,6 +435,8 @@ pub enum StoreError {
     KeyProvider(String),
     #[error("invalid embedding: {0}")]
     InvalidEmbedding(String),
+    #[error("invalid transcript cue: {0}")]
+    InvalidTranscriptCue(String),
     #[error("gop segment not found: {0}")]
     GopNotFound(String),
     #[error("gop commit raced with retention")]
@@ -881,7 +908,6 @@ type SlotSummaryExportRow = (
     Option<String>,
 );
 
-
 impl Vault {
     /// The whole geometry history, oldest first. Callers that bound many
     /// moments at once should take this once and use [`slot::slot_bounds_in`]
@@ -954,9 +980,9 @@ impl Vault {
         // flipping the control twice on an idle Mac leaves one boundary, not a
         // trail of empty geometries.
         while next.len() > 1
-            && next
-                .last()
-                .is_some_and(|segment| !self.has_moment_at_or_after(segment.from_ms).unwrap_or(true))
+            && next.last().is_some_and(|segment| {
+                !self.has_moment_at_or_after(segment.from_ms).unwrap_or(true)
+            })
         {
             next.pop();
         }
@@ -1153,11 +1179,7 @@ impl Vault {
 
     pub fn timeline_sync(&self) -> Result<Vec<Moment>, StoreError> {
         let connection = self.readers.get();
-        query_moments(
-            &connection,
-            "ORDER BY m.captured_at_ms, m.id",
-            params![],
-        )
+        query_moments(&connection, "ORDER BY m.captured_at_ms, m.id", params![])
     }
 
     pub fn timeline_since_sync(&self, since_ms: i64) -> Result<Vec<Moment>, StoreError> {
@@ -1201,8 +1223,11 @@ impl Vault {
             is_favorite: false,
             ocr_text: None,
             transcript_text: None,
+            transcript_cues: Vec::new(),
+            audio_segment_id: None,
             audio_artifact_id: None,
             audio_started_at_ms: None,
+            audio_ended_at_ms: None,
             accessibility_artifact_id: None,
             application_name: None,
             bundle_identifier: None,
@@ -2107,7 +2132,9 @@ impl Vault {
         let connection = self.readers.get();
         let transcripts: i64 = connection.query_row(
             &format!(
-                "SELECT count(*) FROM audio_segments a WHERE {AUDIO_CLAIMABLE_PREDICATE}"
+                "SELECT
+                    (SELECT count(*) FROM audio_segments a WHERE {AUDIO_CLAIMABLE_PREDICATE}) +
+                    (SELECT count(*) FROM audio_segments a WHERE {AUDIO_ALIGNMENT_CLAIMABLE_PREDICATE})"
             ),
             [now_ms],
             |row| row.get(0),
@@ -2221,7 +2248,8 @@ impl Vault {
         // Wider than `limit` so the exact match below has slack when a `LIKE`
         // hit turns out not to be one, and capped so a one-letter query cannot
         // walk a year of summaries.
-        let candidate_limit = i64::try_from(limit.saturating_mul(8).clamp(limit, 400)).unwrap_or(400);
+        let candidate_limit =
+            i64::try_from(limit.saturating_mul(8).clamp(limit, 400)).unwrap_or(400);
         let connection = self.readers.get();
         // The candidate window is chosen by **match kind first, recency
         // second, across the whole filtered range**. Ordering by recency alone
@@ -2300,8 +2328,11 @@ impl Vault {
                     details
                         .as_deref()
                         .map(slot::details_sections)
-                        .or_else(|| threads
-                        .and_then(|raw| serde_json::from_str::<Vec<slot::T2Thread>>(&raw).ok()))
+                        .or_else(|| {
+                            threads.and_then(|raw| {
+                                serde_json::from_str::<Vec<slot::T2Thread>>(&raw).ok()
+                            })
+                        })
                         .unwrap_or_default(),
                     entities
                         .and_then(|raw| serde_json::from_str::<Vec<slot::T2Entity>>(&raw).ok())
@@ -2366,20 +2397,50 @@ impl Vault {
                 [card.slot_start_ms],
                 |row| {
                     Ok((
-                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                        row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                        row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
-                        row.get(15)?, row.get(16)?, row.get(17)?,
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                        row.get(17)?,
                     ))
                 },
             )
             .optional()?;
 
         let Some((
-            state_raw, generation, schema_version, title, bullets_json, artifacts_json, category,
-            description, threads_json, entities_json, decisions_json, not_captured_json, confidence,
-            produced_at_ms, producer, latency_ms, stored_end_ms, details,
-        )) = row else {
+            state_raw,
+            generation,
+            schema_version,
+            title,
+            bullets_json,
+            artifacts_json,
+            category,
+            description,
+            threads_json,
+            entities_json,
+            decisions_json,
+            not_captured_json,
+            confidence,
+            produced_at_ms,
+            producer,
+            latency_ms,
+            stored_end_ms,
+            details,
+        )) = row
+        else {
             return Ok(slot::SlotSummaryExport {
                 slot_start_ms: card.slot_start_ms,
                 slot_end_ms: card.slot_end_ms,
@@ -2480,10 +2541,7 @@ impl Vault {
         let mut grouped: HashMap<i64, Vec<slot::SlotMomentRow>> = HashMap::new();
         for row in rows {
             let bounds = slot::slot_bounds_in(row.captured_at_ms, &segments);
-            grouped
-                .entry(bounds.start_ms)
-                .or_default()
-                .push(row);
+            grouped.entry(bounds.start_ms).or_default().push(row);
         }
         // Slots are independent — one card's build reads nothing from
         // another's — and a day holds up to 48 of them. Building serially
@@ -2665,8 +2723,16 @@ impl Vault {
             } else {
                 None
             };
-            let decisions = if is_v2 { parse_list(decisions_json) } else { None };
-            let not_captured = if is_v2 { parse_list(not_captured_json) } else { None };
+            let decisions = if is_v2 {
+                parse_list(decisions_json)
+            } else {
+                None
+            };
+            let not_captured = if is_v2 {
+                parse_list(not_captured_json)
+            } else {
+                None
+            };
             Ok((
                 start,
                 slot::StoredSlotOverlay {
@@ -2967,11 +3033,7 @@ impl Vault {
     /// # Errors
     ///
     /// Returns an error if the update fails.
-    pub fn update_message(
-        &self,
-        id: &str,
-        update: &MessageUpdate<'_>,
-    ) -> Result<(), StoreError> {
+    pub fn update_message(&self, id: &str, update: &MessageUpdate<'_>) -> Result<(), StoreError> {
         let connection = self.connection.lock().unwrap();
         connection.execute(
             "UPDATE conversation_messages
@@ -3346,7 +3408,10 @@ impl Vault {
     /// # Errors
     ///
     /// Returns an error when the vault cannot be queried.
-    pub fn slot_acts(&self, slot_start_ms: i64) -> Result<Option<acts::MaterializedActs>, StoreError> {
+    pub fn slot_acts(
+        &self,
+        slot_start_ms: i64,
+    ) -> Result<Option<acts::MaterializedActs>, StoreError> {
         let connection = self.readers.get();
         let raw: Option<Option<String>> = connection
             .query_row(
@@ -3666,9 +3731,8 @@ impl Vault {
     pub fn prune_edge_snapshots_before(&self, horizon_ms: i64) -> Result<usize, StoreError> {
         let doomed: Vec<(String, String)> = {
             let connection = self.connection.lock().unwrap();
-            let mut statement = connection.prepare(
-                "SELECT id, artifact_id FROM edge_snapshots WHERE captured_at_ms < ?1",
-            )?;
+            let mut statement = connection
+                .prepare("SELECT id, artifact_id FROM edge_snapshots WHERE captured_at_ms < ?1")?;
             let rows = statement.query_map([horizon_ms], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -3747,7 +3811,8 @@ impl Vault {
                             a.audio_artifact_id, a.transcription_attempts
                        FROM audio_segments a
                       WHERE {AUDIO_CLAIMABLE_PREDICATE}
-                  ORDER BY a.started_at_ms, a.id LIMIT 1"),
+                  ORDER BY a.started_at_ms, a.id LIMIT 1"
+                ),
                 [now_ms],
                 |row| {
                     let track: String = row.get(2)?;
@@ -3812,12 +3877,113 @@ impl Vault {
     ///
     /// Returns an error when the queue rows cannot be updated.
     pub fn retry_failed_audio_transcriptions(&self, now_ms: i64) -> Result<usize, StoreError> {
-        self.connection.lock().unwrap().execute(
-            "UPDATE audio_segments
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE audio_segments
                 SET transcription_state = 'pending', transcription_next_attempt_ms = ?1
               WHERE transcription_state = 'failed'",
-            [now_ms],
-        ).map_err(Into::into)
+                [now_ms],
+            )
+            .map_err(Into::into)
+    }
+
+    /// Makes every failed forced-alignment item immediately eligible after an
+    /// aligner model repair, without disturbing ASR retry clocks.
+    pub fn retry_failed_audio_alignments(&self, now_ms: i64) -> Result<usize, StoreError> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE audio_segments
+                SET alignment_state = 'pending', alignment_next_attempt_ms = ?1
+              WHERE alignment_state = 'failed'",
+                [now_ms],
+            )
+            .map_err(Into::into)
+    }
+
+    // @dec:forced-aligned-audio-transcript-cues — docs/decisions/active/product/2026-08-24-forced-aligned-audio-transcript-cues.md
+    /// Claims one transcript that still needs word/character alignment. Work
+    /// left `running` by a daemon crash is eligible again after five minutes.
+    pub fn claim_audio_alignment(
+        &self,
+        now_ms: i64,
+    ) -> Result<Option<ClaimedAudioAlignment>, StoreError> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE audio_segments SET alignment_state = 'pending'
+              WHERE alignment_state = 'running'
+                AND alignment_updated_at_ms <= ?1",
+            [now_ms.saturating_sub(5 * 60 * 1_000)],
+        )?;
+        let candidate = transaction
+            .query_row(
+                &format!(
+                    "SELECT a.id, a.session_id, a.track, a.started_at_ms, a.ended_at_ms,
+                            a.audio_artifact_id, a.transcription_language, a.alignment_attempts,
+                            (SELECT te.text FROM text_evidence te
+                              WHERE te.audio_segment_id = a.id AND te.source = 'transcript'
+                              ORDER BY te.started_at_ms, te.id LIMIT 1)
+                       FROM audio_segments a
+                      WHERE {AUDIO_ALIGNMENT_CLAIMABLE_PREDICATE}
+                   ORDER BY a.started_at_ms, a.id LIMIT 1"
+                ),
+                [now_ms],
+                |row| {
+                    let track: String = row.get(2)?;
+                    Ok(ClaimedAudioAlignment {
+                        segment: AudioSegment {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            track: if track == "microphone" {
+                                AudioTrack::Microphone
+                            } else {
+                                AudioTrack::System
+                            },
+                            started_at_ms: row.get(3)?,
+                            ended_at_ms: row.get(4)?,
+                            audio_artifact_id: row.get(5)?,
+                        },
+                        language: row.get(6)?,
+                        attempts: row.get::<_, u32>(7)?.saturating_add(1),
+                        transcript: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(claimed) = &candidate {
+            transaction.execute(
+                "UPDATE audio_segments
+                    SET alignment_state = 'running',
+                        alignment_attempts = alignment_attempts + 1,
+                        alignment_updated_at_ms = ?2,
+                        alignment_error = NULL
+                  WHERE id = ?1",
+                params![claimed.segment.id, now_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(candidate)
+    }
+
+    pub fn fail_audio_alignment(
+        &self,
+        segment_id: &str,
+        error: &str,
+        next_attempt_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE audio_segments
+                SET alignment_state = 'failed', alignment_error = ?2,
+                    alignment_next_attempt_ms = ?3, alignment_updated_at_ms = ?4
+              WHERE id = ?1",
+            params![segment_id, error, next_attempt_ms, now_ms],
+        )?;
+        Ok(())
     }
 
     /// Whether any audio overlapping `from_ms..=to_ms` is still owed a
@@ -3926,18 +4092,21 @@ impl Vault {
         &self,
         segment: &AudioSegment,
         text: &str,
+        language: Option<&str>,
         model_version: &str,
         now_ms: i64,
     ) -> Result<Option<String>, StoreError> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
-        let existing: Option<String> = transaction.query_row(
-            "SELECT id FROM text_evidence
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM text_evidence
               WHERE audio_segment_id = ?1 AND source = 'transcript'
               ORDER BY id LIMIT 1",
-            [&segment.id],
-            |row| row.get(0),
-        ).optional()?;
+                [&segment.id],
+                |row| row.get(0),
+            )
+            .optional()?;
         let evidence_id = if text.trim().is_empty() || existing.is_some() {
             None
         } else {
@@ -3947,8 +4116,15 @@ impl Vault {
                  (id, session_id, moment_id, audio_segment_id, source, text, started_at_ms,
                   ended_at_ms, model_version, layout_json)
                  VALUES (?1, ?2, NULL, ?3, 'transcript', ?4, ?5, ?6, ?7, NULL)",
-                params![id, segment.session_id, segment.id, text, segment.started_at_ms,
-                    segment.ended_at_ms, model_version],
+                params![
+                    id,
+                    segment.session_id,
+                    segment.id,
+                    text,
+                    segment.started_at_ms,
+                    segment.ended_at_ms,
+                    model_version
+                ],
             )?;
             transaction.execute(
                 "INSERT INTO evidence_fts (evidence_id, text) VALUES (?1, ?2)",
@@ -3956,15 +4132,103 @@ impl Vault {
             )?;
             Some(id)
         };
+        let has_transcript = existing.is_some() || !text.trim().is_empty();
         transaction.execute(
             "UPDATE audio_segments
                 SET transcription_state = 'done', transcription_error = NULL,
-                    transcription_next_attempt_ms = 0, transcription_updated_at_ms = ?2
+                    transcription_next_attempt_ms = 0, transcription_updated_at_ms = ?2,
+                    transcription_language = COALESCE(?3, transcription_language),
+                    alignment_state = CASE
+                        WHEN ?4 = 'not_needed' THEN 'not_needed'
+                        WHEN EXISTS (
+                            SELECT 1 FROM transcript_cues tc
+                             WHERE tc.audio_segment_id = audio_segments.id
+                        ) THEN 'done'
+                        ELSE 'pending'
+                    END,
+                    alignment_error = NULL,
+                    alignment_next_attempt_ms = 0, alignment_updated_at_ms = ?2
+              WHERE id = ?1",
+            params![
+                segment.id,
+                now_ms,
+                language,
+                if has_transcript {
+                    "pending"
+                } else {
+                    "not_needed"
+                }
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(evidence_id)
+    }
+
+    /// Replaces the timestamped cue set and marks alignment complete in one
+    /// transaction. Offsets are relative to the segment start.
+    pub fn complete_audio_alignment(
+        &self,
+        segment: &AudioSegment,
+        cues: &[TranscriptCue],
+        model_version: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let duration_ms = segment.ended_at_ms.saturating_sub(segment.started_at_ms);
+        if cues.is_empty() {
+            return Err(StoreError::InvalidTranscriptCue(
+                "forced alignment returned no cues".to_owned(),
+            ));
+        }
+        let mut previous_end_ms = 0_i64;
+        for (index, cue) in cues.iter().enumerate() {
+            if usize::try_from(cue.ordinal).unwrap_or(usize::MAX) != index
+                || cue.text.trim().is_empty()
+                || cue.start_offset_ms < 0
+                || cue.start_offset_ms < previous_end_ms
+                || cue.end_offset_ms <= cue.start_offset_ms
+                || cue.end_offset_ms > duration_ms
+            {
+                return Err(StoreError::InvalidTranscriptCue(format!(
+                    "cue {index} overlaps its predecessor or falls outside 0..={duration_ms} ms"
+                )));
+            }
+            previous_end_ms = cue.end_offset_ms;
+        }
+
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM transcript_cues WHERE audio_segment_id = ?1",
+            [&segment.id],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO transcript_cues
+                 (audio_segment_id, ordinal, text, start_offset_ms, end_offset_ms,
+                  timing_kind, model_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for cue in cues {
+                insert.execute(params![
+                    segment.id,
+                    cue.ordinal,
+                    cue.text,
+                    cue.start_offset_ms,
+                    cue.end_offset_ms,
+                    transcript_timing_kind_name(cue.timing_kind),
+                    model_version,
+                ])?;
+            }
+        }
+        transaction.execute(
+            "UPDATE audio_segments
+                SET alignment_state = 'done', alignment_error = NULL,
+                    alignment_next_attempt_ms = 0, alignment_updated_at_ms = ?2
               WHERE id = ?1",
             params![segment.id, now_ms],
         )?;
         transaction.commit()?;
-        Ok(evidence_id)
+        Ok(())
     }
 
     pub fn set_favorite(&self, moment_id: &str, favorite: bool) -> Result<(), StoreError> {
@@ -4099,47 +4363,17 @@ impl Vault {
 
     pub fn moment_by_id(&self, moment_id: &str) -> Result<Option<Moment>, StoreError> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
-                    (SELECT group_concat(te.text, '\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
-                    (SELECT group_concat(te.text, '\n')
-                       FROM text_evidence te
-                       JOIN audio_segments audio ON audio.id = te.audio_segment_id
-                      WHERE audio.session_id = m.session_id
-                        AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                        AND te.source = 'transcript'),
-                    (SELECT audio.audio_artifact_id
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    (SELECT audio.started_at_ms
-                       FROM audio_segments audio
-                      WHERE audio.session_id = m.session_id
-                        AND audio.started_at_ms <= m.captured_at_ms + 30000
-                        AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                      ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                        audio.started_at_ms DESC
-                      LIMIT 1),
-                    m.accessibility_artifact_id,
-                    m.application_name,
-                    m.bundle_identifier,
-                    m.window_title,
-                    m.url,
-                    m.document,
-                    m.gop_segment_id,
-                    m.gop_index,
-                    m.still_origin,
-                    (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
-             FROM moments m WHERE m.id = ?1",
-        )?;
-        statement
+        let sql = moment_query_sql("WHERE m.id = ?1", true);
+        let mut statement = connection.prepare(&sql)?;
+        let mut moment = statement
             .query_row([moment_id], moment_from_row)
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        if let Some(moment) = &mut moment {
+            if let Some(segment_id) = moment.audio_segment_id.as_deref() {
+                moment.transcript_cues = transcript_cues_for_segment(&connection, segment_id)?;
+            }
+        }
+        Ok(moment)
     }
 
     /// Decrypted accessibility snapshot bytes for a moment, if present.
@@ -4638,9 +4872,8 @@ impl Vault {
             let (oldest, total) = {
                 let connection = self.readers.get();
                 let total: i64 =
-                    connection.query_row("SELECT COUNT(*) FROM conversations", [], |row| {
-                        row.get(0)
-                    })?;
+                    connection
+                        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
                 let oldest: Option<String> = connection
                     .query_row(
                         "SELECT id FROM conversations ORDER BY updated_at_ms ASC, id ASC LIMIT 1",
@@ -4850,11 +5083,10 @@ impl Vault {
             // the sweep is skipped rather than guessed. Deleting on the theory
             // that "everything is older than nothing" would take live events on
             // a vault that had merely never captured a frame.
-            let retention_horizon_ms: Option<i64> = transaction.query_row(
-                "SELECT MIN(captured_at_ms) FROM moments",
-                [],
-                |row| row.get(0),
-            )?;
+            let retention_horizon_ms: Option<i64> =
+                transaction.query_row("SELECT MIN(captured_at_ms) FROM moments", [], |row| {
+                    row.get(0)
+                })?;
             let removed_anything = !candidates.is_empty()
                 || !gop_artifact_ids.is_empty()
                 || !audio_candidates.is_empty();
@@ -5162,6 +5394,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_24(connection)?;
     migrate_schema_25(connection)?;
     migrate_schema_26(connection)?;
+    migrate_schema_27(connection, from_version)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -5684,12 +5917,10 @@ fn migrate_schema_20(connection: &Connection, from_version: u32) -> Result<(), S
     if from_version >= 20 || read_summary_slot_cutover(connection)?.is_some() {
         return Ok(());
     }
-    let latest: Option<i64> = connection
-        .query_row(
-            "SELECT MAX(captured_at_ms) FROM moments",
-            [],
-            |row| row.get(0),
-        )?;
+    let latest: Option<i64> =
+        connection.query_row("SELECT MAX(captured_at_ms) FROM moments", [], |row| {
+            row.get(0)
+        })?;
     if let Some(latest) = latest {
         connection.execute(
             "INSERT INTO vault_meta (key, value_int) VALUES (?1, ?2)",
@@ -5871,6 +6102,74 @@ fn migrate_schema_26(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Durable forced-alignment queue plus the bounded cue set exposed only by a
+/// detail read. Existing transcript evidence becomes alignment backlog; silent
+/// segments remain complete without manufacturing empty cue work.
+fn migrate_schema_27(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(audio_segments)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for column in [
+        "transcription_language TEXT",
+        "alignment_state TEXT NOT NULL DEFAULT 'pending'",
+        "alignment_attempts INTEGER NOT NULL DEFAULT 0",
+        "alignment_error TEXT",
+        "alignment_next_attempt_ms INTEGER NOT NULL DEFAULT 0",
+        "alignment_updated_at_ms INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let name = column.split(' ').next().unwrap_or_default();
+        if !existing.iter().any(|held| held == name) {
+            connection.execute(
+                &format!("ALTER TABLE audio_segments ADD COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS transcript_cues (
+           audio_segment_id TEXT NOT NULL REFERENCES audio_segments(id) ON DELETE CASCADE,
+           ordinal INTEGER NOT NULL,
+           text TEXT NOT NULL,
+           start_offset_ms INTEGER NOT NULL,
+           end_offset_ms INTEGER NOT NULL,
+           timing_kind TEXT NOT NULL,
+           model_version TEXT NOT NULL,
+           PRIMARY KEY (audio_segment_id, ordinal)
+         );
+         CREATE INDEX IF NOT EXISTS transcript_cues_segment_time
+           ON transcript_cues(audio_segment_id, start_offset_ms);
+         CREATE INDEX IF NOT EXISTS audio_segments_alignment_queue
+           ON audio_segments(alignment_state, alignment_next_attempt_ms, started_at_ms);",
+    )?;
+    if from_version >= 27 {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "UPDATE audio_segments SET alignment_state = 'done'
+          WHERE EXISTS (
+              SELECT 1 FROM transcript_cues tc
+               WHERE tc.audio_segment_id = audio_segments.id
+          );
+         UPDATE audio_segments SET alignment_state = 'pending'
+          WHERE NOT EXISTS (
+              SELECT 1 FROM transcript_cues tc
+               WHERE tc.audio_segment_id = audio_segments.id
+          ) AND EXISTS (
+              SELECT 1 FROM text_evidence te
+               WHERE te.audio_segment_id = audio_segments.id AND te.source = 'transcript'
+          );
+         UPDATE audio_segments SET alignment_state = 'not_needed'
+          WHERE transcription_state = 'done'
+            AND NOT EXISTS (
+              SELECT 1 FROM text_evidence te
+               WHERE te.audio_segment_id = audio_segments.id AND te.source = 'transcript'
+            );",
+    )?;
+    Ok(())
+}
+
 fn migrate_schema_18(connection: &Connection, from_version: u32) -> Result<(), StoreError> {
     if from_version >= 18 {
         return Ok(());
@@ -5943,23 +6242,31 @@ fn migrate_query_indexes(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-// @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
-/// Playhead / list index: identity, time, app, still/GOP/audio pointers.
-/// `ocr_text` and `transcript_text` are always NULL here — concatenating them
-/// per row is what made `timeline_list` miss the unary deadline.
-fn query_moment_index(
-    connection: &Connection,
-    filter_sql: &str,
-    params: impl rusqlite::Params,
-) -> Result<Vec<Moment>, StoreError> {
-    // Pick the overlapping audio row once, then read both fields from that
-    // row. Two scalar copies of this overlap/order query made every timeline
-    // moment build the same temporary sort twice.
-    let sql = format!(
+// @dec:forced-aligned-audio-transcript-cues — docs/decisions/active/product/2026-08-24-forced-aligned-audio-transcript-cues.md
+// @dec:transcribed-audio-track-preferred — docs/decisions/active/product/2026-08-24-transcribed-audio-track-preferred.md
+/// One read model chooses one audio segment, then derives its artifact,
+/// bounds, and transcript from that same row. Keeping the selection here
+/// prevents lean and hydrated moment reads from drifting apart.
+fn moment_query_sql(filter_sql: &str, include_evidence: bool) -> String {
+    let evidence_columns = if include_evidence {
+        "(SELECT group_concat(te.text, '\n')
+            FROM text_evidence te
+           WHERE te.moment_id = m.id AND te.source = 'ocr'),
+         (SELECT te.text
+            FROM text_evidence te
+           WHERE te.audio_segment_id = audio.id AND te.source = 'transcript'
+           ORDER BY te.id
+           LIMIT 1)"
+    } else {
+        "NULL, NULL"
+    };
+    format!(
         "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
-                NULL, NULL,
+                {evidence_columns},
+                audio.id,
                 audio.audio_artifact_id,
                 audio.started_at_ms,
+                audio.ended_at_ms,
                 m.accessibility_artifact_id,
                 m.application_name,
                 m.bundle_identifier,
@@ -5973,15 +6280,34 @@ fn query_moment_index(
          FROM moments m
          LEFT JOIN audio_segments audio ON audio.id = (
              SELECT candidate.id
-               FROM audio_segments candidate
+              FROM audio_segments candidate
               WHERE candidate.session_id = m.session_id
-                AND candidate.started_at_ms <= m.captured_at_ms + 30000
-                AND candidate.ended_at_ms >= m.captured_at_ms - 30000
-              ORDER BY CASE candidate.track WHEN 'system' THEN 0 ELSE 1 END,
-                candidate.started_at_ms DESC
+                AND candidate.started_at_ms <= m.captured_at_ms
+                AND candidate.ended_at_ms >= m.captured_at_ms
+              ORDER BY CASE WHEN EXISTS (
+                    SELECT 1
+                      FROM text_evidence transcript
+                     WHERE transcript.audio_segment_id = candidate.id
+                       AND transcript.source = 'transcript'
+                ) THEN 0 ELSE 1 END,
+                CASE candidate.track WHEN 'system' THEN 0 ELSE 1 END,
+                candidate.started_at_ms DESC,
+                candidate.id
               LIMIT 1
          ) {filter_sql}"
-    );
+    )
+}
+
+// @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
+/// Playhead / list index: identity, time, app, still/GOP/audio pointers.
+/// `ocr_text` and `transcript_text` are always NULL here — concatenating them
+/// per row is what made `timeline_list` miss the unary deadline.
+fn query_moment_index(
+    connection: &Connection,
+    filter_sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<Moment>, StoreError> {
+    let sql = moment_query_sql(filter_sql, false);
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params, moment_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -5994,43 +6320,7 @@ fn query_moments(
     filter_sql: &str,
     params: impl rusqlite::Params,
 ) -> Result<Vec<Moment>, StoreError> {
-    let sql = format!(
-        "SELECT m.id, m.session_id, m.captured_at_ms, m.image_artifact_id, m.is_favorite,
-                (SELECT group_concat(te.text, '\\n') FROM text_evidence te WHERE te.moment_id = m.id AND te.source = 'ocr'),
-                (SELECT group_concat(te.text, '\\n')
-                   FROM text_evidence te
-                   JOIN audio_segments audio ON audio.id = te.audio_segment_id
-                  WHERE audio.session_id = m.session_id
-                    AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                    AND te.source = 'transcript'),
-                (SELECT audio.audio_artifact_id
-                   FROM audio_segments audio
-                  WHERE audio.session_id = m.session_id
-                    AND audio.started_at_ms <= m.captured_at_ms + 30000
-                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                    audio.started_at_ms DESC
-                  LIMIT 1),
-                (SELECT audio.started_at_ms
-                   FROM audio_segments audio
-                  WHERE audio.session_id = m.session_id
-                    AND audio.started_at_ms <= m.captured_at_ms + 30000
-                    AND audio.ended_at_ms >= m.captured_at_ms - 30000
-                  ORDER BY CASE audio.track WHEN 'system' THEN 0 ELSE 1 END,
-                    audio.started_at_ms DESC
-                  LIMIT 1),
-                m.accessibility_artifact_id,
-                m.application_name,
-                m.bundle_identifier,
-                m.window_title,
-                m.url,
-                m.document,
-                (SELECT gs.id FROM gop_segments gs WHERE gs.id = m.gop_segment_id AND gs.status = 'ready'),
-                m.gop_index,
-                m.still_origin,
-                (SELECT gs.frame_count FROM gop_segments gs WHERE gs.id = m.gop_segment_id)
-         FROM moments m {filter_sql}"
-    );
+    let sql = moment_query_sql(filter_sql, true);
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params, moment_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -6045,24 +6335,27 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
         is_favorite: row.get::<_, i64>(4)? != 0,
         ocr_text: row.get(5)?,
         transcript_text: row.get(6)?,
-        audio_artifact_id: row.get(7)?,
-        audio_started_at_ms: row.get(8)?,
-        accessibility_artifact_id: row.get(9)?,
-        application_name: row.get(10)?,
-        bundle_identifier: row.get(11)?,
-        window_title: row.get(12)?,
-        url: row.get(13)?,
-        document: row.get(14)?,
+        transcript_cues: Vec::new(),
+        audio_segment_id: row.get(7)?,
+        audio_artifact_id: row.get(8)?,
+        audio_started_at_ms: row.get(9)?,
+        audio_ended_at_ms: row.get(10)?,
+        accessibility_artifact_id: row.get(11)?,
+        application_name: row.get(12)?,
+        bundle_identifier: row.get(13)?,
+        window_title: row.get(14)?,
+        url: row.get(15)?,
+        document: row.get(16)?,
         gop: match (
-            row.get::<_, Option<String>>(15)?,
-            row.get::<_, Option<i64>>(16)?,
+            row.get::<_, Option<String>>(17)?,
+            row.get::<_, Option<i64>>(18)?,
         ) {
             (Some(segment_id), Some(index)) => Some(afterray_protocol::GopRef {
                 segment_id,
                 index: u16::try_from(index).unwrap_or(0),
                 keyframe_index: 0,
                 frame_count: row
-                    .get::<_, Option<i64>>(18)?
+                    .get::<_, Option<i64>>(20)?
                     .and_then(|count| u16::try_from(count).ok())
                     .unwrap_or(0),
                 codec: "av01".to_owned(),
@@ -6070,9 +6363,43 @@ fn moment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Moment> {
             _ => None,
         },
         still_origin: row
-            .get::<_, Option<String>>(17)?
+            .get::<_, Option<String>>(19)?
             .unwrap_or_else(|| "capture".to_owned()),
     })
+}
+
+fn transcript_cues_for_segment(
+    connection: &Connection,
+    segment_id: &str,
+) -> Result<Vec<TranscriptCue>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT ordinal, text, start_offset_ms, end_offset_ms, timing_kind
+           FROM transcript_cues
+          WHERE audio_segment_id = ?1
+       ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map([segment_id], |row| {
+        let timing_kind: String = row.get(4)?;
+        Ok(TranscriptCue {
+            ordinal: row.get(0)?,
+            text: row.get(1)?,
+            start_offset_ms: row.get(2)?,
+            end_offset_ms: row.get(3)?,
+            timing_kind: if timing_kind == "coarse" {
+                TranscriptTimingKind::Coarse
+            } else {
+                TranscriptTimingKind::Aligned
+            },
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+const fn transcript_timing_kind_name(kind: TranscriptTimingKind) -> &'static str {
+    match kind {
+        TranscriptTimingKind::Aligned => "aligned",
+        TranscriptTimingKind::Coarse => "coarse",
+    }
 }
 
 fn encrypt_artifact(
@@ -6587,12 +6914,7 @@ mod tests {
         let bounds = vault.summary_slot_bounds(1_600_000_000_000);
         let session = vault.create_session_sync(bounds.start_ms).unwrap();
         vault
-            .insert_moment(
-                &session.id,
-                bounds.start_ms + 1_000,
-                "image/jpeg",
-                b"frame",
-            )
+            .insert_moment(&session.id, bounds.start_ms + 1_000, "image/jpeg", b"frame")
             .unwrap();
         let card = vault.slot_card(bounds.start_ms, 10_000).unwrap();
         vault
@@ -6702,7 +7024,10 @@ mod tests {
             .insert_moment(&session.id, now - 5_000, "image/jpeg", b"pixels")
             .unwrap();
         assert_eq!(
-            vault.compute_backlog(now, &policy).unwrap().unindexed_moments,
+            vault
+                .compute_backlog(now, &policy)
+                .unwrap()
+                .unindexed_moments,
             1,
             "the grace window keeps in-flight OCR out of the backlog"
         );
@@ -6720,7 +7045,12 @@ mod tests {
             let bounds = vault.summary_slot_bounds(at);
             let session = vault.create_session_sync(bounds.start_ms).unwrap();
             vault
-                .insert_moment(&session.id, bounds.start_ms + 1_000, "image/jpeg", b"pixels")
+                .insert_moment(
+                    &session.id,
+                    bounds.start_ms + 1_000,
+                    "image/jpeg",
+                    b"pixels",
+                )
                 .unwrap();
             let card = vault.slot_card(bounds.start_ms, 10_000).unwrap();
             let summary = slot::T2CardV2 {
@@ -6752,7 +7082,11 @@ mod tests {
             "newest first: {runs:?}"
         );
 
-        assert_eq!(vault.recent_summary_runs(2).unwrap().len(), 2, "limit holds");
+        assert_eq!(
+            vault.recent_summary_runs(2).unwrap().len(),
+            2,
+            "limit holds"
+        );
     }
 
     #[test]
@@ -6799,8 +7133,18 @@ mod tests {
         assert_eq!(exported.generation, Some(1));
         assert!(exported.summary.is_some());
         let json = serde_json::to_string(&exported).unwrap();
-        for forbidden in ["ocr", "accessibility", "evidence", "prompt", "completion", "tool_result"] {
-            assert!(!json.contains(forbidden), "export leaked {forbidden}: {json}");
+        for forbidden in [
+            "ocr",
+            "accessibility",
+            "evidence",
+            "prompt",
+            "completion",
+            "tool_result",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "export leaked {forbidden}: {json}"
+            );
         }
     }
 
@@ -6821,7 +7165,12 @@ mod tests {
         let older = vault.summary_slot_bounds(bounds.start_ms - 1);
         let older_session = vault.create_session_sync(older.start_ms).unwrap();
         vault
-            .insert_moment(&older_session.id, older.start_ms + 1_000, "image/jpeg", b"px")
+            .insert_moment(
+                &older_session.id,
+                older.start_ms + 1_000,
+                "image/jpeg",
+                b"px",
+            )
             .unwrap();
         let older_card = vault.slot_card(older.start_ms, 10_000).unwrap();
         vault
@@ -7414,7 +7763,107 @@ mod tests {
     }
 
     #[test]
-    fn timeline_index_prefers_system_audio_for_overlapping_segments() {
+    fn timeline_index_prefers_system_audio_when_both_tracks_have_transcripts() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_500, "image/jpeg", b"frame")
+            .unwrap();
+        let after_audio = vault
+            .insert_moment(&session.id, 2_101, "image/jpeg", b"after")
+            .unwrap();
+        let microphone = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                900,
+                2_100,
+                "audio/mp4",
+                b"microphone",
+            )
+            .unwrap();
+        let system = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                1_000,
+                2_000,
+                "audio/mp4",
+                b"system",
+            )
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                Some(&microphone.id),
+                "transcript",
+                "microphone words that must not accompany system audio",
+                microphone.started_at_ms,
+                Some(microphone.ended_at_ms),
+                "test",
+                None,
+            )
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                Some(&system.id),
+                "transcript",
+                "system words",
+                system.started_at_ms,
+                Some(system.ended_at_ms),
+                "test",
+                None,
+            )
+            .unwrap();
+
+        let listed = vault.timeline_range_sync(1_500, 1_500).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].audio_segment_id.as_deref(),
+            Some(system.id.as_str())
+        );
+        assert_ne!(
+            listed[0].audio_artifact_id.as_deref(),
+            Some(microphone.audio_artifact_id.as_str())
+        );
+        assert_eq!(
+            listed[0].audio_artifact_id.as_deref(),
+            Some(system.audio_artifact_id.as_str())
+        );
+        assert_eq!(listed[0].audio_started_at_ms, Some(system.started_at_ms));
+        assert_eq!(listed[0].audio_ended_at_ms, Some(system.ended_at_ms));
+        assert_eq!(listed[0].transcript_text, None);
+        assert_eq!(listed[0].id, moment.id);
+
+        let detailed = vault.moment_by_id(&moment.id).unwrap().unwrap();
+        assert_eq!(
+            detailed.audio_segment_id.as_deref(),
+            Some(system.id.as_str())
+        );
+        assert_eq!(detailed.transcript_text.as_deref(), Some("system words"));
+
+        let historical = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(
+            historical[0].audio_segment_id.as_deref(),
+            Some(system.id.as_str())
+        );
+        assert_eq!(
+            historical[0].transcript_text.as_deref(),
+            Some("system words")
+        );
+        let after = historical
+            .iter()
+            .find(|candidate| candidate.id == after_audio.id)
+            .unwrap();
+        assert_eq!(after.audio_segment_id, None);
+        assert_eq!(after.transcript_text, None);
+    }
+
+    #[test]
+    fn timeline_index_prefers_transcribed_microphone_over_silent_system() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(100).unwrap();
         let moment = vault
@@ -7440,19 +7889,68 @@ mod tests {
                 b"system",
             )
             .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                None,
+                Some(&microphone.id),
+                "transcript",
+                "the transcript that should remain coupled to microphone playback",
+                microphone.started_at_ms,
+                Some(microphone.ended_at_ms),
+                "test",
+                None,
+            )
+            .unwrap();
 
         let listed = vault.timeline_range_sync(1_500, 1_500).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_ne!(
-            listed[0].audio_artifact_id.as_deref(),
-            Some(microphone.audio_artifact_id.as_str())
+        assert_eq!(
+            listed[0].audio_segment_id.as_deref(),
+            Some(microphone.id.as_str())
         );
         assert_eq!(
             listed[0].audio_artifact_id.as_deref(),
+            Some(microphone.audio_artifact_id.as_str())
+        );
+        assert_ne!(
+            listed[0].audio_artifact_id.as_deref(),
             Some(system.audio_artifact_id.as_str())
         );
-        assert_eq!(listed[0].audio_started_at_ms, Some(system.started_at_ms));
-        assert_eq!(listed[0].id, moment.id);
+        assert_eq!(
+            listed[0].audio_started_at_ms,
+            Some(microphone.started_at_ms)
+        );
+        assert_eq!(
+            listed[0].audio_ended_at_ms,
+            Some(microphone.ended_at_ms)
+        );
+        assert_eq!(listed[0].transcript_text, None);
+
+        let detailed = vault.moment_by_id(&moment.id).unwrap().unwrap();
+        assert_eq!(
+            detailed.audio_segment_id.as_deref(),
+            Some(microphone.id.as_str())
+        );
+        assert_eq!(
+            detailed.audio_artifact_id.as_deref(),
+            Some(microphone.audio_artifact_id.as_str())
+        );
+        assert_eq!(
+            detailed.transcript_text.as_deref(),
+            Some("the transcript that should remain coupled to microphone playback")
+        );
+
+        let historical = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(
+            historical[0].audio_segment_id.as_deref(),
+            Some(microphone.id.as_str())
+        );
+        assert_eq!(
+            historical[0].transcript_text.as_deref(),
+            Some("the transcript that should remain coupled to microphone playback")
+        );
     }
 
     #[test]
@@ -7486,16 +7984,23 @@ mod tests {
     fn audio_transcription_claims_survive_failure_restart_and_replay() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(100).unwrap();
-        let segment = vault.insert_audio_segment(
-            &session.id, AudioTrack::Microphone, 200, 300, "audio/mp4", b"audio",
-        ).unwrap();
+        let segment = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                200,
+                300,
+                "audio/mp4",
+                b"audio",
+            )
+            .unwrap();
 
         let first = vault.claim_audio_transcription(1_000).unwrap().unwrap();
         assert_eq!(first.segment.id, segment.id);
         assert_eq!(first.attempts, 1);
-        vault.fail_audio_transcription(
-            &segment.id, "model unavailable", 2_000, 1_000,
-        ).unwrap();
+        vault
+            .fail_audio_transcription(&segment.id, "model unavailable", 2_000, 1_000)
+            .unwrap();
         assert!(vault.claim_audio_transcription(1_999).unwrap().is_none());
         assert_eq!(vault.retry_failed_audio_transcriptions(1_500).unwrap(), 1);
 
@@ -7508,16 +8013,233 @@ mod tests {
         assert_eq!(recovered.segment.id, segment.id);
         assert_eq!(recovered.attempts, 3);
 
-        assert!(vault.complete_audio_transcription(
-            &segment, "hello world", "test-asr", 400_000,
-        ).unwrap().is_some());
+        assert!(
+            vault
+                .complete_audio_transcription(
+                    &segment,
+                    "hello world",
+                    Some("English"),
+                    "test-asr",
+                    400_000,
+                )
+                .unwrap()
+                .is_some()
+        );
         assert!(vault.claim_audio_transcription(500_000).unwrap().is_none());
-        assert!(vault.complete_audio_transcription(
-            &segment, "duplicate", "test-asr", 500_000,
-        ).unwrap().is_none());
+        assert!(
+            vault
+                .complete_audio_transcription(
+                    &segment,
+                    "duplicate",
+                    Some("English"),
+                    "test-asr",
+                    500_000,
+                )
+                .unwrap()
+                .is_none()
+        );
         let transcripts = vault.transcripts_in_range(0, 1_000, 10).unwrap();
         assert_eq!(transcripts.len(), 1);
         assert_eq!(transcripts[0].2, "hello world");
+    }
+
+    #[test]
+    fn transcript_alignment_is_independent_and_only_hydrates_detail_reads() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_500, "image/jpeg", b"screen")
+            .unwrap();
+        let segment = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                1_000,
+                4_000,
+                "audio/mp4",
+                b"audio",
+            )
+            .unwrap();
+        vault
+            .complete_audio_transcription(
+                &segment,
+                "Hello world. Next thought.",
+                Some("English"),
+                "test-asr",
+                5_000,
+            )
+            .unwrap();
+
+        let policy = PackPolicy {
+            hot_window_ms: 0,
+            hot_min_stills: 0,
+            ocr_grace_ms: 0,
+            keyint: 6,
+        };
+        assert_eq!(
+            vault.compute_backlog(6_000, &policy).unwrap().transcripts,
+            1
+        );
+
+        let first = vault.claim_audio_alignment(6_000).unwrap().unwrap();
+        assert_eq!(first.segment.id, segment.id);
+        assert_eq!(first.transcript, "Hello world. Next thought.");
+        assert_eq!(first.language.as_deref(), Some("English"));
+        assert_eq!(first.attempts, 1);
+        vault
+            .fail_audio_alignment(&segment.id, "aligner busy", 8_000, 6_000)
+            .unwrap();
+        assert!(vault.claim_audio_alignment(7_999).unwrap().is_none());
+        let second = vault.claim_audio_alignment(8_000).unwrap().unwrap();
+        assert_eq!(second.attempts, 2);
+
+        assert!(matches!(
+            vault.complete_audio_alignment(
+                &segment,
+                &[TranscriptCue {
+                    ordinal: 0,
+                    text: "outside".to_owned(),
+                    start_offset_ms: 2_900,
+                    end_offset_ms: 3_100,
+                    timing_kind: TranscriptTimingKind::Aligned,
+                }],
+                "test-aligner",
+                8_500,
+            ),
+            Err(StoreError::InvalidTranscriptCue(_))
+        ));
+        assert!(matches!(
+            vault.complete_audio_alignment(
+                &segment,
+                &[
+                    TranscriptCue {
+                        ordinal: 0,
+                        text: "first".to_owned(),
+                        start_offset_ms: 100,
+                        end_offset_ms: 1_000,
+                        timing_kind: TranscriptTimingKind::Aligned,
+                    },
+                    TranscriptCue {
+                        ordinal: 1,
+                        text: "overlap".to_owned(),
+                        start_offset_ms: 900,
+                        end_offset_ms: 1_200,
+                        timing_kind: TranscriptTimingKind::Aligned,
+                    },
+                ],
+                "test-aligner",
+                8_500,
+            ),
+            Err(StoreError::InvalidTranscriptCue(_))
+        ));
+
+        let cues = vec![
+            TranscriptCue {
+                ordinal: 0,
+                text: "Hello world.".to_owned(),
+                start_offset_ms: 100,
+                end_offset_ms: 1_200,
+                timing_kind: TranscriptTimingKind::Aligned,
+            },
+            TranscriptCue {
+                ordinal: 1,
+                text: "Next thought.".to_owned(),
+                start_offset_ms: 1_500,
+                end_offset_ms: 2_700,
+                timing_kind: TranscriptTimingKind::Aligned,
+            },
+        ];
+        vault
+            .complete_audio_alignment(&segment, &cues, "test-aligner", 9_000)
+            .unwrap();
+        vault
+            .complete_audio_transcription(
+                &segment,
+                "replayed transcript claim",
+                Some("English"),
+                "test-asr",
+                9_500,
+            )
+            .unwrap();
+        assert!(vault.claim_audio_alignment(10_000).unwrap().is_none());
+        assert_eq!(
+            vault.compute_backlog(10_000, &policy).unwrap().transcripts,
+            0
+        );
+
+        let index = vault.timeline_range_sync(1_500, 1_500).unwrap();
+        assert!(index[0].transcript_cues.is_empty());
+        let history = vault.moments_sync(&session.id).unwrap();
+        assert!(history[0].transcript_cues.is_empty());
+        let detail = vault.moment_by_id(&moment.id).unwrap().unwrap();
+        assert_eq!(detail.transcript_cues, cues);
+    }
+
+    #[test]
+    fn silent_audio_never_enters_the_alignment_queue() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let segment = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                1_000,
+                2_000,
+                "audio/mp4",
+                b"audio",
+            )
+            .unwrap();
+        vault
+            .complete_audio_transcription(&segment, "  ", None, "test-asr", 3_000)
+            .unwrap();
+        assert!(vault.claim_audio_alignment(4_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn reopening_schema_27_preserves_alignment_backoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [27_u8; 32];
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let vault = Vault::open_with_key(config.clone(), key).unwrap();
+        let session = vault.create_session_sync(100).unwrap();
+        let segment = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                1_000,
+                2_000,
+                "audio/mp4",
+                b"audio",
+            )
+            .unwrap();
+        vault
+            .complete_audio_transcription(
+                &segment,
+                "spoken words",
+                Some("English"),
+                "test-asr",
+                3_000,
+            )
+            .unwrap();
+        vault.claim_audio_alignment(4_000).unwrap().unwrap();
+        vault
+            .fail_audio_alignment(&segment.id, "worker died", 10_000, 5_000)
+            .unwrap();
+        drop(vault);
+
+        let reopened = Vault::open_with_key(config, key).unwrap();
+        assert!(reopened.claim_audio_alignment(9_999).unwrap().is_none());
+        assert_eq!(
+            reopened
+                .claim_audio_alignment(10_000)
+                .unwrap()
+                .unwrap()
+                .attempts,
+            2
+        );
     }
 
     /// The question a summariser asks before sealing a card it can never
@@ -7528,7 +8250,14 @@ mod tests {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(100).unwrap();
         let spoken = vault
-            .insert_audio_segment(&session.id, AudioTrack::Microphone, 1_000, 2_000, "audio/mp4", b"a")
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                1_000,
+                2_000,
+                "audio/mp4",
+                b"a",
+            )
             .unwrap();
 
         assert!(vault.has_untranscribed_audio_between(1_500, 1_600).unwrap());
@@ -7554,7 +8283,13 @@ mod tests {
         assert!(vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
 
         vault
-            .complete_audio_transcription(&spoken, "hello world", "test-asr", 4_000)
+            .complete_audio_transcription(
+                &spoken,
+                "hello world",
+                Some("English"),
+                "test-asr",
+                4_000,
+            )
             .unwrap();
         assert!(!vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
     }
@@ -7567,11 +8302,18 @@ mod tests {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(100).unwrap();
         let quiet = vault
-            .insert_audio_segment(&session.id, AudioTrack::System, 1_000, 2_000, "audio/mp4", b"a")
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                1_000,
+                2_000,
+                "audio/mp4",
+                b"a",
+            )
             .unwrap();
         assert_eq!(
             vault
-                .complete_audio_transcription(&quiet, "   ", "test-asr", 3_000)
+                .complete_audio_transcription(&quiet, "   ", None, "test-asr", 3_000)
                 .unwrap(),
             None,
             "an empty transcript writes no evidence"
@@ -7595,13 +8337,27 @@ mod tests {
         assert_eq!(empty.last_success_ms, None, "never transcribed anything");
 
         let done = vault
-            .insert_audio_segment(&session.id, AudioTrack::Microphone, 100, 200, "audio/mp4", b"a")
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                100,
+                200,
+                "audio/mp4",
+                b"a",
+            )
             .unwrap();
         let broken = vault
-            .insert_audio_segment(&session.id, AudioTrack::Microphone, 300, 400, "audio/mp4", b"b")
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                300,
+                400,
+                "audio/mp4",
+                b"b",
+            )
             .unwrap();
         vault
-            .complete_audio_transcription(&done, "spoken", "test-asr", 5_000)
+            .complete_audio_transcription(&done, "spoken", Some("English"), "test-asr", 5_000)
             .unwrap();
         vault
             .fail_audio_transcription(&broken.id, "worker died", 9_000, 6_000)
@@ -7619,7 +8375,10 @@ mod tests {
 
         // A clock that moved backwards must not leave ASR looking eternally
         // fresh: both instants are clamped to the caller's now.
-        assert_eq!(vault.asr_health(1_000).unwrap().last_success_ms, Some(1_000));
+        assert_eq!(
+            vault.asr_health(1_000).unwrap().last_success_ms,
+            Some(1_000)
+        );
     }
 
     /// There is no retry cap in this codebase — segments retry forever — so
@@ -7630,7 +8389,14 @@ mod tests {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(100).unwrap();
         let segment = vault
-            .insert_audio_segment(&session.id, AudioTrack::Microphone, 100, 200, "audio/mp4", b"a")
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                100,
+                200,
+                "audio/mp4",
+                b"a",
+            )
             .unwrap();
 
         for attempt in 1..=AUDIO_BACKOFF_SATURATION_ATTEMPTS {
@@ -7723,6 +8489,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "done");
+        let alignment = migrated.claim_audio_alignment(1_000).unwrap().unwrap();
+        assert_eq!(alignment.segment.id, completed.id);
+        assert_eq!(alignment.transcript, "already transcribed");
     }
 
     #[test]
@@ -9871,27 +10640,41 @@ mod tests {
 
         // By entity, by thread prose, and by title.
         for needle in ["rav1e", "IVF header writer", "GOP header"] {
-            let hits = vault.find_slot_mentions(needle, &SearchFilter::default(), 10).unwrap();
+            let hits = vault
+                .find_slot_mentions(needle, &SearchFilter::default(), 10)
+                .unwrap();
             assert_eq!(hits.len(), 1, "`{needle}` found {hits:?}");
             assert_eq!(hits[0].slot_start_ms, slot_at);
         }
-        let hit = &vault.find_slot_mentions("rav1e", &SearchFilter::default(), 10).unwrap()[0];
+        let hit = &vault
+            .find_slot_mentions("rav1e", &SearchFilter::default(), 10)
+            .unwrap()[0];
         assert_eq!(hit.matched_entities, vec!["rav1e".to_owned()]);
         assert_eq!(hit.moment_ids, frames, "the frames to cite came back");
-        assert_eq!(hit.decisions, vec!["Keep the length check in the packer".to_owned()]);
+        assert_eq!(
+            hit.decisions,
+            vec!["Keep the length check in the packer".to_owned()]
+        );
 
         // Case and spacing fold, an unrelated word does not.
-        assert_eq!(vault.find_slot_mentions("RAV1E", &SearchFilter::default(), 10).unwrap().len(), 1);
-        assert!(vault.find_slot_mentions("kubernetes", &SearchFilter::default(), 10).unwrap().is_empty());
+        assert_eq!(
+            vault
+                .find_slot_mentions("RAV1E", &SearchFilter::default(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            vault
+                .find_slot_mentions("kubernetes", &SearchFilter::default(), 10)
+                .unwrap()
+                .is_empty()
+        );
 
         // A window that excludes the slot excludes the hit.
         assert!(
             vault
-                .find_slot_mentions(
-                    "rav1e",
-                    &SearchFilter::range(Some(slot_at + 1), None),
-                    10,
-                )
+                .find_slot_mentions("rav1e", &SearchFilter::range(Some(slot_at + 1), None), 10,)
                 .unwrap()
                 .is_empty()
         );
@@ -9913,7 +10696,14 @@ mod tests {
         // under either slot geometry; `slot_start_for` would fold ten-minute
         // spacing back onto one slot and overwrite the row under test.
         let oldest = day_start;
-        insert_named_moment(&vault, &session.id, oldest, "Zed", "dev.zed.Zed", "tools.rs");
+        insert_named_moment(
+            &vault,
+            &session.id,
+            oldest,
+            "Zed",
+            "dev.zed.Zed",
+            "tools.rs",
+        );
         let card = vault.slot_card(oldest, 10_000).unwrap();
         vault
             .put_t2_summary_v2(
@@ -10094,7 +10884,16 @@ mod tests {
             moment_id: Some("m2".into()),
         }];
         let matched = |needle: &str| {
-            match_slot_mention(needle, 10, 20, "2026-08-16", Some("Ran a worker"), &threads, &entities, &[])
+            match_slot_mention(
+                needle,
+                10,
+                20,
+                "2026-08-16",
+                Some("Ran a worker"),
+                &threads,
+                &entities,
+                &[],
+            )
         };
 
         let (mention, kind) = matched("Qwen3.5: 4B").expect("folded match");
@@ -10110,7 +10909,10 @@ mod tests {
 
         // The prefilter must be no narrower than the decision above.
         assert_eq!(like_prefilter("Qwen3.5: 4B").as_deref(), Some("%Qwen3.5:%"));
-        assert_eq!(like_prefilter("100%_sure").as_deref(), Some("%100\\%\\_sure%"));
+        assert_eq!(
+            like_prefilter("100%_sure").as_deref(),
+            Some("%100\\%\\_sure%")
+        );
         assert_eq!(like_prefilter("   "), None);
     }
 
@@ -10402,9 +11204,7 @@ mod tests {
     /// text is long enough to carry the frame past `AX_TEXT_MIN_CHARS` — but
     /// only when both panes are counted together.
     fn two_pane_snapshot(sidebar: &[&str], content: &[&str]) -> Vec<u8> {
-        let node = |role: &str, text: &str| {
-            serde_json::json!({"role": role, "value": text, "children": []})
-        };
+        let node = |role: &str, text: &str| serde_json::json!({"role": role, "value": text, "children": []});
         serde_json::to_vec(&serde_json::json!({
             "application_name": "Feishu",
             "bundle_identifier": "com.electron.lark",
@@ -10525,7 +11325,11 @@ mod tests {
             ["赵亮: shipped the fix", "me: thanks"],
             "only the pane the click landed in"
         );
-        assert_eq!(run.peripheral.len(), 20, "the sidebar is visible, not operated");
+        assert_eq!(
+            run.peripheral.len(),
+            20,
+            "the sidebar is visible, not operated"
+        );
         assert_eq!(
             card.not_engaged,
             vec![acts::Region {
@@ -10765,7 +11569,9 @@ mod tests {
             "the words do not: ActContent is never frozen"
         );
         assert!(
-            !serde_json::to_string(&after).unwrap().contains("the merge is green"),
+            !serde_json::to_string(&after)
+                .unwrap()
+                .contains("the merge is green"),
             "nothing anywhere in the rebuilt card still carries the typed text"
         );
     }
@@ -10865,7 +11671,10 @@ mod tests {
         );
         vault.materialize_slot_acts(slot + 60_000, 10_000).unwrap();
         assert!(
-            vault.slots_missing_acts(slot, window_end).unwrap().is_empty(),
+            vault
+                .slots_missing_acts(slot, window_end)
+                .unwrap()
+                .is_empty(),
             "frozen slots leave the work list"
         );
     }
@@ -11144,16 +11953,15 @@ mod tests {
 
         vault.delete_history(slot, slot + SLOT_DURATION_MS).unwrap();
 
-        let remaining = vault.input_events_between(0, at + SLOT_DURATION_MS * 4).unwrap();
+        let remaining = vault
+            .input_events_between(0, at + SLOT_DURATION_MS * 4)
+            .unwrap();
         assert_eq!(
             remaining
                 .iter()
                 .map(|event| (event.at_ms, event.end_ms))
                 .collect::<Vec<_>>(),
-            vec![
-                (slot - 1, None),
-                (slot + SLOT_DURATION_MS + 1, None),
-            ],
+            vec![(slot - 1, None), (slot + SLOT_DURATION_MS + 1, None),],
             "only rows entirely outside the deleted window may survive"
         );
         assert!(
@@ -11441,7 +12249,10 @@ mod tests {
 
         let found = vault.edge_snapshots_between(1_000, 2_000).unwrap();
         assert_eq!(
-            found.iter().map(|row| row.captured_at_ms).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|row| row.captured_at_ms)
+                .collect::<Vec<_>>(),
             vec![1_000, 1_999],
             "the upper bound is open"
         );
@@ -11452,7 +12263,12 @@ mod tests {
             vec![next_slot.clone()],
             "the next window picks up exactly what this one left"
         );
-        assert!(vault.edge_snapshots_between(2_000, 2_000).unwrap().is_empty());
+        assert!(
+            vault
+                .edge_snapshots_between(2_000, 2_000)
+                .unwrap()
+                .is_empty()
+        );
 
         let payload = vault.read_artifact(&edge.artifact_id).unwrap();
         assert_eq!(payload.bytes, tree, "the encrypted tree decrypts unchanged");
@@ -11511,13 +12327,21 @@ mod tests {
         let frame = vec![7_u8; 4096];
         let tree = two_pane_snapshot(&["sidebar row"], &["赵亮: shipped the fix"]);
 
-        vault.insert_moment(&session.id, 1_000, "image/jpeg", &frame).unwrap();
-        vault.insert_moment(&session.id, 2_000, "image/jpeg", &frame).unwrap();
+        vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", &frame)
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 2_000, "image/jpeg", &frame)
+            .unwrap();
         // What the vault costs while it holds only the two oldest frames is the
         // limit that will squeeze the two newest ones out.
         let two_frames = vault.storage_usage_bytes().unwrap();
-        vault.insert_moment(&session.id, 3_000, "image/jpeg", &frame).unwrap();
-        vault.insert_moment(&session.id, 4_000, "image/jpeg", &frame).unwrap();
+        vault
+            .insert_moment(&session.id, 3_000, "image/jpeg", &frame)
+            .unwrap();
+        vault
+            .insert_moment(&session.id, 4_000, "image/jpeg", &frame)
+            .unwrap();
 
         let instants = [500_i64, 1_500, 2_500, 3_500, 4_500];
         vault
@@ -11592,7 +12416,9 @@ mod tests {
         vault
             .insert_moment(&session.id, 1_000, "image/jpeg", &vec![7_u8; 4096])
             .unwrap();
-        vault.insert_input_events(&[input_event(500, None, "click")]).unwrap();
+        vault
+            .insert_input_events(&[input_event(500, None, "click")])
+            .unwrap();
 
         vault.set_storage_limit_bytes(1).unwrap();
 
@@ -11702,7 +12528,11 @@ mod tests {
             .expect("the slot has a run");
         assert_eq!(
             run.lines,
-            ["赵亮: shipped the fix", "me: thanks", "赵亮: staging looks clean"],
+            [
+                "赵亮: shipped the fix",
+                "me: thanks",
+                "赵亮: staging looks clean"
+            ],
             "the edge tree's new chat line joins the engaged bucket"
         );
         assert_eq!(
@@ -11719,7 +12549,10 @@ mod tests {
                 slot::TimelineEntry::Gap(_) => None,
             })
             .expect("the slot had a run before the edge tree too");
-        assert_eq!(card.facts.moment_count, before.facts.moment_count, "3 frames");
+        assert_eq!(
+            card.facts.moment_count, before.facts.moment_count,
+            "3 frames"
+        );
         assert_eq!(card.evidence.moment_ids, before.evidence.moment_ids);
         assert_eq!(card.anchor_moment_id, before.anchor_moment_id);
         assert_eq!(run.moment_id, bare.moment_id);

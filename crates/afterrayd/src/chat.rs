@@ -807,7 +807,7 @@ if "hello" in prompt:
 else:
     text = "FINAL\nhello"
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": text},
   "retryable": False
 }))
@@ -856,7 +856,7 @@ if "kind=tool_result" in prompt:
 else:
     text = "TOOL list_activity\nARGS {\"from_ms\":0,\"to_ms\":1,\"limit\":5}"
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": text},
   "retryable": False
 }))

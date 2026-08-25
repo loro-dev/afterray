@@ -90,15 +90,20 @@ public enum RecallScenario: String, CaseIterable, Identifiable, Sendable {
         ]
         return (0..<count).map { index in
             let app = applications[min(index / 7, applications.count - 1) % applications.count]
+            let capturedAtMs = base + Int64(index * 42_000)
+            let hasAudio = index.isMultiple(of: 3)
             return RecallMoment(
                 id: "moment-\(index)",
                 sessionId: "session-today",
-                capturedAtMs: base + Int64(index * 42_000),
+                capturedAtMs: capturedAtMs,
                 imageArtifactId: "mock://frame/\(index)",
                 isFavorite: favoriteEvery.map { index.isMultiple(of: $0) } ?? false,
                 ocrText: processing && index > count - 4 ? nil : screenCopy[index % screenCopy.count],
                 transcriptText: processing && index > count - 6 ? nil : transcriptCopy[index % transcriptCopy.count],
-                audioArtifactId: index.isMultiple(of: 3) ? "mock://audio/\(index)" : nil,
+                audioSegmentId: hasAudio ? "mock-segment-\(index)" : nil,
+                audioArtifactId: hasAudio ? "mock://audio/\(index)" : nil,
+                audioStartedAtMs: hasAudio ? capturedAtMs - 30_000 : nil,
+                audioEndedAtMs: hasAudio ? capturedAtMs + 270_000 : nil,
                 applicationName: app.name,
                 bundleIdentifier: app.bundle,
                 url: app.url

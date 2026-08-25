@@ -18,6 +18,72 @@ public struct RecallSession: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public enum RecallTranscriptTimingKind: String, Codable, Equatable, Sendable {
+    case aligned
+    case coarse
+}
+
+public struct RecallTranscriptCue: Codable, Equatable, Sendable {
+    public let ordinal: UInt32
+    public let text: String
+    public let startOffsetMs: Int64
+    public let endOffsetMs: Int64
+    public let timingKind: RecallTranscriptTimingKind
+
+    public init(
+        ordinal: UInt32,
+        text: String,
+        startOffsetMs: Int64,
+        endOffsetMs: Int64,
+        timingKind: RecallTranscriptTimingKind
+    ) {
+        self.ordinal = ordinal
+        self.text = text
+        self.startOffsetMs = startOffsetMs
+        self.endOffsetMs = endOffsetMs
+        self.timingKind = timingKind
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ordinal, text
+        case startOffsetMs = "start_offset_ms"
+        case endOffsetMs = "end_offset_ms"
+        case timingKind = "timing_kind"
+    }
+}
+
+// @dec:forced-aligned-audio-transcript-cues — docs/decisions/active/product/2026-08-24-forced-aligned-audio-transcript-cues.md
+/// Exact audio row selected for one moment. The artifact, bounds, and
+/// transcript are deliberately inseparable at the Swift presentation seam.
+public struct RecallAudioSegment: Equatable, Identifiable, Sendable {
+    public let id: String
+    public let artifactID: String
+    public let startedAtMs: Int64
+    public let endedAtMs: Int64
+    public let transcriptText: String?
+    public let transcriptCues: [RecallTranscriptCue]
+
+    public var duration: TimeInterval {
+        TimeInterval(max(endedAtMs - startedAtMs, 0)) / 1_000
+    }
+
+    public init(
+        id: String,
+        artifactID: String,
+        startedAtMs: Int64,
+        endedAtMs: Int64,
+        transcriptText: String?,
+        transcriptCues: [RecallTranscriptCue] = []
+    ) {
+        self.id = id
+        self.artifactID = artifactID
+        self.startedAtMs = startedAtMs
+        self.endedAtMs = endedAtMs
+        self.transcriptText = transcriptText
+        self.transcriptCues = transcriptCues
+    }
+}
+
 public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let sessionId: String
@@ -28,10 +94,14 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
     public let stillOrigin: String
     public let ocrText: String?
     public let transcriptText: String?
+    public let transcriptCues: [RecallTranscriptCue]
 
-    /// Optional until the daemon's recall read model attaches the nearest audio segment.
+    /// These flat fields preserve the additive wire contract. Use
+    /// `audioSegment` in presentation code so they cannot be mixed piecemeal.
+    public let audioSegmentId: String?
     public let audioArtifactId: String?
     public let audioStartedAtMs: Int64?
+    public let audioEndedAtMs: Int64?
     public let accessibilityArtifactId: String?
     public let applicationName: String?
     public let bundleIdentifier: String?
@@ -49,8 +119,11 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         stillOrigin: String = "capture",
         ocrText: String? = nil,
         transcriptText: String? = nil,
+        transcriptCues: [RecallTranscriptCue] = [],
+        audioSegmentId: String? = nil,
         audioArtifactId: String? = nil,
         audioStartedAtMs: Int64? = nil,
+        audioEndedAtMs: Int64? = nil,
         accessibilityArtifactId: String? = nil,
         applicationName: String? = nil,
         bundleIdentifier: String? = nil,
@@ -67,8 +140,11 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         self.stillOrigin = stillOrigin
         self.ocrText = ocrText
         self.transcriptText = transcriptText
+        self.transcriptCues = transcriptCues
+        self.audioSegmentId = audioSegmentId
         self.audioArtifactId = audioArtifactId
         self.audioStartedAtMs = audioStartedAtMs
+        self.audioEndedAtMs = audioEndedAtMs
         self.accessibilityArtifactId = accessibilityArtifactId
         self.applicationName = applicationName
         self.bundleIdentifier = bundleIdentifier
@@ -82,6 +158,23 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         return !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    public var audioSegment: RecallAudioSegment? {
+        guard let id = audioSegmentId,
+              let artifactID = audioArtifactId,
+              let startedAtMs = audioStartedAtMs,
+              let endedAtMs = audioEndedAtMs,
+              endedAtMs > startedAtMs
+        else { return nil }
+        return RecallAudioSegment(
+            id: id,
+            artifactID: artifactID,
+            startedAtMs: startedAtMs,
+            endedAtMs: endedAtMs,
+            transcriptText: transcriptText,
+            transcriptCues: transcriptCues
+        )
+    }
+
     enum CodingKeys: String, CodingKey {
         case id
         case sessionId = "session_id"
@@ -92,8 +185,11 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         case stillOrigin = "still_origin"
         case ocrText = "ocr_text"
         case transcriptText = "transcript_text"
+        case transcriptCues = "transcript_cues"
+        case audioSegmentId = "audio_segment_id"
         case audioArtifactId = "audio_artifact_id"
         case audioStartedAtMs = "audio_started_at_ms"
+        case audioEndedAtMs = "audio_ended_at_ms"
         case accessibilityArtifactId = "accessibility_artifact_id"
         case applicationName = "application_name"
         case bundleIdentifier = "bundle_identifier"
@@ -113,8 +209,14 @@ public struct RecallMoment: Codable, Equatable, Identifiable, Sendable {
         stillOrigin = try container.decodeIfPresent(String.self, forKey: .stillOrigin) ?? "capture"
         ocrText = try container.decodeIfPresent(String.self, forKey: .ocrText)
         transcriptText = try container.decodeIfPresent(String.self, forKey: .transcriptText)
+        transcriptCues = try container.decodeIfPresent(
+            [RecallTranscriptCue].self,
+            forKey: .transcriptCues
+        ) ?? []
+        audioSegmentId = try container.decodeIfPresent(String.self, forKey: .audioSegmentId)
         audioArtifactId = try container.decodeIfPresent(String.self, forKey: .audioArtifactId)
         audioStartedAtMs = try container.decodeIfPresent(Int64.self, forKey: .audioStartedAtMs)
+        audioEndedAtMs = try container.decodeIfPresent(Int64.self, forKey: .audioEndedAtMs)
         accessibilityArtifactId = try container.decodeIfPresent(String.self, forKey: .accessibilityArtifactId)
         applicationName = try container.decodeIfPresent(String.self, forKey: .applicationName)
         bundleIdentifier = try container.decodeIfPresent(String.self, forKey: .bundleIdentifier)

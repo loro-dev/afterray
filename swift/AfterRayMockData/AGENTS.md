@@ -5,6 +5,7 @@ Implements AfterRayRecall's model protocols with deterministic fixture data so t
 ## Key files
 
 - `Sources/RecallScenarios.swift:5` `RecallScenario` — named fixture sets including `empty`, `short`, `long`, `stress`, `processing`, `favorites`, and `search`. Entry point for labs and snapshots.
+- `Sources/AudioCaptionFixtures.swift` — isolated audio-chrome states (idle, playing, buffering, bilingual, no-audio) for `make audio-chrome-snapshots`.
 - `Sources/SettingsPreviewModel.swift:6` `SettingsPreviewModel` — `AfterRaySettingsModeling` over in-memory state.
 - `Sources/ComputePreviewModel.swift` `ComputePreviewModel` + `ComputeFixtures` — the compute dashboard without a daemon. The default fixture is the awkward case (on battery, summaries held, a model resident and idle), because that is the state the panel has to read well in.
 - `Sources/ChatPreviewModel.swift:25` `ChatPreviewModel` — `AfterRayChatModeling` with scripted replies. The `.thinking` fixture is think → tool → think so chat-lab shows ordered parts.

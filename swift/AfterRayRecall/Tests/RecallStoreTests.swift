@@ -52,6 +52,51 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(momentRequestIDs, ["m2"])
     }
 
+    func testHydrateSelectedEvidenceReplacesAudioMetadataAsOneSegment() async throws {
+        let lean = RecallMoment(
+            id: "m1",
+            sessionId: "s1",
+            capturedAtMs: 50_000,
+            ocrText: "lean OCR must not suppress detail hydration",
+            audioSegmentId: "lean-segment",
+            audioArtifactId: "lean-audio",
+            audioStartedAtMs: 0,
+            audioEndedAtMs: 300_000
+        )
+        let detail = RecallMoment(
+            id: "m1",
+            sessionId: "s1",
+            capturedAtMs: 50_000,
+            transcriptText: "detail words",
+            transcriptCues: [
+                RecallTranscriptCue(
+                    ordinal: 0,
+                    text: "detail words",
+                    startOffsetMs: 1_000,
+                    endOffsetMs: 2_000,
+                    timingKind: .aligned
+                )
+            ],
+            audioSegmentId: "detail-segment",
+            audioArtifactId: "detail-audio",
+            audioStartedAtMs: 10_000,
+            audioEndedAtMs: 310_000
+        )
+        let store = RecallStore(daemon: SegmentDetailDaemon(lean: lean, detail: detail))
+
+        await store.loadTimeline()
+        XCTAssertEqual(store.selectedMoment?.audioSegment?.id, "lean-segment")
+        await store.hydrateSelectedEvidence()
+
+        let selected = try XCTUnwrap(store.selectedMoment)
+        XCTAssertEqual(selected.audioSegmentId, "detail-segment")
+        XCTAssertEqual(selected.audioArtifactId, "detail-audio")
+        XCTAssertEqual(selected.audioStartedAtMs, 10_000)
+        XCTAssertEqual(selected.audioEndedAtMs, 310_000)
+        XCTAssertEqual(selected.audioSegment?.transcriptText, "detail words")
+        XCTAssertEqual(selected.audioSegment?.transcriptCues.count, 1)
+    }
+
     func testUnchangedPlayheadDoesNotPublish() async {
         let store = RecallStore(daemon: FakeDaemon())
         await store.loadTimeline()
@@ -1090,4 +1135,33 @@ private actor FakeDaemon: RecallDaemonServing {
     }
 
     func momentRequestIDs() -> [String] { requestedMomentIDs }
+}
+
+private actor SegmentDetailDaemon: RecallDaemonServing {
+    let lean: RecallMoment
+    let detail: RecallMoment
+
+    init(lean: RecallMoment, detail: RecallMoment) {
+        self.lean = lean
+        self.detail = detail
+    }
+
+    func sessions() async throws -> [RecallSession] {
+        [RecallSession(id: lean.sessionId, startedAtMs: lean.capturedAtMs)]
+    }
+
+    func timeline() async throws -> [RecallMoment] { [lean] }
+    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [lean] }
+    func timeline(fromMs _: Int64, toMs _: Int64) async throws -> [RecallMoment] { [lean] }
+    func moments(sessionID _: String) async throws -> [RecallMoment] { [detail] }
+    func recallWindow(
+        sessionID _: String,
+        centerMs _: Int64,
+        limit _: Int
+    ) async throws -> [RecallMoment] { [lean] }
+    func moment(id _: String) async throws -> RecallMoment { detail }
+    func artifact(id: String) async throws -> ArtifactPayload {
+        ArtifactPayload(id: id, contentType: "audio/mp4", bytes: Data())
+    }
+    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }

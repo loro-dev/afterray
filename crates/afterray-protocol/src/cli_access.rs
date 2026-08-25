@@ -93,6 +93,7 @@ pub fn authorize_cli_request(
 pub fn redact_moment_for_cli(moment: &mut Moment) {
     moment.ocr_text = None;
     moment.transcript_text = None;
+    moment.transcript_cues.clear();
 }
 
 pub fn redact_search_hit_for_cli(hit: &mut SearchHit) {
@@ -140,6 +141,7 @@ fn strip_moment_object(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.remove("ocr_text");
         object.remove("transcript_text");
+        object.remove("transcript_cues");
     }
 }
 
@@ -217,7 +219,10 @@ mod tests {
             }),
             CliRequestClass::Privileged
         );
-        assert_eq!(cli_request_class(&Request::RecordStart), CliRequestClass::Privileged);
+        assert_eq!(
+            cli_request_class(&Request::RecordStart),
+            CliRequestClass::Privileged
+        );
         assert_eq!(
             cli_request_class(&Request::UpdateSettings {
                 record_audio: None,
@@ -278,5 +283,31 @@ mod tests {
         );
         assert_eq!(data[0]["text"], "");
         assert_eq!(data[0]["moment_id"], "m1");
+    }
+
+    #[test]
+    fn moment_redaction_removes_flat_and_timestamped_transcripts() {
+        let mut data = serde_json::json!({
+            "id": "m1",
+            "ocr_text": "private screen text",
+            "transcript_text": "private audio text",
+            "transcript_cues": [{
+                "ordinal": 0,
+                "text": "private audio text",
+                "start_offset_ms": 0,
+                "end_offset_ms": 1_000,
+                "timing_kind": "aligned"
+            }]
+        });
+        redact_cli_response_data(
+            &Request::MomentGet {
+                moment_id: "m1".into(),
+            },
+            &mut data,
+        );
+        assert!(data.get("ocr_text").is_none());
+        assert!(data.get("transcript_text").is_none());
+        assert!(data.get("transcript_cues").is_none());
+        assert_eq!(data["id"], "m1");
     }
 }

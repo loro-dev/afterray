@@ -6,9 +6,9 @@ pub mod cli_access;
 pub mod socket;
 
 pub use cli_access::{
-    APP_TOKEN_ENV, CLI_EVIDENCE_WINDOW_MS, CLI_FORBIDDEN, CliRequestClass, EVIDENCE_ACCESS_DISABLED,
-    authorize_cli_request, cli_request_class, evidence_window_open, redact_cli_response_data,
-    redact_moment_for_cli, redact_search_hit_for_cli,
+    APP_TOKEN_ENV, CLI_EVIDENCE_WINDOW_MS, CLI_FORBIDDEN, CliRequestClass,
+    EVIDENCE_ACCESS_DISABLED, authorize_cli_request, cli_request_class, evidence_window_open,
+    redact_cli_response_data, redact_moment_for_cli, redact_search_hit_for_cli,
 };
 
 pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
@@ -32,8 +32,10 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// with nothing under it, and a silent empty panel is exactly the failure the
 /// strict handshake exists to turn into a loud one. 16 adds `timeline_range`
 /// (a bounded local-day index, no OCR/transcript concat) so the overlay does
-/// not have to download the whole vault to paint a playhead.
-pub const PROTOCOL_VERSION: u32 = 16;
+/// not have to download the whole vault to paint a playhead. 17 binds the
+/// selected transcript to one exact audio segment and carries its bounds. 18
+/// adds model-aligned transcript cues for time-accurate playback highlighting.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -522,7 +524,6 @@ impl ComputeWorkload {
         }
     }
 
-
     /// The resource this workload contends for.
     ///
     /// Background jobs in the GPU lane are also serialized by the model
@@ -552,7 +553,6 @@ pub enum ComputeLane {
     Gpu,
     Cpu,
 }
-
 
 /// Why a workload is or is not allowed to start right now.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -735,7 +735,6 @@ fn default_compute_thresholds() -> ComputeThresholds {
         force_window_seconds: 1800,
     }
 }
-
 
 /// Median duration of the successful runs in `runs`.
 ///
@@ -1069,6 +1068,7 @@ pub struct Session {
     pub ended_at_ms: Option<i64>,
 }
 
+// @dec:forced-aligned-audio-transcript-cues — docs/decisions/active/product/2026-08-24-forced-aligned-audio-transcript-cues.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Moment {
     pub id: String,
@@ -1079,8 +1079,16 @@ pub struct Moment {
     pub is_favorite: bool,
     pub ocr_text: Option<String>,
     pub transcript_text: Option<String>,
+    /// Relative to `audio_started_at_ms`; detail reads only. Lean timeline
+    /// ranges keep this empty so a scrub never carries transcript evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_cues: Vec<TranscriptCue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_segment_id: Option<String>,
     pub audio_artifact_id: Option<String>,
     pub audio_started_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_ended_at_ms: Option<i64>,
     pub accessibility_artifact_id: Option<String>,
     pub application_name: Option<String>,
     pub bundle_identifier: Option<String>,
@@ -1237,6 +1245,25 @@ pub struct AudioSegment {
 pub enum AudioTrack {
     System,
     Microphone,
+}
+
+/// A bounded subtitle cue inside one exact audio segment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptCue {
+    pub ordinal: u32,
+    pub text: String,
+    pub start_offset_ms: i64,
+    pub end_offset_ms: i64,
+    pub timing_kind: TranscriptTimingKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptTimingKind {
+    /// Produced by a speech forced-alignment model from audio plus transcript.
+    Aligned,
+    /// A bounded fallback whose edges come from an inference window.
+    Coarse,
 }
 
 /// JSON header for `read_artifact`. The decrypted bytes follow the newline
@@ -1804,10 +1831,7 @@ mod tests {
             r#"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10}"#,
         )
         .unwrap();
-        assert_eq!(
-            settings.summary_slot_minutes,
-            DEFAULT_SUMMARY_SLOT_MINUTES
-        );
+        assert_eq!(settings.summary_slot_minutes, DEFAULT_SUMMARY_SLOT_MINUTES);
         assert_eq!(
             settings.summary_slot_minutes_options,
             summary_slot_minutes_options()
@@ -2106,10 +2130,46 @@ mod tests {
         assert!(moment.window_title.is_none());
         assert!(moment.url.is_none());
         assert!(moment.document.is_none());
+        assert!(moment.audio_segment_id.is_none());
+        assert!(moment.audio_ended_at_ms.is_none());
+        assert!(moment.transcript_cues.is_empty());
         let encoded = serde_json::to_value(&moment).unwrap();
         assert!(encoded.get("window_title").is_none());
         assert!(encoded.get("url").is_none());
         assert!(encoded.get("document").is_none());
+        assert!(encoded.get("audio_segment_id").is_none());
+        assert!(encoded.get("audio_ended_at_ms").is_none());
+        assert!(encoded.get("transcript_cues").is_none());
+    }
+
+    #[test]
+    fn moment_exact_audio_segment_bounds_round_trip() {
+        let moment: Moment = serde_json::from_str(
+            r#"{"id":"m1","session_id":"s1","captured_at_ms":123000,"is_favorite":false,"audio_segment_id":"segment-1","audio_artifact_id":"artifact-1","audio_started_at_ms":100000,"audio_ended_at_ms":400000}"#,
+        )
+        .unwrap();
+        assert_eq!(moment.audio_segment_id.as_deref(), Some("segment-1"));
+        assert_eq!(moment.audio_ended_at_ms, Some(400_000));
+        let encoded = serde_json::to_value(moment).unwrap();
+        assert_eq!(encoded["audio_segment_id"], "segment-1");
+        assert_eq!(encoded["audio_ended_at_ms"], 400_000);
+    }
+
+    #[test]
+    fn moment_aligned_transcript_cues_round_trip() {
+        let moment: Moment = serde_json::from_str(
+            r#"{"id":"m1","session_id":"s1","captured_at_ms":123000,"is_favorite":false,"transcript_cues":[{"ordinal":0,"text":"Hello.","start_offset_ms":100,"end_offset_ms":900,"timing_kind":"aligned"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(moment.transcript_cues.len(), 1);
+        assert_eq!(moment.transcript_cues[0].text, "Hello.");
+        assert_eq!(
+            moment.transcript_cues[0].timing_kind,
+            TranscriptTimingKind::Aligned
+        );
+        let encoded = serde_json::to_value(moment).unwrap();
+        assert_eq!(encoded["transcript_cues"][0]["start_offset_ms"], 100);
+        assert_eq!(encoded["transcript_cues"][0]["timing_kind"], "aligned");
     }
 
     #[test]

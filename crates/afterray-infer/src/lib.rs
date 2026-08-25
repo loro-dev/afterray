@@ -6,6 +6,7 @@
     clippy::similar_names
 )]
 
+mod align;
 mod asr;
 mod audio;
 mod embed;
@@ -13,6 +14,7 @@ mod embed;
 use afterray_models::{AdapterError, ModelInput, ModelOutput};
 use std::path::PathBuf;
 
+pub use align::align_transcript;
 pub use asr::transcribe;
 pub use audio::load_mono_16k;
 pub use embed::embed_text;
@@ -20,6 +22,7 @@ pub use embed::embed_text;
 #[derive(Debug, Clone)]
 pub struct InferConfig {
     pub asr_model: PathBuf,
+    pub aligner_model: PathBuf,
     pub embedding_model: PathBuf,
 }
 
@@ -35,6 +38,7 @@ impl InferConfig {
         };
         Self {
             asr_model: path_for("asr"),
+            aligner_model: path_for(afterray_models::QWEN3_ALIGNER_PACK_ID),
             embedding_model: path_for("embedding"),
         }
     }
@@ -55,6 +59,13 @@ pub fn execute(config: &InferConfig, input: &ModelInput) -> Result<ModelOutput, 
                 language: detected.or_else(|| language.clone()),
             })
         }
+        ModelInput::Align {
+            audio_path,
+            text,
+            language,
+        } => Ok(ModelOutput::Alignment {
+            cues: align_transcript(&config.aligner_model, audio_path, text, language)?,
+        }),
         ModelInput::Embedding { text } => Ok(ModelOutput::Embedding {
             vector: embed_text(&config.embedding_model, text)?,
         }),

@@ -26,4 +26,4 @@ Interactive UI development harness for the recall surfaces (root `Package.swift`
 - The Recall library's views take loader closures and protocol models precisely so this harness can drive them — keep new surfaces mock-drivable (see `swift/AfterRayRecall` and `swift/AfterRayMockData`).
 - Mock image/thumbnail generation must stay off the main actor; synchronous `NSImage.lockFocus()` made the lab report hitches that production daemon I/O does not have.
 - For CLI Instruments runs, attach to the release lab and do not allocate a PTY/TTY to `xctrace`; deferred Animation Hitches traces otherwise stall during finalization.
-- For headless pixel review use `apps/AfterRayVisualSnapshots` (`make snapshots`) instead.
+- For headless pixel review use `apps/AfterRayVisualSnapshots` (`make snapshots`, or `make audio-chrome-snapshots` for the isolated audio chrome).

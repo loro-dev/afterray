@@ -81,6 +81,9 @@ public final class RecallStore: ObservableObject {
         // Timeline geometry and favorite state remain authoritative in `base`.
         // Only fields intentionally omitted from or optional in the lean index
         // are overlaid from the selected-detail read model.
+        // Audio is atomic: transcript, artifact, and bounds all come from the
+        // same selected segment rather than being merged field by field.
+        let audioOwner = detail.audioSegmentId == nil ? base : detail
         return RecallMoment(
             id: base.id,
             sessionId: base.sessionId,
@@ -90,9 +93,12 @@ public final class RecallStore: ObservableObject {
             gop: base.gop ?? detail.gop,
             stillOrigin: base.stillOrigin,
             ocrText: detail.ocrText,
-            transcriptText: detail.transcriptText,
-            audioArtifactId: detail.audioArtifactId ?? base.audioArtifactId,
-            audioStartedAtMs: detail.audioStartedAtMs ?? base.audioStartedAtMs,
+            transcriptText: audioOwner.transcriptText,
+            transcriptCues: audioOwner.transcriptCues,
+            audioSegmentId: audioOwner.audioSegmentId,
+            audioArtifactId: audioOwner.audioArtifactId,
+            audioStartedAtMs: audioOwner.audioStartedAtMs,
+            audioEndedAtMs: audioOwner.audioEndedAtMs,
             accessibilityArtifactId: detail.accessibilityArtifactId
                 ?? base.accessibilityArtifactId,
             applicationName: base.applicationName ?? detail.applicationName,
@@ -300,6 +306,7 @@ public final class RecallStore: ObservableObject {
 
     /// Loads the warm window that contains `momentID` and parks the playhead on it.
     public func openMoment(id momentID: String) async {
+        guard !Task.isCancelled else { return }
         if selectLoaded(momentID: momentID) {
             await hydrateSelectedEvidence()
             return
@@ -307,18 +314,25 @@ public final class RecallStore: ObservableObject {
         let requestGeneration = sensitiveGeneration
         do {
             let detail = try await daemon.moment(id: momentID)
+            guard !Task.isCancelled else { return }
             await ensureTimelineContains(ms: detail.capturedAtMs)
-            guard sensitiveGeneration == requestGeneration else { return }
+            guard !Task.isCancelled,
+                  sensitiveGeneration == requestGeneration
+            else { return }
             if selectLoaded(momentID: momentID) {
                 patchEvidence(detail)
                 await loadDaySummary(dayMs: detail.capturedAtMs, force: true)
+                guard !Task.isCancelled else { return }
                 await hydrateSelectedEvidence()
                 return
             }
             let bounds = DaySummaryLayout.dayBounds(ms: detail.capturedAtMs)
             let rawMoments = try await daemon.timeline(fromMs: bounds.start, toMs: bounds.end - 1)
+            guard !Task.isCancelled else { return }
             let prepared = await Self.prepareTimeline(rawMoments)
-            guard sensitiveGeneration == requestGeneration else { return }
+            guard !Task.isCancelled,
+                  sensitiveGeneration == requestGeneration
+            else { return }
             loadedTimelineDayBounds = bounds
             let nowMs = Int64(Date.now.timeIntervalSince1970 * 1_000)
             timelineHasOlder = true
@@ -592,7 +606,6 @@ public final class RecallStore: ObservableObject {
         guard let selected = RecallPlayhead.resolve(playheadMs: playheadMs, moments: moments)
         else { return }
         if selectedMomentDetail?.id == selected.id { return }
-        if selected.ocrText != nil || selected.transcriptText != nil { return }
         let requestGeneration = sensitiveGeneration
         let momentID = selected.id
         do {
@@ -1065,6 +1078,7 @@ public protocol RecallAudioPlaying: AnyObject {
     var isPlaying: Bool { get }
     var isBuffering: Bool { get }
     var playingArtifactID: String? { get }
+    var playingMomentID: String? { get }
     func toggle(moment: RecallMoment)
     func play(moment: RecallMoment)
     func pause()

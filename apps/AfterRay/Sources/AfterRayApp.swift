@@ -1337,6 +1337,11 @@ private final class ApplicationBundleDragSourceView: NSView, NSDraggingSource {
     func ignoreModifierKeys(for _: NSDraggingSession) -> Bool { true }
 }
 
+private struct AudioTimelineFollowTaskKey: Hashable {
+    let generation: UInt64
+    let isPlaying: Bool
+}
+
 private struct AfterRayRootView: View {
     // Shared with the standalone history window: both faces must observe
     // the same store, or the popped-out panel drifts from the overlay.
@@ -1364,12 +1369,13 @@ private struct AfterRayRootView: View {
     var body: some View {
         RecallView(
             moments: store.moments,
+            selectedMomentDetail: store.selectedMoment,
             timelineRevision: store.timelineRevision,
             timelineSpine: store.timelineSpine,
             timelineDayCoverage: store.timelineDayCoverage,
             playheadMs: Binding(
                 get: { store.playheadMs },
-                set: { store.select(playheadMs: $0) }
+                set: { selectTimeline(playheadMs: $0, origin: .user) }
             ),
             isLive: $isLive,
             loadState: store.loadState,
@@ -1380,11 +1386,16 @@ private struct AfterRayRootView: View {
                 try await images.data(artifactID: artifactID)
             },
             onToggleAudio: { moment in
-                audioPlayer.toggle(moment: moment)
+                toggleAudio(for: moment)
             },
             isAudioPlaying: audioPlayer.isPlaying,
             isAudioBuffering: audioPlayer.isBuffering,
-            playingAudioArtifactID: audioPlayer.playingArtifactID,
+            audioPlaybackContext: audioPlayer.playbackContext,
+            audioPlaybackTime: { audioPlayer.playbackTime },
+            audioSegmentDuration: audioPlayer.playingMomentID == store.selectedMoment?.id
+                ? audioPlayer.playbackDuration
+                : nil,
+            timelineTravelOrigin: audioPlayer.isPlaying ? .audioPlayback : nil,
             onReload: reload,
             onOpenSettings: { AfterRaySettingsController.shared.show() },
             // Dismiss first: the overlay panel is `.statusBar` level and
@@ -1418,17 +1429,10 @@ private struct AfterRayRootView: View {
                 await store.loadDaySummary(dayMs: dayMs)
             },
             onSelectionSettled: {
-                await store.hydrateSelectedEvidence()
-                guard !Task.isCancelled else { return }
-                await store.prefetchAdjacentTimelineDays()
-                guard !Task.isCancelled else { return }
-                audioPlayer.prefetch(
-                    artifactID: audioPrefetchKey.isEmpty ? nil : audioPrefetchKey
-                )
+                await settleSelectedRecallEvidence()
             },
-            onScrubBegan: {
-                audioPlayer.prefetch(artifactID: nil)
-            },
+            // @dec:forced-aligned-audio-transcript-cues — docs/decisions/active/product/2026-08-24-forced-aligned-audio-transcript-cues.md
+            onTimelineTravelBegan: beginTimelineTravel,
             searchSession: control.searchSession,
             thumbnailLoader: { momentID in
                 try await images.thumbnail(momentID: momentID).bytes
@@ -1520,6 +1524,12 @@ private struct AfterRayRootView: View {
         .task {
             await keepDaemonAlive()
         }
+        .task(id: AudioTimelineFollowTaskKey(
+            generation: audioPlayer.generation,
+            isPlaying: audioPlayer.isPlaying
+        )) {
+            await followAudioTimeline()
+        }
         .task(id: control.status?.recordingState) {
             while !Task.isCancelled,
                   !AfterRayTerminationState.shared.isTerminating,
@@ -1582,8 +1592,11 @@ private struct AfterRayRootView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallToggleAudio)) { _ in
-            guard !isLive, let moment = store.selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else { return }
-            audioPlayer.toggle(moment: moment)
+            guard !isLive,
+                  let moment = store.selectedMoment,
+                  moment.id == audioPlayer.playingMomentID || moment.audioSegment != nil
+            else { return }
+            toggleAudio(for: moment)
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionDidResume)) { _ in
             Task {
@@ -1600,7 +1613,7 @@ private struct AfterRayRootView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionWillSuspend)) { _ in
-            audioPlayer.stop()
+            audioPlayer.clearSensitiveData()
             store.clearSensitiveState()
             control.clearSensitiveState()
             chat.clearSensitiveState()
@@ -1613,6 +1626,103 @@ private struct AfterRayRootView: View {
             Task { try? await SummaryExportFileStore.shared.cleanupAll() }
         }
         .afterRayLocalized()
+    }
+
+    private func beginTimelineTravel(_ origin: RecallTimelineTravelOrigin) {
+        if RecallTimelineTravelPolicy.invalidatesAudio(origin) {
+            audioPlayer.stop()
+        }
+    }
+
+    // @dec:settled-search-evidence-and-off-main-audio-prepare — docs/decisions/active/architecture/2026-08-25-settled-search-evidence-and-off-main-audio-prepare.md
+    /// Search travel may cross many unloaded day windows. Only the result that
+    /// survives the view's quiet period is allowed to open a window and hydrate
+    /// transcript evidence.
+    private func settleSelectedRecallEvidence() async {
+        if let expectedMomentID = control.searchSession?.selectedFrame?.momentId {
+            if store.selectedMoment?.id == expectedMomentID {
+                await store.hydrateSelectedEvidence()
+            } else {
+                await store.openMoment(id: expectedMomentID)
+            }
+            guard !Task.isCancelled,
+                  control.searchSession?.selectedFrame?.momentId == expectedMomentID,
+                  store.selectedMoment?.id == expectedMomentID
+            else { return }
+        } else {
+            await store.hydrateSelectedEvidence()
+            guard !Task.isCancelled else { return }
+        }
+
+        if let moment = store.selectedMoment {
+            audioPlayer.updateEvidence(from: moment)
+        }
+        if control.searchSession != nil {
+            await store.loadDaySummary(dayMs: store.playheadMs)
+            guard !Task.isCancelled else { return }
+        }
+        await store.prefetchAdjacentTimelineDays()
+    }
+
+    /// Playback evidence has its own request lifetime. Automatic timeline
+    /// following deliberately suppresses selection hydration, so tying cues to
+    /// that task could leave fast playback permanently on the sparse index row.
+    private func toggleAudio(for moment: RecallMoment) {
+        audioPlayer.toggle(moment: moment)
+        guard let context = audioPlayer.playbackContext else { return }
+        let expectedGeneration = audioPlayer.generation
+        let expectedSegmentID = context.segmentID
+        Task {
+            guard let detail = try? await images.moment(id: moment.id),
+                  !Task.isCancelled,
+                  audioPlayer.generation == expectedGeneration,
+                  audioPlayer.playbackContext?.segmentID == expectedSegmentID
+            else { return }
+            audioPlayer.updateEvidence(
+                from: detail,
+                generation: expectedGeneration
+            )
+        }
+    }
+
+    private func selectTimeline(
+        playheadMs: Int64,
+        origin: RecallTimelineTravelOrigin
+    ) {
+        beginTimelineTravel(origin)
+        guard origin != .audioPlayback || audioPlayer.isPlaying else { return }
+        store.select(playheadMs: playheadMs)
+    }
+
+    // @dec:audio-playback-follows-timeline — docs/decisions/active/product/2026-08-24-audio-playback-follows-timeline.md
+    private func followAudioTimeline() async {
+        guard audioPlayer.isPlaying else { return }
+        while !Task.isCancelled, audioPlayer.isPlaying {
+            guard let position = audioPlayer.timelinePlaybackPosition else { return }
+            let target = AudioTimelineFollow.target(
+                for: position,
+                moments: store.moments
+            )
+            if let target, target.moment.id != audioPlayer.playingMomentID {
+                audioPlayer.followTimeline(to: target.moment)
+                selectTimeline(
+                    playheadMs: target.moment.capturedAtMs,
+                    origin: .audioPlayback
+                )
+            }
+
+            let interval = AudioTimelineFollow.nextCheckInterval(
+                position: position,
+                target: target
+            )
+            do {
+                try await Task.sleep(
+                    for: .milliseconds(Int64((interval * 1_000).rounded(.up)))
+                )
+            } catch {
+                return
+            }
+        }
     }
 
     private func openSummarySlot(_ slot: DaySlotSummary) {
@@ -1638,11 +1748,6 @@ private struct AfterRayRootView: View {
 
     private var controlBarTopPadding: CGFloat {
         RecallGeometry.controlBarTopPadding(safeAreaTop: overlayLayout.topSafeAreaInset)
-    }
-
-    private var audioPrefetchKey: String {
-        guard !isLive, let moment = store.selectedMoment, moment.hasVisibleTranscript, let artifactID = moment.audioArtifactId else { return "" }
-        return artifactID
     }
 
     private func bootstrap() async {
@@ -1769,6 +1874,7 @@ private struct AfterRayRootView: View {
     /// Recall almost always means "the thing I just had open".
     private func submitSearch() {
         Task {
+            audioPlayer.stop()
             guard let frame = await control.search() else { return }
             enterHistory()
             await store.openMoment(id: frame.momentId)
@@ -1777,12 +1883,12 @@ private struct AfterRayRootView: View {
 
     private func selectSearchFrame(_ index: Int) {
         guard let frame = control.selectFrame(at: index) else { return }
+        audioPlayer.stop()
         enterHistory()
-        // Stepping through results stays cheap: only fall back to a full
-        // timeline reload when the frame is not already in memory.
-        if !store.selectLoaded(momentID: frame.momentId) {
-            Task { await store.openMoment(id: frame.momentId) }
-        }
+        // Loaded rows are an O(1) dictionary lookup and may present at once.
+        // An unloaded result can imply a full day-window recenter, so the
+        // selection-settle task opens only the final result after quiet.
+        _ = store.selectLoaded(momentID: frame.momentId)
     }
 
     private func enterHistory() {
@@ -1844,6 +1950,7 @@ private struct AfterRayRootView: View {
     /// A citation from the standalone chat window. The overlay comes up on
     /// this moment; the chat window stays put so the stream can keep going.
     private func openCitedMoment(_ momentID: String) {
+        audioPlayer.stop()
         control.dismissSearch()
         enterHistory()
         if !store.selectLoaded(momentID: momentID) {

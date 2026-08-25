@@ -32,6 +32,7 @@ dirs = "6.0"
 futures-util = "0.3"
 fs2 = "0.4"
 rand = "0.9"
+qwen-asr = "0.11.0"
 # `system-proxy` restores the default proxy resolution that `default-features =
 # false` silently dropped: HTTP(S)_PROXY/ALL_PROXY env vars *and* the macOS
 # system proxy (what Clash/Surge-style clients configure). Without it every

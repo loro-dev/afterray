@@ -1,4 +1,4 @@
-.PHONY: check check-i18n test docs-sync verify test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile visual-lab-window-stress visual-lab-window-stress-profile settings-lab chat-lab compute-lab snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
+.PHONY: check check-i18n test docs-sync verify test-repeat build daemon status models visual-lab visual-lab-summary-stress visual-lab-stress visual-lab-stress-profile visual-lab-window-stress visual-lab-window-stress-profile settings-lab chat-lab compute-lab snapshots audio-chrome-snapshots dev dev-ui open onboarding stop v0 v0-build v0-daemon capture-shim swift-app release release-local sparkle-tools release-preflight verify-release publish publish-dry-run tag-release
 
 # `--all-targets` on purpose. Plain `cargo check --workspace` does not compile
 # `#[cfg(test)]` modules at all, so a refactor can leave the test code broken
@@ -219,7 +219,11 @@ compute-lab:
 # no window on screen. Override the destination: make snapshots OUT=/tmp/x
 OUT ?= /tmp/afterray-snapshots
 snapshots:
-	swift run afterray-visual-snapshots $(OUT)
+	swift run afterray-visual-snapshots -- $(OUT)
+
+# Isolated audio-chrome component only (no RecallView). Agent iteration loop.
+audio-chrome-snapshots:
+	swift run afterray-visual-snapshots -- $(OUT) --only audio-chrome
 
 dev:
 	./scripts/dev.sh

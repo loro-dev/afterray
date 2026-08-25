@@ -31,7 +31,9 @@ final class AfterRayServices {
         store = RecallStore(daemon: daemon)
         control = AfterRayControlModel(daemon: daemon)
         chat = AfterRayChatModel(daemon: daemon)
-        audioPlayer = ArtifactAudioPlayer(repository: repository)
+        audioPlayer = ArtifactAudioPlayer(
+            repository: RecallAudioRepository(daemon: daemon)
+        )
         compute = ComputeActivityModel(daemon: daemon)
     }
 }

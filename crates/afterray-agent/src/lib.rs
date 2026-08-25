@@ -287,7 +287,7 @@ req = json.load(sys.stdin)
 prompt = ((req.get("input") or {}).get("prompt") or "")
 assert "what did I do" in prompt, prompt
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": "FINAL\nYou read a design doc."},
   "retryable": False
 }))
@@ -328,7 +328,7 @@ import json, sys, time
 json.load(sys.stdin)
 time.sleep(60)
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": "FINAL\nfar too late"},
   "retryable": False
 }))

@@ -73,6 +73,7 @@ dependencies = [
  "anyhow",
  "encoding_rs",
  "llama-cpp-2",
+ "qwen-asr",
  "qwen3-asr",
  "rubato 0.16.2",
  "serde_json",
@@ -2702,6 +2703,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "qwen-asr"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f2d649ea1585c574469353ac89a891d53548c7b9422034f8e1b14743632606f"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

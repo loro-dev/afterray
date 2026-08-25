@@ -25,10 +25,8 @@ enum SnapshotRunner {
         application.appearance = NSAppearance(named: .darkAqua)
         AfterRayLocalization.shared.apply(stored: "en")
 
-        let outputDirectory = URL(
-            fileURLWithPath: CommandLine.arguments.dropFirst().first
-                ?? "/tmp/afterray-snapshots"
-        )
+        let options = SnapshotCLI.parse(Array(CommandLine.arguments.dropFirst()))
+        let outputDirectory = URL(fileURLWithPath: options.outputDirectory)
         try? FileManager.default.createDirectory(
             at: outputDirectory,
             withIntermediateDirectories: true
@@ -44,12 +42,16 @@ enum SnapshotRunner {
             _ = AppIconLookup.icon(bundleIdentifier: identifier)
         }
 
-        for scene in SnapshotScene.all {
+        let scenes = SnapshotScene.all.filter { scene in
+            guard let prefix = options.onlyPrefix else { return true }
+            return scene.name.hasPrefix(prefix)
+        }
+        for scene in scenes {
             let url = outputDirectory.appendingPathComponent("\(scene.name).png")
             render(scene: scene, to: url)
             print("wrote \(url.path)")
         }
-        print("\n\(SnapshotScene.all.count) snapshot(s) in \(outputDirectory.path)")
+        print("\n\(scenes.count) snapshot(s) in \(outputDirectory.path)")
     }
 
     private static func render(scene: SnapshotScene, to url: URL) {
@@ -107,6 +109,31 @@ struct SnapshotScene {
     static var all: [SnapshotScene] {
         chromeScenes + highlightScenes + stampScene + settingsScenes + historyPanelScene
             + mixedHistoryScene + captionScenes + chatScenes + computeScenes
+            + audioChromeScenes
+    }
+}
+
+private struct SnapshotCLI {
+    var outputDirectory: String
+    var onlyPrefix: String?
+
+    static func parse(_ arguments: [String]) -> SnapshotCLI {
+        var outputDirectory = "/tmp/afterray-snapshots"
+        var onlyPrefix: String?
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--only", index + 1 < arguments.count {
+                onlyPrefix = arguments[index + 1]
+                index += 2
+            } else if argument.hasPrefix("-") {
+                index += 1
+            } else {
+                outputDirectory = argument
+                index += 1
+            }
+        }
+        return SnapshotCLI(outputDirectory: outputDirectory, onlyPrefix: onlyPrefix)
     }
 }
 
@@ -692,7 +719,10 @@ private var captionScenes: [SnapshotScene] {
             imageArtifactId: moment.imageArtifactId,
             ocrText: moment.ocrText,
             transcriptText: long,
+            audioSegmentId: "mock-segment-\(moment.id)",
             audioArtifactId: "mock://audio/\(moment.id)",
+            audioStartedAtMs: moment.capturedAtMs - 30_000,
+            audioEndedAtMs: moment.capturedAtMs + 270_000,
             applicationName: moment.applicationName,
             bundleIdentifier: moment.bundleIdentifier
         )
@@ -709,6 +739,7 @@ private var captionScenes: [SnapshotScene] {
                     playheadMs: .constant(playheadMs),
                     isLive: .constant(false),
                     imageLoader: MockArtifactFactory.loader,
+                    audioSegmentDuration: 60,
                     onOpenSettings: {},
                     recordingState: .recording,
                     onToggleRecording: {},
@@ -780,4 +811,35 @@ private func chatScene(name: String, scenario: ChatScenario) -> SnapshotScene {
                 .frame(width: 1_080, height: 720)
         )
     )
+}
+
+/// Pure `AudioMomentChrome` on a fake timestamp + track. These scenes are the
+/// agent iteration loop — they must not go through `RecallView`.
+@MainActor
+private var audioChromeScenes: [SnapshotScene] {
+    let size = CGSize(width: 800, height: 420)
+    let named: [(String, AudioMomentChromeModel)] = [
+        ("audio-chrome-idle-audio-only", AudioCaptionFixtures.idleAudioOnly()),
+        ("audio-chrome-idle-with-caption", AudioCaptionFixtures.idleWithCaption()),
+        ("audio-chrome-playing-highlight", AudioCaptionFixtures.playingHighlight()),
+        ("audio-chrome-buffering", AudioCaptionFixtures.buffering()),
+        ("audio-chrome-long-bilingual", AudioCaptionFixtures.longBilingual()),
+        ("audio-chrome-mid-progress", AudioCaptionFixtures.midProgress()),
+        ("audio-chrome-sliding-caption", AudioCaptionFixtures.slidingCaption()),
+        ("audio-chrome-hidden-no-audio", AudioCaptionFixtures.hiddenNoAudio()),
+    ]
+    return named.map { name, model in
+        SnapshotScene(
+            name: name,
+            size: size,
+            // `PlayheadTimestamp` includes translucent glass. Give AppKit a
+            // full compositor turn before caching or adjacent scenes can
+            // intermittently omit that layer from the PNG.
+            settleSeconds: 1.0,
+            content: AnyView(
+                AudioMomentChromeStage(model: model)
+                    .frame(width: size.width, height: size.height)
+            )
+        )
+    }
 }

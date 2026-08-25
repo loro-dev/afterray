@@ -911,7 +911,7 @@ if "Tool result" in prompt:
 else:
     text = "TOOL list_activity\nARGS {\"from_ms\":0,\"to_ms\":1}"
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": text},
   "retryable": False
 }))
@@ -1010,7 +1010,7 @@ if calls >= 6:
 else:
     text = "TOOL get_now\nARGS {}"
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": text},
   "retryable": False
 }))
@@ -1131,7 +1131,7 @@ if calls >= 1:
 else:
     text = "TOOL get_moment_context\nARGS {\"moment_id\": \"%MOMENT%\"}"
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": text},
   "retryable": False
 }))
@@ -1256,7 +1256,7 @@ with open({dump:?}, "a") as handle:
 seen_tool = any(m["content"].startswith("TOOL ") for m in messages)
 text = "FINAL\nYou were reading." if seen_tool else "TOOL get_now\nARGS {{}}"
 print(json.dumps({{
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {{"type": "llm", "text": text}},
   "retryable": False
 }}))
@@ -1391,7 +1391,7 @@ import json, sys, time
 json.load(sys.stdin)
 time.sleep(60)
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": "FINAL\nfar too late"},
   "retryable": False
 }))
@@ -1628,7 +1628,7 @@ import json, sys, time
 json.load(sys.stdin)
 time.sleep(0.4)
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": "FINAL\nthe whole answer"},
   "retryable": False
 }))
@@ -2186,7 +2186,7 @@ req = json.load(sys.stdin)
 prompt = (req.get("input") or {}).get("prompt") or ""
 assert "unique-prior-turn" in prompt, prompt
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": "FINAL\nI remember."},
   "retryable": False
 }))

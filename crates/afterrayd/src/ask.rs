@@ -734,7 +734,7 @@ import json, sys
 req = json.load(sys.stdin)
 assert "AfterRay" in (req.get("input") or {}).get("system", "") or True
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "llm", "text": "You reviewed a design doc."},
   "retryable": False
 }))

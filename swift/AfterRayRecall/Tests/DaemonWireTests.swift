@@ -58,13 +58,13 @@ final class DaemonWireTests: XCTestCase {
     }
 
     func testUnaryResponseDecodesTimelineDataWithoutAnIntermediateObject() throws {
-        let json = #"{"protocol_version":16,"ok":true,"data":[{"id":"m1","session_id":"s1","captured_at_ms":123,"image_artifact_id":"a1","is_favorite":false}]}"#
+        let json = #"{"protocol_version":18,"ok":true,"data":[{"id":"m1","session_id":"s1","captured_at_ms":123,"image_artifact_id":"a1","is_favorite":false}]}"#
         let response = try JSONDecoder().decode(
             DaemonResponse<[RecallMoment]>.self,
             from: Data(json.utf8)
         )
 
-        XCTAssertEqual(response.protocolVersion, 16)
+        XCTAssertEqual(response.protocolVersion, 18)
         XCTAssertTrue(response.ok)
         XCTAssertEqual(response.data?.map(\.id), ["m1"])
         XCTAssertNil(response.error)
@@ -126,6 +126,9 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertEqual(moment.ocrText, "hello")
         XCTAssertNil(moment.audioArtifactId)
         XCTAssertNil(moment.audioStartedAtMs)
+        XCTAssertNil(moment.audioSegmentId)
+        XCTAssertNil(moment.audioEndedAtMs)
+        XCTAssertTrue(moment.transcriptCues.isEmpty)
         XCTAssertNil(moment.accessibilityArtifactId)
         XCTAssertFalse(moment.hasVisibleTranscript)
     }
@@ -137,7 +140,10 @@ final class DaemonWireTests: XCTestCase {
             capturedAtMs: 1,
             imageArtifactId: "a1",
             transcriptText: "   ",
-            audioArtifactId: "audio-1"
+            audioSegmentId: "segment-1",
+            audioArtifactId: "audio-1",
+            audioStartedAtMs: 0,
+            audioEndedAtMs: 300_000
         )
         let spoken = RecallMoment(
             id: "m2",
@@ -145,10 +151,29 @@ final class DaemonWireTests: XCTestCase {
             capturedAtMs: 2,
             imageArtifactId: "a1",
             transcriptText: "hello there",
-            audioArtifactId: "audio-2"
+            audioSegmentId: "segment-2",
+            audioArtifactId: "audio-2",
+            audioStartedAtMs: 0,
+            audioEndedAtMs: 300_000
         )
         XCTAssertFalse(blank.hasVisibleTranscript)
         XCTAssertTrue(spoken.hasVisibleTranscript)
+    }
+
+    func testMomentDecodesOneExactAudioSegmentWithItsTranscript() throws {
+        let json = #"{"id":"m1","session_id":"s1","captured_at_ms":123000,"is_favorite":false,"transcript_text":"matching words","transcript_cues":[{"ordinal":0,"text":"matching words","start_offset_ms":1000,"end_offset_ms":2500,"timing_kind":"aligned"}],"audio_segment_id":"segment-1","audio_artifact_id":"audio-1","audio_started_at_ms":100000,"audio_ended_at_ms":400000}"#
+        let moment = try JSONDecoder().decode(RecallMoment.self, from: Data(json.utf8))
+        let segment = try XCTUnwrap(moment.audioSegment)
+
+        XCTAssertEqual(segment.id, "segment-1")
+        XCTAssertEqual(segment.artifactID, "audio-1")
+        XCTAssertEqual(segment.startedAtMs, 100_000)
+        XCTAssertEqual(segment.endedAtMs, 400_000)
+        XCTAssertEqual(segment.duration, 300)
+        XCTAssertEqual(segment.transcriptText, "matching words")
+        XCTAssertEqual(segment.transcriptCues.count, 1)
+        XCTAssertEqual(segment.transcriptCues[0].startOffsetMs, 1_000)
+        XCTAssertEqual(segment.transcriptCues[0].timingKind, .aligned)
     }
 
     func testMomentDecodesAccessibilityArtifact() throws {
@@ -681,7 +706,7 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 16)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 18)
     }
 
     func testCaptureSetPausedRequestMatchesRustShape() throws {

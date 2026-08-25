@@ -1,0 +1,12 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "apps/AfterRay/Sources/AfterRayApp.swift::onTimelineTravelBegan: beginTimelineTravel,": "sha256:159816d1d422f7b7",
+  "crates/afterray-infer/src/align.rs::pub fn align_transcript(": "sha256:35d62c385fb02580",
+  "crates/afterray-protocol/src/lib.rs::pub struct Moment {": "sha256:fc031918a1f06401",
+  "crates/afterray-store/src/lib.rs::fn moment_query_sql(filter_sql: &str, include_evidence: bool) -> String {": "sha256:9a2f4bb85b314059",
+  "crates/afterray-store/src/lib.rs::pub fn claim_audio_alignment(": "sha256:ae4898e64bee3deb",
+  "crates/afterrayd/src/main.rs::async fn run_one_audio_alignment(state: &Arc<AppState>) -> Result<bool, String> {": "sha256:e918cc3e451ba2ac",
+  "swift/AfterRayRecall/Sources/ArtifactAudioPlayer.swift::struct ArtifactAudioPlaybackSource: Equatable, Sendable {": "sha256:f62641c3c96929ad",
+  "swift/AfterRayRecall/Sources/RecallModels.swift::public struct RecallAudioSegment: Equatable, Identifiable, Sendable {": "sha256:38b1ff7e2b33e79f",
+  "swift/AfterRayRecall/Sources/RecallView.swift::private var showsPlayheadAudioChrome: Bool {": "sha256:31e0010d42e3c862"
+}

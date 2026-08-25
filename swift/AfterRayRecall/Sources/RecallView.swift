@@ -22,6 +22,47 @@ enum RecallPresentation {
     }
 }
 
+/// Combines the lean timeline selection with its separately hydrated evidence.
+/// The identity check is essential during a scrub: the store may still hold
+/// detail for the last committed frame while the transient playhead is already
+/// presenting another one.
+enum RecallSelectionPresentation {
+    static func resolve(
+        playheadMs: Int64,
+        moments: [RecallMoment],
+        hydratedSelection: RecallMoment?
+    ) -> RecallMoment? {
+        guard let base = RecallPlayhead.resolve(
+            playheadMs: playheadMs,
+            moments: moments
+        )
+        else { return nil }
+        guard let hydratedSelection,
+              hydratedSelection.id == base.id
+        else { return base }
+        return hydratedSelection
+    }
+}
+
+// @dec:settled-search-evidence-and-off-main-audio-prepare — docs/decisions/active/architecture/2026-08-25-settled-search-evidence-and-off-main-audio-prepare.md
+enum RecallSelectionQuietTaskKey {
+    static func make(
+        timelineTravelOrigin: RecallTimelineTravelOrigin?,
+        isScrubbing: Bool,
+        searchSelectedIndex: Int?,
+        searchSelectedMomentID: String?,
+        selectedMomentID: String?,
+        playheadDayKey: String
+    ) -> String {
+        if timelineTravelOrigin == .audioPlayback { return "audio-playback-follow" }
+        if isScrubbing { return "scrubbing" }
+        if let searchSelectedIndex {
+            return "search|\(searchSelectedIndex)|\(searchSelectedMomentID ?? "-")"
+        }
+        return "\(selectedMomentID ?? "-")|\(playheadDayKey)"
+    }
+}
+
 /// Per-frame scrub state is deliberately not observed by `RecallView`.
 ///
 /// Keeping the continuous playhead in root `@State` invalidated the complete
@@ -125,6 +166,9 @@ public struct RecallView: View {
     @Environment(\.afterRayCopy) private var copy
     @Environment(\.afterRayLocale) private var afterRayLocale
     public let moments: [RecallMoment]
+    /// Evidence-enriched current selection. This remains separate from the
+    /// lean timeline array so one detail read cannot invalidate its full spine.
+    public let selectedMomentDetail: RecallMoment?
     /// Store-prepared layout input. Production passes all three values from
     /// the same publication; static labs may leave them nil.
     public let timelineRevision: UInt64?
@@ -140,7 +184,11 @@ public struct RecallView: View {
     public var onToggleAudio: ((RecallMoment) -> Void)?
     public var isAudioPlaying: Bool
     public var isAudioBuffering: Bool
-    public var playingAudioArtifactID: String?
+    public var audioPlaybackContext: RecallAudioPlaybackContext?
+    public var audioPlaybackTime: () -> TimeInterval
+    public var audioSegmentDuration: TimeInterval?
+    /// Nil while stationary; non-nil names the owner of active travel.
+    public var timelineTravelOrigin: RecallTimelineTravelOrigin?
     public var onReload: (() -> Void)?
     public var onOpenSettings: (() -> Void)?
     /// Opens the address of a recalled browser frame. The overlay panel sits
@@ -173,12 +221,12 @@ public struct RecallView: View {
     public var onPopOutHistory: (() -> Void)?
     public var onOpenSummarySlot: ((DaySlotSummary) -> Void)?
     public var onVisibleDayChange: ((Int64) async -> Void)?
-    /// Metadata, summary, and audio work owned by the app starts only after a
+    /// Metadata and summary work owned by the app starts only after a
     /// real quiet period. Keeping the async call inside this view's keyed task
     /// lets the next gesture cancel it before it publishes into the root.
     public var onSelectionSettled: (() async -> Void)?
-    /// Cancels app-owned speculative work at the first movement frame.
-    public var onScrubBegan: (() -> Void)?
+    /// Invalidates resources according to who owns this travel.
+    public var onTimelineTravelBegan: ((RecallTimelineTravelOrigin) -> Void)?
     /// Non-nil puts the view in search mode: the bottom bar becomes a filmstrip
     /// of matched frames and travel snaps between them instead of wall clock.
     public var searchSession: RecallSearchSession?
@@ -229,6 +277,7 @@ public struct RecallView: View {
 
     public init(
         moments: [RecallMoment],
+        selectedMomentDetail: RecallMoment? = nil,
         timelineRevision: UInt64? = nil,
         timelineSpine: TimelineSpine? = nil,
         timelineDayCoverage: TimelineDayCoverage? = nil,
@@ -242,7 +291,10 @@ public struct RecallView: View {
         onToggleAudio: ((RecallMoment) -> Void)? = nil,
         isAudioPlaying: Bool = false,
         isAudioBuffering: Bool = false,
-        playingAudioArtifactID: String? = nil,
+        audioPlaybackContext: RecallAudioPlaybackContext? = nil,
+        audioPlaybackTime: @escaping () -> TimeInterval = { 0 },
+        audioSegmentDuration: TimeInterval? = nil,
+        timelineTravelOrigin: RecallTimelineTravelOrigin? = nil,
         onReload: (() -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil,
         onOpenWebLink: ((URL) -> Void)? = nil,
@@ -263,7 +315,7 @@ public struct RecallView: View {
         onOpenSummarySlot: ((DaySlotSummary) -> Void)? = nil,
         onVisibleDayChange: ((Int64) async -> Void)? = nil,
         onSelectionSettled: (() async -> Void)? = nil,
-        onScrubBegan: (() -> Void)? = nil,
+        onTimelineTravelBegan: ((RecallTimelineTravelOrigin) -> Void)? = nil,
         searchSession: RecallSearchSession? = nil,
         thumbnailLoader: RecallThumbnailLoader? = nil,
         ocrLoader: RecallOcrLoader? = nil,
@@ -271,6 +323,7 @@ public struct RecallView: View {
         onApproachTimelineEdge: ((TimelineExtendDirection, Int64) async -> Bool)? = nil
     ) {
         self.moments = moments
+        self.selectedMomentDetail = selectedMomentDetail
         self.timelineRevision = timelineRevision
         self.timelineSpine = timelineSpine
         self.timelineDayCoverage = timelineDayCoverage
@@ -284,7 +337,10 @@ public struct RecallView: View {
         self.onToggleAudio = onToggleAudio
         self.isAudioPlaying = isAudioPlaying
         self.isAudioBuffering = isAudioBuffering
-        self.playingAudioArtifactID = playingAudioArtifactID
+        self.audioPlaybackContext = audioPlaybackContext
+        self.audioPlaybackTime = audioPlaybackTime
+        self.audioSegmentDuration = audioSegmentDuration
+        self.timelineTravelOrigin = timelineTravelOrigin
         self.onReload = onReload
         self.onOpenSettings = onOpenSettings
         self.onOpenWebLink = onOpenWebLink
@@ -305,7 +361,7 @@ public struct RecallView: View {
         self.onOpenSummarySlot = onOpenSummarySlot
         self.onVisibleDayChange = onVisibleDayChange
         self.onSelectionSettled = onSelectionSettled
-        self.onScrubBegan = onScrubBegan
+        self.onTimelineTravelBegan = onTimelineTravelBegan
         self.searchSession = searchSession
         self.thumbnailLoader = thumbnailLoader
         self.ocrLoader = ocrLoader
@@ -314,12 +370,75 @@ public struct RecallView: View {
     }
 
     private var selectedAudioIsActive: Bool {
-        selectedMoment?.audioArtifactId != nil
-            && selectedMoment?.audioArtifactId == playingAudioArtifactID
+        selectedMoment?.id != nil
+            && selectedMoment?.id == audioPlaybackContext?.followedMomentID
+    }
+
+    // @dec:forced-aligned-audio-transcript-cues — docs/decisions/active/product/2026-08-24-forced-aligned-audio-transcript-cues.md
+    private var showsPlayheadAudioChrome: Bool {
+        !isScrubbing
+            && !renderedIsLive
+            && (selectedAudioIsActive
+                || selectedMoment?.audioSegment != nil
+                || selectedMoment?.hasVisibleTranscript == true)
+    }
+
+    private var selectedAudioChromeModel: AudioMomentChromeModel? {
+        guard let moment = selectedMoment else { return nil }
+        let activeContext = selectedAudioIsActive ? audioPlaybackContext : nil
+        let momentSegment = moment.audioSegment
+        guard let artifactID = activeContext?.artifactID ?? momentSegment?.artifactID else { return nil }
+        let momentOffset = activeContext?.sourceOffset
+            ?? ArtifactAudioPlayer.offset(for: moment)
+        let selectedSegmentOwnsPlayback = activeContext?.segmentID == momentSegment?.id
+        let transcript = if activeContext == nil || selectedSegmentOwnsPlayback {
+            momentSegment?.transcriptText ?? activeContext?.transcriptText
+        } else {
+            activeContext?.transcriptText
+        }
+        let transcriptCues = if activeContext == nil || selectedSegmentOwnsPlayback {
+            momentSegment?.transcriptCues.isEmpty == false
+                ? momentSegment?.transcriptCues ?? []
+                : activeContext?.transcriptCues ?? []
+        } else {
+            activeContext?.transcriptCues ?? []
+        }
+        let metadataDuration = activeContext?.segmentDuration
+            ?? momentSegment?.duration
+            ?? 0
+        let decodedDuration = audioSegmentDuration ?? 0
+        let segmentDuration = max(
+            decodedDuration > 0 ? decodedDuration : metadataDuration,
+            0
+        )
+        let isActive = selectedAudioIsActive
+        return AudioMomentChromeModel(
+            hasAudio: true,
+            isPlaying: isAudioPlaying && isActive,
+            isBuffering: isAudioBuffering && isActive,
+            samples: AudioMomentTranscript.samples(
+                seed: AudioMomentTranscript.stableSeed(artifactID)
+            ),
+            cues: AudioMomentTranscript.displayCues(
+                transcript: transcript,
+                alignedCues: transcriptCues,
+                segmentDuration: segmentDuration,
+                momentOffset: momentOffset
+            ),
+            playbackTime: isActive ? audioPlaybackTime() : momentOffset,
+            momentOffset: momentOffset,
+            segmentDuration: segmentDuration,
+            timestamp: Date(timeIntervalSince1970: TimeInterval(moment.capturedAtMs) / 1_000),
+            isLive: false
+        )
     }
 
     private var selectedMoment: RecallMoment? {
-        RecallPlayhead.resolve(playheadMs: renderedPlayheadMs, moments: moments)
+        RecallSelectionPresentation.resolve(
+            playheadMs: renderedPlayheadMs,
+            moments: moments,
+            hydratedSelection: selectedMomentDetail
+        )
     }
 
     private var renderedPlayheadMs: Int64 {
@@ -450,9 +569,6 @@ public struct RecallView: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
 
-                // Caption floats just above the timeline and does not
-                // participate in this VStack. In-flow it was a full-width
-                // row that lifted DaySummaryPanel whenever ASR was present.
                 VStack(spacing: 0) {
                     timelineChromeRow
                         .padding(.bottom, 9)
@@ -483,26 +599,6 @@ public struct RecallView: View {
                         .padding(.bottom, 18)
                     }
                 }
-                .overlay(alignment: .top) {
-                    if !isScrubbing,
-                       !renderedIsLive,
-                       selectedMoment?.hasVisibleTranscript == true
-                    {
-                        TranscriptCaption(
-                            text: selectedMoment?.transcriptText,
-                            canPlay: selectedMoment?.audioArtifactId != nil,
-                            isPlaying: isAudioPlaying && selectedAudioIsActive,
-                            isBuffering: isAudioBuffering && selectedAudioIsActive,
-                            onToggleAudio: {
-                                if let moment = selectedMoment {
-                                    onToggleAudio?(moment)
-                                }
-                            }
-                        )
-                        .padding(.horizontal, RecallGeometry.overlayChromeMargin)
-                        .alignmentGuide(.top) { $0[.bottom] + 12 }
-                    }
-                }
             }
 
             if showsDetails, !renderedIsLive, let moment = selectedMoment {
@@ -516,7 +612,7 @@ public struct RecallView: View {
                         onToggleAudio: onToggleAudio,
                         isAudioPlaying: isAudioPlaying,
                         isAudioBuffering: isAudioBuffering,
-                        playingAudioArtifactID: playingAudioArtifactID,
+                        playingAudioMomentID: audioPlaybackContext?.followedMomentID,
                         onClose: { showsDetails = false }
                     )
                 }
@@ -543,7 +639,10 @@ public struct RecallView: View {
         }
         .onMoveCommand(perform: handleMoveCommand)
         .onKeyPress(.space) {
-            guard !renderedIsLive, let moment = selectedMoment, moment.hasVisibleTranscript, moment.audioArtifactId != nil else {
+            guard !renderedIsLive,
+                  let moment = selectedMoment,
+                  selectedAudioIsActive || moment.audioSegment != nil
+            else {
                 return .ignored
             }
             onToggleAudio?(moment)
@@ -556,11 +655,19 @@ public struct RecallView: View {
             // Pre-decoding neighbouring GOP frames here kept VideoToolbox busy
             // long after launch and made the next gesture hitch. Only the exact
             // settled frame is promoted; non-visual work waits longer.
-            guard !isScrubbing else { return }
+            guard !isScrubbing, timelineTravelOrigin != .audioPlayback else { return }
             try? await Task.sleep(for: .milliseconds(Self.selectionQuietMilliseconds))
-            guard !Task.isCancelled, !isScrubbing else { return }
+            guard !Task.isCancelled,
+                  !isScrubbing,
+                  timelineTravelOrigin != .audioPlayback
+            else { return }
             await onSelectionSettled?()
             guard !Task.isCancelled, !isScrubbing else { return }
+            // A cold search settle may recenter the store while this task still
+            // holds the pre-open View value. Its owner loads the final search
+            // day from store state; using this captured playhead would reopen
+            // the old day's summary.
+            guard searchSession == nil else { return }
             await onVisibleDayChange?(renderedPlayheadMs)
         }
         .task(id: highlightTaskKey) {
@@ -591,18 +698,26 @@ public struct RecallView: View {
     /// and recreates the task graph. During motion these keys stay byte-stable
     /// and change once to the settled selection at the end.
     private var selectionQuietTaskKey: String {
-        guard !isScrubbing else { return "scrubbing" }
-        return "\(selectedMoment?.id ?? "-")|\(playheadDayKey)"
+        RecallSelectionQuietTaskKey.make(
+            timelineTravelOrigin: timelineTravelOrigin,
+            isScrubbing: isScrubbing,
+            searchSelectedIndex: searchSession?.selectedIndex,
+            searchSelectedMomentID: searchSession?.selectedFrame?.momentId,
+            selectedMomentID: selectedMoment?.id,
+            playheadDayKey: playheadDayKey
+        )
     }
 
     private var highlightTaskKey: String {
-        isScrubbing ? "scrubbing" : highlightKey
+        if timelineTravelOrigin == .audioPlayback { return "audio-playback-follow" }
+        return isScrubbing ? "scrubbing" : highlightKey
     }
 
     /// Everything that means "the picture is not standing still yet". Motion
     /// state is in here as well as identity: `isScrubbing` only goes false once
     /// the scroll inertia has run out, so it already carries the glide.
     private var textLayerKey: String {
+        if timelineTravelOrigin == .audioPlayback { return "audio-playback-follow" }
         if isScrubbing { return "scrubbing" }
         return [
             selectedMoment?.id ?? "-",
@@ -625,7 +740,7 @@ public struct RecallView: View {
         // One evidence round trip per cell the scrub passes through is a queue
         // of requests for frames nobody is looking at any more. The boxes are
         // only worth fetching for the frame the scrub stops on.
-        guard !isScrubbing else { return }
+        guard !isScrubbing, timelineTravelOrigin != .audioPlayback else { return }
         guard
             let ocrLoader,
             let moment = selectedMoment,
@@ -655,7 +770,10 @@ public struct RecallView: View {
         textLayerRegions = []
         textSelection.clearSelection()
         guard
-            !isScrubbing, !isZoomingTimeline, !renderedIsLive,
+            !isScrubbing,
+            timelineTravelOrigin != .audioPlayback,
+            !isZoomingTimeline,
+            !renderedIsLive,
             let ocrLoader,
             let moment = selectedMoment,
             let still = settledStill,
@@ -833,6 +951,35 @@ public struct RecallView: View {
                 isLive: renderedIsLive
             )
         }
+        .overlay(alignment: .top) {
+            if showsPlayheadAudioChrome {
+                if let model = selectedAudioChromeModel {
+                    AudioMomentChrome(
+                        model: model,
+                        onToggle: {
+                            if let moment = selectedMoment {
+                                onToggleAudio?(moment)
+                            }
+                        },
+                        playbackTime: audioPlaybackTime
+                    )
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .offset(y: AudioMomentChrome.recallOffsetY)
+                } else {
+                    // Transcript-only captures keep the established caption,
+                    // but audio captures use the waveform chrome.
+                    TranscriptCaption(
+                        text: selectedMoment?.transcriptText,
+                        canPlay: false,
+                        isPlaying: false,
+                        isBuffering: false,
+                        onToggleAudio: {}
+                    )
+                    .padding(.horizontal, RecallGeometry.overlayChromeMargin)
+                    .offset(y: -110)
+                }
+            }
+        }
     }
 
     private var recallDrag: some Gesture {
@@ -892,6 +1039,9 @@ public struct RecallView: View {
         guard let searchSession, !searchSession.frames.isEmpty else { return }
         let clamped = min(max(index, 0), searchSession.frames.count - 1)
         guard clamped != searchSession.selectedIndex else { return }
+        if !isScrubbing {
+            onTimelineTravelBegan?(.user)
+        }
         onSelectSearchFrame?(clamped)
     }
 
@@ -981,6 +1131,9 @@ public struct RecallView: View {
         let clampedMs = resolvedLive
             ? (moments.last?.capturedAtMs ?? nextMs)
             : layout.clamp(nextMs)
+        if clampedMs != playheadMs || resolvedLive != isLive {
+            onTimelineTravelBegan?(.user)
+        }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -1011,7 +1164,7 @@ public struct RecallView: View {
             scrubIsLive = isLive
         }
         isScrubbing = true
-        onScrubBegan?()
+        onTimelineTravelBegan?(.user)
         RecallDecodedImageCache.shared.prioritizeScrubPreviews()
     }
 
@@ -3077,7 +3230,7 @@ private struct RecallDetailsMenu: View {
     let onToggleAudio: ((RecallMoment) -> Void)?
     let isAudioPlaying: Bool
     let isAudioBuffering: Bool
-    let playingAudioArtifactID: String?
+    let playingAudioMomentID: String?
     let onClose: () -> Void
 
     var body: some View {
@@ -3187,8 +3340,8 @@ private struct RecallDetailsMenu: View {
                 ) {
                     page = .accessibility
                 }
-                if moment.hasVisibleTranscript, moment.audioArtifactId != nil {
-                    let isThis = moment.audioArtifactId == playingAudioArtifactID
+                if moment.audioSegment != nil {
+                    let isThis = moment.id == playingAudioMomentID
                     Button {
                         onToggleAudio?(moment)
                     } label: {

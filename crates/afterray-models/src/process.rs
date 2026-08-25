@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
 use tokio::{io::AsyncWriteExt, process::Command};
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 /// One-shot JSON request written to the worker's stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,7 +206,11 @@ impl ModelAdapter for ProcessAdapter {
             result = &mut wait => result?,
         };
 
-        decode_worker_output(&output, self.config.capability, self.config.max_output_bytes)
+        decode_worker_output(
+            &output,
+            self.config.capability,
+            self.config.max_output_bytes,
+        )
     }
 }
 
@@ -267,7 +271,9 @@ fn decode_worker_output(
 async fn validate_local_input(input: &ModelInput) -> Result<(), AdapterError> {
     let path = match input {
         ModelInput::Ocr { image_path, .. } => Some(image_path),
-        ModelInput::Asr { audio_path, .. } => Some(audio_path),
+        ModelInput::Asr { audio_path, .. } | ModelInput::Align { audio_path, .. } => {
+            Some(audio_path)
+        }
         ModelInput::Embedding { .. } | ModelInput::Llm { .. } => None,
     };
     if let Some(path) = path {
@@ -306,7 +312,7 @@ mod tests {
 import json, sys
 request = json.load(sys.stdin)
 print(json.dumps({
-  "protocol_version": 1,
+  "protocol_version": 2,
   "output": {"type": "embedding", "vector": [1.0, 2.0, 3.0]},
   "retryable": False
 }))

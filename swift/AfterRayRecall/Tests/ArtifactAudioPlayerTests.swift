@@ -1,13 +1,26 @@
 import XCTest
 @testable import AfterRayRecall
 
+final class SensitiveAudioDataTests: XCTestCase {
+    func testClearOverwritesTheOwnedDecryptedBytes() {
+        let data = SensitiveAudioData(copying: Data([0x01, 0x7f, 0xff]))
+
+        data.clear()
+
+        XCTAssertTrue(data.isCleared)
+        XCTAssertTrue(data.isZeroed)
+    }
+}
+
 final class ArtifactAudioPlaybackSessionTests: XCTestCase {
     func testCompletedLoadAfterStopDoesNotEnterPlaying() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1")
+        let source = playbackSource()
+        let generation = session.beginPlay(source: source)
 
         XCTAssertTrue(session.isBuffering)
         XCTAssertEqual(session.artifactID, "audio-1")
+        XCTAssertEqual(session.momentID, "moment-1")
         XCTAssertFalse(session.isPlaying)
 
         session.stop()
@@ -23,9 +36,10 @@ final class ArtifactAudioPlaybackSessionTests: XCTestCase {
 
     func testToggleWhileBufferingCancelsAndIgnoresLateLoad() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1")
+        let source = playbackSource()
+        let generation = session.beginPlay(source: source)
 
-        XCTAssertTrue(session.cancelIfBuffering(artifactID: "audio-1"))
+        XCTAssertTrue(session.cancelIfBuffering(source: source))
         XCTAssertFalse(session.isBuffering)
         XCTAssertFalse(session.isPlaying)
         XCTAssertNil(session.artifactID)
@@ -35,9 +49,14 @@ final class ArtifactAudioPlaybackSessionTests: XCTestCase {
 
     func testCancelIfBufferingIgnoresADifferentArtifact() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1")
+        let source = playbackSource()
+        let generation = session.beginPlay(source: source)
 
-        XCTAssertFalse(session.cancelIfBuffering(artifactID: "audio-2"))
+        XCTAssertFalse(
+            session.cancelIfBuffering(
+                source: playbackSource(momentID: "moment-2", artifactID: "audio-2")
+            )
+        )
         XCTAssertTrue(session.isBuffering)
         XCTAssertEqual(session.artifactID, "audio-1")
         XCTAssertTrue(session.finishLoad(generation: generation))
@@ -46,7 +65,7 @@ final class ArtifactAudioPlaybackSessionTests: XCTestCase {
 
     func testFailLoadAfterCancelIsIgnored() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1")
+        let generation = session.beginPlay(source: playbackSource())
         session.stop()
         session.failLoad(generation: generation)
         XCTAssertFalse(session.isPlaying)
@@ -54,29 +73,36 @@ final class ArtifactAudioPlaybackSessionTests: XCTestCase {
         XCTAssertNil(session.artifactID)
     }
 
-    func testTogglePausesAndResumesRegardlessOfFrame() {
+    func testToggleOnlyPausesAndResumesTheSameMomentSource() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1")
+        let source = playbackSource()
+        let generation = session.beginPlay(source: source)
         XCTAssertTrue(session.finishLoad(generation: generation))
 
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", hasPlayer: true),
+            session.toggleDecision(source: source, hasPlayer: true),
             .pause
         )
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-2", hasPlayer: true),
-            .pause
+            session.toggleDecision(
+                source: playbackSource(momentID: "moment-2", offset: 7),
+                hasPlayer: true
+            ),
+            .loadAndPlay
         )
 
         session.pause()
         XCTAssertEqual(session.phase, .paused)
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", hasPlayer: true),
+            session.toggleDecision(source: source, hasPlayer: true),
             .resume
         )
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "other", hasPlayer: true),
-            .resume
+            session.toggleDecision(
+                source: playbackSource(momentID: "moment-2", artifactID: "other"),
+                hasPlayer: true
+            ),
+            .loadAndPlay
         )
 
         session.resume()
@@ -85,27 +111,54 @@ final class ArtifactAudioPlaybackSessionTests: XCTestCase {
 
     func testToggleWhileBufferingCancelsViaDecision() {
         var session = ArtifactAudioPlaybackSession()
-        _ = session.beginPlay(artifactID: "audio-1")
+        let source = playbackSource()
+        _ = session.beginPlay(source: source)
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", hasPlayer: false),
+            session.toggleDecision(source: source, hasPlayer: false),
             .cancelBuffering
         )
     }
 
     func testToggleWithoutAPlayerReloads() {
         var session = ArtifactAudioPlaybackSession()
-        let generation = session.beginPlay(artifactID: "audio-1")
+        let source = playbackSource()
+        let generation = session.beginPlay(source: source)
         XCTAssertTrue(session.finishLoad(generation: generation))
         session.pause()
         XCTAssertEqual(
-            session.toggleDecision(artifactID: "audio-1", hasPlayer: false),
+            session.toggleDecision(source: source, hasPlayer: false),
             .loadAndPlay
+        )
+    }
+
+    private func playbackSource(
+        momentID: String = "moment-1",
+        artifactID: String = "audio-1",
+        offset: TimeInterval = 0
+    ) -> ArtifactAudioPlaybackSource {
+        ArtifactAudioPlaybackSource(
+            momentID: momentID,
+            artifactID: artifactID,
+            offset: offset
         )
     }
 }
 
 @MainActor
 final class ArtifactAudioPlayerTests: XCTestCase {
+    func testRepositoryPreparesAndDiscardsSensitiveAudio() async throws {
+        let repository = RecallAudioRepository(
+            daemon: DelayedArtifactDaemon(delayMs: 0, bytes: silentWav())
+        )
+
+        let prepared = try await repository.preparedAudio(artifactID: "audio-1")
+        XCTAssertFalse(prepared.sensitiveData.isCleared)
+
+        await repository.discard(prepared)
+        XCTAssertTrue(prepared.sensitiveData.isCleared)
+        XCTAssertTrue(prepared.sensitiveData.isZeroed)
+    }
+
     func testOffsetUsesAudioStartedAtMsAndClampsBelowZero() {
         XCTAssertEqual(
             ArtifactAudioPlayer.offset(for: moment(capturedAtMs: 2_500, startedAtMs: 1_000)),
@@ -126,7 +179,7 @@ final class ArtifactAudioPlayerTests: XCTestCase {
 
     func testStopDuringLoadDoesNotStartPlayback() async throws {
         let daemon = DelayedArtifactDaemon(delayMs: 80)
-        let player = ArtifactAudioPlayer(repository: RecallImageRepository(daemon: daemon))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
         let target = moment(capturedAtMs: 2_500, startedAtMs: 1_000, audioID: "audio-1")
 
         player.play(moment: target)
@@ -149,7 +202,7 @@ final class ArtifactAudioPlayerTests: XCTestCase {
 
     func testToggleWhileLoadingCancelsAndDoesNotPlay() async throws {
         let daemon = DelayedArtifactDaemon(delayMs: 80)
-        let player = ArtifactAudioPlayer(repository: RecallImageRepository(daemon: daemon))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
         let target = moment(capturedAtMs: 2_500, startedAtMs: 1_000, audioID: "audio-1")
 
         player.toggle(moment: target)
@@ -171,12 +224,13 @@ final class ArtifactAudioPlayerTests: XCTestCase {
 
     func testToggleAfterPauseResumesWithoutReloading() async throws {
         let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav())
-        let player = ArtifactAudioPlayer(repository: RecallImageRepository(daemon: daemon))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
         let target = moment(capturedAtMs: 1_000, startedAtMs: 1_000, audioID: "audio-1")
 
         player.play(moment: target)
         try await waitUntil(player.isPlaying, timeoutMs: 400)
         XCTAssertEqual(player.playingArtifactID, "audio-1")
+        XCTAssertEqual(player.playingMomentID, "m1")
         let generation = player.generation
 
         player.pause()
@@ -191,29 +245,139 @@ final class ArtifactAudioPlayerTests: XCTestCase {
         XCTAssertEqual(player.playingArtifactID, "audio-1")
     }
 
-    func testToggleIgnoresAMovedPlayhead() async throws {
-        let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav())
-        let player = ArtifactAudioPlayer(repository: RecallImageRepository(daemon: daemon))
-        let start = moment(capturedAtMs: 1_000, startedAtMs: 1_000, audioID: "audio-1")
-        let later = moment(capturedAtMs: 8_000, startedAtMs: 1_000, audioID: "audio-1")
+    func testDifferentMomentInSameArtifactReloadsAtTheNewOffset() async throws {
+        let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav(duration: 10))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
+        let start = moment(
+            id: "m1",
+            capturedAtMs: 1_000,
+            startedAtMs: 1_000,
+            audioID: "audio-1"
+        )
+        let later = moment(
+            id: "m2",
+            capturedAtMs: 8_000,
+            startedAtMs: 1_000,
+            audioID: "audio-1"
+        )
 
         player.play(moment: start)
         try await waitUntil(player.isPlaying, timeoutMs: 400)
         let generation = player.generation
 
         player.toggle(moment: later)
+        XCTAssertTrue(player.isBuffering)
+        XCTAssertGreaterThan(player.generation, generation)
+        XCTAssertEqual(player.playingMomentID, "m2")
+        try await waitUntil(player.isPlaying, timeoutMs: 400)
+        XCTAssertGreaterThanOrEqual(player.playbackTime, 6.9)
+    }
+
+    func testAutomaticFollowKeepsTheOriginalPlaybackSourceForPauseResume() async throws {
+        let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav(duration: 10))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
+        let source = moment(
+            id: "m1",
+            capturedAtMs: 1_000,
+            startedAtMs: 1_000,
+            audioID: "audio-1"
+        )
+        let followedFrame = moment(
+            id: "m2",
+            capturedAtMs: 3_000,
+            startedAtMs: 1_000,
+            audioID: "audio-1"
+        )
+
+        player.play(moment: source)
+        try await waitUntil(player.isPlaying, timeoutMs: 400)
+        let generation = player.generation
+
+        player.followTimeline(to: followedFrame)
+        XCTAssertEqual(player.playbackContext?.sourceMomentID, "m1")
+        XCTAssertEqual(player.playbackContext?.followedMomentID, "m2")
+        XCTAssertEqual(player.playbackContext?.segmentID, "segment-audio-1")
+        XCTAssertEqual(player.playbackContext?.segmentDuration, 60)
+
+        player.toggle(moment: followedFrame)
         XCTAssertFalse(player.isPlaying)
         XCTAssertEqual(player.generation, generation)
 
-        player.toggle(moment: later)
+        player.toggle(moment: followedFrame)
         XCTAssertTrue(player.isPlaying)
-        XCTAssertFalse(player.isBuffering)
         XCTAssertEqual(player.generation, generation)
+        XCTAssertEqual(player.playbackContext?.sourceMomentID, "m1")
+    }
+
+    func testDetailHydrationRefinesEvidenceWithoutReplacingPlayback() async throws {
+        let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav(duration: 10))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
+        let source = moment(
+            id: "m1",
+            capturedAtMs: 1_000,
+            startedAtMs: 1_000,
+            audioID: "audio-1"
+        )
+        player.play(moment: source)
+        try await waitUntil(player.isPlaying, timeoutMs: 400)
+        let generation = player.generation
+
+        let cue = RecallTranscriptCue(
+            ordinal: 0,
+            text: "Aligned words.",
+            startOffsetMs: 0,
+            endOffsetMs: 2_000,
+            timingKind: .aligned
+        )
+        player.updateEvidence(from: moment(
+            id: "m2",
+            capturedAtMs: 2_000,
+            startedAtMs: 1_000,
+            audioID: "audio-1",
+            transcriptText: "Aligned words.",
+            transcriptCues: [cue]
+        ))
+
+        XCTAssertEqual(player.generation, generation)
+        XCTAssertEqual(player.playbackContext?.sourceMomentID, "m1")
+        XCTAssertEqual(player.playbackContext?.transcriptText, "Aligned words.")
+        XCTAssertEqual(player.playbackContext?.transcriptCues, [cue])
+    }
+
+    func testStaleDetailHydrationCannotRefineANewerPlaybackGeneration() async throws {
+        let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav(duration: 10))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
+        let source = moment(
+            id: "m1",
+            capturedAtMs: 1_000,
+            startedAtMs: 1_000,
+            audioID: "audio-1"
+        )
+        player.play(moment: source)
+        try await waitUntil(player.isPlaying, timeoutMs: 400)
+        let staleGeneration = player.generation
+
+        player.stop()
+        player.play(moment: source)
+        try await waitUntil(player.isPlaying, timeoutMs: 400)
+        player.updateEvidence(
+            from: moment(
+                id: "m1",
+                capturedAtMs: 1_000,
+                startedAtMs: 1_000,
+                audioID: "audio-1",
+                transcriptText: "Stale words."
+            ),
+            generation: staleGeneration
+        )
+
+        XCTAssertNotEqual(player.generation, staleGeneration)
+        XCTAssertNil(player.playbackContext?.transcriptText)
     }
 
     func testRepeatedPausePlayStaysOnTheSameSession() async throws {
         let daemon = DelayedArtifactDaemon(delayMs: 10, bytes: silentWav())
-        let player = ArtifactAudioPlayer(repository: RecallImageRepository(daemon: daemon))
+        let player = ArtifactAudioPlayer(repository: RecallAudioRepository(daemon: daemon))
         let target = moment(capturedAtMs: 1_000, startedAtMs: 1_000, audioID: "audio-1")
 
         player.play(moment: target)
@@ -243,17 +407,25 @@ final class ArtifactAudioPlayerTests: XCTestCase {
     }
 
     private func moment(
+        id: String = "m1",
         capturedAtMs: Int64,
         startedAtMs: Int64?,
-        audioID: String = "audio-1"
+        audioID: String = "audio-1",
+        transcriptText: String? = nil,
+        transcriptCues: [RecallTranscriptCue] = []
     ) -> RecallMoment {
-        RecallMoment(
-            id: "m1",
+        let segmentStartedAtMs = startedAtMs ?? capturedAtMs
+        return RecallMoment(
+            id: id,
             sessionId: "s1",
             capturedAtMs: capturedAtMs,
             imageArtifactId: "img-1",
+            transcriptText: transcriptText,
+            transcriptCues: transcriptCues,
+            audioSegmentId: "segment-\(audioID)",
             audioArtifactId: audioID,
-            audioStartedAtMs: startedAtMs
+            audioStartedAtMs: segmentStartedAtMs,
+            audioEndedAtMs: max(segmentStartedAtMs + 60_000, capturedAtMs + 1_000)
         )
     }
 }

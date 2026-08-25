@@ -15,6 +15,10 @@ pub const QWEN35_9B_MLX_PACK_ID: &str = "llm_qwen35_9b_mlx4";
 pub const QWEN3_ASR_REPOSITORY: &str = "Qwen/Qwen3-ASR-1.7B";
 pub const QWEN3_ASR_REVISION: &str = "7278e1e70fe206f11671096ffdd38061171dd6e5";
 pub const QWEN3_ASR_EXPECTED_BYTES: u64 = 4_703_114_308;
+pub const QWEN3_ALIGNER_PACK_ID: &str = "asr_aligner";
+pub const QWEN3_ALIGNER_REPOSITORY: &str = "Qwen/Qwen3-ForcedAligner-0.6B";
+pub const QWEN3_ALIGNER_REVISION: &str = "c7cbfc2048c462b0d63a45797104fc9db3ad62b7";
+pub const QWEN3_ALIGNER_EXPECTED_BYTES: u64 = 1_840_072_459;
 pub const NOMIC_EMBED_REPOSITORY: &str = "nomic-ai/nomic-embed-text-v1.5-GGUF";
 pub const NOMIC_EMBED_FILE: &str = "nomic-embed-text-v1.5.Q4_K_M.gguf";
 pub const NOMIC_EMBED_REVISION: &str = "0188c9bf409793f810680a5a431e7b899c46104c";
@@ -107,7 +111,28 @@ impl PackSpec {
             }
             PackSource::HuggingFacePinnedSnapshot {
                 revision, files, ..
-            } => inspect_pinned_snapshot(&self.path, revision, files),
+            } => {
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                if self.capability == "llm_vlm" {
+                    return ModelPack {
+                        id: self.id.clone(),
+                        name: self.name.clone(),
+                        capability: self.capability.clone(),
+                        path: self.path.display().to_string(),
+                        present: false,
+                        state: ModelPackState::Incompatible,
+                        bytes: directory_size(&self.path),
+                        required: self.required,
+                        note: Some(self.note.clone()),
+                        expected_bytes: Some(self.expected_bytes),
+                        revision: self.revision().map(ToOwned::to_owned),
+                        error: Some(
+                            "AfterRay MLX requires Apple Silicon and macOS 14 or newer".into(),
+                        ),
+                    };
+                }
+                inspect_pinned_snapshot(&self.path, revision, files)
+            }
             _ => {
                 let (present, bytes) = inspect_model_path(&self.path);
                 let state = if present {
@@ -190,6 +215,8 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
     let embedding_file = env_or("AFTERRAY_EMBEDDING_FILE", NOMIC_EMBED_FILE);
     let embedding_pinned =
         embedding_repository == NOMIC_EMBED_REPOSITORY && embedding_file == NOMIC_EMBED_FILE;
+    let aligner_repository = env_or("AFTERRAY_ALIGNER_REPOSITORY", QWEN3_ALIGNER_REPOSITORY);
+    let aligner_pinned = aligner_repository == QWEN3_ALIGNER_REPOSITORY;
     vec![
         PackSpec {
             id: "asr".into(),
@@ -202,6 +229,35 @@ pub fn catalog_in(directory: &Path) -> Vec<PackSpec> {
             source: PackSource::HuggingFaceSnapshot {
                 repository: asr_repository,
                 pin: asr_pin,
+            },
+        },
+        PackSpec {
+            id: QWEN3_ALIGNER_PACK_ID.into(),
+            name: "Qwen3 subtitle aligner".into(),
+            capability: "asr_alignment".into(),
+            path: env_or_join(
+                "AFTERRAY_ALIGNER_MODEL",
+                directory,
+                "Qwen3-ForcedAligner-0.6B",
+            ),
+            required: true,
+            note: format!("{aligner_repository} · word/character timestamps · ZH/EN/JA · Rust/CPU"),
+            expected_bytes: if aligner_pinned {
+                QWEN3_ALIGNER_EXPECTED_BYTES
+            } else {
+                1_840_000_000
+            },
+            source: if aligner_pinned {
+                PackSource::HuggingFacePinnedSnapshot {
+                    repository: aligner_repository,
+                    revision: QWEN3_ALIGNER_REVISION.into(),
+                    files: qwen3_aligner_manifest(),
+                }
+            } else {
+                PackSource::HuggingFaceSnapshot {
+                    repository: aligner_repository,
+                    pin: None,
+                }
             },
         },
         PackSpec {
@@ -293,6 +349,72 @@ pub fn qwen3_asr_manifest() -> Vec<ManifestFile> {
             "tokenizer_config.json",
             12_487,
             "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+        ),
+        (
+            "vocab.json",
+            2_776_833,
+            "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        ),
+    ];
+    FILES
+        .iter()
+        .map(|(path, bytes, sha256)| ManifestFile {
+            path: (*path).into(),
+            bytes: *bytes,
+            sha256: (*sha256).into(),
+        })
+        .collect()
+}
+
+/// Exact official `ForcedAligner` snapshot. It is a separate pack so text ASR
+/// remains usable when timestamp alignment is unavailable or still downloading.
+#[must_use]
+pub fn qwen3_aligner_manifest() -> Vec<ManifestFile> {
+    const FILES: &[(&str, u64, &str)] = &[
+        (
+            ".gitattributes",
+            1_519,
+            "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
+        ),
+        (
+            "README.md",
+            57_456,
+            "5058416891bc47a2051557765997e8c42f8eb78a0e33c3e775bd17d4b0ba4d50",
+        ),
+        (
+            "chat_template.json",
+            1_161,
+            "75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff",
+        ),
+        (
+            "config.json",
+            5_982,
+            "d616c65d46c4b90bdc651b0a0963ea932732241140f337f9bb6b0335a9c8ef09",
+        ),
+        (
+            "generation_config.json",
+            115,
+            "948d089b23bca1d214e768d59c4438365665f52ec6d33678f4062206b3fbbb8c",
+        ),
+        (
+            "merges.txt",
+            1_671_853,
+            "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        ),
+        (
+            "model.safetensors",
+            1_835_544_544,
+            "47831d0e82f96b20e9034dba01a075ee06436654719f6a68289e49f1b65ce0e7",
+        ),
+        (
+            "preprocessor_config.json",
+            330,
+            "45e120a4eda2c20c5d7f2ea9354e63536bf35e27aa573fb7cdf78017b378770d",
+        ),
+        (
+            "tokenizer_config.json",
+            12_666,
+            "3ab80063f8511deb9566e6ad438d17b7a6277fcffd52d92854112f19d36bd81c",
         ),
         (
             "vocab.json",
@@ -563,49 +685,37 @@ fn inspect_pinned_snapshot(
     revision: &str,
     files: &[ManifestFile],
 ) -> (bool, u64, ModelPackState, Option<String>) {
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        return (
-            false,
-            directory_size(path),
-            ModelPackState::Incompatible,
-            Some("AfterRay MLX requires Apple Silicon and macOS 14 or newer".into()),
-        );
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        let bytes = directory_size(path);
-        let marker = path.join(READY_MARKER);
-        let marker_revision = std::fs::read_to_string(marker)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|value| value.get("revision")?.as_str().map(ToOwned::to_owned));
-        if marker_revision.as_deref() != Some(revision) {
-            let staging = download_staging_path(path);
-            if staging.is_dir() {
-                return (
-                    false,
-                    directory_size(&staging),
-                    ModelPackState::Downloading,
-                    Some("download is resumable; continue from Settings".into()),
-                );
-            }
-            return (false, bytes, ModelPackState::NotDownloaded, None);
+    let bytes = directory_size(path);
+    let marker = path.join(READY_MARKER);
+    let marker_revision = std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("revision")?.as_str().map(ToOwned::to_owned));
+    if marker_revision.as_deref() != Some(revision) {
+        let staging = download_staging_path(path);
+        if staging.is_dir() {
+            return (
+                false,
+                directory_size(&staging),
+                ModelPackState::Downloading,
+                Some("download is resumable; continue from Settings".into()),
+            );
         }
-        for file in files {
-            let candidate = path.join(&file.path);
-            let size = std::fs::metadata(&candidate).ok().map(|meta| meta.len());
-            if size != Some(file.bytes) {
-                return (
-                    false,
-                    bytes,
-                    ModelPackState::Failed,
-                    Some(format!("{} is missing or has the wrong size", file.path)),
-                );
-            }
-        }
-        (true, bytes, ModelPackState::Ready, None)
+        return (false, bytes, ModelPackState::NotDownloaded, None);
     }
+    for file in files {
+        let candidate = path.join(&file.path);
+        let size = std::fs::metadata(&candidate).ok().map(|meta| meta.len());
+        if size != Some(file.bytes) {
+            return (
+                false,
+                bytes,
+                ModelPackState::Failed,
+                Some(format!("{} is missing or has the wrong size", file.path)),
+            );
+        }
+    }
+    (true, bytes, ModelPackState::Ready, None)
 }
 
 fn download_staging_path(path: &Path) -> PathBuf {
@@ -685,7 +795,7 @@ mod tests {
     /// The pins are what make third-party download mirrors safe to use:
     /// sizes and hashes are recorded here, never taken from the server.
     #[test]
-    fn asr_and_embedding_are_pinned_with_matching_totals() {
+    fn speech_and_embedding_packs_are_pinned_with_matching_totals() {
         let catalog = catalog_in(Path::new("/tmp/afterray-models"));
 
         let asr = catalog.iter().find(|pack| pack.id == "asr").unwrap();
@@ -700,6 +810,24 @@ mod tests {
         );
         assert!(pin.files.iter().all(|file| file.sha256.len() == 64));
         assert_eq!(asr.revision(), Some(QWEN3_ASR_REVISION));
+
+        let aligner = catalog
+            .iter()
+            .find(|pack| pack.id == QWEN3_ALIGNER_PACK_ID)
+            .unwrap();
+        assert_eq!(aligner.revision(), Some(QWEN3_ALIGNER_REVISION));
+        assert_eq!(
+            qwen3_aligner_manifest()
+                .iter()
+                .map(|file| file.bytes)
+                .sum::<u64>(),
+            QWEN3_ALIGNER_EXPECTED_BYTES
+        );
+        assert!(
+            qwen3_aligner_manifest()
+                .iter()
+                .all(|file| file.sha256.len() == 64)
+        );
 
         let embedding = catalog.iter().find(|pack| pack.id == "embedding").unwrap();
         let PackSource::HuggingFaceFile {
@@ -717,13 +845,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_asr_embedding_and_the_managed_mlx_packs() {
+    fn catalog_has_speech_embedding_and_the_managed_mlx_packs() {
         let catalog = catalog_in(Path::new("/tmp/afterray-models"));
         let ids: Vec<_> = catalog.iter().map(|spec| spec.id.as_str()).collect();
         assert_eq!(
             ids,
             [
                 "asr",
+                QWEN3_ALIGNER_PACK_ID,
                 "embedding",
                 QWEN35_4B_MLX_PACK_ID,
                 QWEN35_9B_MLX_PACK_ID
@@ -731,20 +860,21 @@ mod tests {
         );
         assert!(catalog[0].required);
         assert!(catalog[1].required);
-        assert!(!catalog[2].required);
+        assert!(catalog[2].required);
         assert!(!catalog[3].required);
-        assert_eq!(catalog[2].expected_bytes, QWEN35_4B_MLX_EXPECTED_BYTES);
-        assert_eq!(catalog[2].revision(), Some(QWEN35_4B_MLX_REVISION));
+        assert!(!catalog[4].required);
+        assert_eq!(catalog[3].expected_bytes, QWEN35_4B_MLX_EXPECTED_BYTES);
+        assert_eq!(catalog[3].revision(), Some(QWEN35_4B_MLX_REVISION));
         assert_eq!(
             QWEN35_4B_MLX_REPOSITORY,
             "mlx-community/Qwen3.5-4B-MLX-4bit"
         );
         assert!(matches!(
-            catalog[2].source,
+            catalog[3].source,
             PackSource::HuggingFacePinnedSnapshot { .. }
         ));
-        assert_eq!(catalog[3].expected_bytes, QWEN35_9B_MLX_EXPECTED_BYTES);
-        assert_eq!(catalog[3].revision(), Some(QWEN35_9B_MLX_REVISION));
+        assert_eq!(catalog[4].expected_bytes, QWEN35_9B_MLX_EXPECTED_BYTES);
+        assert_eq!(catalog[4].revision(), Some(QWEN35_9B_MLX_REVISION));
         assert_eq!(
             QWEN35_9B_MLX_REPOSITORY,
             "mlx-community/Qwen3.5-9B-MLX-4bit"
@@ -786,6 +916,10 @@ mod tests {
         ));
         assert!(matches!(
             catalog[1].source,
+            PackSource::HuggingFacePinnedSnapshot { .. }
+        ));
+        assert!(matches!(
+            catalog[2].source,
             PackSource::HuggingFaceFile { .. }
         ));
         let weights = qwen35_9b_mlx_manifest()

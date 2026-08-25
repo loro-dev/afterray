@@ -3,7 +3,7 @@ import Foundation
 import ImageIO
 import Vision
 
-private let protocolVersion = 1
+private let protocolVersion = 2
 
 private struct WorkerRequest: Decodable {
     let protocolVersion: Int
@@ -132,5 +132,5 @@ do {
         retryable: false
     )
     let data = try? JSONEncoder().encode(response)
-    print(data.map { String(decoding: $0, as: UTF8.self) } ?? "{\"protocol_version\":1,\"error\":\"Native worker failed\",\"retryable\":false}")
+    print(data.map { String(decoding: $0, as: UTF8.self) } ?? "{\"protocol_version\":2,\"error\":\"Native worker failed\",\"retryable\":false}")
 }

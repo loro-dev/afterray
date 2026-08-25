@@ -1149,6 +1149,7 @@ fn output_summary(output: &ModelOutput) -> String {
             }
             _ => format!("asr, {} chars", text.chars().count()),
         },
+        ModelOutput::Alignment { cues } => format!("alignment, {} cues", cues.len()),
         ModelOutput::Embedding { vector } => format!("embedding, {} dims", vector.len()),
         ModelOutput::Llm { text, .. } => format!("llm, {} chars", text.chars().count()),
     }
@@ -1557,11 +1558,9 @@ mod tests {
     #[tokio::test]
     async fn prepare_runs_before_the_job_can_start() {
         let queue = ModelQueue::new(
-            vec![Arc::new(crate::ProcessAdapter::new(crate::ProcessAdapterConfig::new(
-                "echo-llm",
-                ModelCapability::Llm,
-                "/bin/false",
-            ))) as Arc<dyn ModelAdapter>],
+            vec![Arc::new(crate::ProcessAdapter::new(
+                crate::ProcessAdapterConfig::new("echo-llm", ModelCapability::Llm, "/bin/false"),
+            )) as Arc<dyn ModelAdapter>],
             QueueConfig::default(),
         )
         .unwrap();

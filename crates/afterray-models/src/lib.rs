@@ -14,18 +14,19 @@ mod process;
 mod queue;
 mod remote;
 
-pub use catalog::{
-    ManifestFile, PackSource, PackSpec, QWEN35_4B_MLX_EXPECTED_BYTES, QWEN35_4B_MLX_PACK_ID,
-    QWEN35_4B_MLX_REPOSITORY, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_EXPECTED_BYTES,
-    QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REPOSITORY, QWEN35_9B_MLX_REVISION, READY_MARKER,
-    catalog_in, default_catalog, inspect_model_path, library, library_in,
-    mlx_pack_context_tokens, model_directory,
-    qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
-    specs_for_download, specs_for_download_in,
-};
 pub use asr_pack::{
     QWEN3_ASR_RECIPE_VERSION, invalidate_qwen3_asr_ready, prepare_configured_qwen3_asr,
     prepare_qwen3_asr, verify_qwen3_asr_prepared,
+};
+pub use catalog::{
+    ManifestFile, PackSource, PackSpec, QWEN3_ALIGNER_EXPECTED_BYTES, QWEN3_ALIGNER_PACK_ID,
+    QWEN3_ALIGNER_REPOSITORY, QWEN3_ALIGNER_REVISION, QWEN35_4B_MLX_EXPECTED_BYTES,
+    QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REPOSITORY, QWEN35_4B_MLX_REVISION,
+    QWEN35_9B_MLX_EXPECTED_BYTES, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REPOSITORY,
+    QWEN35_9B_MLX_REVISION, READY_MARKER, catalog_in, default_catalog, inspect_model_path, library,
+    library_in, mlx_pack_context_tokens, model_directory, qwen3_aligner_manifest,
+    qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
+    specs_for_download, specs_for_download_in,
 };
 pub use context::{
     CONTEXT_ENV_VARS, ContextProbe, MINIMUM_CONTEXT_TOKENS, REMOTE_DEFAULT_CONTEXT_TOKENS,
@@ -35,10 +36,9 @@ pub use context::{
 pub use delta::{LlmDelta, LlmDeltaKind};
 pub use download::{
     ABANDONED_DOWNLOAD_GRACE, DownloadError, DownloadProgress, MIRROR_HUGGINGFACE_ENDPOINT,
-    OFFICIAL_HUGGINGFACE_ENDPOINT, download_pack, download_packs,
-    download_packs_with_cancellation, huggingface_endpoint, huggingface_mirror_to_persist,
-    reclaim_abandoned_downloads, remove_pack, set_huggingface_endpoint, staging_directory,
-    verify_files,
+    OFFICIAL_HUGGINGFACE_ENDPOINT, download_pack, download_packs, download_packs_with_cancellation,
+    huggingface_endpoint, huggingface_mirror_to_persist, reclaim_abandoned_downloads, remove_pack,
+    set_huggingface_endpoint, staging_directory, verify_files,
 };
 pub use persistent_mlx::{
     MLX_WORKER_PROTOCOL_VERSION, MlxWorkerHealth, PersistentMlxAdapter, PersistentMlxConfig,
@@ -58,6 +58,7 @@ pub use remote::{
     openai_sse_delta, probe_llm, recommend_model,
 };
 
+pub use afterray_protocol::{TranscriptCue, TranscriptTimingKind};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
@@ -97,6 +98,14 @@ pub enum ModelInput {
         audio_path: PathBuf,
         #[serde(skip_serializing_if = "Option::is_none")]
         language: Option<String>,
+    },
+    /// Second ASR stage: align known text against the same 16 kHz audio and
+    /// return bounded cues. It shares the ASR lane but has independent durable
+    /// state in the vault, so a missing aligner never discards transcription.
+    Align {
+        audio_path: PathBuf,
+        text: String,
+        language: String,
     },
     Embedding {
         text: String,
@@ -142,7 +151,7 @@ impl ModelInput {
     pub const fn capability(&self) -> ModelCapability {
         match self {
             Self::Ocr { .. } => ModelCapability::Ocr,
-            Self::Asr { .. } => ModelCapability::Asr,
+            Self::Asr { .. } | Self::Align { .. } => ModelCapability::Asr,
             Self::Embedding { .. } => ModelCapability::Embedding,
             Self::Llm { .. } => ModelCapability::Llm,
         }
@@ -178,6 +187,9 @@ pub enum ModelOutput {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         language: Option<String>,
+    },
+    Alignment {
+        cues: Vec<TranscriptCue>,
     },
     Embedding {
         vector: Vec<f32>,
@@ -221,7 +233,7 @@ impl ModelOutput {
     pub const fn capability(&self) -> ModelCapability {
         match self {
             Self::Ocr { .. } => ModelCapability::Ocr,
-            Self::Asr { .. } => ModelCapability::Asr,
+            Self::Asr { .. } | Self::Alignment { .. } => ModelCapability::Asr,
             Self::Embedding { .. } => ModelCapability::Embedding,
             Self::Llm { .. } => ModelCapability::Llm,
         }
