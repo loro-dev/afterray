@@ -26,8 +26,8 @@ The daemon samples machine-wide GPU utilization once a second through public
 IOKit: the `AGXAccelerator` service's `PerformanceStatistics` dictionary,
 key `Device Utilization %` (falling back to `GPU Activity(%)`), exposed by
 `afterray_platform_macos::gpu_utilization()`. The governor keeps the newest
-fifteen readings; after the CPU gate passes, summaries may run only when the
-average over the last fifteen seconds is at or below 0.5.
+fifteen readings; after the CPU gate passes, summaries and transcription may
+run only when the average over the last fifteen seconds is at or below 0.5.
 
 The gate is fail-closed, exactly like the load average: a failed probe
 records no sample, so the window goes stale, and an empty or stale window
@@ -35,8 +35,9 @@ holds summaries with "GPU utilization unavailable" — an unanswered probe is
 never read as "idle". `AFTERRAY_GPU_PROBE=0` at daemon launch skips the check
 and never starts the sampler. A "run now" override bypasses the gate with the
 rest of the machine conditions: the user pressing start is newer information
-than any reading. Only summaries carry the check; see below for why ASR and
-Archive do not.
+than any reading. Archive does not carry the check — an all-core CPU encode
+has no GPU to contend for; ASR gained it by later user direction, see
+[2026-08-25-asr-machine-gate](2026-08-25-asr-machine-gate.md).
 
 ## Alternatives considered
 
@@ -57,10 +58,12 @@ model state as much as with external GPU load, and a gate that fires on its
 own workload's slowdown is a feedback loop. Kept in mind as the fallback if
 the AGX statistics key ever stops answering.
 
-**GPU gates on ASR and Archive too.** Rejected. The ASR backlog is durable
-(audio rows wait in the vault), is already serialized through the GPU lane,
-and already throttles on battery — a wait costs minutes, never data. Archive
-is an all-core CPU encode with no GPU to contend for.
+**GPU gates on ASR and Archive too.** Archive is an all-core CPU encode with
+no GPU to contend for, so it stays ungated. ASR was originally left ungated —
+its backlog is durable (audio rows wait in the vault), it is already
+serialized through the GPU lane, and it already throttles on battery — but
+later user direction gave it the same idle/load/GPU conditions as summaries:
+[2026-08-25-asr-machine-gate](2026-08-25-asr-machine-gate.md).
 
 **Per-process GPU accounting.** Still does not exist as a public macOS API;
 that is why the dashboard reports lanes instead of percentages, and this gate

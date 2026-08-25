@@ -166,6 +166,35 @@ pub(crate) fn t2_may_run(conditions: MachineConditions) -> GateDecision {
     }
 }
 
+// @dec:asr-machine-gate — docs/decisions/active/architecture/2026-08-25-asr-machine-gate.md
+/// Transcription shares the summary gate's idle and load conditions — a
+/// multi-second Metal job the user would feel while active — but not its
+/// power policy: on battery it throttles (`asr_sweep_interval`) instead of
+/// stopping, because the audio rows are a durable backlog. The governor
+/// chains the GPU check onto this at `decide`.
+pub(crate) fn asr_may_run(conditions: MachineConditions) -> GateDecision {
+    if conditions.idle_seconds < T2_MIN_IDLE_SECONDS {
+        return Err(GateRefusal::new(
+            ComputeGateCode::InUse,
+            format!(
+                "in use {:.0}s ago, needs {T2_MIN_IDLE_SECONDS:.0}s",
+                conditions.idle_seconds
+            ),
+        ));
+    }
+    match conditions.load_per_core {
+        Some(load) if load > T2_MAX_LOAD_PER_CORE => Err(GateRefusal::new(
+            ComputeGateCode::MachineBusy,
+            format!("load {load:.2}/core is above {T2_MAX_LOAD_PER_CORE:.2}"),
+        )),
+        None => Err(GateRefusal::new(
+            ComputeGateCode::Unavailable,
+            "load average unavailable",
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// How much work each workload has waiting, in the two forms that differ.
 ///
 /// `pending` is what reached the in-memory job queue — seconds of it. `backlog`
@@ -461,15 +490,15 @@ impl ComputeGovernor {
     }
 
     // @dec:gpu-utilization-gate — docs/decisions/active/architecture/2026-08-24-gpu-utilization-gate.md
-    /// The machine-GPU check summaries run after the CPU gate. The load
-    /// average sees only CPU work; a game, a local LLM, or a video export
-    /// elsewhere on the machine is exactly what it misses.
+    /// The machine-GPU check GPU-heavy background work runs after the CPU
+    /// gate. The load average sees only CPU work; a game, a local LLM, or a
+    /// video export elsewhere on the machine is exactly what it misses.
     ///
     /// Fail-closed like the load average: the newest reading must be no older
     /// than the window, and the average over the window must sit under the
     /// threshold. An empty or stale window means the probe is not answering,
     /// which is not permission.
-    fn summary_gpu_may_run(&self, now_ms: i64) -> GateDecision {
+    fn gpu_may_run(&self, now_ms: i64) -> GateDecision {
         if self.limits.gpu_probe_disabled_by_env {
             return Ok(());
         }
@@ -535,8 +564,9 @@ impl ComputeGovernor {
         match workload {
             // Both of these are the reason a machine feels slow: a 200-second
             // local model pass, and an all-core AV1 encode.
-            ComputeWorkload::Summary => t2_may_run(conditions)
-                .and_then(|()| self.summary_gpu_may_run(now_ms)),
+            ComputeWorkload::Summary => {
+                t2_may_run(conditions).and_then(|()| self.gpu_may_run(now_ms))
+            }
             ComputeWorkload::Archive => {
                 if conditions.on_ac {
                     Ok(())
@@ -547,11 +577,17 @@ impl ComputeGovernor {
                     ))
                 }
             }
-            // Cheap, and each one is the only chance to index what was just
-            // captured. Transcription slows down on battery instead of
-            // stopping — the audio rows are a durable backlog, so late is fine
+            // Transcription waits for the same idle, quiet, GPU-free machine
+            // summaries do — it is a multi-second Metal job — but keeps its
+            // own power policy: on battery it throttles instead of stopping,
+            // because the audio rows are a durable backlog, so late is fine
             // and never is not.
-            ComputeWorkload::Ocr | ComputeWorkload::Asr | ComputeWorkload::Embedding => Ok(()),
+            ComputeWorkload::Asr => {
+                asr_may_run(conditions).and_then(|()| self.gpu_may_run(now_ms))
+            }
+            // Cheap, and each one is the only chance to index what was just
+            // captured.
+            ComputeWorkload::Ocr | ComputeWorkload::Embedding => Ok(()),
         }
     }
 
@@ -857,6 +893,7 @@ mod tests {
             let refusal = governor.decide(held, on_battery, 0).unwrap_err();
             assert_eq!(refusal.code, ComputeGateCode::OnBattery, "{held:?}");
         }
+        record_steady_gpu(&governor, 0, 0.1);
         for allowed in [
             ComputeWorkload::Ocr,
             ComputeWorkload::Asr,
@@ -876,6 +913,7 @@ mod tests {
             on_ac: false,
             ..IDEAL
         };
+        record_steady_gpu(&governor, 0, 0.1);
         assert!(governor.decide(ComputeWorkload::Asr, on_battery, 0).is_ok());
         assert!(
             governor.asr_sweep_interval(on_battery, 0) > governor.asr_sweep_interval(IDEAL, 0),
@@ -883,9 +921,83 @@ mod tests {
         );
     }
 
+    /// Transcription is a multi-second Metal job: like summaries, it waits for
+    /// an idle, quiet, GPU-free machine. Battery stays a throttle, not a stop.
+    #[test]
+    fn transcription_waits_for_an_idle_quiet_machine() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        record_steady_gpu(&governor, now, 0.1);
+
+        for (label, conditions, code) in [
+            (
+                "recently active",
+                MachineConditions {
+                    idle_seconds: 5.0,
+                    ..IDEAL
+                },
+                ComputeGateCode::InUse,
+            ),
+            (
+                "busy",
+                MachineConditions {
+                    load_per_core: Some(3.0),
+                    ..IDEAL
+                },
+                ComputeGateCode::MachineBusy,
+            ),
+            (
+                "unreadable load",
+                MachineConditions {
+                    load_per_core: None,
+                    ..IDEAL
+                },
+                ComputeGateCode::Unavailable,
+            ),
+        ] {
+            assert_eq!(
+                governor
+                    .decide(ComputeWorkload::Asr, conditions, now)
+                    .unwrap_err()
+                    .code,
+                code,
+                "{label}"
+            );
+        }
+        assert!(governor.decide(ComputeWorkload::Asr, IDEAL, now).is_ok());
+    }
+
+    #[test]
+    fn transcription_waits_while_the_gpu_is_busy() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        record_steady_gpu(&governor, now, 0.9);
+        let refusal = governor
+            .decide(ComputeWorkload::Asr, IDEAL, now)
+            .unwrap_err();
+        assert_eq!(refusal.code, ComputeGateCode::MachineBusy);
+        assert!(refusal.reason.contains("GPU"), "{}", refusal.reason);
+    }
+
+    /// Pressing start is newer information than any reading: a forced
+    /// transcription run skips the machine conditions, like a forced summary.
+    #[test]
+    fn run_now_lets_transcription_ignore_the_machine() {
+        let governor = governor(ComputeMode::Full);
+        let now = 1_700_000_000_000;
+        governor.force_now(ComputeWorkload::Asr, now);
+        let hostile = MachineConditions {
+            idle_seconds: 0.0,
+            load_per_core: Some(9.0),
+            ..IDEAL
+        };
+        assert!(governor.decide(ComputeWorkload::Asr, hostile, now).is_ok());
+    }
+
     #[test]
     fn essential_mode_keeps_indexing_and_drops_the_expensive_work() {
         let governor = governor(ComputeMode::Essential);
+        record_steady_gpu(&governor, 0, 0.1);
         for allowed in [
             ComputeWorkload::Ocr,
             ComputeWorkload::Asr,
@@ -1077,8 +1189,9 @@ mod tests {
         );
     }
 
-    /// Transcription has no machine gate, so bypassing the gate alone would make
-    /// its "run now" nothing but a redrawn row. The override has to reach the
+    /// Transcription's "run now" must do more than skip the machine gates:
+    /// the battery throttle would still stretch the sweep to five minutes,
+    /// leaving the button a redrawn row. The override has to reach the
     /// throttle that is actually slowing it down.
     #[test]
     fn forcing_transcription_speeds_up_its_sweep_on_battery() {
@@ -1173,6 +1286,7 @@ mod tests {
         governor.pause_for(now, 3600);
         governor.force_now(ComputeWorkload::Summary, now);
         assert!(governor.paused_until_ms(now).is_none());
+        record_steady_gpu(&governor, now, 0.1);
         assert!(governor.decide(ComputeWorkload::Asr, IDEAL, now).is_ok());
     }
 

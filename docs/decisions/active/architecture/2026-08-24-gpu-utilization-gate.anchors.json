@@ -1,5 +1,5 @@
 {
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
   "crates/afterray-platform-macos/src/gpu.rs::pub fn gpu_utilization() -> Option<f64> {": "sha256:6384072aa97c8df7",
-  "crates/afterrayd/src/compute.rs::fn summary_gpu_may_run(&self, now_ms: i64) -> GateDecision {": "sha256:ab444df25dc21a94"
+  "crates/afterrayd/src/compute.rs::fn gpu_may_run(&self, now_ms: i64) -> GateDecision {": "sha256:e23ee93f04eac4da"
 }

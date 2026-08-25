@@ -17,7 +17,7 @@ Before this existed, the answer was scattered and the app's story was not true:
 | Workload | Where it runs | Gate before | Gate now |
 |---|---|---|---|
 | Screen text (OCR, Apple Vision) | `ProcessAdapter` child, per capture (~10s) | none | mode `off` only |
-| Transcription (Qwen3-ASR) | `ProcessAdapter` child, 60s sweeper | none | governor; throttled to 300s on battery |
+| Transcription (Qwen3-ASR) | `ProcessAdapter` child, 60s sweeper | none | governor: waits for an idle, quiet, GPU-free machine like summaries; throttled to 300s on battery |
 | Search index (embeddings) | `ProcessAdapter` child, per evidence row | none | governor |
 | Summaries (T2, local LLM) | persistent MLX worker, 5-min sweeper | AC + ≥30% battery + ≥30s idle + load/core ≤0.7 | governor: AC + ≥30% battery + ≥120s idle + load/core ≤0.7; worker unloads after 120s unused |
 | Archive compression (rav1e) | thread **inside** the daemon | `AFTERRAY_GOP_REQUIRE_AC`, default **off** | governor only (`require_ac` removed) |
@@ -159,9 +159,10 @@ machine actually wants.
 - **Whether the button is offered is the daemon's call** (`ComputeGate.can_run_now`).
   It depends on which workloads have a machine gate or a throttle of their own —
   something only `decide` knows — so a client that re-derived it would drift the
-  moment that changed. Transcription qualifies because its override also reaches
-  `asr_sweep_interval`: ASR has no machine gate, so bypassing the gate alone would
-  have made its button redraw a row and nothing else.
+  moment that changed. Transcription qualifies because its override reaches both
+  the machine gates it shares with summaries and `asr_sweep_interval`: bypassing
+  the gates alone would leave the battery throttle stretching the sweep to five
+  minutes, and the button would redraw a row and nothing else.
 - **What "run now" will and will not override.** It skips the *machine
   conditions*, and it lifts an active suspension, because pressing start is newer
   information from the same person and keeping the pause would leave a button
@@ -187,8 +188,9 @@ project rejects outright — private-framework FFI in a workspace that denies
 There is, however, a public IOKit path to a **machine-wide** reading — the
 `AGXAccelerator` service's `PerformanceStatistics["Device Utilization %"]`,
 the same key stats and mxmon use. The daemon samples it at 1 Hz
-(`afterray_platform_macos::gpu_utilization`) and the summary gate averages
-the last 15 seconds: above 50% machine-wide GPU, summaries wait, because a
+(`afterray_platform_macos::gpu_utilization`) and the governor averages
+the last 15 seconds: above 50% machine-wide GPU, summaries and transcription
+wait, because a
 game or a local LLM elsewhere is exactly the load the CPU load average
 misses. Fail-closed like the other probes, disable-able with
 `AFTERRAY_GPU_PROBE=0`. The full trade-off:
