@@ -9,9 +9,10 @@
     "apps/AfterRay/AGENTS.md": 6400,
     "apps/AfterRayCaptureShim/AGENTS.md": 6700,
     "crates/afterray-models/AGENTS.md": 6500,
+    "crates/afterray-platform-macos/AGENTS.md": 4400,
     "crates/afterray-protocol/AGENTS.md": 4300,
     "crates/afterray-store/AGENTS.md": 10400,
-    "crates/afterrayd/AGENTS.md": 8200,
+    "crates/afterrayd/AGENTS.md": 8400,
     "scripts/AGENTS.md": 5300,
     "swift/AfterRayRecall/AGENTS.md": 10800
   }

@@ -1,0 +1,4 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterrayd/src/compute.rs::pub(crate) fn asr_may_run(conditions: MachineConditions) -> GateDecision {": "sha256:5c9d08c999bbb2d8"
+}

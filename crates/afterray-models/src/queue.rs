@@ -119,6 +119,10 @@ pub struct QueueConfig {
     pub max_attempts: u32,
     pub retry_delay: Duration,
     pub concurrency: CapabilityConcurrency,
+    /// Serialize background local-GPU work across capabilities, so an OCR
+    /// pass, a transcription and a background LLM summary never run at the
+    /// same time. Only interactive chat bypasses the lane.
+    pub gpu_lane: bool,
 }
 
 impl Default for QueueConfig {
@@ -127,6 +131,7 @@ impl Default for QueueConfig {
             max_attempts: 3,
             retry_delay: Duration::from_secs(2),
             concurrency: CapabilityConcurrency::default(),
+            gpu_lane: true,
         }
     }
 }
@@ -326,6 +331,149 @@ impl LlmLeaseHold {
 impl Drop for LlmLeaseHold {
     fn drop(&mut self) {
         self.inner.llm_gate.remove_hold(self.lease);
+        self.inner.gpu_gate.remove_hold(self.lease);
+    }
+}
+
+/// Scheduling class for the GPU lane. OCR is on the capture critical path —
+/// short, and a frame that goes un-OCR'd is never indexed later — so it jumps
+/// ahead of background work whose backlog is durable (audio rows, vault
+/// counts). Within a class, admission is FIFO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GpuClass {
+    Ocr,
+    Background,
+}
+
+// @dec:gpu-lane-serialization — docs/decisions/active/architecture/2026-08-24-gpu-lane-serialization.md
+/// Priority admission for the local-GPU lane: one permit, so at most one
+/// background GPU job runs at a time across all capabilities. Same shape as
+/// [`LlmGate`], holds included: while an LLM lease hold is active, plain
+/// background work is not admitted — the slot is reserved for OCR and for
+/// the rounds of the loop that holds the lease. That mirror is what lets a
+/// leased background pass (the T2 summariser) ride the lane without
+/// deadlocking against a plain background job the same hold keeps out of
+/// the LLM gate: a waiter the holds exclude parks here holding nothing.
+struct GpuGate {
+    state: std::sync::Mutex<GpuGateState>,
+}
+
+struct GpuGateState {
+    free: usize,
+    next_seq: u64,
+    waiters: Vec<GpuGateWaiter>,
+    /// Lease ids held open by a live multi-round loop (the T2 summariser).
+    /// Mirrored from `LlmGate` by `ModelQueue::hold_llm_lease`.
+    holds: Vec<u64>,
+}
+
+struct GpuGateWaiter {
+    class: GpuClass,
+    lease: Option<u64>,
+    seq: u64,
+    admit: tokio::sync::oneshot::Sender<()>,
+}
+
+impl GpuGate {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(GpuGateState {
+                free: 1,
+                next_seq: 0,
+                waiters: Vec::new(),
+                holds: Vec::new(),
+            }),
+        }
+    }
+
+    /// Whether a waiter of this shape may take the slot right now. OCR is
+    /// always admissible; background work only while no LLM lease hold is
+    /// active, or when it is a round of the loop holding one.
+    fn admissible(state: &GpuGateState, class: GpuClass, lease: Option<u64>) -> bool {
+        class == GpuClass::Ocr
+            || state.holds.is_empty()
+            || lease.is_some_and(|id| state.holds.contains(&id))
+    }
+
+    async fn acquire(&self, class: GpuClass, lease: Option<u64>) {
+        let waiting = {
+            let mut state = self.state.lock().unwrap();
+            if state.free > 0
+                && state.waiters.is_empty()
+                && Self::admissible(&state, class, lease)
+            {
+                state.free -= 1;
+                None
+            } else {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let seq = state.next_seq;
+                state.next_seq += 1;
+                state.waiters.push(GpuGateWaiter {
+                    class,
+                    lease,
+                    seq,
+                    admit: tx,
+                });
+                // The slot can be free even with waiters parked: a hold may
+                // have kept plain background out while nothing admissible was
+                // queued. A newly admissible arrival must trigger a hand-over
+                // now — no later event will.
+                if state.free > 0 {
+                    state.free -= 1;
+                    Self::hand_over(&mut state);
+                }
+                Some(rx)
+            }
+        };
+        if let Some(rx) = waiting {
+            // A dropped sender only happens on queue teardown; treat as admit
+            // so shutdown never deadlocks a waiter.
+            let _ = rx.await;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        Self::hand_over(&mut state);
+    }
+
+    fn add_hold(&self, lease: u64) {
+        self.state.lock().unwrap().holds.push(lease);
+    }
+
+    fn remove_hold(&self, lease: u64) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(index) = state.holds.iter().position(|held| *held == lease) {
+            state.holds.swap_remove(index);
+        }
+        // A slot may have been left free for this hold; offer it to whoever
+        // is now admissible.
+        if state.free > 0 {
+            state.free -= 1;
+            Self::hand_over(&mut state);
+        }
+    }
+
+    /// Hands one slot to the best admissible waiter, or banks it as free.
+    fn hand_over(state: &mut GpuGateState) {
+        loop {
+            let best = state
+                .waiters
+                .iter()
+                .enumerate()
+                .filter(|(_, waiter)| Self::admissible(state, waiter.class, waiter.lease))
+                .min_by_key(|(_, waiter)| (waiter.class, waiter.seq))
+                .map(|(index, _)| index);
+            let Some(index) = best else {
+                state.free += 1;
+                return;
+            };
+            let waiter = state.waiters.swap_remove(index);
+            if waiter.admit.send(()).is_ok() {
+                return; // slot handed over
+            }
+            // Waiter was cancelled while queued; pick the next one.
+        }
     }
 }
 
@@ -335,6 +483,8 @@ struct QueueInner {
     /// Priority admission, LLM only: the one capability where an interactive
     /// user and a multi-minute background pass share a single slot.
     llm_gate: LlmGate,
+    /// Cross-capability admission for background local-GPU work.
+    gpu_gate: GpuGate,
     lease_counter: std::sync::atomic::AtomicU64,
     jobs: Mutex<HashMap<JobId, JobRecord>>,
     changed: Notify,
@@ -383,6 +533,7 @@ impl ModelQueue {
                 adapters: by_capability,
                 semaphores,
                 llm_gate: LlmGate::new(llm_permits),
+                gpu_gate: GpuGate::new(),
                 lease_counter: std::sync::atomic::AtomicU64::new(1),
                 jobs: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
@@ -402,6 +553,10 @@ impl ModelQueue {
             .lease_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.llm_gate.add_hold(lease);
+        // Mirrored at the GPU lane: the loop's rounds keep their priority
+        // there too, and a plain background job the hold excludes parks at
+        // the lane holding nothing — never a permit the loop needs.
+        self.inner.gpu_gate.add_hold(lease);
         LlmLeaseHold {
             inner: Arc::clone(&self.inner),
             lease,
@@ -718,39 +873,64 @@ async fn run_attempts(inner: &Arc<QueueInner>, id: &str, generation: u64) {
             return;
         };
 
-        // The LLM lane admits by priority; every other capability keeps the
-        // plain FIFO semaphore — OCR frames and embeddings are short and
-        // homogeneous, ordering games would buy nothing there.
-        let mut gate_lease: Option<()> = None;
-        let permit = if capability == ModelCapability::Llm {
-            tokio::select! {
-                () = cancellation.cancelled() => return,
-                () = inner.llm_gate.acquire(priority) => {}
-            }
-            gate_lease = Some(());
-            None
-        } else {
-            tokio::select! {
-                () = cancellation.cancelled() => return,
-                result = semaphore.acquire_owned() => {
-                    let Ok(permit) = result else {
-                        finish_failed(inner, id, generation, "model queue is shutting down".to_owned()).await;
-                        return;
-                    };
-                    Some(permit)
+        // The GPU lane is taken *before* the capability slot: a background
+        // LLM pass queued behind a transcription must not hold the LLM lane
+        // hostage while it waits — interactive chat would be stuck behind it.
+        // With one GPU permit, the capability slot of whoever holds the lane
+        // is always free, so this ordering cannot deadlock.
+        let gpu_acquired = match acquire_gpu_lane(
+            inner,
+            capability,
+            priority,
+            adapter.as_ref(),
+            &input,
+            &cancellation,
+        )
+        .await
+        {
+            GpuLaneOutcome::Cancelled => return,
+            GpuLaneOutcome::NotNeeded => false,
+            GpuLaneOutcome::Acquired => true,
+        };
+
+        let (llm_admitted, permit) = match acquire_capability_slot(
+            inner,
+            id,
+            generation,
+            capability,
+            priority,
+            semaphore,
+            &cancellation,
+        )
+        .await
+        {
+            SlotOutcome::Acquired {
+                llm_admitted,
+                permit,
+            } => (llm_admitted, permit),
+            SlotOutcome::Cancelled | SlotOutcome::ShuttingDown => {
+                if gpu_acquired {
+                    inner.gpu_gate.release();
                 }
+                return;
             }
         };
         if !set_running(inner, id, generation).await {
-            if gate_lease.is_some() {
+            if llm_admitted {
                 inner.llm_gate.release();
+            }
+            if gpu_acquired {
+                inner.gpu_gate.release();
             }
             return;
         }
         let result = adapter.execute(id, &input, cancellation.clone()).await;
         drop(permit);
-        if gate_lease.is_some() {
+        if llm_admitted {
             inner.llm_gate.release();
+        }
+        if gpu_acquired {
+            inner.gpu_gate.release();
         }
 
         match result {
@@ -773,6 +953,112 @@ async fn run_attempts(inner: &Arc<QueueInner>, id: &str, generation: u64) {
                 return;
             }
         }
+    }
+}
+
+enum GpuLaneOutcome {
+    Cancelled,
+    NotNeeded,
+    Acquired,
+}
+
+enum SlotOutcome {
+    Cancelled,
+    ShuttingDown,
+    Acquired {
+        llm_admitted: bool,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    },
+}
+
+/// Takes the capability slot: priority admission for the LLM lane, the plain
+/// FIFO semaphore everywhere else — OCR frames and embeddings are short and
+/// homogeneous, ordering games would buy nothing there.
+async fn acquire_capability_slot(
+    inner: &Arc<QueueInner>,
+    id: &str,
+    generation: u64,
+    capability: ModelCapability,
+    priority: JobPriority,
+    semaphore: Arc<Semaphore>,
+    cancellation: &Cancellation,
+) -> SlotOutcome {
+    if capability == ModelCapability::Llm {
+        tokio::select! {
+            () = cancellation.cancelled() => SlotOutcome::Cancelled,
+            () = inner.llm_gate.acquire(priority) => {
+                SlotOutcome::Acquired { llm_admitted: true, permit: None }
+            }
+        }
+    } else {
+        tokio::select! {
+            () = cancellation.cancelled() => SlotOutcome::Cancelled,
+            result = semaphore.acquire_owned() => {
+                if let Ok(permit) = result {
+                    SlotOutcome::Acquired { llm_admitted: false, permit: Some(permit) }
+                } else {
+                    finish_failed(inner, id, generation, "model queue is shutting down".to_owned()).await;
+                    SlotOutcome::ShuttingDown
+                }
+            }
+        }
+    }
+}
+
+/// Takes the GPU lane for this attempt when it needs one.
+async fn acquire_gpu_lane(
+    inner: &Arc<QueueInner>,
+    capability: ModelCapability,
+    priority: JobPriority,
+    adapter: &dyn ModelAdapter,
+    input: &ModelInput,
+    cancellation: &Cancellation,
+) -> GpuLaneOutcome {
+    let Some(class) = gpu_lane_class(inner, capability, priority, adapter, input) else {
+        return GpuLaneOutcome::NotNeeded;
+    };
+    let lease = match priority {
+        JobPriority::Background { lease } => lease,
+        JobPriority::Interactive => None,
+    };
+    // Biased: a completed admission wins the tie against cancellation. Losing
+    // that race would strand the one GPU permit — the waiter is already
+    // admitted and nothing would release it. Winning it is safe: `cancel`
+    // marks the job Cancelled, `set_running` in the caller fails, and the
+    // permit is released there.
+    tokio::select! {
+        biased;
+        () = inner.gpu_gate.acquire(class, lease) => GpuLaneOutcome::Acquired,
+        () = cancellation.cancelled() => GpuLaneOutcome::Cancelled,
+    }
+}
+
+/// Whether this attempt must hold the GPU lane, and in which class.
+///
+/// OCR always rides the lane in its own class: it is on the capture critical
+/// path and a skipped frame is never indexed later. ASR, embeddings and all
+/// background LLM work share the background class — their backlogs are
+/// durable, so waiting costs latency, never data. Only interactive chat
+/// bypasses the lane; leased background rounds (the T2 summariser's real
+/// shape) ride it, kept deadlock-free by the gate's hold-aware admission.
+/// Remote endpoints bypass it too.
+fn gpu_lane_class(
+    inner: &QueueInner,
+    capability: ModelCapability,
+    priority: JobPriority,
+    adapter: &dyn ModelAdapter,
+    input: &ModelInput,
+) -> Option<GpuClass> {
+    if !inner.config.gpu_lane || !adapter.uses_local_gpu(input) {
+        return None;
+    }
+    match capability {
+        ModelCapability::Ocr => Some(GpuClass::Ocr),
+        ModelCapability::Asr | ModelCapability::Embedding => Some(GpuClass::Background),
+        ModelCapability::Llm => match priority {
+            JobPriority::Interactive => None,
+            JobPriority::Background { .. } => Some(GpuClass::Background),
+        },
     }
 }
 
@@ -1136,6 +1422,9 @@ mod tests {
                     embedding: concurrency,
                     ..CapabilityConcurrency::default()
                 },
+                // These tests pin per-capability semaphore semantics; the GPU
+                // lane would serialize the very overlap they measure.
+                gpu_lane: false,
             },
         )
         .unwrap()
@@ -1426,5 +1715,426 @@ mod tests {
         assert_eq!(queue.cancel(&id).await.unwrap().state, JobState::Cancelled);
         assert_eq!(queue.retry(&id).await.unwrap().state, JobState::Pending);
         assert_eq!(queue.wait(&id).await.unwrap().state, JobState::Done);
+    }
+
+    /// One adapter per capability sharing start-order and concurrency
+    /// counters, so GPU-lane tests measure overlap *across* capabilities.
+    struct GpuTrackingAdapter {
+        capability: ModelCapability,
+        label: &'static str,
+        local_gpu: bool,
+        starts: Arc<std::sync::Mutex<Vec<String>>>,
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for GpuTrackingAdapter {
+        fn capability(&self) -> ModelCapability {
+            self.capability
+        }
+
+        fn name(&self) -> &'static str {
+            "gpu-tracking"
+        }
+
+        fn uses_local_gpu(&self, _input: &ModelInput) -> bool {
+            self.local_gpu
+        }
+
+        async fn execute(
+            &self,
+            _job_id: &str,
+            input: &ModelInput,
+            cancellation: Cancellation,
+        ) -> Result<ModelOutput, AdapterError> {
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(running, Ordering::SeqCst);
+            let label = match input {
+                ModelInput::Llm { prompt, .. } => prompt.clone(),
+                _ => self.label.to_owned(),
+            };
+            self.starts.lock().unwrap().push(label);
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    self.running.fetch_sub(1, Ordering::SeqCst);
+                    return Err(AdapterError::Cancelled);
+                }
+                () = tokio::time::sleep(self.delay) => {}
+            }
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(match self.capability {
+                ModelCapability::Ocr => ModelOutput::Ocr {
+                    text: String::new(),
+                    regions: Vec::new(),
+                },
+                ModelCapability::Asr => ModelOutput::Asr {
+                    text: String::new(),
+                    language: None,
+                },
+                ModelCapability::Embedding => ModelOutput::Embedding { vector: vec![1.0] },
+                ModelCapability::Llm => ModelOutput::llm(String::new()),
+            })
+        }
+    }
+
+    struct GpuRig {
+        starts: Arc<std::sync::Mutex<Vec<String>>>,
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl GpuRig {
+        fn new() -> Self {
+            Self {
+                starts: Arc::new(std::sync::Mutex::new(Vec::new())),
+                running: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn adapter(
+            &self,
+            capability: ModelCapability,
+            label: &'static str,
+            delay: Duration,
+        ) -> Arc<GpuTrackingAdapter> {
+            self.adapter_with_gpu(capability, label, true, delay)
+        }
+
+        fn adapter_with_gpu(
+            &self,
+            capability: ModelCapability,
+            label: &'static str,
+            local_gpu: bool,
+            delay: Duration,
+        ) -> Arc<GpuTrackingAdapter> {
+            Arc::new(GpuTrackingAdapter {
+                capability,
+                label,
+                local_gpu,
+                starts: Arc::clone(&self.starts),
+                running: Arc::clone(&self.running),
+                peak: Arc::clone(&self.peak),
+                delay,
+            })
+        }
+
+        fn queue(adapters: Vec<Arc<GpuTrackingAdapter>>, gpu_lane: bool) -> ModelQueue {
+            ModelQueue::new(
+                adapters
+                    .into_iter()
+                    .map(|adapter| adapter as Arc<dyn ModelAdapter>)
+                    .collect::<Vec<_>>(),
+                QueueConfig {
+                    gpu_lane,
+                    ..QueueConfig::default()
+                },
+            )
+            .unwrap()
+        }
+
+        /// Waits until one job is actually executing, so a later submission is
+        /// guaranteed to find the lane taken rather than racing the spawn.
+        async fn wait_running(&self) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while self.running.load(Ordering::SeqCst) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first job starts");
+        }
+    }
+
+    fn ocr_input() -> ModelInput {
+        ModelInput::Ocr {
+            image_path: std::path::PathBuf::from("/tmp/frame.jpg"),
+            prompt: None,
+        }
+    }
+
+    fn asr_input() -> ModelInput {
+        ModelInput::Asr {
+            audio_path: std::path::PathBuf::from("/tmp/audio.m4a"),
+            language: None,
+        }
+    }
+
+    /// The invariant: a background OCR pass, a transcription and a background
+    /// LLM summary never run at the same time.
+    #[tokio::test]
+    async fn gpu_lane_serializes_background_work_across_capabilities() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(40)),
+                rig.adapter(ModelCapability::Asr, "asr", Duration::from_millis(40)),
+            ],
+            true,
+        );
+
+        let first = queue.submit(ocr_input()).await.unwrap();
+        let second = queue.submit(asr_input()).await.unwrap();
+        for id in [&first, &second] {
+            assert_eq!(queue.wait(id).await.unwrap().state, JobState::Done);
+        }
+        assert_eq!(rig.peak.load(Ordering::SeqCst), 1, "GPU jobs overlapped");
+    }
+
+    /// The T2 summariser's case: a background local-LLM pass rides the lane
+    /// like any other background GPU work.
+    #[tokio::test]
+    async fn background_local_llm_takes_the_gpu_lane() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(40)),
+                rig.adapter(ModelCapability::Llm, "llm", Duration::from_millis(40)),
+            ],
+            true,
+        );
+
+        let frame = queue.submit(ocr_input()).await.unwrap();
+        let summary = queue
+            .submit_with(llm_job("t2"), JobPriority::Background { lease: None })
+            .await
+            .unwrap();
+        for id in [&frame, &summary] {
+            assert_eq!(queue.wait(id).await.unwrap().state, JobState::Done);
+        }
+        assert_eq!(rig.peak.load(Ordering::SeqCst), 1, "GPU jobs overlapped");
+    }
+
+    /// OCR is on the capture critical path; work with a durable backlog must
+    /// not go ahead of it even when it queued first.
+    #[tokio::test]
+    async fn ocr_overtakes_queued_background_gpu_work() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Asr, "asr", Duration::from_millis(60)),
+                rig.adapter(ModelCapability::Embedding, "embedding", Duration::from_millis(10)),
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(10)),
+            ],
+            true,
+        );
+
+        let holder = queue.submit(asr_input()).await.unwrap();
+        rig.wait_running().await;
+        let background = queue.submit(embedding_input()).await.unwrap();
+        let frame = queue.submit(ocr_input()).await.unwrap();
+
+        for id in [&holder, &background, &frame] {
+            queue.wait(id).await.unwrap();
+        }
+        assert_eq!(
+            *rig.starts.lock().unwrap(),
+            vec!["asr", "ocr", "embedding"],
+            "OCR must win the lane over earlier-queued background work"
+        );
+    }
+
+    /// Interactive work is never governed: a chat reply does not queue behind
+    /// background GPU work.
+    #[tokio::test]
+    async fn interactive_llm_bypasses_the_gpu_lane() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(60)),
+                rig.adapter(ModelCapability::Llm, "llm", Duration::from_millis(10)),
+            ],
+            true,
+        );
+
+        let frame = queue.submit(ocr_input()).await.unwrap();
+        rig.wait_running().await;
+        let chat = queue
+            .submit_with(llm_job("chat"), JobPriority::Interactive)
+            .await
+            .unwrap();
+        for id in [&frame, &chat] {
+            queue.wait(id).await.unwrap();
+        }
+        assert_eq!(
+            rig.peak.load(Ordering::SeqCst),
+            2,
+            "interactive chat must overlap background GPU work"
+        );
+    }
+
+    /// The T2 summariser's real submission shape: `run_slot_t2` holds a lease
+    /// and submits every round as `Background { lease: Some(id) }`. Those
+    /// rounds must still ride the lane — a summary overlapping a running OCR
+    /// or ASR job is exactly what the lane exists to prevent.
+    #[tokio::test]
+    async fn leased_background_llm_rides_the_gpu_lane() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(60)),
+                rig.adapter(ModelCapability::Llm, "llm", Duration::from_millis(10)),
+            ],
+            true,
+        );
+
+        let hold = queue.hold_llm_lease();
+        let frame = queue.submit(ocr_input()).await.unwrap();
+        rig.wait_running().await;
+        let round = queue
+            .submit_with(
+                llm_job("t2-round"),
+                JobPriority::Background {
+                    lease: Some(hold.id()),
+                },
+            )
+            .await
+            .unwrap();
+        for id in [&frame, &round] {
+            queue.wait(id).await.unwrap();
+        }
+        drop(hold);
+        assert_eq!(
+            rig.peak.load(Ordering::SeqCst),
+            1,
+            "a leased background pass must wait for the lane"
+        );
+    }
+
+    /// While a loop holds its lease, its rounds win the lane over plain
+    /// background work — and the excluded rival parks at the lane holding
+    /// nothing, so it cannot deadlock the loop at the LLM gate.
+    #[tokio::test]
+    async fn lease_hold_reserves_the_gpu_lane_between_rounds() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Asr, "asr", Duration::from_millis(50)),
+                rig.adapter(ModelCapability::Llm, "llm", Duration::from_millis(10)),
+            ],
+            true,
+        );
+
+        let holder = queue.submit(asr_input()).await.unwrap();
+        rig.wait_running().await;
+        let hold = queue.hold_llm_lease();
+        // The rival queues first but is plain background: the hold excludes it.
+        let rival = queue
+            .submit_with(llm_job("rival"), JobPriority::Background { lease: None })
+            .await
+            .unwrap();
+        let round = queue
+            .submit_with(
+                llm_job("round"),
+                JobPriority::Background {
+                    lease: Some(hold.id()),
+                },
+            )
+            .await
+            .unwrap();
+        queue.wait(&holder).await.unwrap();
+        queue.wait(&round).await.unwrap();
+        // The rival cannot run until the hold drops.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(queue.get(&rival).await.unwrap().state, JobState::Pending);
+        drop(hold);
+        assert_eq!(queue.wait(&rival).await.unwrap().state, JobState::Done);
+        assert_eq!(
+            *rig.starts.lock().unwrap(),
+            vec!["asr", "round", "rival"],
+            "the loop's round must win the lane over the excluded rival"
+        );
+    }
+
+    /// A remote endpoint does not touch the local GPU, so its jobs neither
+    /// hold the lane nor are held by it.
+    #[tokio::test]
+    async fn remote_llm_does_not_take_the_gpu_lane() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(60)),
+                rig.adapter_with_gpu(
+                    ModelCapability::Llm,
+                    "remote-llm",
+                    false,
+                    Duration::from_millis(10),
+                ),
+            ],
+            true,
+        );
+
+        let frame = queue.submit(ocr_input()).await.unwrap();
+        rig.wait_running().await;
+        let summary = queue
+            .submit_with(llm_job("remote-t2"), JobPriority::Background { lease: None })
+            .await
+            .unwrap();
+        for id in [&frame, &summary] {
+            queue.wait(id).await.unwrap();
+        }
+        assert_eq!(
+            rig.peak.load(Ordering::SeqCst),
+            2,
+            "a remote LLM job must overlap local GPU work"
+        );
+    }
+
+    /// A waiter cancelled at the lane must neither run nor strand the permit.
+    #[tokio::test]
+    async fn cancelling_a_gpu_lane_waiter_does_not_leak_the_permit() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(40)),
+                rig.adapter(ModelCapability::Asr, "asr", Duration::from_millis(10)),
+            ],
+            true,
+        );
+
+        let first = queue.submit(ocr_input()).await.unwrap();
+        rig.wait_running().await;
+        let cancelled = queue.submit(asr_input()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await; // park on the lane
+        assert_eq!(
+            queue.cancel(&cancelled).await.unwrap().state,
+            JobState::Cancelled
+        );
+
+        let next = queue.submit(ocr_input()).await.unwrap();
+        for id in [&first, &next] {
+            assert_eq!(queue.wait(id).await.unwrap().state, JobState::Done);
+        }
+        assert_eq!(
+            *rig.starts.lock().unwrap(),
+            vec!["ocr", "ocr"],
+            "the cancelled waiter must neither run nor block the lane"
+        );
+    }
+
+    /// `AFTERRAY_GPU_LANE=0` restores the old free-for-all scheduling.
+    #[tokio::test]
+    async fn gpu_lane_disabled_restores_overlap() {
+        let rig = GpuRig::new();
+        let queue = GpuRig::queue(
+            vec![
+                rig.adapter(ModelCapability::Ocr, "ocr", Duration::from_millis(40)),
+                rig.adapter(ModelCapability::Asr, "asr", Duration::from_millis(40)),
+            ],
+            false,
+        );
+
+        let first = queue.submit(ocr_input()).await.unwrap();
+        let second = queue.submit(asr_input()).await.unwrap();
+        for id in [&first, &second] {
+            assert_eq!(queue.wait(id).await.unwrap().state, JobState::Done);
+        }
+        assert_eq!(
+            rig.peak.load(Ordering::SeqCst),
+            2,
+            "with the lane off, GPU jobs of different capabilities overlap"
+        );
     }
 }

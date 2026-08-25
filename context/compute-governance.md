@@ -17,7 +17,7 @@ Before this existed, the answer was scattered and the app's story was not true:
 | Workload | Where it runs | Gate before | Gate now |
 |---|---|---|---|
 | Screen text (OCR, Apple Vision) | `ProcessAdapter` child, per capture (~10s) | none | mode `off` only |
-| Transcription (Qwen3-ASR) | `ProcessAdapter` child, 60s sweeper | none | governor; throttled to 300s on battery |
+| Transcription (Qwen3-ASR) | `ProcessAdapter` child, 60s sweeper | none | governor: waits for an idle, quiet, GPU-free machine like summaries; throttled to 300s on battery |
 | Search index (embeddings) | `ProcessAdapter` child, per evidence row | none | governor |
 | Summaries (T2, local LLM) | persistent MLX worker, 5-min sweeper | AC + ≥30% battery + ≥30s idle + load/core ≤0.7 | governor: AC + ≥30% battery + ≥120s idle + load/core ≤0.7; worker unloads after 120s unused |
 | Archive compression (rav1e) | thread **inside** the daemon | `AFTERRAY_GOP_REQUIRE_AC`, default **off** | governor only (`require_ac` removed) |
@@ -66,6 +66,28 @@ that silently cost an hour of searchable history would be a bad trade for a
 fraction of one core, so the pause deliberately exempts OCR. Only `off`, whose
 copy states the cost, stops it. **Adding an OCR backlog is what would make a
 pause complete**; until then, do not extend the pause to cover it.
+
+## The GPU lane: one background GPU job at a time
+
+The governor decides whether background work may start; it does nothing about
+what runs *together*. That is the model queue's job
+(`crates/afterray-models/src/queue.rs` `GpuGate`): every background job whose
+adapter touches the local GPU — OCR, ASR, embeddings, background LLM passes —
+takes a single shared permit before its capability slot, so a transcription and
+a 200-second summary never run at the same time. OCR rides its own class ahead
+of the durable-backlog work; only interactive chat and remote LLM endpoints
+bypass the lane. Leased background rounds (the T2 summariser's real shape)
+ride it too — the gate mirrors the LLM gate's lease holds, so a plain
+background job excluded by a hold parks at the lane holding nothing and cannot
+deadlock the loop at the LLM gate. The GPU slot is taken *before*
+the capability slot so a queued background summary never holds the LLM lane
+hostage against an incoming chat. Decision and alternatives:
+[docs/decisions/active/architecture/2026-08-24-gpu-lane-serialization.md](../docs/decisions/active/architecture/2026-08-24-gpu-lane-serialization.md).
+
+What the dashboard sees: a job waiting at the lane is `Pending` in its
+capability, so the per-capability pending counts in `QueueActivity` now include
+lane waiters — "asr, 3 pending" can mean "3 jobs, one running, the rest queued
+behind an OCR pass".
 
 ## Summary timing: "how much longer will I be slow?"
 
@@ -137,9 +159,10 @@ machine actually wants.
 - **Whether the button is offered is the daemon's call** (`ComputeGate.can_run_now`).
   It depends on which workloads have a machine gate or a throttle of their own —
   something only `decide` knows — so a client that re-derived it would drift the
-  moment that changed. Transcription qualifies because its override also reaches
-  `asr_sweep_interval`: ASR has no machine gate, so bypassing the gate alone would
-  have made its button redraw a row and nothing else.
+  moment that changed. Transcription qualifies because its override reaches both
+  the machine gates it shares with summaries and `asr_sweep_interval`: bypassing
+  the gates alone would leave the battery throttle stretching the sweep to five
+  minutes, and the button would redraw a row and nothing else.
 - **What "run now" will and will not override.** It skips the *machine
   conditions*, and it lifts an active suspension, because pressing start is newer
   information from the same person and keeping the pause would leave a button
@@ -156,11 +179,22 @@ machine actually wants.
 
 ## Why there is no GPU percentage
 
-macOS publishes no per-process GPU accounting. `powermetrics` needs root and
-reports machine-wide numbers; the only in-process route to even a machine-wide
-figure is the private `IOReport` framework, which would mean private-framework
-FFI in a workspace that denies `unsafe_code` outside one crate, plus a
-notarization and OS-upgrade risk.
+macOS publishes no per-process GPU accounting, so no task row can carry an
+honest GPU figure. `powermetrics` needs root; the only in-process route to a
+per-process number would be the private `IOReport` framework, which the
+project rejects outright — private-framework FFI in a workspace that denies
+`unsafe_code` outside one crate, plus a notarization and OS-upgrade risk.
+
+There is, however, a public IOKit path to a **machine-wide** reading — the
+`AGXAccelerator` service's `PerformanceStatistics["Device Utilization %"]`,
+the same key stats and mxmon use. The daemon samples it at 1 Hz
+(`afterray_platform_macos::gpu_utilization`) and the governor averages
+the last 15 seconds: above 50% machine-wide GPU, summaries and transcription
+wait, because a
+game or a local LLM elsewhere is exactly the load the CPU load average
+misses. Fail-closed like the other probes, disable-able with
+`AFTERRAY_GPU_PROBE=0`. The full trade-off:
+[gpu-utilization-gate](../docs/decisions/active/architecture/2026-08-24-gpu-utilization-gate.md).
 
 So the dashboard reports each task's **lane** (`ComputeLane::Gpu` / `Cpu`) and
 the costs that genuinely are attributable to a pid:

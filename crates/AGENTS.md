@@ -17,7 +17,7 @@ Eleven crates (`Cargo.toml` workspace, edition 2024, rust 1.85). The daemon `aft
 - [afterray-codec](afterray-codec/AGENTS.md) — encode-only AV1 (rav1e → IVF), JPEG→I420, thumbnails.
 - [afterray-core](afterray-core/AGENTS.md) — trait definitions only (`CaptureBackend`, `Store`); no logic.
 - [afterray-protocol](afterray-protocol/AGENTS.md) — wire types + `PROTOCOL_VERSION` (src/lib.rs:34); bump the version here, not in the daemon.
-- [afterray-models](afterray-models/AGENTS.md) — in-memory `ModelQueue`, worker orchestration, LLM routing and remote-endpoint guards (`src/remote.rs`); the `jobs` table in the store schema is vestigial.
+- [afterray-models](afterray-models/AGENTS.md) — in-memory `ModelQueue` (with a one-permit GPU lane serializing background local-GPU work across capabilities), worker orchestration, LLM routing and remote-endpoint guards (`src/remote.rs`); the `jobs` table in the store schema is vestigial.
 - [afterray-infer](afterray-infer/AGENTS.md) — in-process ASR/embedding backends + the one-shot `afterray-model-worker` binary; deliberately rejects OCR and LLM.
 - [afterray-cli](afterray-cli/AGENTS.md) — read-only CLI over the socket (`make status`); keep `skills/afterray/` in sync with it.
 - `afterray-harness` — the tool-calling loop, budgets, truncation, compaction and the append-only `History`. **Depends on no `afterray-*` crate and no HTTP client** (`Cargo.toml:9` states the rule); an `afterray-*` line in its dependencies means the separation is lost.
@@ -28,4 +28,4 @@ Eleven crates (`Cargo.toml` workspace, edition 2024, rust 1.85). The daemon `aft
 - `make check` → `cargo check --workspace`; `make test` → `cargo test --workspace` + `swift test`
 - `cargo clippy --workspace --all-targets -- -D warnings` — lint gate
 - `make build` builds the capture shim first; the daemon finds it at `apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim` or via `AFTERRAY_CAPTURE_SHIM`
-- Useful env vars: `AFTERRAY_DATA_DIR`, `AFTERRAY_SOCKET`, `AFTERRAY_CAPTURE_INTERVAL_SECONDS`, `AFTERRAY_T2_SWEEP_SECONDS` (0 disables), `AFTERRAY_GOP_ARCHIVE` / `AFTERRAY_GOP_KEYINT`, `HF_ENDPOINT` (model-download mirror, e.g. `https://hf-mirror.com`). Official-origin network failures also retry once from hf-mirror.com ([why](../docs/decisions/active/product/2026-08-20-hf-mirror-failover.md)).
+- Useful env vars: `AFTERRAY_DATA_DIR`, `AFTERRAY_SOCKET`, `AFTERRAY_CAPTURE_INTERVAL_SECONDS`, `AFTERRAY_T2_SWEEP_SECONDS` (0 disables), `AFTERRAY_GOP_ARCHIVE` / `AFTERRAY_GOP_KEYINT`, `AFTERRAY_GPU_LANE` (0 disables the model queue's GPU serialization), `AFTERRAY_GPU_PROBE` (0 disables the machine-GPU check on summaries and its 1 Hz sampler), `HF_ENDPOINT` (model-download mirror, e.g. `https://hf-mirror.com`). Official-origin network failures also retry once from hf-mirror.com ([why](../docs/decisions/active/product/2026-08-20-hf-mirror-failover.md)).

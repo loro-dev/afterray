@@ -524,6 +524,10 @@ impl ComputeWorkload {
 
 
     /// The resource this workload contends for.
+    ///
+    /// Background jobs in the GPU lane are also serialized by the model
+    /// queue's `GpuGate` — one local GPU job at a time
+    /// (`docs/decisions/active/architecture/2026-08-24-gpu-lane-serialization.md`).
     #[must_use]
     pub const fn lane(self) -> ComputeLane {
         match self {

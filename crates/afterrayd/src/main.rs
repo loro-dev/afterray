@@ -222,18 +222,29 @@ async fn async_main() -> anyhow::Result<()> {
         mlx_worker_path,
         Arc::clone(&llm_config),
     );
-    let models = ModelQueue::new(adapters, QueueConfig::default())?;
+    let models = ModelQueue::new(
+        adapters,
+        QueueConfig {
+            // AFTERRAY_GPU_LANE=0 restores the old free-for-all scheduling.
+            gpu_lane: std::env::var("AFTERRAY_GPU_LANE").as_deref() != Ok("0"),
+            ..QueueConfig::default()
+        },
+    )?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let packer = Arc::new(gop_packer::GopPacker::new(
         gop_packer::GopPackerConfig::from_env(),
     ));
+    // AFTERRAY_GPU_PROBE=0 skips the machine-GPU check on summaries; without
+    // a probe the gate would only ever answer "unavailable", which is a hold.
+    let gpu_probe_enabled = std::env::var("AFTERRAY_GPU_PROBE").as_deref() != Ok("0");
     let compute = Arc::new(compute::ComputeGovernor::new(
         persisted.compute_mode,
         persisted.compute_paused_until_ms,
         compute::ComputeLimits {
             summaries_disabled_by_env: t2_sweep_period().is_zero(),
             archive_disabled_by_env: !packer.config.archive,
+            gpu_probe_disabled_by_env: !gpu_probe_enabled,
         },
     ));
     // Persisted durations, so "summaries usually take about this long" is
@@ -344,6 +355,9 @@ async fn async_main() -> anyhow::Result<()> {
     spawn_mlx_idle_reaper(Arc::clone(&state));
     spawn_text_df_maintainer(Arc::clone(&state));
     spawn_asr_sweeper(Arc::clone(&state));
+    if gpu_probe_enabled {
+        spawn_gpu_sampler(Arc::clone(&state));
+    }
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -4272,6 +4286,33 @@ fn spawn_asr_sweeper(state: Arc<AppState>) {
             }
         }
         eprintln!("asr backlog: stopped");
+    });
+    lifecycle_state.lifecycle.track_task(task);
+}
+
+/// Feeds the governor's GPU window at 1 Hz. A failed probe records nothing —
+/// the window ages out on its own, which the summary gate reads as
+/// "unavailable" (fail-closed), never as "idle".
+fn spawn_gpu_sampler(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    let lifecycle_state = Arc::clone(&state);
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Some(value) = afterray_platform_macos::gpu_utilization() {
+                        state.compute.record_gpu_utilization(now_ms(), value);
+                    }
+                }
+            }
+        }
+        eprintln!("gpu sampler: stopped");
     });
     lifecycle_state.lifecycle.track_task(task);
 }

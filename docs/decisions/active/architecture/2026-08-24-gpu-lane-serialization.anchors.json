@@ -1,0 +1,4 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterray-models/src/queue.rs::struct GpuGate {": "sha256:38887d75e19fdb64"
+}
