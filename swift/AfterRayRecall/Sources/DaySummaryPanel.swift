@@ -431,22 +431,17 @@ private struct DaySummaryRow: View, Equatable {
             .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 3) {
-                DaySummaryTitleLayout(title: text.primary) {
-                    Text(text.primary)
-                        .font(.system(size: 12, weight: text.isT2 ? .semibold : .regular))
-                        .foregroundStyle(text.isT2 ? .white.opacity(0.92) : .white.opacity(0.58))
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-
-                    if text.isT2 {
-                        DaySummaryTitleActions(
+                DaySummaryTitleLayout(
+                    title: text.primary,
+                    isEmphasized: text.isT2,
+                    actions: text.isT2
+                        ? DaySummaryTitleActions(
                             isVisible: isHovering,
                             onCopy: copySummary,
                             onOpenMarkdown: openSummaryMarkdown
                         )
-                    }
-                }
+                        : nil
+                )
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 ForEach(Array(text.detail.enumerated()), id: \.offset) { _, line in
