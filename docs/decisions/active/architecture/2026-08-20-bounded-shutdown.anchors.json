@@ -5,5 +5,5 @@
   "crates/afterray-models/src/queue.rs::pub async fn shutdown(&self) -> usize {": "sha256:35da49f4fa3cd079",
   "crates/afterray-platform-macos/src/lib.rs::pub async fn stop_capture(&self) -> Result<(), CaptureError> {": "sha256:06181862fdae98dd",
   "crates/afterrayd/src/main.rs::impl AppState {": "sha256:73685ecd40e350f8",
-  "swift/AfterRayRecall/Sources/DaemonClient.swift::public actor UnixSocketDaemonClient: AfterRayDaemonServing {": "sha256:89270957e9b7e799"
+  "swift/AfterRayRecall/Sources/DaemonClient.swift::public actor UnixSocketDaemonClient: AfterRayDaemonServing {": "sha256:a3eeaec4cd0a9c4a"
 }

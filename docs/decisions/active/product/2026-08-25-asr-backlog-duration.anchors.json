@@ -1,0 +1,6 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterray-protocol/src/lib.rs::pub struct ComputeGate {": "sha256:dcf3c39712c88586",
+  "crates/afterray-store/src/lib.rs::pub fn compute_backlog(": "sha256:61f7cabfa7961cc3",
+  "swift/AfterRayRecall/Sources/ComputeActivityPanel.swift::private func waitingLabel(_ gate: ComputeGate) -> String {": "sha256:e7d91ca68e758744"
+}

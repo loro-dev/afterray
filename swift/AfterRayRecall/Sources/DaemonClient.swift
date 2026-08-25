@@ -228,7 +228,7 @@ public extension AfterRayDaemonServing {
 // @dec:daemon-owns-the-vault — docs/decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
-    public static let protocolVersion = 18
+    public static let protocolVersion = 19
     /// Shutdown is a handoff, not a normal query. A wedged daemon must not hold
     /// application termination behind the ordinary 30-second unary deadline.
     public static let shutdownReceiveTimeout: TimeInterval = 1.5

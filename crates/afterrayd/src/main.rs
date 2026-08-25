@@ -3468,6 +3468,7 @@ struct BacklogCounts {
     summaries: usize,
     archive: usize,
     transcripts: usize,
+    transcript_duration_ms: i64,
     /// Moments that still have a JPEG but no screen text. Only frames whose
     /// pixels survive are counted: once a moment is packed into a GOP its JPEG
     /// is gone, so counting those would show a pile nothing can ever drain.
@@ -3510,6 +3511,7 @@ async fn backlog_counts(state: &Arc<AppState>) -> BacklogCounts {
                 summaries,
                 archive: vault.archive_stills,
                 transcripts: vault.transcripts,
+                transcript_duration_ms: vault.transcript_duration_ms,
                 unindexed: vault.unindexed_moments,
             })
     })
@@ -3608,6 +3610,7 @@ async fn compute_status(state: &Arc<AppState>) -> afterray_protocol::ComputeStat
         activity.pending_for(ModelCapability::Asr),
         backlog.transcripts,
     );
+    counts.set_backlog_duration(ComputeWorkload::Asr, backlog.transcript_duration_ms);
     // Embeddings follow whatever OCR and ASR produce; no pile of their own.
     counts.set(
         ComputeWorkload::Embedding,

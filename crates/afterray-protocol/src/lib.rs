@@ -35,7 +35,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// not have to download the whole vault to paint a playhead. 17 binds the
 /// selected transcript to one exact audio segment and carries its bounds. 18
 /// adds model-aligned transcript cues for time-accurate playback highlighting.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// 19 adds the durable audio duration behind an ASR backlog, so the work panel
+/// can say how much recorded time remains rather than an opaque segment count.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -579,6 +581,7 @@ pub enum ComputeGateCode {
     DisabledByEnv,
 }
 
+// @dec:asr-backlog-duration — docs/decisions/active/product/2026-08-25-asr-backlog-duration.md
 /// One workload's current standing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeGate {
@@ -598,6 +601,10 @@ pub struct ComputeGate {
     /// have reached the job queue; this is the pile behind that.
     #[serde(default)]
     pub backlog: usize,
+    /// The durable audio timeline covered by this backlog. Only ASR currently
+    /// has a meaningful duration, so other workloads omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlog_duration_ms: Option<i64>,
     /// When a user-requested override for this workload expires, if one is
     /// running. While set, the machine conditions below are bypassed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1605,6 +1612,21 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::ComputePause { seconds: 3600 }).unwrap(),
             r#"{"type":"compute_pause","seconds":3600}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComputeGate {
+                workload: ComputeWorkload::Asr,
+                allowed: false,
+                code: ComputeGateCode::InUse,
+                reason: None,
+                pending: 2,
+                backlog: 4,
+                backlog_duration_ms: Some(720_000),
+                forced_until_ms: None,
+                can_run_now: true,
+            })
+            .unwrap(),
+            r#"{"workload":"asr","allowed":false,"code":"in_use","pending":2,"backlog":4,"backlog_duration_ms":720000,"can_run_now":true}"#
         );
     }
 

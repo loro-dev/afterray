@@ -558,6 +558,7 @@ extension AfterRayCopy {
         public var workTypes: String
         public var itemsWaiting: (Int) -> String
         public var waitingCount: (Int) -> String
+        public var waitingAudioDuration: (String) -> String
         public var upToDate: String
         public var forced: String
         public var held: String

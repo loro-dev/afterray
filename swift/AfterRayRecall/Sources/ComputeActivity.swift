@@ -126,6 +126,9 @@ public struct ComputeGate: Codable, Equatable, Sendable, Identifiable {
     /// Work counted from the vault: the pile behind `pending`, and what "run
     /// now" promises to drain.
     public let backlog: Int
+    /// Recorded time covered by the durable backlog, when the workload has a
+    /// natural timeline (currently ASR).
+    public let backlogDurationMs: Int64?
     /// Set while a user-requested override is running for this workload.
     public let forcedUntilMs: Int64?
     /// Whether offering "run now" here would change anything. Decided by the
@@ -149,6 +152,7 @@ public struct ComputeGate: Codable, Equatable, Sendable, Identifiable {
         reason: String? = nil,
         pending: Int = 0,
         backlog: Int = 0,
+        backlogDurationMs: Int64? = nil,
         forcedUntilMs: Int64? = nil,
         canRunNow: Bool = false
     ) {
@@ -158,6 +162,7 @@ public struct ComputeGate: Codable, Equatable, Sendable, Identifiable {
         self.reason = reason
         self.pending = pending
         self.backlog = backlog
+        self.backlogDurationMs = backlogDurationMs
         self.forcedUntilMs = forcedUntilMs
         self.canRunNow = canRunNow
     }
@@ -169,6 +174,7 @@ public struct ComputeGate: Codable, Equatable, Sendable, Identifiable {
         case reason
         case pending
         case backlog
+        case backlogDurationMs = "backlog_duration_ms"
         case forcedUntilMs = "forced_until_ms"
         case canRunNow = "can_run_now"
     }
@@ -181,6 +187,7 @@ public struct ComputeGate: Codable, Equatable, Sendable, Identifiable {
         reason = try container.decodeIfPresent(String.self, forKey: .reason)
         pending = try container.decodeIfPresent(Int.self, forKey: .pending) ?? 0
         backlog = try container.decodeIfPresent(Int.self, forKey: .backlog) ?? 0
+        backlogDurationMs = try container.decodeIfPresent(Int64.self, forKey: .backlogDurationMs)
         forcedUntilMs = try container.decodeIfPresent(Int64.self, forKey: .forcedUntilMs)
         canRunNow = try container.decodeIfPresent(Bool.self, forKey: .canRunNow) ?? false
     }

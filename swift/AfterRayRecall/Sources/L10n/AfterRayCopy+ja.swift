@@ -536,6 +536,7 @@ extension AfterRayCopy {
             workTypes: "処理の種類",
             itemsWaiting: { "\($0)件待機中" },
             waitingCount: { "\($0)件待機" },
+            waitingAudioDuration: { "\($0) の音声を文字起こし待ち" },
             upToDate: "最新",
             forced: "強制",
             held: "保留",

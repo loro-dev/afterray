@@ -265,10 +265,7 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
                         .foregroundStyle(gate.allowed
                             ? RecallPalette.textPrimary
                             : RecallPalette.textSecondary)
-                    // Always a count, even at zero: an empty right-hand column
-                    // reads as "the panel is not telling me" rather than
-                    // "nothing is waiting".
-                    Text(gate.remaining > 0 ? copy.compute.waitingCount(gate.remaining) : copy.compute.upToDate)
+                    Text(waitingLabel(gate))
                         .font(.system(size: 10))
                         .foregroundStyle(gate.remaining > 0
                             ? (gate.allowed ? RecallPalette.textSecondary : RecallPalette.ray)
@@ -299,6 +296,15 @@ public struct ComputeActivityPanel<Model: ComputeActivityPresenting>: View {
     private func gateSubtitle(_ gate: ComputeGate) -> String {
         if gate.isForced { return copy.compute.runningNowAtRequest }
         return gate.allowed ? gate.workload.engine : (gate.reason ?? copy.compute.heldShort)
+    }
+
+    // @dec:asr-backlog-duration — docs/decisions/active/product/2026-08-25-asr-backlog-duration.md
+    private func waitingLabel(_ gate: ComputeGate) -> String {
+        guard gate.remaining > 0 else { return copy.compute.upToDate }
+        if gate.workload == .asr, let durationMs = gate.backlogDurationMs, durationMs > 0 {
+            return copy.compute.waitingAudioDuration(ComputeFormat.duration(ms: durationMs))
+        }
+        return copy.compute.waitingCount(gate.remaining)
     }
 
     private func gateStateLabel(_ gate: ComputeGate) -> String {

@@ -2,7 +2,7 @@
 
 Verified against code 2026-08-15.
 
-AfterRay has **three separate JSON protocols**: the versioned control socket between `afterrayd` and its clients (CLI, SwiftUI app), the one-shot worker protocol (OCR/ASR/embedding), and the persistent MLX worker protocol (local LLM). Each has its own version constant; bump both sides of whichever you touch.
+AfterRay has **three separate JSON protocols**: the versioned control socket between `afterrayd` and its clients (CLI, SwiftUI app), the one-shot worker protocol (OCR/ASR/embedding), and the persistent MLX worker protocol (local LLM). Each has its own version constant; bump both sides of whichever you touch. Control protocol 19 adds `ComputeGate.backlog_duration_ms`: ASR reports the recorded time waiting, not just a segment count.
 
 ## 1. Control socket: afterrayd ↔ CLI / SwiftUI app
 

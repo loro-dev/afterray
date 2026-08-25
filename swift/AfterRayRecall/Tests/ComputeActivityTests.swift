@@ -476,6 +476,14 @@ final class ComputeActivityTests: XCTestCase {
         XCTAssertEqual(ComputeFormat.duration(ms: -5), "0s")
     }
 
+    func testAsrBacklogDurationDecodesFromTheDaemon() throws {
+        let gate = try JSONDecoder().decode(
+            ComputeGate.self,
+            from: Data(#"{"workload":"asr","allowed":false,"code":"in_use","backlog":200,"backlog_duration_ms":720000}"#.utf8)
+        )
+        XCTAssertEqual(gate.backlogDurationMs, 720_000)
+    }
+
     // MARK: - Formatting
 
     func testCpuPercentSaysIdleRatherThanRoundingToZero() {

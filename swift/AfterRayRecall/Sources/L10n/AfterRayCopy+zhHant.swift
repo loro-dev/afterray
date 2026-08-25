@@ -536,6 +536,7 @@ extension AfterRayCopy {
             workTypes: "工作類型",
             itemsWaiting: { "\($0) 項等待中" },
             waitingCount: { "\($0) 項等待" },
+            waitingAudioDuration: { "待轉錄 \($0) 音訊" },
             upToDate: "已是最新",
             forced: "強制",
             held: "暫緩",

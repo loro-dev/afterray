@@ -204,6 +204,7 @@ pub(crate) fn asr_may_run(conditions: MachineConditions) -> GateDecision {
 pub(crate) struct WorkloadCounts {
     pending: HashMap<ComputeWorkload, usize>,
     backlog: HashMap<ComputeWorkload, usize>,
+    backlog_duration_ms: HashMap<ComputeWorkload, i64>,
 }
 
 impl WorkloadCounts {
@@ -212,12 +213,20 @@ impl WorkloadCounts {
         self.backlog.insert(workload, backlog);
     }
 
+    pub(crate) fn set_backlog_duration(&mut self, workload: ComputeWorkload, duration_ms: i64) {
+        self.backlog_duration_ms.insert(workload, duration_ms.max(0));
+    }
+
     fn pending(&self, workload: ComputeWorkload) -> usize {
         self.pending.get(&workload).copied().unwrap_or(0)
     }
 
     fn backlog(&self, workload: ComputeWorkload) -> usize {
         self.backlog.get(&workload).copied().unwrap_or(0)
+    }
+
+    fn backlog_duration_ms(&self, workload: ComputeWorkload) -> Option<i64> {
+        self.backlog_duration_ms.get(&workload).copied()
     }
 }
 
@@ -668,6 +677,7 @@ impl ComputeGovernor {
                     reason,
                     pending,
                     backlog,
+                    backlog_duration_ms: counts.backlog_duration_ms(workload),
                     forced_until_ms: self.forced_until_ms(workload, now_ms),
                     // `remaining` here matches what the panel shows: the queue
                     // count is a subset of the vault count, so the larger of the
@@ -1137,8 +1147,23 @@ mod tests {
             .find(|gate| gate.workload == ComputeWorkload::Ocr)
             .expect("ocr row");
         assert_eq!(ocr.pending, 7);
+        assert_eq!(ocr.backlog_duration_ms, None);
         assert!(ocr.allowed);
         assert!(ocr.reason.is_none());
+    }
+
+    #[test]
+    fn an_asr_row_carries_the_duration_of_the_audio_backlog() {
+        let governor = governor(ComputeMode::Full);
+        let mut counts = WorkloadCounts::default();
+        counts.set(ComputeWorkload::Asr, 2, 4);
+        counts.set_backlog_duration(ComputeWorkload::Asr, 720_000);
+        let asr = governor
+            .gates(IDEAL, 0, &counts)
+            .into_iter()
+            .find(|gate| gate.workload == ComputeWorkload::Asr)
+            .expect("asr row");
+        assert_eq!(asr.backlog_duration_ms, Some(720_000));
     }
 
     #[test]

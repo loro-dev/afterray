@@ -538,6 +538,7 @@ extension AfterRayCopy {
             workTypes: "Types de tâches",
             itemsWaiting: { $0 <= 1 ? "\($0) élément en attente" : "\($0) éléments en attente" },
             waitingCount: { "\($0) en attente" },
+            waitingAudioDuration: { "\($0) d’audio en attente" },
             upToDate: "à jour",
             forced: "Forcé",
             held: "Retenu",

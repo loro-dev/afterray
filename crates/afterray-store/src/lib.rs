@@ -354,6 +354,8 @@ pub struct ComputeBacklog {
     pub archive_stills: usize,
     /// Audio segments waiting for, or retrying, transcription.
     pub transcripts: usize,
+    /// Recorded duration covered by the ASR and forced-alignment backlog.
+    pub transcript_duration_ms: i64,
     /// Moments that still have their JPEG but no screen text.
     ///
     /// Bounded to what is still recoverable on purpose: once a moment is packed
@@ -2111,6 +2113,7 @@ impl Vault {
         Ok(cards)
     }
 
+    // @dec:asr-backlog-duration — docs/decisions/active/product/2026-08-25-asr-backlog-duration.md
     /// Counts the durable background backlog.
     ///
     /// Three counts in one call because the dashboard shows them together, and
@@ -2131,14 +2134,18 @@ impl Vault {
             policy.keyint,
         );
         let connection = self.readers.get();
-        let transcripts: i64 = connection.query_row(
+        let (transcripts, transcript_duration_ms): (i64, i64) = connection.query_row(
             &format!(
                 "SELECT
                     (SELECT count(*) FROM audio_segments a WHERE {AUDIO_CLAIMABLE_PREDICATE}) +
-                    (SELECT count(*) FROM audio_segments a WHERE {AUDIO_ALIGNMENT_CLAIMABLE_PREDICATE})"
+                    (SELECT count(*) FROM audio_segments a WHERE {AUDIO_ALIGNMENT_CLAIMABLE_PREDICATE}),
+                    (SELECT COALESCE(sum(a.ended_at_ms - a.started_at_ms), 0)
+                       FROM audio_segments a WHERE {AUDIO_CLAIMABLE_PREDICATE}) +
+                    (SELECT COALESCE(sum(a.ended_at_ms - a.started_at_ms), 0)
+                       FROM audio_segments a WHERE {AUDIO_ALIGNMENT_CLAIMABLE_PREDICATE})"
             ),
             [now_ms],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         // Two bounds, both deliberate. A minute of grace so a frame whose OCR is
         // in flight is not counted as neglected — at a ten-second capture
@@ -2166,6 +2173,7 @@ impl Vault {
         Ok(ComputeBacklog {
             archive_stills,
             transcripts: usize::try_from(transcripts).unwrap_or(0),
+            transcript_duration_ms: transcript_duration_ms.max(0),
             unindexed_moments: usize::try_from(unindexed_moments).unwrap_or(0),
         })
     }
@@ -8120,6 +8128,11 @@ mod tests {
             vault.compute_backlog(6_000, &policy).unwrap().transcripts,
             1
         );
+        assert_eq!(
+            vault.compute_backlog(6_000, &policy).unwrap().transcript_duration_ms,
+            3_000,
+            "the ASR panel must describe the recorded time, not only one opaque item"
+        );
 
         let first = vault.claim_audio_alignment(6_000).unwrap().unwrap();
         assert_eq!(first.segment.id, segment.id);
@@ -8204,6 +8217,10 @@ mod tests {
         assert!(vault.claim_audio_alignment(10_000).unwrap().is_none());
         assert_eq!(
             vault.compute_backlog(10_000, &policy).unwrap().transcripts,
+            0
+        );
+        assert_eq!(
+            vault.compute_backlog(10_000, &policy).unwrap().transcript_duration_ms,
             0
         );
 
