@@ -1,7 +1,8 @@
 use crate::{
-    AdapterError, Cancellation, LlmDelta, LlmUsage, ManifestFile, ModelInput, ModelOutput,
-    READY_MARKER,
+    AdapterError, Cancellation, LlmDelta, LlmUsage, ManifestFile, ModelAdapter,
+    ModelCapability, ModelInput, ModelOutput, READY_MARKER,
 };
+use async_trait::async_trait;
 use afterray_protocol::ModelPackState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,9 +18,15 @@ use tokio::{
     sync::{Mutex as AsyncMutex, mpsc},
 };
 
-pub const MLX_WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const MLX_WORKER_PROTOCOL_VERSION: u32 = 3;
 const SHUTDOWN_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const SHUTDOWN_KILL_WAIT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlxWorkerProtocol {
+    Vlm,
+    Asr,
+}
 
 #[derive(Debug, Clone)]
 pub struct PersistentMlxConfig {
@@ -31,6 +38,10 @@ pub struct PersistentMlxConfig {
     pub load_timeout: Duration,
     pub generate_timeout: Duration,
     pub restart_backoff: Duration,
+    pub protocol: MlxWorkerProtocol,
+    /// Qwen3 ASR has a generated tokenizer and a stricter ready marker than a
+    /// generic MLX snapshot, so it must use the ASR-specific verifier.
+    pub verify_qwen3_asr: bool,
 }
 
 impl PersistentMlxConfig {
@@ -45,6 +56,8 @@ impl PersistentMlxConfig {
             load_timeout: Duration::from_secs(180),
             generate_timeout: Duration::from_secs(300),
             restart_backoff: Duration::from_secs(1),
+            protocol: MlxWorkerProtocol::Vlm,
+            verify_qwen3_asr: false,
         }
     }
 }
@@ -118,6 +131,11 @@ impl PersistentMlxAdapter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[must_use]
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.health().pid
     }
 
     // @dec:mlx-prefill-and-request-isolation — docs/decisions/active/architecture/2026-08-20-mlx-prefill-and-request-isolation.md
@@ -204,6 +222,11 @@ impl PersistentMlxAdapter {
             self.set_health(ModelPackState::Incompatible, None, None, Some(error.into()));
             return Err(AdapterError::Process(error.into()));
         }
+        if self.config.protocol != MlxWorkerProtocol::Vlm {
+            return Err(AdapterError::InvalidOutput(
+                "ASR MLX adapter received an LLM request".into(),
+            ));
+        }
         // `messages` is ignored here on purpose: the worker protocol takes one
         // prompt, and `prompt` is the flattening of exactly those messages.
         let ModelInput::Llm { prompt, system, .. } = input else {
@@ -258,9 +281,82 @@ impl PersistentMlxAdapter {
         if runtime.worker.is_some() {
             runtime.last_request_finished = Some(Instant::now());
         }
-        result.map(|(text, usage)| match usage {
+        result.map(|(text, usage, _)| match usage {
             Some(usage) => ModelOutput::llm_with_usage(text, usage),
             None => ModelOutput::llm(text),
+        })
+    }
+
+    /// Executes one ASR request through the resident MLX Audio process.
+    pub async fn execute_asr(
+        &self,
+        job_id: &str,
+        input: &ModelInput,
+        cancellation: Cancellation,
+    ) -> Result<ModelOutput, AdapterError> {
+        if let Some(error) = mlx_platform_incompatibility() {
+            self.set_health(ModelPackState::Incompatible, None, None, Some(error.into()));
+            return Err(AdapterError::Process(error.into()));
+        }
+        if self.config.protocol != MlxWorkerProtocol::Asr {
+            return Err(AdapterError::InvalidOutput(
+                "VLM MLX adapter received an ASR request".into(),
+            ));
+        }
+        let ModelInput::Asr { audio_path, language } = input else {
+            return Err(AdapterError::InvalidOutput(
+                "MLX ASR adapter received a non-ASR input".into(),
+            ));
+        };
+        let shutdown_cancellation = self
+            .shutdown_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut runtime = self.inner.lock().await;
+        if shutdown_cancellation.is_cancelled() {
+            return Err(AdapterError::Cancelled);
+        }
+        self.ensure_started(&mut runtime).await?;
+        let audio_path = audio_path.display().to_string();
+        let request = MlxRequest::AsrGenerate {
+            v: MLX_WORKER_PROTOCOL_VERSION,
+            request_id: job_id,
+            audio_path: &audio_path,
+            language: language.as_deref(),
+        };
+        let result = self
+            .run_generate(
+                &mut runtime,
+                request,
+                job_id,
+                None,
+                cancellation,
+                shutdown_cancellation,
+            )
+            .await;
+        match &result {
+            Err(AdapterError::Cancelled) => {
+                // The MLX Audio API is not interruptible while it is inside
+                // generation. Dropping the whole process is the only boundary
+                // that guarantees its eventual final line cannot be read as a
+                // later job's response.
+                runtime.worker = None;
+                runtime.last_request_finished = None;
+                self.stop_child().await;
+                self.set_health(ModelPackState::Ready, None, None, None);
+            }
+            Err(error) if error.retryable() => {
+                self.fail_worker(&mut runtime, error.to_string()).await;
+            }
+            _ if runtime.worker.is_some() => {
+                runtime.last_request_finished = Some(Instant::now());
+            }
+            _ => {}
+        }
+        result.map(|(text, _, language)| ModelOutput::Asr {
+            text,
+            language,
         })
     }
 
@@ -369,6 +465,18 @@ impl PersistentMlxAdapter {
     }
 
     async fn verify_model(&self) -> Result<(), AdapterError> {
+        if self.config.verify_qwen3_asr {
+            self.set_health(ModelPackState::Verifying, None, None, None);
+            let path = self.config.model_dir.clone();
+            let revision = self.config.revision.clone();
+            let files = self.config.manifest.clone();
+            return tokio::task::spawn_blocking(move || {
+                crate::verify_qwen3_asr_prepared(&path, &revision, &files)
+            })
+            .await
+            .map_err(|error| AdapterError::Process(format!("ASR model verification task failed: {error}")))?
+            .map_err(AdapterError::MissingModel);
+        }
         if self.config.manifest.is_empty() {
             return Ok(());
         }
@@ -400,6 +508,7 @@ impl PersistentMlxAdapter {
             .map_err(|error| AdapterError::MissingModel(error.to_string()))
     }
 
+    // @dec:asr-empty-transcript-results — docs/decisions/active/architecture/2026-08-25-asr-empty-transcript-results.md
     async fn run_generate(
         &self,
         runtime: &mut Runtime,
@@ -408,7 +517,7 @@ impl PersistentMlxAdapter {
         token_tx: Option<mpsc::Sender<LlmDelta>>,
         cancellation: Cancellation,
         shutdown_cancellation: Cancellation,
-    ) -> Result<(String, Option<LlmUsage>), AdapterError> {
+    ) -> Result<(String, Option<LlmUsage>, Option<String>), AdapterError> {
         let Some(worker) = runtime.worker.as_mut() else {
             return Err(AdapterError::Process(
                 "MLX worker disappeared before generation".into(),
@@ -432,6 +541,9 @@ impl PersistentMlxAdapter {
             loop {
                 tokio::select! {
                     () = &mut cancelled => {
+                        if self.config.protocol == MlxWorkerProtocol::Asr {
+                            return Err(AdapterError::Cancelled);
+                        }
                         write_request(&mut worker.stdin, &MlxRequest::Cancel {
                             v: MLX_WORKER_PROTOCOL_VERSION,
                             request_id,
@@ -458,11 +570,23 @@ impl PersistentMlxAdapter {
                                 }
                             }
                             "final" => {
-                                let final_text = normalize_model_output(response.text.as_deref().unwrap_or(""));
-                                if final_text.is_empty() {
+                                let final_text = if self.config.protocol == MlxWorkerProtocol::Asr {
+                                    response.text.clone().ok_or_else(|| {
+                                        AdapterError::InvalidOutput(
+                                            "MLX ASR worker final response omitted text".into(),
+                                        )
+                                    })?
+                                } else {
+                                    normalize_model_output(response.text.as_deref().unwrap_or(""))
+                                };
+                                if self.config.protocol != MlxWorkerProtocol::Asr && final_text.is_empty() {
                                     return Err(AdapterError::InvalidOutput("MLX worker returned empty text".into()));
                                 }
-                                return Ok((final_text, response.usage.and_then(MlxUsage::into_llm)));
+                                return Ok((
+                                    final_text,
+                                    response.usage.and_then(MlxUsage::into_llm),
+                                    response.language,
+                                ));
                             }
                             "error" => return Err(response_error(&response, "MLX generation failed")),
                             other => return Err(AdapterError::InvalidOutput(format!(
@@ -584,10 +708,49 @@ enum MlxRequest<'a> {
         images: Vec<&'a str>,
         max_tokens: u32,
     },
+    AsrGenerate {
+        v: u32,
+        request_id: &'a str,
+        audio_path: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        language: Option<&'a str>,
+    },
     Cancel {
         v: u32,
         request_id: &'a str,
     },
+}
+
+/// ASR is a resident MLX worker too, but it enters the queue as the ASR
+/// capability rather than through the LLM router.
+pub struct PersistentMlxAsrAdapter {
+    name: String,
+    worker: Arc<PersistentMlxAdapter>,
+}
+
+impl PersistentMlxAsrAdapter {
+    #[must_use]
+    pub fn new(name: impl Into<String>, worker: Arc<PersistentMlxAdapter>) -> Self {
+        Self { name: name.into(), worker }
+    }
+}
+
+#[async_trait]
+impl ModelAdapter for PersistentMlxAsrAdapter {
+    fn capability(&self) -> ModelCapability { ModelCapability::Asr }
+
+    fn name(&self) -> &str { &self.name }
+
+    async fn execute(
+        &self,
+        job_id: &str,
+        input: &ModelInput,
+        cancellation: Cancellation,
+    ) -> Result<ModelOutput, AdapterError> {
+        self.worker.execute_asr(job_id, input, cancellation).await
+    }
+
+    fn worker_pid(&self, _job_id: &str) -> Option<u32> { self.worker.worker_pid() }
 }
 
 #[derive(Serialize, Clone)]
@@ -604,9 +767,13 @@ struct MlxResponse {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
     runtime: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    retryable: Option<bool>,
     #[serde(default)]
     usage: Option<MlxUsage>,
 }
@@ -680,7 +847,12 @@ fn validate_response(response: &MlxResponse, request_id: &str) -> Result<(), Ada
 }
 
 fn response_error(response: &MlxResponse, fallback: &str) -> AdapterError {
-    AdapterError::Process(response.error.clone().unwrap_or_else(|| fallback.into()))
+    let message = response.error.clone().unwrap_or_else(|| fallback.into());
+    if response.retryable.unwrap_or(true) {
+        AdapterError::Process(message)
+    } else {
+        AdapterError::MissingModel(message)
+    }
 }
 
 #[must_use]
@@ -728,17 +900,17 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
     *'"kind":"load"'*)
-      printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake@pid-%s"}\n' "$id" "$$"
+      printf '{"v":3,"kind":"ready","request_id":"%s","runtime":"fake@pid-%s"}\n' "$id" "$$"
       ;;
     *'"use_kv_cache"'*)
-      printf '{"v":2,"kind":"error","request_id":"%s","error":"generate protocol must be stateless"}\n' "$id"
+      printf '{"v":3,"kind":"error","request_id":"%s","error":"generate protocol must be stateless"}\n' "$id"
       ;;
     *'"kind":"generate"'*)
-      printf '{"v":2,"kind":"delta","request_id":"%s","text":"hello "}\n' "$id"
-      printf '{"v":2,"kind":"final","request_id":"%s","text":"pid=%s"}\n' "$id" "$$"
+      printf '{"v":3,"kind":"delta","request_id":"%s","text":"hello "}\n' "$id"
+      printf '{"v":3,"kind":"final","request_id":"%s","text":"pid=%s"}\n' "$id" "$$"
       ;;
     *'"kind":"cancel"'*)
-      printf '{"v":2,"kind":"cancelled","request_id":"%s"}\n' "$id"
+      printf '{"v":3,"kind":"cancelled","request_id":"%s"}\n' "$id"
       ;;
   esac
 done
@@ -759,6 +931,13 @@ done
             prompt: value.into(),
             system: Some("system".into()),
             temperature: None,
+        }
+    }
+
+    fn asr_input(path: &str) -> ModelInput {
+        ModelInput::Asr {
+            audio_path: path.into(),
+            language: Some("en".into()),
         }
     }
 
@@ -813,15 +992,107 @@ done
     }
 
     #[tokio::test]
+    async fn asr_reuses_one_worker_then_unloads_after_idle() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"kind":"load"'*) printf '{"v":3,"kind":"ready","request_id":"%s","runtime":"fake-asr"}\n' "$id" ;;
+    *'"kind":"asr_generate"'*) printf '{"v":3,"kind":"final","request_id":"%s","text":"transcript"}\n' "$id" ;;
+  esac
+done
+"#;
+        let mut config = PersistentMlxConfig::new("/bin/sh", "/tmp/fake-asr-model");
+        config.args = vec!["-c".into(), script.into()];
+        config.protocol = MlxWorkerProtocol::Asr;
+        config.load_timeout = Duration::from_secs(2);
+        config.generate_timeout = Duration::from_secs(2);
+        let adapter = PersistentMlxAdapter::new(config);
+
+        assert_eq!(
+            adapter
+                .execute_asr("asr-1", &asr_input("/tmp/one.wav"), Cancellation::default())
+                .await
+                .unwrap(),
+            ModelOutput::Asr { text: "transcript".into(), language: None }
+        );
+        let first_pid = adapter.worker_pid();
+        assert!(first_pid.is_some());
+        adapter
+            .execute_asr("asr-2", &asr_input("/tmp/two.wav"), Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(adapter.worker_pid(), first_pid);
+        assert!(adapter.unload_if_idle(Duration::ZERO).await);
+        assert!(adapter.worker_pid().is_none());
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn asr_empty_final_is_a_successful_transcript() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"kind":"load"'*) printf '{"v":3,"kind":"ready","request_id":"%s","runtime":"fake-asr"}\n' "$id" ;;
+    *'"kind":"asr_generate"'*) printf '{"v":3,"kind":"final","request_id":"%s","text":"","language":"zh"}\n' "$id" ;;
+  esac
+done
+"#;
+        let mut config = PersistentMlxConfig::new("/bin/sh", "/tmp/fake-asr-model");
+        config.args = vec!["-c".into(), script.into()];
+        config.protocol = MlxWorkerProtocol::Asr;
+        config.load_timeout = Duration::from_secs(2);
+        config.generate_timeout = Duration::from_secs(2);
+        let adapter = PersistentMlxAdapter::new(config);
+
+        assert_eq!(
+            adapter
+                .execute_asr("asr-empty", &asr_input("/tmp/silent.wav"), Cancellation::default())
+                .await
+                .unwrap(),
+            ModelOutput::Asr { text: String::new(), language: Some("zh".into()) }
+        );
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_retryable_worker_error_is_not_retried() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"kind":"load"'*) printf '{"v":3,"kind":"ready","request_id":"%s","runtime":"fake-asr"}\n' "$id" ;;
+    *'"kind":"asr_generate"'*) printf '{"v":3,"kind":"error","request_id":"%s","error":"audio input is unreadable","retryable":false}\n' "$id" ;;
+  esac
+done
+"#;
+        let mut config = PersistentMlxConfig::new("/bin/sh", "/tmp/fake-asr-model");
+        config.args = vec!["-c".into(), script.into()];
+        config.protocol = MlxWorkerProtocol::Asr;
+        config.load_timeout = Duration::from_secs(2);
+        config.generate_timeout = Duration::from_secs(2);
+        let adapter = PersistentMlxAdapter::new(config);
+
+        assert!(matches!(
+            adapter
+                .execute_asr("asr-bad-input", &asr_input("/tmp/missing.wav"), Cancellation::default())
+                .await,
+            Err(AdapterError::MissingModel(message)) if message == "audio input is unreadable"
+        ));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn idle_unload_waits_for_an_active_generation() {
         let script = r#"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"kind":"load"'*) printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
+    *'"kind":"load"'*) printf '{"v":3,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
     *'"kind":"generate"'*)
       sleep 0.1
-      printf '{"v":2,"kind":"final","request_id":"%s","text":"ok"}\n' "$id"
+      printf '{"v":3,"kind":"final","request_id":"%s","text":"ok"}\n' "$id"
       ;;
   esac
 done
@@ -852,10 +1123,10 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"kind":"load"'*) printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
-    *'"kind":"cancel"'*) printf '{"v":2,"kind":"cancelled","request_id":"%s"}\n' "$id" ;;
+    *'"kind":"load"'*) printf '{"v":3,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
+    *'"kind":"cancel"'*) printf '{"v":3,"kind":"cancelled","request_id":"%s"}\n' "$id" ;;
     *'"request_id":"cancel-me"'*) ;;
-    *'"kind":"generate"'*) printf '{"v":2,"kind":"final","request_id":"%s","text":"ok"}\n' "$id" ;;
+    *'"kind":"generate"'*) printf '{"v":3,"kind":"final","request_id":"%s","text":"ok"}\n' "$id" ;;
   esac
 done
 "#;
@@ -890,7 +1161,7 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"kind":"load"'*) printf '{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
+    *'"kind":"load"'*) printf '{"v":3,"kind":"ready","request_id":"%s","runtime":"fake"}\n' "$id" ;;
     *'"kind":"cancel"'*) ;;
     *'"kind":"generate"'*) ;;
   esac
@@ -930,10 +1201,10 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"kind":"load"'*) printf '{{"v":2,"kind":"ready","request_id":"%s","runtime":"fake"}}\n' "$id" ;;
+    *'"kind":"load"'*) printf '{{"v":3,"kind":"ready","request_id":"%s","runtime":"fake"}}\n' "$id" ;;
     *'"kind":"generate"'*)
       if [ ! -f '{marker}' ]; then /usr/bin/touch '{marker}'; exit 17; fi
-      printf '{{"v":2,"kind":"final","request_id":"%s","text":"recovered"}}\n' "$id"
+      printf '{{"v":3,"kind":"final","request_id":"%s","text":"recovered"}}\n' "$id"
       ;;
   esac
 done

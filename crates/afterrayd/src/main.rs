@@ -14,10 +14,12 @@ use afterray_harness::ContextBudget;
 use afterray_models::{
     Cancellation, DownloadError, JobState, LlmRouterAdapter, LlmRuntimeConfig, LlmTokenSink,
     ModelAdapter, ModelCapability, ModelInput, ModelOutput, ModelQueue, OcrRegion,
-    PersistentMlxAdapter, PersistentMlxConfig, ProcessAdapter, ProcessAdapterConfig,
+    MlxWorkerProtocol, PersistentMlxAdapter, PersistentMlxAsrAdapter, PersistentMlxConfig,
+    ProcessAdapter, ProcessAdapterConfig,
     QWEN3_ALIGNER_PACK_ID, QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REVISION, QWEN35_9B_MLX_PACK_ID,
     QWEN35_9B_MLX_REVISION, QueueConfig, TranscriptCue, download_packs_with_cancellation,
-    huggingface_mirror_to_persist, library, model_directory, probe_llm, qwen35_9b_mlx_manifest,
+    huggingface_mirror_to_persist, library, model_directory, probe_llm, qwen3_asr_manifest,
+    qwen35_9b_mlx_manifest,
     qwen35_mlx_manifest, reclaim_abandoned_downloads, remove_pack, spec_by_id, specs_for_download,
 };
 use afterray_platform_macos::{
@@ -481,17 +483,7 @@ fn local_model_adapters(
         .with_mlx(QWEN35_4B_MLX_PACK_ID, Arc::clone(&mlx_4b))
         .with_mlx(QWEN35_9B_MLX_PACK_ID, Arc::clone(&mlx_9b));
     let token_sink = llm.token_sink();
-    let asr_model_dir = spec_by_id("asr")
-        .map(|spec| spec.path)
-        .unwrap_or_else(|| model_directory().join("Qwen3-ASR-1.7B-MLX-4bit"));
-    let mut mlx_asr_config = ProcessAdapterConfig::new(
-        "qwen3-asr-mlx",
-        ModelCapability::Asr,
-        mlx_asr_worker,
-    );
-    mlx_asr_config
-        .env
-        .insert("AFTERRAY_ASR_MODEL".into(), asr_model_dir.display().to_string());
+    let mlx_asr = new_mlx_asr_adapter(&mlx_asr_worker);
     (
         vec![
             Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
@@ -499,7 +491,7 @@ fn local_model_adapters(
                 ModelCapability::Ocr,
                 native_worker,
             ))) as Arc<dyn ModelAdapter>,
-            Arc::new(ProcessAdapter::new(mlx_asr_config)),
+            Arc::new(PersistentMlxAsrAdapter::new("qwen3-asr-mlx", Arc::clone(&mlx_asr))),
             Arc::new(ProcessAdapter::new(ProcessAdapterConfig::new(
                 "llama-embedding",
                 ModelCapability::Embedding,
@@ -511,8 +503,21 @@ fn local_model_adapters(
         vec![
             (QWEN35_4B_MLX_PACK_ID.into(), mlx_4b),
             (QWEN35_9B_MLX_PACK_ID.into(), mlx_9b),
+            ("asr".into(), mlx_asr),
         ],
     )
+}
+
+fn new_mlx_asr_adapter(worker: &Path) -> Arc<PersistentMlxAdapter> {
+    let model_dir = spec_by_id("asr")
+        .map(|spec| spec.path)
+        .unwrap_or_else(|| model_directory().join("Qwen3-ASR-1.7B-MLX-4bit"));
+    let mut config = PersistentMlxConfig::new(worker, model_dir);
+    config.protocol = MlxWorkerProtocol::Asr;
+    config.verify_qwen3_asr = true;
+    config.revision = afterray_models::QWEN3_ASR_REVISION.into();
+    config.manifest = qwen3_asr_manifest();
+    Arc::new(PersistentMlxAdapter::new(config))
 }
 
 fn new_mlx_adapter(

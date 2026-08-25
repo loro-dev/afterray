@@ -41,7 +41,7 @@ public struct DaySummaryPanel: View {
     @Environment(\.afterRayLocale) private var afterRayLocale
     var style: DaySummaryPanelStyle = .overlay
     var onPopOut: (() -> Void)? = nil
-    let summaries: [DaySummary]
+    let history: SummaryHistoryState
     /// The slot the playhead sits in — resolved once in `init`, not a stored
     /// `playheadMs`.
     ///
@@ -55,9 +55,6 @@ public struct DaySummaryPanel: View {
     let highlightedSlotStart: Int64?
     /// Local midnight, not a live clock — see `DaySummaryLayout.dayStartMs`.
     let todayStartMs: Int64
-    let hasMore: Bool
-    let totalDays: Int?
-    let isLoadingMore: Bool
     /// Bumped when a scrub settles for one final alignment correction.
     /// Live following is throttled to highlighted slot changes.
     let followPulse: Int
@@ -67,28 +64,22 @@ public struct DaySummaryPanel: View {
     public init(
         style: DaySummaryPanelStyle = .overlay,
         onPopOut: (() -> Void)? = nil,
-        summaries: [DaySummary],
+        history: SummaryHistoryState,
         playheadMs: Int64,
         nowMs: Int64,
-        hasMore: Bool,
-        totalDays: Int? = nil,
-        isLoadingMore: Bool,
         followPulse: Int,
         onSelectSlot: @escaping (DaySlotSummary) -> Void,
         onLoadMore: @escaping () -> Void
     ) {
         self.style = style
         self.onPopOut = onPopOut
-        self.summaries = summaries
+        self.history = history
         // Both collapse a per-frame value to one that only changes when the
         // panel would actually look different.
-        self.highlightedSlotStart = summaries.lazy.compactMap {
+        self.highlightedSlotStart = history.days.lazy.compactMap {
             DaySummaryLayout.highlightedSlotStartMs(playheadMs: playheadMs, slots: $0.slots)
         }.first
         self.todayStartMs = DaySummaryLayout.dayStartMs(atMs: nowMs)
-        self.hasMore = hasMore
-        self.totalDays = totalDays
-        self.isLoadingMore = isLoadingMore
         self.followPulse = followPulse
         self.onSelectSlot = onSelectSlot
         self.onLoadMore = onLoadMore
@@ -106,12 +97,9 @@ public struct DaySummaryPanel: View {
             locale: afterRayLocale,
             style: style,
             onPopOut: onPopOut,
-            summaries: summaries,
+            history: history,
             highlightedSlotStart: highlightedSlotStart,
             todayStartMs: todayStartMs,
-            hasMore: hasMore,
-            totalDays: totalDays,
-            isLoadingMore: isLoadingMore,
             followPulse: followPulse,
             onSelectSlot: onSelectSlot,
             onLoadMore: onLoadMore
@@ -142,12 +130,9 @@ struct DaySummaryPanelContent: View, Equatable {
     @State private var stickyChip: DayHeadingChip?
     let style: DaySummaryPanelStyle
     let onPopOut: (() -> Void)?
-    let summaries: [DaySummary]
+    let history: SummaryHistoryState
     let highlightedSlotStart: Int64?
     let todayStartMs: Int64
-    let hasMore: Bool
-    let totalDays: Int?
-    let isLoadingMore: Bool
     let followPulse: Int
     let onSelectSlot: (DaySlotSummary) -> Void
     let onLoadMore: () -> Void
@@ -156,24 +141,21 @@ struct DaySummaryPanelContent: View, Equatable {
         lhs.locale == rhs.locale
             && lhs.highlightedSlotStart == rhs.highlightedSlotStart
             && lhs.followPulse == rhs.followPulse
-            && lhs.isLoadingMore == rhs.isLoadingMore
-            && lhs.hasMore == rhs.hasMore
-            && lhs.totalDays == rhs.totalDays
+            && lhs.history == rhs.history
             && lhs.todayStartMs == rhs.todayStartMs
             && lhs.style == rhs.style
             && (lhs.onPopOut == nil) == (rhs.onPopOut == nil)
-            && lhs.summaries == rhs.summaries
     }
 
 
     private var dayCountLabel: String {
-        HistoryDayCount.label(totalDays: totalDays, copy: copy)
+        HistoryDayCount.label(totalDays: history.totalDays, copy: copy)
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if summaries.isEmpty {
+            if history.days.isEmpty, history.boundary == .end {
                 emptyState
             } else {
                 historyList
@@ -214,7 +196,7 @@ struct DaySummaryPanelContent: View, Equatable {
         .padding(.bottom, 8)
         .contextMenu {
             Button(copy.recall.copyAllLoadedDays) {
-                copyToPasteboard(DaySummaryClipboard.historyText(summaries))
+                copyToPasteboard(DaySummaryClipboard.historyText(history.days))
             }
         }
     }
@@ -235,10 +217,10 @@ struct DaySummaryPanelContent: View, Equatable {
 
     private var listItems: [HistoryListItem] {
         HistoryListItems.build(
-            summaries: summaries,
+            summaries: history.days,
             nowMs: todayStartMs,
             expandedSlotStarts: expandedSlotStarts,
-            hasMore: hasMore,
+            boundary: history.boundary,
             copy: copy,
             locale: locale
         )
@@ -247,13 +229,12 @@ struct DaySummaryPanelContent: View, Equatable {
     private var historyList: some View {
         HistoryListScrollView(
             items: listItems,
-            isLoadingMore: isLoadingMore,
-            hasMore: hasMore,
+            boundary: history.boundary,
             showsIndicator: style == .window,
             followID: highlightedSlotStart.map { HistoryListItem.slotID(slotStartMs: $0) },
             followGeneration: followGeneration,
             onLoadMore: {
-                if hasMore, !isLoadingMore { onLoadMore() }
+                if history.boundary.canLoad { onLoadMore() }
             },
             onStickyChip: { chip in
                 if chip != stickyChip { stickyChip = chip }
@@ -329,7 +310,7 @@ struct DaySummaryPanelContent: View, Equatable {
                 label: label,
                 isToday: isToday,
                 onCopyDay: {
-                    guard let day = summaries.first(where: { $0.dayStartMs == dayStartMs })
+                    guard let day = history.days.first(where: { $0.dayStartMs == dayStartMs })
                     else { return }
                     copyToPasteboard(DaySummaryClipboard.dayText(day))
                 }
@@ -351,7 +332,10 @@ struct DaySummaryPanelContent: View, Equatable {
             )
             .equatable()
         case .loadMore:
-            HistorySummaryLoadTrigger(isLoading: isLoadingMore)
+            HistorySummaryLoadTrigger(
+                boundary: history.boundary,
+                onRetry: onLoadMore
+            )
         }
     }
 }
@@ -600,21 +584,35 @@ private struct DaySummaryPanelChrome: ViewModifier {
 
 private struct HistorySummaryLoadTrigger: View {
     @Environment(\.afterRayCopy) private var copy
-    let isLoading: Bool
+    let boundary: SummaryHistoryBoundary
+    let onRetry: () -> Void
+
+    private var accessibilityLabel: String {
+        if boundary.isLoading { return copy.recall.loadingOlderSummaries }
+        if boundary.isFailure { return copy.common.retry }
+        return copy.recall.loadOlderSummaries
+    }
 
     var body: some View {
         Group {
-            if isLoading {
+            if boundary.isLoading {
                 ProgressView()
                     .controlSize(.small)
                     .tint(RecallPalette.ray)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            } else if boundary.isFailure {
+                Button(copy.common.retry, action: onRetry)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(RecallPalette.ray)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
             } else {
                 Color.clear.frame(height: 1)
             }
         }
-        .accessibilityLabel(isLoading ? copy.recall.loadingOlderSummaries : copy.recall.loadOlderSummaries)
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 

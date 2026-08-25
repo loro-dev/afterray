@@ -43,7 +43,7 @@ final class HistoryListVirtualizationTests: XCTestCase {
             summaries: [day],
             nowMs: dayMs + 3_600_000,
             expandedSlotStarts: [],
-            hasMore: true
+            boundary: .loadable(.before(dayMs))
         )
         XCTAssertEqual(items.count, 4)
         guard case let .heading(_, label, isToday) = items[0] else {
@@ -78,10 +78,35 @@ final class HistoryListVirtualizationTests: XCTestCase {
             summaries: [day],
             nowMs: dayMs,
             expandedSlotStarts: [],
-            hasMore: false
+            boundary: .end
         )
         XCTAssertEqual(items.count, 2)
         XCTAssertEqual(items.map(\.id), ["d-0", "s-0"])
+    }
+
+    func testOnlyEndRemovesTheBoundaryRow() {
+        let activeBoundaries: [SummaryHistoryBoundary] = [
+            .loadable(.newest),
+            .loading(.newest, requestID: 1),
+            .failed(.newest, message: "offline"),
+        ]
+        for boundary in activeBoundaries {
+            let items = HistoryListItems.build(
+                summaries: [],
+                nowMs: dayMs,
+                expandedSlotStarts: [],
+                boundary: boundary
+            )
+            XCTAssertEqual(items, [.loadMore])
+        }
+
+        let ended = HistoryListItems.build(
+            summaries: [],
+            nowMs: dayMs,
+            expandedSlotStarts: [],
+            boundary: .end
+        )
+        XCTAssertTrue(ended.isEmpty)
     }
 
     /// `ScrollGeometry.visibleRect.minY` is the distance scrolled from the top

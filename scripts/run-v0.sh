@@ -299,7 +299,7 @@ export AFTERRAY_GOP_ARCHIVE="${AFTERRAY_GOP_ARCHIVE:-1}"
 export AFTERRAY_GOP_REQUIRE_AC="${AFTERRAY_GOP_REQUIRE_AC:-0}"
 export AFTERRAY_GOP_KEYINT="${AFTERRAY_GOP_KEYINT:-30}"
 mkdir -p "$AFTERRAY_DATA_DIR"
-default_asr_model="$repo_root/.afterray/models/Qwen3-ASR-1.7B"
+default_asr_model="$repo_root/.afterray/models/Qwen3-ASR-1.7B-MLX-4bit"
 if [[ -z "${AFTERRAY_ASR_MODEL:-}" && -d "$default_asr_model" ]]; then
   export AFTERRAY_ASR_MODEL="$default_asr_model"
 fi

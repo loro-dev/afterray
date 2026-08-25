@@ -267,8 +267,8 @@ second background step clears the recovery manifest or `afterrayd` can start.
 | `AFTERRAY_GOP_KEYINT` | Max frames per closed GOP (`6` `12` `20` `24` `30`) | `30` |
 | `AFTERRAY_MODEL_WORKER` | Rust inference worker | Bundled `afterray-model-worker` |
 | `AFTERRAY_MODEL_DIR` | Weight directory | `.afterray/models` |
-| `AFTERRAY_ASR_MODEL` | Qwen3-ASR snapshot directory | `$AFTERRAY_MODEL_DIR/Qwen3-ASR-1.7B` |
-| `AFTERRAY_ASR_REPOSITORY` | Hugging Face repo for ASR | `Qwen/Qwen3-ASR-1.7B` |
+| `AFTERRAY_ASR_MODEL` | Qwen3-ASR MLX snapshot directory | `$AFTERRAY_MODEL_DIR/Qwen3-ASR-1.7B-MLX-4bit` |
+| `AFTERRAY_ASR_REPOSITORY` | Hugging Face repo for ASR | `mlx-community/Qwen3-ASR-1.7B-4bit` |
 | `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | `$AFTERRAY_MODEL_DIR/nomic-embed-text-v1.5.Q4_K_M.gguf` |
 | `AFTERRAY_LLM_MODEL` | Optional built-in instruct GGUF path | `$AFTERRAY_MODEL_DIR/<AFTERRAY_LLM_FILE>` |
 | `AFTERRAY_LLM_REPOSITORY` | Hugging Face repo for the built-in GGUF | `unsloth/Qwen3.6-27B-GGUF` |

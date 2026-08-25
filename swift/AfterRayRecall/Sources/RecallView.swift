@@ -209,18 +209,13 @@ public struct RecallView: View {
     public var onToggleRecording: (() -> Void)?
     public var chromeTopPadding: CGFloat
     public var trailingChromeInset: CGFloat
-    public var daySummary: DaySummary
-    /// Newest first; the history panel pages older days from the daemon.
-    public var summaryHistory: [DaySummary]
-    public var summaryHistoryHasMore: Bool
-    public var summaryHistoryTotalDays: Int?
-    public var isLoadingSummaryHistory: Bool
+    /// Newest first, with one explicit boundary for the document tail.
+    public var summaryHistory: SummaryHistoryState
     public var onLoadOlderSummaryHistory: (() -> Void)?
     /// Detach the history panel into a standalone window; nil hides the
     /// affordance (Visual Lab, snapshots).
     public var onPopOutHistory: (() -> Void)?
     public var onOpenSummarySlot: ((DaySlotSummary) -> Void)?
-    public var onVisibleDayChange: ((Int64) async -> Void)?
     /// Metadata and summary work owned by the app starts only after a
     /// real quiet period. Keeping the async call inside this view's keyed task
     /// lets the next gesture cancel it before it publishes into the root.
@@ -305,15 +300,10 @@ public struct RecallView: View {
         onToggleRecording: (() -> Void)? = nil,
         chromeTopPadding: CGFloat = 22,
         trailingChromeInset: CGFloat = 0,
-        daySummary: DaySummary = .empty,
-        summaryHistory: [DaySummary] = [],
-        summaryHistoryHasMore: Bool = false,
-        summaryHistoryTotalDays: Int? = nil,
-        isLoadingSummaryHistory: Bool = false,
+        summaryHistory: SummaryHistoryState = .empty,
         onLoadOlderSummaryHistory: (() -> Void)? = nil,
         onPopOutHistory: (() -> Void)? = nil,
         onOpenSummarySlot: ((DaySlotSummary) -> Void)? = nil,
-        onVisibleDayChange: ((Int64) async -> Void)? = nil,
         onSelectionSettled: (() async -> Void)? = nil,
         onTimelineTravelBegan: ((RecallTimelineTravelOrigin) -> Void)? = nil,
         searchSession: RecallSearchSession? = nil,
@@ -351,15 +341,10 @@ public struct RecallView: View {
         self.onToggleRecording = onToggleRecording
         self.chromeTopPadding = chromeTopPadding
         self.trailingChromeInset = trailingChromeInset
-        self.daySummary = daySummary
         self.summaryHistory = summaryHistory
-        self.summaryHistoryHasMore = summaryHistoryHasMore
-        self.summaryHistoryTotalDays = summaryHistoryTotalDays
-        self.isLoadingSummaryHistory = isLoadingSummaryHistory
         self.onLoadOlderSummaryHistory = onLoadOlderSummaryHistory
         self.onPopOutHistory = onPopOutHistory
         self.onOpenSummarySlot = onOpenSummarySlot
-        self.onVisibleDayChange = onVisibleDayChange
         self.onSelectionSettled = onSelectionSettled
         self.onTimelineTravelBegan = onTimelineTravelBegan
         self.searchSession = searchSession
@@ -474,7 +459,7 @@ public struct RecallView: View {
                 RecallPalette.background.ignoresSafeArea()
             }
 
-            if !moments.isEmpty || renderedIsLive || summaryHistory.contains(where: { !$0.day.isEmpty }) {
+            if !moments.isEmpty || renderedIsLive || !summaryHistory.days.isEmpty {
                 recallContent
             } else if case .failed(let message) = loadState {
                 FailureView(message: message, onReload: onReload)
@@ -543,12 +528,9 @@ public struct RecallView: View {
                                     popOut()
                                 }
                             },
-                            summaries: summaryHistory.isEmpty ? [daySummary] : summaryHistory,
+                            history: summaryHistory,
                             playheadMs: renderedPlayheadMs,
                             nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
-                            hasMore: summaryHistoryHasMore,
-                            totalDays: summaryHistoryTotalDays,
-                            isLoadingMore: isLoadingSummaryHistory,
                             followPulse: followPulse,
                             onSelectSlot: { slot in
                                 if let onOpenSummarySlot {
@@ -662,13 +644,6 @@ public struct RecallView: View {
                   timelineTravelOrigin != .audioPlayback
             else { return }
             await onSelectionSettled?()
-            guard !Task.isCancelled, !isScrubbing else { return }
-            // A cold search settle may recenter the store while this task still
-            // holds the pre-open View value. Its owner loads the final search
-            // day from store state; using this captured playhead would reopen
-            // the old day's summary.
-            guard searchSession == nil else { return }
-            await onVisibleDayChange?(renderedPlayheadMs)
         }
         .task(id: highlightTaskKey) {
             await loadHighlightRegions()

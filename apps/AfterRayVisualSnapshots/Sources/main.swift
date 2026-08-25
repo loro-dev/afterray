@@ -160,7 +160,7 @@ private func chromeScene(
                 onOpenSettings: {},
                 recordingState: .recording,
                 onToggleRecording: {},
-                daySummary: .mockRich(around: playheadMs),
+                summaryHistory: .complete(days: [.mockRich(around: playheadMs)]),
                 searchSession: session,
                 thumbnailLoader: MockSearchData.thumbnailLoader,
                 ocrLoader: MockSearchData.ocrLoader
@@ -561,16 +561,54 @@ private var historyPanelScene: [SnapshotScene] {
             content: AnyView(
                 DaySummaryPanel(
                     style: .window,
-                    summaries: [today, yesterday],
+                    history: .complete(days: [today, yesterday]),
                     playheadMs: dayStart + 25 * slotMs + 60_000,
                     nowMs: now,
-                    hasMore: false,
-                    isLoadingMore: false,
                     followPulse: 0,
                     onSelectSlot: { _ in },
                     onLoadMore: {}
                 )
                 .frame(width: 380, height: 720)
+            )
+        ),
+        SnapshotScene(
+            name: "16-history-panel-loading",
+            size: CGSize(width: 380, height: 180),
+            settleSeconds: 0.3,
+            content: AnyView(
+                DaySummaryPanel(
+                    style: .window,
+                    history: SummaryHistoryState(
+                        days: [],
+                        boundary: .loading(.newest, requestID: 1)
+                    ),
+                    playheadMs: now,
+                    nowMs: now,
+                    followPulse: 0,
+                    onSelectSlot: { _ in },
+                    onLoadMore: {}
+                )
+                .frame(width: 380, height: 180)
+            )
+        ),
+        SnapshotScene(
+            name: "16-history-panel-failed",
+            size: CGSize(width: 380, height: 180),
+            settleSeconds: 0.3,
+            content: AnyView(
+                DaySummaryPanel(
+                    style: .window,
+                    history: SummaryHistoryState(
+                        days: [],
+                        boundary: .failed(.newest, message: "offline")
+                    ),
+                    playheadMs: now,
+                    nowMs: now,
+                    followPulse: 0,
+                    onSelectSlot: { _ in },
+                    onLoadMore: {}
+                )
+                .frame(width: 380, height: 180)
             )
         ),
     ]
@@ -591,11 +629,9 @@ private var mixedHistoryScene: [SnapshotScene] {
             content: AnyView(
                 DaySummaryPanel(
                     style: .window,
-                    summaries: summaries,
+                    history: .complete(days: summaries),
                     playheadMs: playheadMs,
                     nowMs: playheadMs,
-                    hasMore: false,
-                    isLoadingMore: false,
                     followPulse: 0,
                     onSelectSlot: { _ in },
                     onLoadMore: {}
@@ -743,7 +779,7 @@ private var captionScenes: [SnapshotScene] {
                     onOpenSettings: {},
                     recordingState: .recording,
                     onToggleRecording: {},
-                    daySummary: .mockRich(around: playheadMs)
+                    summaryHistory: .complete(days: [.mockRich(around: playheadMs)])
                 )
                 .frame(width: CGFloat(width), height: CGFloat(height))
             )

@@ -5,7 +5,7 @@ import MLXLMCommon
 import MLXVLM
 import Tokenizers
 
-public let mlxWorkerProtocolVersion = 2
+public let mlxWorkerProtocolVersion = 3
 public let mlxRuntimeVersion = "mlx-swift-lm@65be34c"
 public let qwen35_4BRevision = "32f3e8ecf65426fc3306969496342d504bfa13f3"
 public let qwen35_9BRevision = "938d8919941c6e7efd3c7150eff7fe9d12afa631"

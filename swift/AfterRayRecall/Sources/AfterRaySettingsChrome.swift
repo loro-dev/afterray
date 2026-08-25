@@ -24,6 +24,7 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var isUpdatingLanguage: Bool { get }
     var recordAudio: Bool { get }
     var excludedBundleIds: [String] { get }
+    var excludedBundleDisplayNames: [String: String] { get }
     var excludedDomains: [String] { get }
     var isUpdatingExclusions: Bool { get }
     var isClearingHistory: Bool { get }
@@ -165,6 +166,22 @@ public struct AfterRayStorageSnapshot: Equatable, Sendable {
             volumeTotal: UInt64(values?.volumeTotalCapacity ?? 0),
             volumeFree: UInt64(max(free, 0))
         )
+    }
+
+    /// Directory enumeration touches every stored artifact and model file, so
+    /// it must not run on the actor that renders Settings.
+    public static func measureOffMain(
+        dataDirectory: URL,
+        modelDirectory: URL,
+        runtimeDirectory: URL
+    ) async -> Self {
+        await Task.detached(priority: .utility) {
+            measure(
+                dataDirectory: dataDirectory,
+                modelDirectory: modelDirectory,
+                runtimeDirectory: runtimeDirectory
+            )
+        }.value
     }
 
     public static func itemBytes(at url: URL) -> UInt64 {
@@ -440,7 +457,12 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         }
         .afterRayLocalized()
-        .task { await model.refresh() }
+        .task {
+            await model.refresh()
+            if page == .models {
+                await model.probeLlm()
+            }
+        }
         .alert(
             copy.settings.moveMemoriesTitle,
             isPresented: memoryLocationConfirmationPresented
@@ -460,6 +482,11 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         .onChange(of: model.developerOptionsEnabled) { _, enabled in
             if !enabled, page == .developer {
                 page = .advanced
+            }
+        }
+        .onChange(of: page) { _, nextPage in
+            if nextPage == .models {
+                Task { await model.probeLlm() }
             }
         }
     }
@@ -983,10 +1010,9 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     }
 
     private func appName(for bundleID: String) -> String {
-        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            return FileManager.default.displayName(atPath: url.path)
-        }
-        return AfterRayPrivacyCatalog.protectedName(for: bundleID) ?? bundleID
+        model.excludedBundleDisplayNames[bundleID]
+            ?? AfterRayPrivacyCatalog.protectedName(for: bundleID)
+            ?? bundleID
     }
 
     // MARK: Models

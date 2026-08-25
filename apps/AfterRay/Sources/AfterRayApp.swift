@@ -1346,6 +1346,7 @@ private struct AfterRayRootView: View {
     // Shared with the standalone history window: both faces must observe
     // the same store, or the popped-out panel drifts from the overlay.
     @ObservedObject private var store = AfterRayServices.shared.store
+    @ObservedObject private var history = AfterRayServices.shared.history
     @ObservedObject private var control = AfterRayServices.shared.control
     @ObservedObject private var audioPlayer = AfterRayServices.shared.audioPlayer
     @StateObject private var permissions = SystemPermissionCoordinator()
@@ -1415,19 +1416,12 @@ private struct AfterRayRootView: View {
             isChangingRecording: control.isChangingRecording,
             onToggleRecording: toggleRecording,
             chromeTopPadding: controlBarTopPadding,
-            daySummary: store.daySummary,
-            summaryHistory: store.summaryHistory,
-            summaryHistoryHasMore: store.summaryHistoryHasMore,
-            summaryHistoryTotalDays: store.summaryHistoryTotalDays,
-            isLoadingSummaryHistory: store.isLoadingSummaryHistory,
+            summaryHistory: history.state,
             onLoadOlderSummaryHistory: {
-                Task { await store.loadOlderSummaryHistory() }
+                Task { await history.loadNext() }
             },
             onPopOutHistory: { HistoryWindowController.shared.show() },
             onOpenSummarySlot: openSummarySlot,
-            onVisibleDayChange: { dayMs in
-                await store.loadDaySummary(dayMs: dayMs)
-            },
             onSelectionSettled: {
                 await settleSelectedRecallEvidence()
             },
@@ -1556,6 +1550,7 @@ private struct AfterRayRootView: View {
         // the overlay's first frame (focus, live-route, compute watch).
         .onReceive(NotificationCenter.default.publisher(for: .afterRayRecallDidOpen)) { notification in
             audioPlayer.stop()
+            Task { await history.refreshNewest() }
             if permissions.allGranted, !AfterRaySettingsController.shared.isVisible {
                 queryFocusRequest &+= 1
             }
@@ -1609,12 +1604,15 @@ private struct AfterRayRootView: View {
                 {
                     _ = await control.ensureRecording()
                 }
-                await store.refreshTimeline(preservingSelection: !isLive)
+                async let timeline: Void = store.refreshTimeline(preservingSelection: !isLive)
+                async let summaries: Void = history.reload()
+                _ = await (timeline, summaries)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .afterRaySystemSessionWillSuspend)) { _ in
             audioPlayer.clearSensitiveData()
             store.clearSensitiveState()
+            history.clearSensitiveState()
             control.clearSensitiveState()
             chat.clearSensitiveState()
             ChatWindowController.shared.close()
@@ -1656,10 +1654,6 @@ private struct AfterRayRootView: View {
 
         if let moment = store.selectedMoment {
             audioPlayer.updateEvidence(from: moment)
-        }
-        if control.searchSession != nil {
-            await store.loadDaySummary(dayMs: store.playheadMs)
-            guard !Task.isCancelled else { return }
         }
         await store.prefetchAdjacentTimelineDays()
     }
@@ -1790,7 +1784,9 @@ private struct AfterRayRootView: View {
             await control.refreshStatus()
         }
         guard !AfterRayTerminationState.shared.isTerminating else { return }
-        await store.loadTimeline()
+        async let timeline: Void = store.loadTimeline()
+        async let summaries: Void = history.reload()
+        _ = await (timeline, summaries)
         await store.prefetchAdjacentTimelineDays()
         // The in-process scrub driver waits for this real overlay and display
         // link. Normal launches never carry the opt-in environment variable.
@@ -1832,7 +1828,8 @@ private struct AfterRayRootView: View {
             guard await startDaemonOrReportFailure() != nil else { return }
             async let status: Void = control.refreshStatus()
             async let timeline: Void = store.refreshTimeline(preservingSelection: !isLive)
-            _ = await (status, timeline)
+            async let summaries: Void = history.refreshNewest()
+            _ = await (status, timeline, summaries)
         }
     }
 
@@ -1848,7 +1845,9 @@ private struct AfterRayRootView: View {
                 } else {
                     await control.refreshStatus()
                 }
-                await store.refreshTimeline(preservingSelection: !isLive)
+                async let timeline: Void = store.refreshTimeline(preservingSelection: !isLive)
+                async let summaries: Void = history.refreshNewest()
+                _ = await (timeline, summaries)
             }
             try? await Task.sleep(for: .seconds(1))
         }

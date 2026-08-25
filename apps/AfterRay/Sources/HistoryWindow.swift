@@ -15,6 +15,7 @@ final class AfterRayServices {
     let daemon: UnixSocketDaemonClient
     let images: RecallImageRepository
     let store: RecallStore
+    let history: SummaryHistoryStore
     let control: AfterRayControlModel
     let chat: AfterRayChatModel
     let audioPlayer: ArtifactAudioPlayer
@@ -29,6 +30,7 @@ final class AfterRayServices {
         self.daemon = daemon
         images = repository
         store = RecallStore(daemon: daemon)
+        history = SummaryHistoryStore(loader: daemon)
         control = AfterRayControlModel(daemon: daemon)
         chat = AfterRayChatModel(daemon: daemon)
         audioPlayer = ArtifactAudioPlayer(
@@ -115,10 +117,7 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
         Task { @MainActor in
             do {
                 _ = try await DaemonSupervisor.shared.startIfNeeded()
-                await AfterRayServices.shared.store.loadDaySummary(
-                    dayMs: Int64(Date.now.timeIntervalSince1970 * 1_000),
-                    force: true
-                )
+                await AfterRayServices.shared.history.refreshNewest()
             } catch {
                 AfterRayServices.shared.store.reportFailure(error.localizedDescription)
             }
@@ -134,22 +133,20 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
 
 private struct HistoryWindowRoot: View {
     @ObservedObject private var store = AfterRayServices.shared.store
+    @ObservedObject private var history = AfterRayServices.shared.history
 
     var body: some View {
         DaySummaryPanel(
             style: .window,
-            summaries: store.summaryHistory.isEmpty ? [store.daySummary] : store.summaryHistory,
+            history: history.state,
             playheadMs: store.playheadMs,
-            nowMs: Int64(Date().timeIntervalSince1970 * 1_000),
-            hasMore: store.summaryHistoryHasMore,
-            totalDays: store.summaryHistoryTotalDays,
-            isLoadingMore: store.isLoadingSummaryHistory,
+            nowMs: Int64(Date.now.timeIntervalSince1970 * 1_000),
             followPulse: 0,
             onSelectSlot: { slot in
                 RecallOverlayController.shared.show(navigatingTo: slot)
             },
             onLoadMore: {
-                Task { await AfterRayServices.shared.store.loadOlderSummaryHistory() }
+                Task { await AfterRayServices.shared.history.loadNext() }
             }
         )
         .preferredColorScheme(.dark)

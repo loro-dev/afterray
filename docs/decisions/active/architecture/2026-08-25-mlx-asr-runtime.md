@@ -17,9 +17,12 @@ computer unusable for users with an ASR backlog.
 
 The default `asr` pack is the SHA-256-pinned
 `mlx-community/Qwen3-ASR-1.7B-4bit` snapshot. The daemon sends ASR jobs to a
-separate SwiftPM MLX helper that accepts only the existing one-shot worker
-protocol and loads only the verified local model directory. It never contacts
-Hugging Face or writes a cache at inference time.
+separate SwiftPM MLX helper. The helper loads only the verified local model
+directory, then serves serial NDJSON requests in one process. Its process and
+idle-reclamation check share the same mutex, so an active transcription cannot
+be mistaken for idle. The daemon reclaims the helper after 120 seconds without
+a completed request; the next ASR job starts and verifies a fresh process. It
+never contacts Hugging Face or writes a cache at inference time.
 
 The helper remains separate from the Qwen3.5 VLM package because its dependency
 graph has its own MLX runtime version. Forced alignment remains a distinct CPU
@@ -42,6 +45,6 @@ isolated.
 
 ASR downloads a new approximately 1.61 GB model pack. Existing Candle packs
 are not considered ready for the default ASR path. The queue contract and its
-background GPU serialization remain unchanged; the later persistent-worker
-change may reuse this helper protocol only after its lifecycle is explicitly
-validated.
+background GPU serialization remain unchanged. Cancellation kills the helper
+instead of leaving a synchronous MLX generation's future stdout line to be
+misread by the next job; the following job reloads in a new process.

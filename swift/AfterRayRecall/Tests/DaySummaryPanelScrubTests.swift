@@ -45,11 +45,9 @@ final class DaySummaryPanelScrubTests: XCTestCase {
             )
         }
         return DaySummaryPanel(
-            summaries: days,
+            history: .complete(days: days),
             playheadMs: playheadMs,
             nowMs: nowMs,
-            hasMore: false,
-            isLoadingMore: false,
             followPulse: 0,
             onSelectSlot: { _ in },
             onLoadMore: {}

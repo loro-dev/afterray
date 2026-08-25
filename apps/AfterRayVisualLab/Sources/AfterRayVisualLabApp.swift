@@ -192,8 +192,9 @@ private struct VisualLabView: View {
                     onOpenSettings: {},
                     recordingState: labRecordingState,
                     onToggleRecording: { labRecordingState = Self.nextLabRecordingState(labRecordingState) },
-                    daySummary: labDaySummary,
-                    summaryHistory: summaryStressHistory,
+                    summaryHistory: .complete(
+                        days: summaryStressHistory.isEmpty ? [labDaySummary] : summaryStressHistory
+                    ),
                     searchSession: searchSession,
                     thumbnailLoader: MockSearchData.thumbnailLoader,
                     ocrLoader: MockSearchData.ocrLoader,

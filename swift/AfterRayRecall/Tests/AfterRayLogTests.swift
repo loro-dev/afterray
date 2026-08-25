@@ -46,6 +46,28 @@ final class AfterRayLogTests: XCTestCase {
         XCTAssertEqual(snapshot.afterrayBytes, 5_000)
     }
 
+    func testStorageMeasureOffMainMatchesSynchronousMeasure() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("afterray-storage-async-\(UUID().uuidString)", isDirectory: true)
+        let models = root.appendingPathComponent("Models", isDirectory: true)
+        try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(repeating: 1, count: 1_000).write(to: models.appendingPathComponent("m.bin"))
+
+        let expected = AfterRayStorageSnapshot.measure(
+            dataDirectory: root,
+            modelDirectory: models,
+            runtimeDirectory: root.appendingPathComponent("mlx-runtime", isDirectory: true)
+        )
+        let actual = await AfterRayStorageSnapshot.measureOffMain(
+            dataDirectory: root,
+            modelDirectory: models,
+            runtimeDirectory: root.appendingPathComponent("mlx-runtime", isDirectory: true)
+        )
+
+        XCTAssertEqual(actual, expected)
+    }
+
     func testLogDirectoryIsStable() {
         let first = AfterRayLog.directory
         let second = AfterRayLog.directory

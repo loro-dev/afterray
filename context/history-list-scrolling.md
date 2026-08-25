@@ -10,10 +10,18 @@ Code: `swift/AfterRayRecall/Sources/HistoryListScrollView.swift`,
 
 ## The shape of the data
 
-A page is 7 days (`RecallStore.loadOlderSummaryHistory`, `limit: 7`), flattened
-by `HistoryListItems.build` into one row per day heading plus one per visible
-slot — roughly 90 rows a page. Pages only arrive when the user scrolls to the
-bottom.
+A page is 7 days (`SummaryHistoryStore`, `limit: 7`), flattened by
+`HistoryListItems.build` into one row per day heading plus one per visible slot
+— roughly 90 rows a page. The first request always uses the daemon's newest
+boundary (`before: nil`); later requests use only the cursor returned by the
+preceding page. Timeline selection never seeds this document.
+
+The document tail is one enum, not independent loading/has-more booleans:
+loadable, loading, failed, or end. Near-bottom layout requests only a loadable
+cursor; loading draws progress, failure draws Retry, and only end removes the
+tail row. The boundary itself deduplicates calls, so no wall-clock throttle is
+part of correctness. A page containing no panel-visible rows follows its next
+cursor inside the same loading operation.
 
 Row heights are not predictable: a card is a wrapped title plus a wrapped
 description plus an optional icon strip. Two cards with the same fields can
@@ -221,9 +229,9 @@ full-resolution Nth-frame promotion.
 Selection-only work has a separate 500ms quiet boundary. `moment_get` evidence
 is stored beside the selected moment instead of replacing a row in the lean
 timeline; it therefore does not increment the timeline revision or invalidate
-the prepared spine. Day summary, adjacent-day maintenance, and audio prefetch
-run in the same cancellable task, and the first movement frame cancels it. OCR,
-summary, and audio data are not needed to move the pointer.
+the prepared spine. Adjacent-day maintenance and audio evidence run in the same
+cancellable task, and the first movement frame cancels it. History summary
+pagination is independent of this task and of pointer movement.
 
 ## Which display
 

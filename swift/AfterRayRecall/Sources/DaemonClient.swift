@@ -19,7 +19,7 @@ public enum DaemonClientError: LocalizedError, Equatable {
     }
 }
 
-public protocol RecallDaemonServing: Sendable {
+public protocol RecallDaemonServing: SummaryHistoryPageLoading {
     func sessions() async throws -> [RecallSession]
     func timeline() async throws -> [RecallMoment]
     func timeline(sinceMs: Int64) async throws -> [RecallMoment]

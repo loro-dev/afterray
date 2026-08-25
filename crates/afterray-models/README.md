@@ -45,7 +45,7 @@ Default packs:
 
 | id | Source | Runtime |
 | --- | --- | --- |
-| `asr` | `Qwen/Qwen3-ASR-1.7B` | Candle Metal via `qwen3-asr` |
+| `asr` | pinned `mlx-community/Qwen3-ASR-1.7B-4bit` | persistent Swift MLX Audio worker |
 | `embedding` | nomic GGUF | `llama-cpp-2` Metal |
 | `llm_qwen35_4b_mlx4` | Recommended on-device assistant: pinned `mlx-community/Qwen3.5-4B-MLX-4bit` snapshot | signed MLXVLM worker |
 | `llm_qwen35_9b_mlx4` | Optional higher-quality `mlx-community/Qwen3.5-9B-MLX-4bit` snapshot | signed MLXVLM worker |
@@ -57,10 +57,10 @@ Overlay Q&A can instead use Ollama or an OpenAI-compatible URL from Settings.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AFTERRAY_NATIVE_MODEL_WORKER` | bundled Swift worker | OCR executable |
-| `AFTERRAY_MODEL_WORKER` | bundled `afterray-model-worker` | ASR / embedding / LLM |
+| `AFTERRAY_MODEL_WORKER` | bundled `afterray-model-worker` | embedding / forced alignment |
 | `AFTERRAY_MODEL_DIR` | AfterRay model directory | weight root |
-| `AFTERRAY_ASR_MODEL` | `Qwen3-ASR-1.7B` | ASR snapshot directory |
-| `AFTERRAY_ASR_REPOSITORY` | `Qwen/Qwen3-ASR-1.7B` | Hugging Face repo |
+| `AFTERRAY_ASR_MODEL` | `Qwen3-ASR-1.7B-MLX-4bit` | MLX ASR snapshot directory |
+| `AFTERRAY_ASR_REPOSITORY` | `mlx-community/Qwen3-ASR-1.7B-4bit` | Hugging Face repo |
 | `AFTERRAY_EMBEDDING_MODEL` | nomic GGUF path | embedding weights |
 | `AFTERRAY_MLX_MODEL` | `Qwen3.5-4B-MLX-4bit` | 4B MLX snapshot directory |
 | `AFTERRAY_MLX_9B_MODEL` | `Qwen3.5-9B-MLX-4bit` | 9B MLX snapshot directory |

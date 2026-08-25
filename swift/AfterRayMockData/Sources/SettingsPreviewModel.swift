@@ -34,6 +34,7 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var isClearingHistory = false
     @Published public var recordAudio = true
     @Published public var excludedBundleIds: [String] = []
+    @Published public var excludedBundleDisplayNames: [String: String] = [:]
     @Published public var excludedDomains: [String] = []
     @Published public var llmProbe: LlmEndpointStatus? = LlmEndpointStatus(
         reachable: true,

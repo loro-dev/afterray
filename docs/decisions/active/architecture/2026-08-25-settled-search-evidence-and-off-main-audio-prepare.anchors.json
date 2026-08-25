@@ -1,6 +1,6 @@
 {
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
-  "apps/AfterRay/Sources/AfterRayApp.swift::private func settleSelectedRecallEvidence() async {": "sha256:1a600c9e3cf6ddad",
+  "apps/AfterRay/Sources/AfterRayApp.swift::private func settleSelectedRecallEvidence() async {": "sha256:ca15e9010354bb7d",
   "swift/AfterRayRecall/Sources/RecallAudioRepository.swift::func preparedAudio(artifactID: String) async throws -> PreparedArtifactAudio {": "sha256:7bf91a9ef9140de1",
   "swift/AfterRayRecall/Sources/RecallView.swift::enum RecallSelectionQuietTaskKey {": "sha256:41481f642ae74843"
 }

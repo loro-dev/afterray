@@ -176,7 +176,7 @@ enum HistoryListItems {
         summaries: [DaySummary],
         nowMs: Int64,
         expandedSlotStarts: Set<Int64>,
-        hasMore: Bool,
+        boundary: SummaryHistoryBoundary,
         copy: AfterRayCopy = .english,
         locale: Locale = Locale(identifier: "en")
     ) -> [HistoryListItem] {
@@ -202,7 +202,7 @@ enum HistoryListItems {
                 )
             }
         }
-        if hasMore { items.append(.loadMore) }
+        if boundary != .end { items.append(.loadMore) }
         return items
     }
 }

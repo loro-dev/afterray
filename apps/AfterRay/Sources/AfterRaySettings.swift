@@ -169,7 +169,6 @@ final class AfterRaySettingsController: NSObject, NSWindowDelegate {
 
         AfterRayStandardWindowPresence.activate()
         window.makeKeyAndOrderFront(nil)
-        Task { await model.refresh() }
     }
 
     func hide() {
@@ -190,11 +189,10 @@ final class AfterRaySettingsController: NSObject, NSWindowDelegate {
 final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var settings: AppSettings?
     @Published var library: ModelLibrary?
-    @Published var storage = AfterRayStorageSnapshot.measure(
-        dataDirectory: DaemonSupervisor.shared.dataDirectory,
-        modelDirectory: DaemonSupervisor.shared.modelDirectory,
-        runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
-    )
+    /// The initial window must paint before scanning the vault. `refresh()`
+    /// replaces this empty value from a detached filesystem enumeration.
+    @Published var storage = AfterRayStorageSnapshot()
+    @Published private(set) var excludedBundleDisplayNames: [String: String] = [:]
     @Published var message: String?
     @Published var isRefreshing = false
     @Published var downloadRateBytesPerSecond: Double?
@@ -239,8 +237,9 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         let installedProtected = AfterRayPrivacyCatalog.installedBundleIDs(
             from: settings.protectedBundleIds
         )
+        let names = excludedBundleDisplayNames
         return Array(Set(settings.excludedBundleIds + installedProtected))
-            .sorted { appDisplayName($0) < appDisplayName($1) }
+            .sorted { (names[$0] ?? $0) < (names[$1] ?? $1) }
     }
     var excludedDomains: [String] { settings?.excludedDomains ?? [] }
     var dataDirectoryPath: String {
@@ -252,6 +251,14 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     var logDirectoryPath: String { AfterRayLog.directory.path }
     var logFilePath: String { AfterRayLog.fileURL.path }
 
+    private func measureStorage() async -> AfterRayStorageSnapshot {
+        await AfterRayStorageSnapshot.measureOffMain(
+            dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
+            modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
+            runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
+        )
+    }
+
     private func appDisplayName(_ bundleID: String) -> String {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
             return AfterRayPrivacyCatalog.protectedName(for: bundleID) ?? bundleID
@@ -259,15 +266,26 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         return FileManager.default.displayName(atPath: url.path)
     }
 
+    private func refreshExcludedBundleDisplayNames() {
+        guard let settings else {
+            excludedBundleDisplayNames = [:]
+            return
+        }
+        let installedProtected = AfterRayPrivacyCatalog.installedBundleIDs(
+            from: settings.protectedBundleIds
+        )
+        excludedBundleDisplayNames = Dictionary(
+            uniqueKeysWithValues: Set(settings.excludedBundleIds + installedProtected).map {
+                ($0, appDisplayName($0))
+            }
+        )
+    }
+
     func refresh() async {
+        guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
         refreshCliStatus()
-        storage = AfterRayStorageSnapshot.measure(
-            dataDirectory: URL(fileURLWithPath: settings?.dataDir ?? DaemonSupervisor.shared.dataDirectory.path, isDirectory: true),
-            modelDirectory: URL(fileURLWithPath: settings?.modelDir ?? DaemonSupervisor.shared.modelDirectory.path, isDirectory: true),
-            runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
-        )
         do {
             let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
             async let nextSettings = daemon.settings()
@@ -275,6 +293,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             async let nextJobs = daemon.jobs()
             let loaded = try await (nextSettings, nextLibrary, nextJobs)
             settings = loaded.0
+            refreshExcludedBundleDisplayNames()
             library = loaded.1
             message = nil
             applyDownloadState(loaded.1.download)
@@ -282,13 +301,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             applyLlmDrafts(from: loaded.0)
             AfterRayPreferences.recordAudio = loaded.0.recordAudio
             AfterRayLocalization.shared.apply(stored: loaded.0.uiLanguage)
-            storage = AfterRayStorageSnapshot.measure(
-                dataDirectory: URL(fileURLWithPath: loaded.0.dataDir, isDirectory: true),
-                modelDirectory: URL(fileURLWithPath: loaded.0.modelDir, isDirectory: true),
-                runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
-            )
-            await probeLlm()
-            await persistRecommendedOllamaModelIfNeeded()
+            storage = await measureStorage()
         } catch {
             message = error.localizedDescription
         }
@@ -325,7 +338,10 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             refreshCliStatus()
         }
         do {
-            let destination = try AfterRayCliInstall.install(copy: copy)
+            let copy = copy
+            let destination = try await Task.detached(priority: .utility) {
+                try AfterRayCliInstall.install(copy: copy)
+            }.value
             message = AfterRayCliInstall.isOnPath
                 ? copy.settings.cliInstalledOnPath(destination.path)
                 : copy.settings.cliInstalledNeedPath(destination.path)
@@ -497,6 +513,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 llmModel: nil,
                 llmApiKey: nil
             )
+            refreshExcludedBundleDisplayNames()
             self.message = message
         } catch {
             self.message = error.localizedDescription
@@ -581,11 +598,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 excludedDomains: nil,
                 storageLimitBytes: bytes
             )
-            storage = AfterRayStorageSnapshot.measure(
-                dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
-                modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
-                runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
-            )
+            storage = await measureStorage()
             message = copy.settings.memoryLimitSet(AfterRayStorageSnapshot.byteCount(bytes))
         } catch {
             message = error.localizedDescription
@@ -756,11 +769,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                 socketPath: DaemonSupervisor.shared.socketPath
             ).removeModel(packID: packID)
             message = copy.settings.removedPack(displayName(for: packID))
-            storage = AfterRayStorageSnapshot.measure(
-                dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
-                modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
-                runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
-            )
+            storage = await measureStorage()
         } catch {
             message = error.localizedDescription
         }
@@ -771,9 +780,14 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func copyDiagnostics() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(AfterRayLog.diagnosticsReport(), forType: .string)
-        AfterRayLog.info("diagnostics report copied")
+        Task { @MainActor in
+            let report = await Task.detached(priority: .utility) {
+                AfterRayLog.diagnosticsReport()
+            }.value
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(report, forType: .string)
+            AfterRayLog.info("diagnostics report copied")
+        }
     }
 
     func setLlmProvider(_ provider: LlmProvider) async {
@@ -794,7 +808,6 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             applyLlmDrafts(from: settings)
             message = assistantSourceMessage(provider)
             await probeLlm()
-            await persistRecommendedOllamaModelIfNeeded()
         } catch {
             message = error.localizedDescription
         }
@@ -825,6 +838,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     }
 
     func probeLlm() async {
+        guard !isProbingLlm else { return }
         let provider = settings?.llmProvider ?? .mlxLocal
         guard provider != .mlxLocal else {
             llmProbe = nil
@@ -843,6 +857,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
             if draftLlmModel.isEmpty, let recommended = probed.recommendedModel {
                 draftLlmModel = recommended
             }
+            await persistRecommendedOllamaModelIfNeeded()
         } catch {
             llmProbe = LlmEndpointStatus(
                 reachable: false,
@@ -958,11 +973,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
                     applyDownloadState(next.download)
                     if wasActive, next.download == nil {
                         message = copy.settings.modelDownloadsFinished
-                        storage = AfterRayStorageSnapshot.measure(
-                            dataDirectory: URL(fileURLWithPath: dataDirectoryPath, isDirectory: true),
-                            modelDirectory: URL(fileURLWithPath: modelDirectoryPath, isDirectory: true),
-                            runtimeDirectory: DaemonSupervisor.shared.mlxRuntimeDirectory
-                        )
+                        storage = await measureStorage()
                     }
                     guard next.download?.isActive == true else { return }
                 } catch is CancellationError {

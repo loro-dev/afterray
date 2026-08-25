@@ -30,8 +30,7 @@ import SwiftUI
 /// steady state, which is why writing the offset does not fight momentum.
 struct HistoryListScrollView<Row: View>: View {
     var items: [HistoryListItem]
-    var isLoadingMore: Bool
-    var hasMore: Bool
+    var boundary: SummaryHistoryBoundary
     var showsIndicator: Bool
     var followID: String?
     var followGeneration: Int
@@ -104,13 +103,13 @@ struct HistoryListScrollView<Row: View>: View {
             heights: HistoryListLayout.heights(
                 items: items,
                 cache: runtime.cache,
-                isLoadingMore: isLoadingMore
+                isLoadingMore: boundary.isLoading
             )
         )
     }
 
     private var layoutKeys: [String] {
-        HistoryListLayout.heightKeys(items: items, isLoadingMore: isLoadingMore)
+        HistoryListLayout.heightKeys(items: items, isLoadingMore: boundary.isLoading)
     }
 
     /// `mounted` lags the model by one update after the item list changes, so
@@ -159,16 +158,13 @@ struct HistoryListScrollView<Row: View>: View {
             HistoryStickyHeading.chip(items: items, origins: origins, offset: runtime.offset)
         )
 
-        guard hasMore, !isLoadingMore else { return }
+        guard case .loadable = boundary else { return }
         guard HistoryLoadMore.isNearBottom(
             offset: runtime.offset,
             viewportHeight: runtime.viewportHeight,
             contentHeight: HistoryListLayout.contentHeight(origins: origins)
                 + HistoryListLayout.bottomPadding
         ) else { return }
-        let now = CFAbsoluteTimeGetCurrent()
-        guard now - runtime.lastLoadMoreAt > 0.25 else { return }
-        runtime.lastLoadMoreAt = now
         onLoadMore()
     }
 
@@ -176,7 +172,7 @@ struct HistoryListScrollView<Row: View>: View {
     /// is above the fold, move the offset by the same delta so what the user
     /// is looking at does not shift under them.
     private func record(height: CGFloat, for item: HistoryListItem) {
-        let key = item.heightKey(isLoadingMore: isLoadingMore)
+        let key = item.heightKey(isLoadingMore: boundary.isLoading)
         // Cheap check first. `onGeometryChange` fires for every mounted row on
         // every layout pass, and almost all of them report a height the model
         // already has; building the origins array before finding that out made
@@ -246,5 +242,4 @@ final class HistoryWindowRuntime {
     let cache = HistoryRowHeightCache()
     var offset: CGFloat = 0
     var viewportHeight: CGFloat = HistoryListLayout.defaultViewport
-    var lastLoadMoreAt: CFAbsoluteTime = 0
 }

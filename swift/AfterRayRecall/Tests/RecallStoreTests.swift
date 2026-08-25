@@ -123,22 +123,6 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertTrue(store.moments.isEmpty)
     }
 
-    func testForcedDaySummaryRefreshRecoversAfterTransientConnectionFailure() async {
-        let expected = summaryDay("recovered", startingAt: 400)
-        let daemon = FlakySummaryDaemon(summary: expected)
-        let store = RecallStore(daemon: daemon)
-
-        await store.loadDaySummary(dayMs: expected.dayStartMs, force: true)
-        XCTAssertEqual(store.daySummary, .empty)
-        XCTAssertTrue(store.summaryHistory.isEmpty)
-
-        await store.loadDaySummary(dayMs: expected.dayStartMs, force: true)
-        XCTAssertEqual(store.daySummary, expected)
-        XCTAssertEqual(store.summaryHistory, [expected])
-        let requestCount = await daemon.daySummaryRequestCount()
-        XCTAssertEqual(requestCount, 2)
-    }
-
     func testLoadTimelineRequestsABoundedWarmRangeNotTheFullArchive() async {
         let daemon = RangeCountingDaemon()
         let store = RecallStore(daemon: daemon)
@@ -149,15 +133,10 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(counts.timelineList, 0)
         XCTAssertEqual(counts.timelineSince, 0)
         XCTAssertEqual(counts.timelineRange, 1)
-        XCTAssertEqual(counts.daySummary, 1)
+        XCTAssertEqual(counts.daySummary, 0)
         XCTAssertEqual(store.moments.map(\.id), ["m1", "m2"])
         let events = await daemon.events()
-        guard let summaryIndex = events.firstIndex(of: "summary"),
-              let rangeFinishIndex = events.firstIndex(of: "range-finish")
-        else {
-            return XCTFail("expected both summary and range completion events: \(events)")
-        }
-        XCTAssertLessThan(summaryIndex, rangeFinishIndex)
+        XCTAssertEqual(events, ["range-start", "range-finish"])
     }
 
     func testExplicitTimelineDayDoesNotReuseAnOlderPlayheadDay() async {
@@ -289,85 +268,6 @@ final class RecallStoreTests: XCTestCase {
         XCTAssertEqual(store.playheadMs, 150)
         XCTAssertEqual(store.selectedMoment?.id, "m1")
         XCTAssertEqual(store.moments.map(\.id), ["m1", "m2", "m3"])
-    }
-
-    func testSelectingLoadedOlderDayPreservesNewerHistoryAndPagination() async {
-        let today = summaryDay("today", startingAt: 400)
-        let pagedYesterday = summaryDay("paged-yesterday", startingAt: 300)
-        let selectedYesterday = summaryDay("selected-yesterday", startingAt: 300)
-        let older = summaryDay("older", startingAt: 200)
-        let daemon = SummaryHistoryDaemon(
-            selectedDays: [
-                today.dayStartMs: today,
-                selectedYesterday.dayStartMs: selectedYesterday,
-            ],
-            pages: [
-                today.dayStartMs: SummaryHistoryPage(
-                    days: [pagedYesterday],
-                    nextBeforeMs: pagedYesterday.dayStartMs,
-                    hasMore: true,
-                    totalDays: 4
-                ),
-                pagedYesterday.dayStartMs: SummaryHistoryPage(
-                    days: [older],
-                    nextBeforeMs: nil,
-                    hasMore: false,
-                    totalDays: 4
-                ),
-            ]
-        )
-        let store = RecallStore(daemon: daemon)
-
-        await store.loadDaySummary(dayMs: today.dayStartMs, force: true)
-        XCTAssertEqual(store.summaryHistory, [today, pagedYesterday])
-        XCTAssertTrue(store.summaryHistoryHasMore)
-        XCTAssertEqual(store.summaryHistoryTotalDays, 4)
-
-        await store.loadDaySummary(dayMs: selectedYesterday.dayStartMs, force: true)
-        XCTAssertEqual(store.daySummary, selectedYesterday)
-        XCTAssertEqual(store.summaryHistory, [today, selectedYesterday])
-        XCTAssertTrue(store.summaryHistoryHasMore)
-        let requestsAfterSelection = await daemon.recordedSummaryHistoryRequests()
-        XCTAssertEqual(requestsAfterSelection, [today.dayStartMs])
-
-        await store.loadOlderSummaryHistory()
-        XCTAssertEqual(store.summaryHistory, [today, selectedYesterday, older])
-        XCTAssertFalse(store.summaryHistoryHasMore)
-        let requestsAfterPagination = await daemon.recordedSummaryHistoryRequests()
-        XCTAssertEqual(requestsAfterPagination, [today.dayStartMs, pagedYesterday.dayStartMs])
-    }
-
-    func testSelectingUnloadedOlderDayKeepsHistorySortedWhenPaginationFillsGap() async {
-        let today = summaryDay("today", startingAt: 400)
-        let yesterday = summaryDay("yesterday", startingAt: 300)
-        let middle = summaryDay("middle", startingAt: 200)
-        let selectedOlder = summaryDay("selected-older", startingAt: 100)
-        let daemon = SummaryHistoryDaemon(
-            selectedDays: [
-                today.dayStartMs: today,
-                selectedOlder.dayStartMs: selectedOlder,
-            ],
-            pages: [
-                today.dayStartMs: SummaryHistoryPage(
-                    days: [yesterday],
-                    nextBeforeMs: yesterday.dayStartMs,
-                    hasMore: true
-                ),
-                yesterday.dayStartMs: SummaryHistoryPage(
-                    days: [middle],
-                    nextBeforeMs: nil,
-                    hasMore: false
-                ),
-            ]
-        )
-        let store = RecallStore(daemon: daemon)
-
-        await store.loadDaySummary(dayMs: today.dayStartMs, force: true)
-        await store.loadDaySummary(dayMs: selectedOlder.dayStartMs, force: true)
-        XCTAssertEqual(store.summaryHistory, [today, yesterday, selectedOlder])
-
-        await store.loadOlderSummaryHistory()
-        XCTAssertEqual(store.summaryHistory, [today, yesterday, middle, selectedOlder])
     }
 
     func testExtendOlderMergesTheNextOccupiedDayBeyondTheWarmWindow() async {
@@ -867,48 +767,6 @@ private actor RangeCountingDaemon: RecallDaemonServing {
     func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 
-private actor SummaryHistoryDaemon: RecallDaemonServing {
-    private let selectedDays: [Int64: DaySummary]
-    private let pages: [Int64: SummaryHistoryPage]
-    private var summaryHistoryRequests: [Int64?] = []
-
-    init(selectedDays: [Int64: DaySummary], pages: [Int64: SummaryHistoryPage]) {
-        self.selectedDays = selectedDays
-        self.pages = pages
-    }
-
-    func sessions() async throws -> [RecallSession] { [] }
-    func timeline() async throws -> [RecallMoment] { [] }
-    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
-    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
-    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
-
-    func daySummary(dayMs: Int64) async throws -> DaySummary {
-        guard let summary = selectedDays[dayMs] else {
-            throw DaemonClientError.rejected("No summary for \(dayMs)")
-        }
-        return summary
-    }
-
-    func summaryHistory(beforeMs: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
-        summaryHistoryRequests.append(beforeMs)
-        guard let beforeMs, let page = pages[beforeMs] else {
-            return SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
-        }
-        return page
-    }
-
-    func recordedSummaryHistoryRequests() -> [Int64?] {
-        summaryHistoryRequests
-    }
-
-    func artifact(id: String) async throws -> ArtifactPayload {
-        ArtifactPayload(id: id, contentType: "image/png", bytes: Data())
-    }
-
-    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
-}
-
 private actor RefreshingDaemon: RecallDaemonServing {
     private var storedMoments = [
         RecallMoment(id: "m1", sessionId: "s1", capturedAtMs: 100, imageArtifactId: "a1"),
@@ -1043,40 +901,6 @@ private actor ConnectionFailingDaemon: RecallDaemonServing {
     func setFavorite(momentID _: String, favorite _: Bool) async throws {}
 }
 
-private actor FlakySummaryDaemon: RecallDaemonServing {
-    private let summary: DaySummary
-    private var requestCount = 0
-
-    init(summary: DaySummary) {
-        self.summary = summary
-    }
-
-    func sessions() async throws -> [RecallSession] { [] }
-    func timeline() async throws -> [RecallMoment] { [] }
-    func timeline(sinceMs _: Int64) async throws -> [RecallMoment] { [] }
-    func moments(sessionID _: String) async throws -> [RecallMoment] { [] }
-    func recallWindow(sessionID _: String, centerMs _: Int64, limit _: Int) async throws -> [RecallMoment] { [] }
-
-    func daySummary(dayMs _: Int64) async throws -> DaySummary {
-        requestCount += 1
-        if requestCount == 1 {
-            throw DaemonClientError.connection("Connection refused")
-        }
-        return summary
-    }
-
-    func summaryHistory(beforeMs _: Int64?, limit _: Int) async throws -> SummaryHistoryPage {
-        SummaryHistoryPage(days: [], nextBeforeMs: nil, hasMore: false)
-    }
-
-    func artifact(id: String) async throws -> ArtifactPayload {
-        ArtifactPayload(id: id, contentType: "image/png", bytes: Data())
-    }
-
-    func setFavorite(momentID _: String, favorite _: Bool) async throws {}
-
-    func daySummaryRequestCount() -> Int { requestCount }
-}
 
 private actor FakeDaemon: RecallDaemonServing {
     struct FavoriteCall: Equatable { let momentID: String; let favorite: Bool }

@@ -17,6 +17,7 @@ In-process ASR (Qwen3-ASR via Candle/Metal), transcript forced alignment (Qwen3-
 - Honor the wire retry semantics: `retryable: true` in `WorkerResponse` maps to a retried `AdapterError::Process`, `false` maps to `MissingModel` and never retries. Never return placeholder inference data.
 - Model path overrides: `AFTERRAY_ASR_MODEL` / `AFTERRAY_ALIGNER_MODEL` / `AFTERRAY_EMBEDDING_MODEL` (surfaced in this crate's error messages); the daemon overrides the worker binary itself with `AFTERRAY_MODEL_WORKER`.
 - ASR and embedding use Metal; the aligner is pure Rust CPU with Accelerate/vDSP on Apple Silicon. Each inference is a separate worker process, so these models are not resident together.
+- Replacing Candle ASR with MLX is a proposal, not current behavior: [qwen3-asr-mlx-integration-plan.md](../../docs/qwen3-asr-mlx-integration-plan.md).
 
 ## Build / test
 

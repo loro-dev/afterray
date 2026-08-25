@@ -15,11 +15,6 @@ public final class RecallStore: ObservableObject {
     /// is the observable source of truth and publishing both doubled updates.
     public private(set) var selectedIndex: Int = 0
     @Published public private(set) var loadState: RecallLoadState = .ready
-    @Published public private(set) var daySummary: DaySummary = .empty
-    @Published public private(set) var summaryHistory: [DaySummary] = []
-    @Published public private(set) var summaryHistoryHasMore = false
-    @Published public private(set) var summaryHistoryTotalDays: Int?
-    @Published public private(set) var isLoadingSummaryHistory = false
     /// Detail-only fields for the current selection. Evidence must never be
     /// written back into the 26K-row timeline array: doing so invalidates its
     /// prepared spine and turns one `moment_get` into an O(n) search plus a
@@ -59,9 +54,6 @@ public final class RecallStore: ObservableObject {
     }
     private var nextTimelineExtendID: UInt64 = 0
     private var inFlightExtend: InFlightTimelineExtend?
-    private var loadedDayKey: String?
-    private var summaryHistoryCursorMs: Int64?
-    private var summaryHistoryGeneration: UInt64 = 0
 
     /// Occupied local-day data in the normal warm window. Sparse empty-day
     /// spans may cover more calendar days without adding timeline rows.
@@ -130,9 +122,6 @@ public final class RecallStore: ObservableObject {
         // Loading one day first made yesterday an edge-path dependency even
         // when prefetch started immediately afterwards.
         let bounds = TimelineWarmWindow.bounds(containingMs: anchorMs)
-        // History cards are an independent read model. Start them before the
-        // playhead request so a slow/failed range cannot hold the panel empty.
-        async let summaryLoad: Void = loadDaySummary(dayMs: anchorMs, force: true)
         do {
             let loadedSessions = (try? await daemon.sessions())?.sorted { $0.startedAtMs < $1.startedAtMs } ?? []
             let rawMoments = try await daemon.timeline(fromMs: bounds.start, toMs: bounds.end - 1)
@@ -149,10 +138,7 @@ public final class RecallStore: ObservableObject {
             guard sensitiveGeneration == requestGeneration,
                   timelineWindowGeneration == requestWindowGeneration
             else { return }
-            if Self.isDaemonConnectionError(error), case .failed = loadState {
-                await summaryLoad
-                return
-            }
+            if Self.isDaemonConnectionError(error), case .failed = loadState { return }
             if !Self.isDaemonConnectionError(error) {
                 timelineRevision &+= 1
                 timelineSpine = nil
@@ -163,11 +149,9 @@ public final class RecallStore: ObservableObject {
                 loadedTimelineDayBounds = nil
                 timelineHasOlder = true
                 timelineHasNewer = true
-                loadedDayKey = nil
             }
             loadState = .failed(message: error.localizedDescription)
         }
-        await summaryLoad
     }
 
     /// Refreshes the newest loaded captures so recently completed OCR/AX work
@@ -221,8 +205,6 @@ public final class RecallStore: ObservableObject {
                   timelineRevision == requestRevision
             else { return }
             apply(prepared, preservingSelection: preservingSelection)
-            let summaryMs = playheadMs > 0 ? playheadMs : fromMs
-            await loadDaySummary(dayMs: summaryMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
@@ -258,7 +240,6 @@ public final class RecallStore: ObservableObject {
             loadedTimelineDayBounds = nil
         }
         apply(prepared, selecting: momentID, preservingSelection: preservingSelection)
-        await loadDaySummary(dayMs: playheadMs, force: true)
     }
 
     private func apply(
@@ -321,7 +302,6 @@ public final class RecallStore: ObservableObject {
             else { return }
             if selectLoaded(momentID: momentID) {
                 patchEvidence(detail)
-                await loadDaySummary(dayMs: detail.capturedAtMs, force: true)
                 guard !Task.isCancelled else { return }
                 await hydrateSelectedEvidence()
                 return
@@ -339,7 +319,6 @@ public final class RecallStore: ObservableObject {
             timelineHasNewer = bounds.end < DaySummaryLayout.dayBounds(ms: nowMs).end
             apply(prepared, selecting: momentID)
             patchEvidence(detail)
-            await loadDaySummary(dayMs: detail.capturedAtMs, force: true)
         } catch {
             guard sensitiveGeneration == requestGeneration else { return }
             if Self.isDaemonConnectionError(error) {
@@ -648,90 +627,6 @@ public final class RecallStore: ObservableObject {
         return true
     }
 
-    public func loadDaySummary(dayMs: Int64, force: Bool = false) async {
-        let key = DaySummaryLayout.localDayKey(ms: dayMs)
-        if !force, key == loadedDayKey { return }
-        let requestGeneration = sensitiveGeneration
-        do {
-            let loaded = try await daemon.daySummary(dayMs: dayMs)
-            guard !Task.isCancelled, sensitiveGeneration == requestGeneration else { return }
-            daySummary = loaded
-            loadedDayKey = key
-            guard !loaded.day.isEmpty else { return }
-
-            let initializesHistory = summaryHistory.isEmpty
-            upsertSummaryHistory(loaded)
-            guard initializesHistory else { return }
-
-            summaryHistoryGeneration &+= 1
-            summaryHistoryCursorMs = loaded.dayStartMs
-            summaryHistoryHasMore = true
-            isLoadingSummaryHistory = false
-            guard !Task.isCancelled else { return }
-            await loadOlderSummaryHistory()
-        } catch {
-            guard !Task.isCancelled else { return }
-            guard sensitiveGeneration == requestGeneration else { return }
-            if Self.isDaemonConnectionError(error) { return }
-        }
-    }
-
-    /// Fetches one small page when the history-summary panel reaches its
-    /// bottom. This cursor is the only thing that walks the vault, so a
-    /// row never queries the daemon on its own.
-    public func loadOlderSummaryHistory() async {
-        guard summaryHistoryHasMore,
-              !isLoadingSummaryHistory,
-              let beforeMs = summaryHistoryCursorMs
-        else { return }
-
-        isLoadingSummaryHistory = true
-        let requestGeneration = summaryHistoryGeneration
-        let sensitiveRequestGeneration = sensitiveGeneration
-        defer {
-            if summaryHistoryGeneration == requestGeneration {
-                isLoadingSummaryHistory = false
-            }
-        }
-        do {
-            let page = try await daemon.summaryHistory(beforeMs: beforeMs, limit: 7)
-            guard !Task.isCancelled,
-                  sensitiveGeneration == sensitiveRequestGeneration,
-                  summaryHistoryGeneration == requestGeneration
-            else { return }
-            let knownDays = Set(summaryHistory.map(\.dayStartMs))
-            summaryHistory.append(contentsOf: page.days.filter { !knownDays.contains($0.dayStartMs) })
-            // A direct playhead jump can insert a day older than this cursor
-            // before pagination fills the gap. Keep display order independent
-            // of the order in which those two request paths finish.
-            summaryHistory.sort { $0.dayStartMs > $1.dayStartMs }
-            summaryHistoryCursorMs = page.nextBeforeMs
-            summaryHistoryHasMore = page.hasMore && page.nextBeforeMs != nil
-            if let totalDays = page.totalDays {
-                summaryHistoryTotalDays = totalDays
-            }
-        } catch {
-            guard !Task.isCancelled else { return }
-            guard sensitiveGeneration == sensitiveRequestGeneration,
-                  summaryHistoryGeneration == requestGeneration
-            else { return }
-            if !Self.isDaemonConnectionError(error) {
-                summaryHistoryHasMore = false
-            }
-        }
-    }
-
-    /// Refresh the selected day without replacing the history around it.
-    /// Pagination owns the cursor; moving the playhead must not rewind it.
-    private func upsertSummaryHistory(_ loaded: DaySummary) {
-        if let index = summaryHistory.firstIndex(where: { $0.dayStartMs == loaded.dayStartMs }) {
-            summaryHistory[index] = loaded
-        } else {
-            summaryHistory.append(loaded)
-            summaryHistory.sort { $0.dayStartMs > $1.dayStartMs }
-        }
-    }
-
     public func select(index: Int) {
         guard let index = RecallGeometry.clampedIndex(index, count: moments.count) else { return }
         applyPlayhead(moments[index].capturedAtMs)
@@ -775,14 +670,6 @@ public final class RecallStore: ObservableObject {
         timelineHasOlder = true
         timelineHasNewer = true
         applyPlayhead(0)
-        daySummary = .empty
-        summaryHistory = []
-        summaryHistoryHasMore = false
-        summaryHistoryTotalDays = nil
-        summaryHistoryCursorMs = nil
-        summaryHistoryGeneration &+= 1
-        isLoadingSummaryHistory = false
-        loadedDayKey = nil
         loadState = .ready
     }
 

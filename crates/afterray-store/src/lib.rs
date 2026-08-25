@@ -95,7 +95,7 @@ pub use slot::{
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 27;
+pub const SCHEMA_VERSION: u32 = 28;
 
 // @dec:size-driven-retention — docs/decisions/active/architecture/2026-08-20-size-driven-retention.md
 /// How long a runtime marker in the event stream lives.
@@ -293,12 +293,12 @@ const AUDIO_ALIGNMENT_CLAIMABLE_PREDICATE: &str = "a.alignment_state IN ('pendin
 /// the strongest possible reason to wait). Claimable answers "may the sweeper
 /// pick this up *now*"; this answers "is a transcript still coming".
 ///
-/// The state list is what keeps `done` out, and it is not redundant with the
-/// `NOT EXISTS`: [`Vault::complete_audio_transcription`] marks a segment `done`
-/// even when the model returned nothing to index — silence, an empty room, a
-/// muted track — and writes no evidence row. On the `NOT EXISTS` half alone
-/// every silent segment would read as untranscribed forever, and a summary
-/// waiting on one would wait out its whole cap on every quiet slot.
+/// The state list is what keeps completed work out, and it is not redundant
+/// with the `NOT EXISTS`: [`Vault::complete_audio_transcription`] removes a
+/// segment whose successful result has nothing to index — silence, an empty
+/// room, or a muted track. The remaining rows use `done` only when a durable
+/// transcript exists, so a summary never waits for quiet audio that ASR has
+/// already examined.
 const AUDIO_UNTRANSCRIBED_PREDICATE: &str =
     "a.transcription_state IN ('pending', 'failed', 'running')
                     AND NOT EXISTS (
@@ -326,9 +326,10 @@ pub const AUDIO_BACKOFF_SATURATION_ATTEMPTS: u32 = 6;
 /// worker is also demonstrably alive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AsrHealth {
-    /// When a segment last reached `done`. `None` means transcription has
+    /// When ASR last completed successfully. `None` means transcription has
     /// never once succeeded on this vault — a cold start, an absent model, or
-    /// a worker that cannot run at all.
+    /// a worker that cannot run at all. A successful empty result counts even
+    /// though its audio segment is immediately discarded.
     pub last_success_ms: Option<i64>,
     /// When a segment last recorded an error. Cleared on the segment when it
     /// is re-claimed, so this is "the last thing that happened to some segment
@@ -4028,13 +4029,10 @@ impl Vault {
     /// health is not a property of any slot, and a caller sweeping a backlog
     /// should pay for this once rather than per slot.
     ///
-    /// "Success" is `transcription_state = 'done'` rather than the presence of
-    /// transcript evidence: `done` is written only by
-    /// [`Vault::complete_audio_transcription`] (and, at schema 21, to rows that
-    /// already had evidence), so it means exactly "the worker returned" —
-    /// including the healthy case where what it returned was silence. Keying on
-    /// evidence alone would report a perfectly working ASR as never having
-    /// succeeded on a quiet machine.
+    /// "Success" includes `transcription_state = 'done'` rows and the compact
+    /// marker written when a successful empty result discards its audio. Keying
+    /// on transcript evidence alone would report a perfectly working ASR as
+    /// never having succeeded on a quiet machine.
     ///
     /// Both instants are clamped to `now_ms`. A row stamped in the future — a
     /// clock that moved backwards, a vault carried between machines — would
@@ -4046,8 +4044,12 @@ impl Vault {
     pub fn asr_health(&self, now_ms: i64) -> Result<AsrHealth, StoreError> {
         let connection = self.readers.get();
         let last_success_ms: Option<i64> = connection.query_row(
-            "SELECT max(transcription_updated_at_ms) FROM audio_segments
-              WHERE transcription_state = 'done'",
+            "SELECT max(last_success_ms) FROM (
+                 SELECT transcription_updated_at_ms AS last_success_ms
+                   FROM audio_segments WHERE transcription_state = 'done'
+                 UNION ALL
+                 SELECT last_success_ms FROM asr_success_markers
+             )",
             [],
             |row| row.get(0),
         )?;
@@ -4082,12 +4084,16 @@ impl Vault {
     }
 
     /// Commits transcript evidence and marks the audio item done atomically.
-    /// Replaying a recovered claim is idempotent.
+    /// A successful empty result instead removes its audio segment and
+    /// encrypted artifact, while retaining only a compact ASR-health marker.
+    /// Replaying a recovered claim is idempotent and cannot remove an already
+    /// committed transcript.
     ///
     /// # Errors
     ///
     /// Returns an error when transcript evidence or queue state cannot be
     /// committed.
+    // @dec:asr-empty-transcript-results — docs/decisions/active/architecture/2026-08-25-asr-empty-transcript-results.md
     pub fn complete_audio_transcription(
         &self,
         segment: &AudioSegment,
@@ -4107,6 +4113,26 @@ impl Vault {
                 |row| row.get(0),
             )
             .optional()?;
+        let discard_empty_segment = text.trim().is_empty() && existing.is_none();
+        if discard_empty_segment {
+            let deleted =
+                transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [&segment.id])?;
+            if deleted > 0 {
+                transaction.execute(
+                    "INSERT INTO asr_success_markers (singleton, last_success_ms)
+                     VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET
+                        last_success_ms = max(last_success_ms, excluded.last_success_ms)",
+                    [now_ms],
+                )?;
+            }
+            transaction.commit()?;
+            drop(connection);
+            if deleted > 0 {
+                self.delete_artifact_record_and_file(&segment.audio_artifact_id)?;
+            }
+            return Ok(None);
+        }
         let evidence_id = if text.trim().is_empty() || existing.is_some() {
             None
         } else {
@@ -5395,6 +5421,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_25(connection)?;
     migrate_schema_26(connection)?;
     migrate_schema_27(connection, from_version)?;
+    migrate_schema_28(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -6166,6 +6193,19 @@ fn migrate_schema_27(connection: &Connection, from_version: u32) -> Result<(), S
               SELECT 1 FROM text_evidence te
                WHERE te.audio_segment_id = audio_segments.id AND te.source = 'transcript'
             );",
+    )?;
+    Ok(())
+}
+
+/// A successful empty ASR result has no audio segment to retain. Keep one
+/// bounded marker so the T2 gate can still distinguish a healthy quiet machine
+/// from a worker that has never started.
+fn migrate_schema_28(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS asr_success_markers (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           last_success_ms INTEGER NOT NULL
+         );",
     )?;
     Ok(())
 }
@@ -8294,11 +8334,11 @@ mod tests {
         assert!(!vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
     }
 
-    /// Silence completes with no evidence row at all. Read through the
-    /// `NOT EXISTS` half alone it would look untranscribed forever, and a
-    /// summary waiting on one would wait out its whole cap on every quiet slot.
+    /// Silence is a completed ASR result, but not a recording worth retaining.
+    /// It removes both the segment and its encrypted artifact, while the
+    /// compact marker keeps the health gate from mistaking quiet for broken.
     #[test]
-    fn a_silent_segment_is_not_waiting_for_anything() {
+    fn a_silent_segment_is_discarded_without_looking_like_a_worker_failure() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(100).unwrap();
         let quiet = vault
@@ -8318,13 +8358,60 @@ mod tests {
             None,
             "an empty transcript writes no evidence"
         );
+        assert!(
+            vault.audio_segments_sync(&session.id).unwrap().is_empty(),
+            "a non-playable segment must not remain on the timeline"
+        );
+        assert!(matches!(
+            vault.read_artifact(&quiet.audio_artifact_id),
+            Err(StoreError::ArtifactNotFound(_))
+        ));
+        assert!(
+            !vault.artifact_path(&quiet.audio_artifact_id).exists(),
+            "the encrypted recording file is removed with its segment"
+        );
         assert!(!vault.has_untranscribed_audio_between(1_000, 2_000).unwrap());
         assert_eq!(vault.asr_health(9_000).unwrap().waiting_segments, 0);
         assert_eq!(
             vault.asr_health(9_000).unwrap().last_success_ms,
             Some(3_000),
-            "the worker ran and returned; that is a success even with nothing to index"
+            "the worker ran and returned; that is a success even with no audio retained"
         );
+    }
+
+    #[test]
+    fn an_empty_replay_cannot_discard_an_existing_transcript() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let spoken = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::Microphone,
+                1_000,
+                2_000,
+                "audio/mp4",
+                b"speech",
+            )
+            .unwrap();
+        vault
+            .complete_audio_transcription(&spoken, "hello", Some("English"), "test-asr", 3_000)
+            .unwrap();
+
+        assert_eq!(
+            vault
+                .complete_audio_transcription(&spoken, "", None, "test-asr", 4_000)
+                .unwrap(),
+            None
+        );
+        assert_eq!(vault.audio_segments_sync(&session.id).unwrap().len(), 1);
+        assert_eq!(
+            vault
+                .read_artifact(&spoken.audio_artifact_id)
+                .unwrap()
+                .bytes,
+            b"speech"
+        );
+        assert!(!vault.search("hello", 10).unwrap().is_empty());
     }
 
     #[test]

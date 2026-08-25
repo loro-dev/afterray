@@ -1,0 +1,6 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "apps/AfterRayMlxAsrWorker/Sources/main.swift::case \"asr_generate\":": "sha256:afed625289ead760",
+  "crates/afterray-models/src/persistent_mlx.rs::async fn run_generate(": "sha256:ec337b3d65ad2c47",
+  "crates/afterray-store/src/lib.rs::pub fn complete_audio_transcription(": "sha256:4187d30da181abb9"
+}

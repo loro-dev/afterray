@@ -6,7 +6,7 @@ The shipped macOS app (`AfterRayApp` target, `afterray-app` product). It owns th
 
 - `Sources/AfterRayApp.swift:30` — app delegate; `RecallOverlayController` (overlay panel, Carbon hotkey, screenshot yield); `AfterRayMenuBar`; `AfterRayRootView`. `AfterRayMainMenu` must retain App + **Edit**, or native editing fails. Shipped chrome uses `AfterRayCopy`; see the [i18n contract](../../swift/AfterRayRecall/Sources/L10n/AGENTS.md). Screenshot yield: [screenshot-hotkey-yield](../../docs/decisions/active/product/2026-08-21-screenshot-hotkey-yield.md).
 - `Sources/DaemonSupervisor.swift:6` — spawns/owns `afterrayd` and helper binaries, resolves socket/data dirs; dev layout detected via `.afterray-dev` parent in `developmentRepoRoot()` (:276)
-- `Sources/HistoryWindow.swift:12` `AfterRayServices` (`static let shared`); `AfterRayStandardWindowPresence` (:39) Dock/Cmd-Tab for pop-outs; `HistoryWindowController` (:57)
+- `Sources/HistoryWindow.swift:12` `AfterRayServices` shares timeline and summary-history stores; `AfterRayStandardWindowPresence` owns Dock/Cmd-Tab for pop-outs; `HistoryWindowController` hosts history.
 - `Sources/ChatWindow.swift:10` `ChatWindowController` — standalone chat window; stream lives on `AfterRayServices.shared.chat`
 - `Sources/AfterRaySettings.swift:25` `AfterRaySettingsController` / real `AfterRaySettingsModel` (:47)
 - Others: `SystemPermissionCoordinator.swift`, `AfterRayUpdater.swift` (Sparkle), `AfterRayOnboarding.swift`, `AfterRayCliInstall.swift`, `AfterRayInstallLocation.swift`, `AfterRayMenuBarIcon.swift`, `OnboardingExclusions.swift`, `OverlayOpenRoute.swift` (`ScreenshotUIProcess`)

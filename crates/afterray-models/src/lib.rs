@@ -20,11 +20,12 @@ pub use asr_pack::{
 };
 pub use catalog::{
     ManifestFile, PackSource, PackSpec, QWEN3_ALIGNER_EXPECTED_BYTES, QWEN3_ALIGNER_PACK_ID,
-    QWEN3_ALIGNER_REPOSITORY, QWEN3_ALIGNER_REVISION, QWEN35_4B_MLX_EXPECTED_BYTES,
+    QWEN3_ALIGNER_REPOSITORY, QWEN3_ALIGNER_REVISION, QWEN3_ASR_REVISION,
+    QWEN35_4B_MLX_EXPECTED_BYTES,
     QWEN35_4B_MLX_PACK_ID, QWEN35_4B_MLX_REPOSITORY, QWEN35_4B_MLX_REVISION,
     QWEN35_9B_MLX_EXPECTED_BYTES, QWEN35_9B_MLX_PACK_ID, QWEN35_9B_MLX_REPOSITORY,
     QWEN35_9B_MLX_REVISION, READY_MARKER, catalog_in, default_catalog, inspect_model_path, library,
-    library_in, mlx_pack_context_tokens, model_directory, qwen3_aligner_manifest,
+    library_in, mlx_pack_context_tokens, model_directory, qwen3_aligner_manifest, qwen3_asr_manifest,
     qwen35_9b_mlx_manifest, qwen35_9b_mlx_pack, qwen35_mlx_manifest, qwen35_mlx_pack, spec_by_id,
     specs_for_download, specs_for_download_in,
 };
@@ -41,8 +42,8 @@ pub use download::{
     set_huggingface_endpoint, staging_directory, verify_files,
 };
 pub use persistent_mlx::{
-    MLX_WORKER_PROTOCOL_VERSION, MlxWorkerHealth, PersistentMlxAdapter, PersistentMlxConfig,
-    normalize_model_output,
+    MLX_WORKER_PROTOCOL_VERSION, MlxWorkerHealth, MlxWorkerProtocol, PersistentMlxAdapter,
+    PersistentMlxAsrAdapter, PersistentMlxConfig, normalize_model_output,
 };
 pub use process::{
     ProcessAdapter, ProcessAdapterConfig, WORKER_PROTOCOL_VERSION, WorkerRequest, WorkerResponse,

@@ -4,7 +4,7 @@ Testable core (target `AfterRayMlxVlmWorkerCore`) of the Qwen3.5 MLX vision-lang
 
 ## Key files
 
-- `Sources/WorkerCore.swift` — `mlxWorkerProtocolVersion = 2`, `mlxRuntimeVersion` (the pinned `mlx-swift-lm` revision), and pinned snapshot revisions `qwen35_4BRevision` / `qwen35_9BRevision`.
+- `Sources/WorkerCore.swift` — `mlxWorkerProtocolVersion = 3`, `mlxRuntimeVersion` (the pinned `mlx-swift-lm` revision), and pinned snapshot revisions `qwen35_4BRevision` / `qwen35_9BRevision`.
 - `Sources/WorkerCore.swift` — line-delimited JSON protocol: `load`/`generate`/`cancel` in, `ready`/`delta`/`final`/`cancelled`/`error` out; every response echoes `request_id`.
 - `ProtocolWriter` (:65) owns stdout; `WorkerLog` (:84) logs to stderr.
 - `validateLocalSnapshot` (:347) — requires the `.afterray-ready.json` marker with a pinned revision and `model_type == "qwen3_5"` (:385).

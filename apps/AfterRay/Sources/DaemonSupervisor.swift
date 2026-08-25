@@ -473,7 +473,7 @@ final class DaemonSupervisor {
     private func applyModelDefaults(to environment: inout [String: String]) {
         let defaults = [
             "AFTERRAY_ASR_MODEL": modelDirectory
-                .appendingPathComponent("Qwen3-ASR-1.7B"),
+                .appendingPathComponent("Qwen3-ASR-1.7B-MLX-4bit"),
             "AFTERRAY_EMBEDDING_MODEL": modelDirectory
                 .appendingPathComponent("nomic-embed-text-v1.5.Q4_K_M.gguf"),
         ]
