@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-agent"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-harness",
  "afterray-models",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-cli"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-models",
  "afterray-protocol",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-codec"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "blake3",
  "jpeg-encoder",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-core"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-protocol",
  "async-trait",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-harness"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-infer"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-models",
  "anyhow",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-models"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-protocol",
  "async-trait",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-platform-macos"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-core",
  "async-trait",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-protocol"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "afterray-store"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-core",
  "afterray-protocol",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "afterrayd"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "afterray-agent",
  "afterray-codec",
