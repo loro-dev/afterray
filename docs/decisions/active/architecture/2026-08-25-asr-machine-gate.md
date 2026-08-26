@@ -3,7 +3,9 @@
 Status: active
 Area: models
 Anchors:
+- crates/afterray-protocol/src/lib.rs @dec:asr-machine-gate
 - crates/afterrayd/src/compute.rs @dec:asr-machine-gate
+- swift/AfterRayRecall/Sources/ComputeActivity.swift @dec:asr-machine-gate
 Supersedes: —
 Superseded-by: —
 
@@ -31,6 +33,12 @@ The power conditions are deliberately not shared. Summaries require AC and ≥30
 transcription keeps its throttle-not-stop policy, because the audio rows are a durable
 backlog — late is fine, never is not.
 
+The daemon includes the shared idle/load thresholds and, when enabled, the GPU threshold
+and its fresh 15-second machine-wide average in `ComputeStatusReport`. The transcription
+popover derives its condition list from those wire values. A disabled GPU probe omits the
+GPU condition; an enabled probe without a fresh reading reports that condition as unreadable
+and unmet, matching the fail-closed gate.
+
 ## Alternatives considered
 
 **Apply the full summary gate, AC and battery included.** Rejected: it would silently
@@ -49,7 +57,7 @@ once in this codebase.
 
 On an actively used machine, transcription waits for the first two-minute idle gap with a
 quiet CPU and GPU; the dashboard's ASR row now shows real refusal reasons ("in use 40s
-ago, needs 120s") instead of running unconditionally. T2's fourth gate already tolerates
-late transcripts (`asr_wait_verdict`, 30-minute cap), so cards degrade the same way they
-did when ASR was merely slow. On battery with an idle machine the backlog still drains,
-at 300-second cadence.
+ago, needs 120s"), and its Info popover lists the same idle, load, and GPU conditions instead
+of claiming there are none. T2's fourth gate already tolerates late transcripts
+(`asr_wait_verdict`, 30-minute cap), so cards degrade the same way they did when ASR was
+merely slow. On battery with an idle machine the backlog still drains, at 300-second cadence.

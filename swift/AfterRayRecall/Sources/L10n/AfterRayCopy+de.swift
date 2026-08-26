@@ -580,6 +580,7 @@ extension AfterRayCopy {
             idleFor: { "\($0) s im Leerlauf" },
             lastInput: { "letzte Eingabe vor \($0) s" },
             loadBelow: { "Auslastung unter \($0)/Kern" },
+            gpuAverageBelow: { "GPU-Mittelwert über 15 s unter \($0) %" },
             thermalName: "Thermisch",
             runningNowAtRequest: "läuft jetzt auf Ihre Anforderung",
             heldShort: "zurückgestellt",

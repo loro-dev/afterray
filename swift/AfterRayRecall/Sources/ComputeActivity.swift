@@ -201,17 +201,20 @@ public struct ComputeThresholds: Codable, Equatable, Sendable {
     public let summaryMinBatteryFraction: Double
     public let summaryMinIdleSeconds: Double
     public let summaryMaxLoadPerCore: Double
+    public let summaryMaxGpuUtilization: Double?
     public let forceWindowSeconds: Int
 
     public init(
         summaryMinBatteryFraction: Double = 0.30,
-        summaryMinIdleSeconds: Double = 30,
+        summaryMinIdleSeconds: Double = 120,
         summaryMaxLoadPerCore: Double = 0.7,
+        summaryMaxGpuUtilization: Double? = nil,
         forceWindowSeconds: Int = 1_800
     ) {
         self.summaryMinBatteryFraction = summaryMinBatteryFraction
         self.summaryMinIdleSeconds = summaryMinIdleSeconds
         self.summaryMaxLoadPerCore = summaryMaxLoadPerCore
+        self.summaryMaxGpuUtilization = summaryMaxGpuUtilization
         self.forceWindowSeconds = forceWindowSeconds
     }
 
@@ -219,6 +222,7 @@ public struct ComputeThresholds: Codable, Equatable, Sendable {
         case summaryMinBatteryFraction = "summary_min_battery_fraction"
         case summaryMinIdleSeconds = "summary_min_idle_seconds"
         case summaryMaxLoadPerCore = "summary_max_load_per_core"
+        case summaryMaxGpuUtilization = "summary_max_gpu_utilization"
         case forceWindowSeconds = "force_window_seconds"
     }
 }
@@ -347,6 +351,7 @@ public struct ComputeMachine: Codable, Equatable, Sendable {
     public let batteryFraction: Double?
     public let idleSeconds: Double
     public let loadPerCore: Double?
+    public let gpuUtilization: Double?
     public let thermalLevel: UInt32?
     public let daemonCpuPercent: Double?
     public let daemonFootprintBytes: UInt64?
@@ -356,6 +361,7 @@ public struct ComputeMachine: Codable, Equatable, Sendable {
         batteryFraction: Double? = nil,
         idleSeconds: Double = 0,
         loadPerCore: Double? = nil,
+        gpuUtilization: Double? = nil,
         thermalLevel: UInt32? = nil,
         daemonCpuPercent: Double? = nil,
         daemonFootprintBytes: UInt64? = nil
@@ -364,6 +370,7 @@ public struct ComputeMachine: Codable, Equatable, Sendable {
         self.batteryFraction = batteryFraction
         self.idleSeconds = idleSeconds
         self.loadPerCore = loadPerCore
+        self.gpuUtilization = gpuUtilization
         self.thermalLevel = thermalLevel
         self.daemonCpuPercent = daemonCpuPercent
         self.daemonFootprintBytes = daemonFootprintBytes
@@ -374,6 +381,7 @@ public struct ComputeMachine: Codable, Equatable, Sendable {
         case batteryFraction = "battery_fraction"
         case idleSeconds = "idle_seconds"
         case loadPerCore = "load_per_core"
+        case gpuUtilization = "gpu_utilization"
         case thermalLevel = "thermal_level"
         case daemonCpuPercent = "daemon_cpu_percent"
         case daemonFootprintBytes = "daemon_footprint_bytes"
@@ -474,6 +482,7 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         return Double(pausedUntilMs) / 1000 > now.timeIntervalSince1970
     }
 
+    // @dec:asr-machine-gate — docs/decisions/active/architecture/2026-08-25-asr-machine-gate.md
     /// The conditions that have to hold for `workload` to start on its own,
     /// each paired with the live reading behind it.
     ///
@@ -519,28 +528,19 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
         case .ocr, .asr, .embedding:
             break
         }
-        guard workload == .summary else {
-            if workload == .asr, !machine.onAc {
-                conditions.append(
-                    ComputeCondition(
-                        label: copy.compute.fullSpeed,
-                        detail: copy.compute.batterySlower,
-                        met: true
-                    )
-                )
-            }
+        guard workload == .summary || workload == .asr else {
             return conditions
         }
-        // Summaries are the only workload with the full machine gate, and the
-        // only one where knowing the exact threshold changes what a user does.
-        let battery = machine.batteryFraction
-        conditions.append(
-            ComputeCondition(
-                label: copy.compute.batteryAbove(Int(thresholds.summaryMinBatteryFraction * 100)),
-                detail: ComputeFormat.battery(battery) ?? copy.compute.noBatteryToConserve,
-                met: battery.map { $0 >= thresholds.summaryMinBatteryFraction } ?? true
+        if workload == .summary {
+            let battery = machine.batteryFraction
+            conditions.append(
+                ComputeCondition(
+                    label: copy.compute.batteryAbove(Int(thresholds.summaryMinBatteryFraction * 100)),
+                    detail: ComputeFormat.battery(battery) ?? copy.compute.noBatteryToConserve,
+                    met: battery.map { $0 >= thresholds.summaryMinBatteryFraction } ?? true
+                )
             )
-        )
+        }
         conditions.append(
             ComputeCondition(
                 label: copy.compute.idleFor(Int(thresholds.summaryMinIdleSeconds)),
@@ -555,6 +555,24 @@ public struct ComputeStatus: Codable, Equatable, Sendable {
                 met: machine.loadPerCore.map { $0 <= thresholds.summaryMaxLoadPerCore } ?? false
             )
         )
+        if let gpuLimit = thresholds.summaryMaxGpuUtilization {
+            conditions.append(
+                ComputeCondition(
+                    label: copy.compute.gpuAverageBelow(Int(gpuLimit * 100)),
+                    detail: ComputeFormat.percentage(machine.gpuUtilization) ?? copy.compute.unreadableBusy,
+                    met: machine.gpuUtilization.map { $0 <= gpuLimit } ?? false
+                )
+            )
+        }
+        if workload == .asr, !machine.onAc {
+            conditions.append(
+                ComputeCondition(
+                    label: copy.compute.fullSpeed,
+                    detail: copy.compute.batterySlower,
+                    met: true
+                )
+            )
+        }
         return conditions
     }
 
@@ -736,6 +754,10 @@ public enum ComputeFormat {
     }
 
     public static func battery(_ fraction: Double?) -> String? {
+        percentage(fraction)
+    }
+
+    public static func percentage(_ fraction: Double?) -> String? {
         guard let fraction, fraction.isFinite else { return nil }
         return String(format: "%.0f%%", fraction * 100)
     }

@@ -582,6 +582,7 @@ extension AfterRayCopy {
             idleFor: { "Inactif depuis \($0) s" },
             lastInput: { "dernière saisie il y a \($0) s" },
             loadBelow: { "Charge inférieure à \($0)/cœur" },
+            gpuAverageBelow: { "Moyenne GPU sur 15 s inférieure à \($0) %" },
             thermalName: "Thermique",
             runningNowAtRequest: "en cours à votre demande",
             heldShort: "en attente",

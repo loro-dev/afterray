@@ -3615,7 +3615,7 @@ async fn compute_status(state: &Arc<AppState>) -> afterray_protocol::ComputeStat
     }
 
     let recent_summaries = state.compute.recent_summaries();
-    let machine = state.compute.machine_report(conditions);
+    let machine = state.compute.machine_report(conditions, now);
     let backlog = backlog_counts(state).await;
     let mut counts = compute::WorkloadCounts::default();
     counts.set(
@@ -3651,7 +3651,7 @@ async fn compute_status(state: &Arc<AppState>) -> afterray_protocol::ComputeStat
         running,
         gates,
         machine,
-        thresholds: compute::ComputeGovernor::thresholds(),
+        thresholds: state.compute.thresholds(),
         resident_models,
         summary_typical_ms: afterray_protocol::typical_run_ms(&recent_summaries),
         recent_summaries,

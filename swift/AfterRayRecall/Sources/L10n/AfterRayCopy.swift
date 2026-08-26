@@ -602,6 +602,7 @@ extension AfterRayCopy {
         public var idleFor: (Int) -> String
         public var lastInput: (Int) -> String
         public var loadBelow: (String) -> String
+        public var gpuAverageBelow: (Int) -> String
         public var thermalName: String
         public var runningNowAtRequest: String
         public var heldShort: String

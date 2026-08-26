@@ -224,11 +224,16 @@ final class ComputeActivityTests: XCTestCase {
               "forced_until_ms": 1750001800000
             }
           ],
-          "machine": {"on_ac": false, "idle_seconds": 2.0},
+          "machine": {
+            "on_ac": false,
+            "idle_seconds": 2.0,
+            "gpu_utilization": 0.24
+          },
           "thresholds": {
             "summary_min_battery_fraction": 0.3,
             "summary_min_idle_seconds": 120.0,
             "summary_max_load_per_core": 0.7,
+            "summary_max_gpu_utilization": 0.5,
             "force_window_seconds": 1800
           },
           "resident_models": [],
@@ -241,6 +246,8 @@ final class ComputeActivityTests: XCTestCase {
         XCTAssertEqual(summary.pending, 1)
         XCTAssertTrue(summary.isForced)
         XCTAssertEqual(status.thresholds.forceWindowSeconds, 1_800)
+        XCTAssertEqual(status.thresholds.summaryMaxGpuUtilization, 0.5)
+        XCTAssertEqual(status.machine.gpuUtilization, 0.24)
     }
 
     /// The queue count is a subset of the vault count, so the row must not add
@@ -299,6 +306,7 @@ final class ComputeActivityTests: XCTestCase {
         let conditions = status.automaticConditions(for: .summary)
         let idle = try? XCTUnwrap(conditions.first { $0.label.contains("Idle") })
         XCTAssertEqual(idle?.met, false, "4s idle against a 120s threshold")
+        XCTAssertEqual(idle?.label, "Idle for 120s")
         XCTAssertEqual(idle?.detail, "last input 4s ago")
         XCTAssertTrue(conditions.first { $0.label == "Plugged in" }?.met == true)
         XCTAssertTrue(conditions.first { $0.label.contains("Battery") }?.met == true)
@@ -348,16 +356,72 @@ final class ComputeActivityTests: XCTestCase {
         )
     }
 
-    /// Screen text has no machine gate at all; the popover should say so rather
-    /// than inventing conditions to look consistent.
+    /// Screen text and embeddings have no machine gate at all; the popover
+    /// should say so rather than inventing conditions to look consistent.
     func testCheapWorkloadsHaveNoConditions() {
         let status = ComputeStatus(machine: ComputeMachine(onAc: false, idleSeconds: 0))
         XCTAssertTrue(status.automaticConditions(for: .ocr).isEmpty)
-        // Transcription on battery is throttled, not stopped, and says so.
+        XCTAssertTrue(status.automaticConditions(for: .embedding).isEmpty)
+    }
+
+    func testTranscriptionListsTheMachineConditionsItActuallyUses() {
+        let status = ComputeStatus(
+            machine: ComputeMachine(
+                onAc: true,
+                idleSeconds: 4,
+                loadPerCore: 0.8,
+                gpuUtilization: 0.9
+            ),
+            thresholds: ComputeThresholds(
+                summaryMinIdleSeconds: 120,
+                summaryMaxLoadPerCore: 0.7,
+                summaryMaxGpuUtilization: 0.5
+            )
+        )
+
         let asr = status.automaticConditions(for: .asr)
-        XCTAssertEqual(asr.count, 1)
-        XCTAssertTrue(asr[0].met)
-        XCTAssertTrue(asr[0].detail.contains("five times slower"))
+        XCTAssertEqual(asr.count, 3)
+        XCTAssertEqual(asr.map(\.met), [false, false, false])
+        XCTAssertEqual(asr[0].label, "Idle for 120s")
+        XCTAssertEqual(asr[0].detail, "last input 4s ago")
+        XCTAssertEqual(asr[1].label, "Load below 0.70/core")
+        XCTAssertEqual(asr[1].detail, "0.80/core")
+        XCTAssertEqual(asr[2].label, "15s GPU average below 50%")
+        XCTAssertEqual(asr[2].detail, "90%")
+    }
+
+    func testTranscriptionOnBatteryIsThrottledRatherThanBlocked() {
+        let status = ComputeStatus(
+            machine: ComputeMachine(
+                onAc: false,
+                idleSeconds: 600,
+                loadPerCore: 0.1,
+                gpuUtilization: 0.1
+            ),
+            thresholds: ComputeThresholds(summaryMaxGpuUtilization: 0.5)
+        )
+
+        let asr = status.automaticConditions(for: .asr)
+        XCTAssertEqual(asr.count, 4)
+        XCTAssertTrue(asr.allSatisfy { $0.met })
+        XCTAssertTrue(asr[3].detail.contains("five times slower"))
+    }
+
+    func testTranscriptionGpuConditionMatchesProbeAvailability() {
+        let machine = ComputeMachine(onAc: true, idleSeconds: 600, loadPerCore: 0.1)
+
+        let disabled = ComputeStatus(machine: machine)
+            .automaticConditions(for: .asr)
+        XCTAssertFalse(disabled.contains { $0.label.contains("GPU") })
+
+        let unavailable = ComputeStatus(
+            machine: machine,
+            thresholds: ComputeThresholds(summaryMaxGpuUtilization: 0.5)
+        )
+        .automaticConditions(for: .asr)
+        .first { $0.label.contains("GPU") }
+        XCTAssertEqual(unavailable?.met, false)
+        XCTAssertEqual(unavailable?.detail, "unreadable — treated as busy")
     }
 
     // MARK: - Summary timing

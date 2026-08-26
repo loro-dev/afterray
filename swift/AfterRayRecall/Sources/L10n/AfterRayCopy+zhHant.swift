@@ -580,6 +580,7 @@ extension AfterRayCopy {
             idleFor: { "閒置 \($0) 秒" },
             lastInput: { "上次輸入在 \($0) 秒前" },
             loadBelow: { "每核心負載低於 \($0)" },
+            gpuAverageBelow: { "最近 15 秒 GPU 平均使用率低於 \($0)%" },
             thermalName: "熱壓力",
             runningNowAtRequest: "依你的要求正在執行",
             heldShort: "暫緩",

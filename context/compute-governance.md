@@ -171,13 +171,16 @@ machine actually wants.
   revive a workload disabled by an environment variable at launch, since no
   amount of forcing will make a sweeper that never started do work.
 - **The explanation is generated, not written.** `ComputeThresholds` travels on
-  the wire, so the Info popover's "starts automatically when: plugged in ·
-  battery above 30% · idle for 120s · load below 0.70/core" is built from the
-  numbers the gate actually compares against, each paired with the live reading
-  and marked met or unmet. Hardcoding those numbers in the UI would let the
-  explanation drift from the behaviour, which is worse than no explanation.
+  the wire, so the Info popover is built from the numbers the gate actually
+  compares against, each paired with the live reading and marked met or unmet.
+  Summaries list power, battery, idle, load and the recent machine-wide GPU
+  average. Transcription lists the shared idle, load and GPU conditions; battery
+  only changes its cadence. A disabled GPU probe omits that condition, while a
+  stale enabled probe is shown as unreadable and unmet. Hardcoding those numbers
+  in the UI would let the explanation drift from the behaviour, which is worse
+  than no explanation.
 
-## Why there is no GPU percentage
+## Why there is no per-task GPU percentage
 
 macOS publishes no per-process GPU accounting, so no task row can carry an
 honest GPU figure. `powermetrics` needs root; the only in-process route to a
@@ -197,7 +200,8 @@ misses. Fail-closed like the other probes, disable-able with
 [gpu-utilization-gate](../docs/decisions/active/architecture/2026-08-24-gpu-utilization-gate.md).
 
 So the dashboard reports each task's **lane** (`ComputeLane::Gpu` / `Cpu`) and
-the costs that genuinely are attributable to a pid:
+uses the machine-wide 15-second average only to explain the automatic gate. It
+reports these costs that genuinely are attributable to a pid:
 
 - `afterray-platform-macos/src/process.rs` — `process_usage(pid)` via
   `proc_pid_rusage(RUSAGE_INFO_V0)`: CPU time and physical footprint.

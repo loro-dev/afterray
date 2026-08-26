@@ -324,11 +324,16 @@ impl ComputeGovernor {
 
     /// The numbers the automatic triggers compare against, for the panel's
     /// "why isn't this running?" explanation.
-    pub(crate) const fn thresholds() -> ComputeThresholds {
+    pub(crate) const fn thresholds(&self) -> ComputeThresholds {
         ComputeThresholds {
             summary_min_battery_fraction: T2_MIN_BATTERY,
             summary_min_idle_seconds: T2_MIN_IDLE_SECONDS,
             summary_max_load_per_core: T2_MAX_LOAD_PER_CORE,
+            summary_max_gpu_utilization: if self.limits.gpu_probe_disabled_by_env {
+                None
+            } else {
+                Some(T2_MAX_GPU_UTILIZATION)
+            },
             force_window_seconds: FORCE_WINDOW.as_secs(),
         }
     }
@@ -511,30 +516,12 @@ impl ComputeGovernor {
         if self.limits.gpu_probe_disabled_by_env {
             return Ok(());
         }
-        let samples = self
-            .gpu_samples
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let newest_is_fresh = samples
-            .back()
-            .is_some_and(|(at, _)| now_ms.saturating_sub(*at) <= GPU_WINDOW_MS);
-        if !newest_is_fresh {
+        let Some(average) = self.gpu_utilization(now_ms) else {
             return Err(GateRefusal::new(
                 ComputeGateCode::Unavailable,
                 "GPU utilization unavailable",
             ));
-        }
-        let mut total = 0.0;
-        let mut count = 0_usize;
-        for (at, value) in samples.iter().rev() {
-            if now_ms.saturating_sub(*at) > GPU_WINDOW_MS {
-                break;
-            }
-            total += value;
-            count += 1;
-        }
-        #[expect(clippy::cast_precision_loss, reason = "sample counts are tiny")]
-        let average = total / count as f64;
+        };
         if average > T2_MAX_GPU_UTILIZATION {
             return Err(GateRefusal::new(
                 ComputeGateCode::MachineBusy,
@@ -546,6 +533,33 @@ impl ComputeGovernor {
             ));
         }
         Ok(())
+    }
+
+    /// The same fresh-window average used by the GPU gate and the dashboard.
+    /// Keeping one implementation prevents the explanation from averaging a
+    /// different sample set than the decision it describes.
+    fn gpu_utilization(&self, now_ms: i64) -> Option<f64> {
+        let samples = self
+            .gpu_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let newest_is_fresh = samples
+            .back()
+            .is_some_and(|(at, _)| now_ms.saturating_sub(*at) <= GPU_WINDOW_MS);
+        if !newest_is_fresh {
+            return None;
+        }
+        let mut total = 0.0;
+        let mut count = 0_usize;
+        for (at, value) in samples.iter().rev() {
+            if now_ms.saturating_sub(*at) > GPU_WINDOW_MS {
+                break;
+            }
+            total += value;
+            count += 1;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "sample counts are tiny")]
+        Some(total / count as f64)
     }
 
     /// Whether `workload` may start right now.
@@ -730,13 +744,22 @@ impl ComputeGovernor {
     /// The machine block of the report, including the daemon's own cost — which
     /// is where in-process AV1 packing shows up, since it has no worker pid of
     /// its own.
-    pub(crate) fn machine_report(&self, conditions: MachineConditions) -> ComputeMachine {
+    pub(crate) fn machine_report(
+        &self,
+        conditions: MachineConditions,
+        now_ms: i64,
+    ) -> ComputeMachine {
         let (daemon_cpu_percent, daemon_footprint_bytes) = self.sample(std::process::id());
         ComputeMachine {
             on_ac: conditions.on_ac,
             battery_fraction: conditions.battery,
             idle_seconds: conditions.idle_seconds,
             load_per_core: conditions.load_per_core,
+            gpu_utilization: if self.limits.gpu_probe_disabled_by_env {
+                None
+            } else {
+                self.gpu_utilization(now_ms)
+            },
             thermal_level: conditions.thermal_level,
             daemon_cpu_percent,
             daemon_footprint_bytes,
@@ -1383,11 +1406,25 @@ mod tests {
 
     #[test]
     fn the_reported_thresholds_are_the_ones_the_gate_uses() {
-        let thresholds = ComputeGovernor::thresholds();
+        let thresholds = governor(ComputeMode::Full).thresholds();
         assert!((thresholds.summary_min_idle_seconds - T2_MIN_IDLE_SECONDS).abs() < f64::EPSILON);
         assert!((thresholds.summary_max_load_per_core - T2_MAX_LOAD_PER_CORE).abs() < f64::EPSILON);
         assert!((thresholds.summary_min_battery_fraction - T2_MIN_BATTERY).abs() < f64::EPSILON);
+        assert_eq!(
+            thresholds.summary_max_gpu_utilization,
+            Some(T2_MAX_GPU_UTILIZATION)
+        );
         assert_eq!(thresholds.force_window_seconds, FORCE_WINDOW.as_secs());
+
+        let disabled = ComputeGovernor::new(
+            ComputeMode::Full,
+            0,
+            ComputeLimits {
+                gpu_probe_disabled_by_env: true,
+                ..ComputeLimits::default()
+            },
+        );
+        assert_eq!(disabled.thresholds().summary_max_gpu_utilization, None);
     }
 
     #[test]
@@ -1517,10 +1554,17 @@ mod tests {
     #[test]
     fn the_machine_report_carries_the_probes_the_gates_used() {
         let governor = governor(ComputeMode::Full);
-        let report = governor.machine_report(IDEAL);
+        let now = 1_700_000_000_000;
+        record_steady_gpu(&governor, now, 0.2);
+        let report = governor.machine_report(IDEAL, now);
         assert!(report.on_ac);
         assert_eq!(report.battery_fraction, Some(0.9));
         assert!((report.idle_seconds - 600.0).abs() < f64::EPSILON);
+        assert!(
+            report
+                .gpu_utilization
+                .is_some_and(|value| (value - 0.2).abs() < f64::EPSILON)
+        );
     }
 
     #[test]

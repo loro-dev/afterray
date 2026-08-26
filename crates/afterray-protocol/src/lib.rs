@@ -618,6 +618,7 @@ pub struct ComputeGate {
     pub can_run_now: bool,
 }
 
+// @dec:asr-machine-gate — docs/decisions/active/architecture/2026-08-25-asr-machine-gate.md
 /// The thresholds the automatic triggers compare against.
 ///
 /// On the wire rather than hardcoded in the UI so the "why isn't this running?"
@@ -628,10 +629,16 @@ pub struct ComputeGate {
 pub struct ComputeThresholds {
     /// Charge a summary pass needs, even on AC.
     pub summary_min_battery_fraction: f64,
-    /// How long the machine must have been untouched before a summary starts.
+    /// How long the machine must have been untouched before a summary or
+    /// transcription pass starts.
     pub summary_min_idle_seconds: f64,
-    /// One-minute load average per core a summary will not add to.
+    /// One-minute load average per core a summary or transcription pass will
+    /// not add to.
     pub summary_max_load_per_core: f64,
+    /// Fifteen-second machine-wide GPU average a summary or transcription pass
+    /// will not add to. `None` means the GPU gate is disabled at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_max_gpu_utilization: Option<f64>,
     /// How long a "run now" override lasts.
     pub force_window_seconds: u64,
 }
@@ -679,6 +686,11 @@ pub struct ComputeMachine {
     pub idle_seconds: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_per_core: Option<f64>,
+    /// Machine-wide GPU utilization averaged over the gate's recent window.
+    /// `None` means the probe has no fresh reading; whether that is a blocking
+    /// failure or a disabled gate is stated by `ComputeThresholds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_utilization: Option<f64>,
     /// Higher is hotter; the scale is undocumented, so only compare to zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal_level: Option<u32>,
@@ -739,6 +751,7 @@ fn default_compute_thresholds() -> ComputeThresholds {
         summary_min_battery_fraction: 0.30,
         summary_min_idle_seconds: 120.0,
         summary_max_load_per_core: 0.7,
+        summary_max_gpu_utilization: None,
         force_window_seconds: 1800,
     }
 }
@@ -1628,6 +1641,31 @@ mod tests {
             .unwrap(),
             r#"{"workload":"asr","allowed":false,"code":"in_use","pending":2,"backlog":4,"backlog_duration_ms":720000,"can_run_now":true}"#
         );
+        assert_eq!(
+            serde_json::to_string(&ComputeThresholds {
+                summary_min_battery_fraction: 0.3,
+                summary_min_idle_seconds: 120.0,
+                summary_max_load_per_core: 0.7,
+                summary_max_gpu_utilization: Some(0.5),
+                force_window_seconds: 1800,
+            })
+            .unwrap(),
+            r#"{"summary_min_battery_fraction":0.3,"summary_min_idle_seconds":120.0,"summary_max_load_per_core":0.7,"summary_max_gpu_utilization":0.5,"force_window_seconds":1800}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ComputeMachine {
+                on_ac: true,
+                battery_fraction: Some(0.8),
+                idle_seconds: 120.0,
+                load_per_core: Some(0.2),
+                gpu_utilization: Some(0.3),
+                thermal_level: Some(0),
+                daemon_cpu_percent: Some(1.5),
+                daemon_footprint_bytes: Some(42),
+            })
+            .unwrap(),
+            r#"{"on_ac":true,"battery_fraction":0.8,"idle_seconds":120.0,"load_per_core":0.2,"gpu_utilization":0.3,"thermal_level":0,"daemon_cpu_percent":1.5,"daemon_footprint_bytes":42}"#
+        );
     }
 
     #[test]
@@ -1695,6 +1733,8 @@ mod tests {
         // daemon's report still explains the trigger rather than showing zeroes.
         assert!((report.thresholds.summary_min_idle_seconds - 120.0).abs() < f64::EPSILON);
         assert!((report.thresholds.summary_max_load_per_core - 0.7).abs() < f64::EPSILON);
+        assert_eq!(report.thresholds.summary_max_gpu_utilization, None);
+        assert_eq!(report.machine.gpu_utilization, None);
     }
 
     #[test]
