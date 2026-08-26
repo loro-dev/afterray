@@ -4,6 +4,7 @@ Status: active
 Area: models
 Anchors:
 - crates/afterrayd/src/main.rs @dec:mlx-asr-runtime
+- apps/AfterRayMlxAsrWorker/Sources/main.swift @dec:mlx-asr-runtime
 Supersedes: —
 Superseded-by: —
 
@@ -23,6 +24,11 @@ idle-reclamation check share the same mutex, so an active transcription cannot
 be mistaken for idle. The daemon reclaims the helper after 120 seconds without
 a completed request; the next ASR job starts and verifies a fresh process. It
 never contacts Hugging Face or writes a cache at inference time.
+
+Before generation, the helper decodes the capture file as mono and resamples it
+to 16 kHz, matching the Qwen3 ASR input contract and the previous Candle worker.
+Capture files commonly use 48 kHz; passing those samples through unchanged would
+make the model interpret them at the wrong speed and pitch.
 
 The helper remains separate from the Qwen3.5 VLM package because its dependency
 graph has its own MLX runtime version. Forced alignment remains a distinct CPU

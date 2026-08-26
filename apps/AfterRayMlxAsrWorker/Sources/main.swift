@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXAudioCore
 import MLXAudioSTT
 
@@ -89,7 +90,7 @@ enum AfterRayMlxAsrWorker {
                     guard FileManager.default.isReadableFile(atPath: audioURL.path) else {
                         throw WorkerFailure.missing("audio input is not readable")
                     }
-                    let (_, audio) = try loadAudioArray(from: audioURL)
+                    let audio = try loadAudioForASR(from: audioURL)
                     let started = ContinuousClock.now
                     let result = model.generate(audio: audio, language: request.language)
                     log("transcribed \(result.text.count) chars in \(started.duration(to: .now))")
@@ -115,6 +116,18 @@ enum AfterRayMlxAsrWorker {
                 writeBestEffort("MLX ASR failed: \(error)", requestID: requestID, retryable: true)
             }
         }
+    }
+
+    // Qwen3 ASR expects 16 kHz mono samples. Capture files are commonly
+    // 48 kHz, so leaving the source rate unchanged makes the model hear them
+    // at the wrong speed and pitch.
+    // @dec:mlx-asr-runtime — docs/decisions/active/architecture/2026-08-25-mlx-asr-runtime.md
+    private static func loadAudioForASR(from url: URL) throws -> MLXArray {
+        let (sampleRate, audio) = try loadAudioArray(from: url, sampleRate: 16_000)
+        guard sampleRate == 16_000 else {
+            throw WorkerFailure.invalid("MLX ASR audio was not resampled to 16 kHz")
+        }
+        return audio
     }
 
     private static func validateLocalModel(_ directory: URL) throws {
