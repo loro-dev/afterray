@@ -21,7 +21,7 @@ use chacha20poly1305::{
 #[cfg(target_os = "macos")]
 use core_foundation::{base::TCFType, string::CFString};
 use rand::RngCore;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 #[cfg(target_os = "macos")]
 use security_framework::{
     access_control::{ProtectionMode, SecAccessControl},
@@ -860,6 +860,17 @@ impl ReadPool {
         })
     }
 
+    fn open_read_only(path: &Path, key: &Zeroizing<[u8; 32]>) -> Result<Self, StoreError> {
+        let mut connections = Vec::with_capacity(Self::SIZE);
+        for _ in 0..Self::SIZE {
+            connections.push(Mutex::new(open_keyed_database_read_only(path, key)?));
+        }
+        Ok(Self {
+            connections,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
     /// Prefers an idle connection; blocks on one only when all are busy.
     fn get(&self) -> std::sync::MutexGuard<'_, Connection> {
         let start = self.next.fetch_add(1, Ordering::Relaxed);
@@ -1054,6 +1065,43 @@ impl Vault {
             None => provider.create()?,
         };
         Self::open_with_key(config, *key)
+    }
+
+    // @dec:read-only-vault-inspection — docs/decisions/active/architecture/2026-08-26-read-only-vault-inspection.md
+    /// Opens an existing vault without migrations, retention, reconciliation,
+    /// or any writable SQLite connection. Intended for offline inspection only.
+    pub fn open_read_only(
+        config: VaultConfig,
+        provider: &dyn KeyProvider,
+    ) -> Result<Self, StoreError> {
+        let key = provider.load()?.ok_or(StoreError::MissingVaultKey)?;
+        Self::open_read_only_with_key(config, *key)
+    }
+
+    pub fn open_read_only_with_key(
+        config: VaultConfig,
+        key: [u8; 32],
+    ) -> Result<Self, StoreError> {
+        let master_key = Zeroizing::new(key);
+        let database_key = Zeroizing::new(blake3::derive_key(DATABASE_KEY_CONTEXT, &*master_key));
+        let database_path = config.data_dir.join("afterray.sqlite3");
+        let connection = open_keyed_database_read_only(&database_path, &database_key)?;
+        let summary_slot_segments = read_summary_slot_segments(&connection)?;
+        let readers = ReadPool::open_read_only(&database_path, &database_key)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            readers,
+            card_cache: Mutex::new(HashMap::new()),
+            artifacts_dir: config.data_dir.join("artifacts"),
+            artifact_wrap_key: Zeroizing::new(blake3::derive_key(
+                ARTIFACT_WRAP_KEY_CONTEXT,
+                &*master_key,
+            )),
+            legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
+            artifact_io: RwLock::new(()),
+            max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
+            summary_slot_segments: RwLock::new(summary_slot_segments),
+        })
     }
 
     pub fn open_with_key(config: VaultConfig, key: [u8; 32]) -> Result<Self, StoreError> {
@@ -6666,6 +6714,28 @@ fn open_keyed_database(path: &Path, key: &[u8; 32]) -> Result<Connection, StoreE
     Ok(connection)
 }
 
+fn open_keyed_database_read_only(
+    path: &Path,
+    key: &[u8; 32],
+) -> Result<Connection, StoreError> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut key_pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", encode_hex(key)));
+    let key_result = connection.execute_batch(&key_pragma);
+    key_pragma.zeroize();
+    key_result?;
+    let cipher_version: Option<String> = connection
+        .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+        .optional()?;
+    if cipher_version.as_deref().is_none_or(str::is_empty) {
+        return Err(StoreError::InvalidKey);
+    }
+    connection
+        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+        .map_err(|_| StoreError::InvalidKey)?;
+    connection.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+    Ok(connection)
+}
+
 fn set_database_file_permissions(path: &Path) -> Result<(), StoreError> {
     set_private_file_permissions(path)?;
     for suffix in ["-wal", "-shm"] {
@@ -7561,6 +7631,33 @@ mod tests {
                 .create_called
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn read_only_vault_opens_existing_history_without_a_writable_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VaultConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..VaultConfig::default()
+        };
+        let key = [73_u8; 32];
+        {
+            let vault = Vault::open_with_key(config.clone(), key).unwrap();
+            let session = vault.create_session_sync(1).unwrap();
+            vault
+                .insert_moment(&session.id, 2, "image/jpeg", b"recorded history")
+                .unwrap();
+        }
+
+        let vault = Vault::open_read_only_with_key(config, key).unwrap();
+        assert_eq!(vault.timeline_sync().unwrap().len(), 1);
+        let error = vault
+            .connection
+            .lock()
+            .unwrap()
+            .execute("CREATE TABLE must_not_write (id INTEGER)", [])
+            .unwrap_err();
+        assert!(error.to_string().contains("readonly"), "{error}");
     }
 
     #[test]

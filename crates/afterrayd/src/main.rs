@@ -170,32 +170,46 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+// @dec:read-only-vault-inspection — docs/decisions/active/architecture/2026-08-26-read-only-vault-inspection.md
 async fn async_main() -> anyhow::Result<()> {
     let socket =
         afterray_protocol::socket::default_socket_path().context("resolve daemon socket path")?;
     let (listener, owner_uid) = bind_control_socket(&socket)?;
 
+    let read_only_inspection = std::env::var("AFTERRAY_READ_ONLY_INSPECTION").as_deref() == Ok("1");
     let mut vault_config = VaultConfig::default();
     if let Some(path) = std::env::var_os("AFTERRAY_DATA_DIR") {
         vault_config.data_dir = PathBuf::from(path);
     }
     let staging_dir = vault_config.data_dir.join("capture-staging");
-    let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
-    if removed_staging_files > 0 {
-        eprintln!("removed {removed_staging_files} stale capture staging file(s)");
+    if !read_only_inspection {
+        let removed_staging_files = clear_stale_capture_files(&staging_dir)?;
+        if removed_staging_files > 0 {
+            eprintln!("removed {removed_staging_files} stale capture staging file(s)");
+        }
     }
-    let persisted = migrate_api_key_to_keychain(
-        &vault_config.data_dir,
-        load_persisted_settings(&vault_config.data_dir),
-    );
+    let persisted = if read_only_inspection {
+        load_persisted_settings(&vault_config.data_dir)
+    } else {
+        migrate_api_key_to_keychain(
+            &vault_config.data_dir,
+            load_persisted_settings(&vault_config.data_dir),
+        )
+    };
     vault_config.max_storage_bytes = persisted.storage_limit_bytes;
     afterray_models::set_huggingface_endpoint(Some(persisted.model_download_endpoint.clone()));
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
-    let store = Arc::new(Vault::open(vault_config, &MacOsKeychainProvider)?);
-    let repaired_sessions = store.close_orphaned_sessions_sync(now_ms())?;
-    if repaired_sessions > 0 {
-        eprintln!("closed {repaired_sessions} session(s) left open by an earlier daemon");
+    let store = Arc::new(if read_only_inspection {
+        Vault::open_read_only(vault_config, &MacOsKeychainProvider)?
+    } else {
+        Vault::open(vault_config, &MacOsKeychainProvider)?
+    });
+    if !read_only_inspection {
+        let repaired_sessions = store.close_orphaned_sessions_sync(now_ms())?;
+        if repaired_sessions > 0 {
+            eprintln!("closed {repaired_sessions} session(s) left open by an earlier daemon");
+        }
     }
     let shim_path = std::env::var_os("AFTERRAY_CAPTURE_SHIM").map_or_else(
         || PathBuf::from("apps/AfterRayCaptureShim/.build/release/AfterRayCaptureShim"),
@@ -329,7 +343,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Off the boot path: `recent_summary_runs` sorts an unindexed column, and
     // nothing in the daemon's first seconds needs the answer — the panel is not
     // open yet, and `seed_summaries` no-ops once a live pass has been recorded.
-    {
+    if !read_only_inspection {
         let seed_store = Arc::clone(&state.store);
         let seed_compute = Arc::clone(&state.compute);
         state
@@ -339,8 +353,8 @@ async fn async_main() -> anyhow::Result<()> {
             }));
     }
 
-    settle_orphaned_turns(&state);
-    {
+    if !read_only_inspection {
+        settle_orphaned_turns(&state);
         let removed =
             reclaim_abandoned_downloads(&model_directory(), &std::collections::HashSet::new());
         if removed > 0 {
@@ -348,23 +362,25 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
     println!("afterrayd listening on {}", socket.display());
-    let migration_store = Arc::clone(&state.store);
-    state
-        .lifecycle
-        .track_task(tokio::task::spawn_blocking(move || {
-            match migration_store.run_artifact_maintenance() {
-                Ok(0) => {}
-                Ok(count) => eprintln!("migrated {count} legacy artifact(s) in the background"),
-                Err(error) => eprintln!("background artifact maintenance paused: {error}"),
-            }
-        }));
-    spawn_gop_packer(Arc::clone(&state));
-    spawn_slot_summarizer(Arc::clone(&state));
-    spawn_mlx_idle_reaper(Arc::clone(&state));
-    spawn_text_df_maintainer(Arc::clone(&state));
-    spawn_asr_sweeper(Arc::clone(&state));
-    if gpu_probe_enabled {
-        spawn_gpu_sampler(Arc::clone(&state));
+    if !read_only_inspection {
+        let migration_store = Arc::clone(&state.store);
+        state
+            .lifecycle
+            .track_task(tokio::task::spawn_blocking(move || {
+                match migration_store.run_artifact_maintenance() {
+                    Ok(0) => {}
+                    Ok(count) => eprintln!("migrated {count} legacy artifact(s) in the background"),
+                    Err(error) => eprintln!("background artifact maintenance paused: {error}"),
+                }
+            }));
+        spawn_gop_packer(Arc::clone(&state));
+        spawn_slot_summarizer(Arc::clone(&state));
+        spawn_mlx_idle_reaper(Arc::clone(&state));
+        spawn_text_df_maintainer(Arc::clone(&state));
+        spawn_asr_sweeper(Arc::clone(&state));
+        if gpu_probe_enabled {
+            spawn_gpu_sampler(Arc::clone(&state));
+        }
     }
 
     let shutdown = shutdown_signal();
@@ -407,18 +423,20 @@ async fn async_main() -> anyhow::Result<()> {
     state.begin_draining();
     let shutdown_started = Instant::now();
     cancel_disposable_work(&state).await;
-    // The helper wait and failed-helper recovery are bounded inside `record_stop`.
-    // A healthy consumer drain, memory flush, and session close are required
-    // durability work and must not be cancelled by an outer timeout.
-    let response = record_stop(&state, Some("shutdown")).await;
-    if !response.ok {
-        eprintln!(
-            "could not finish the active session during shutdown: {}",
-            response.error.as_deref().unwrap_or("unknown error")
-        );
-    }
-    if let Err(error) = clear_stale_capture_files(&staging_dir) {
-        eprintln!("could not clear capture staging during shutdown: {error}");
+    if !read_only_inspection {
+        // The helper wait and failed-helper recovery are bounded inside `record_stop`.
+        // A healthy consumer drain, memory flush, and session close are required
+        // durability work and must not be cancelled by an outer timeout.
+        let response = record_stop(&state, Some("shutdown")).await;
+        if !response.ok {
+            eprintln!(
+                "could not finish the active session during shutdown: {}",
+                response.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        if let Err(error) = clear_stale_capture_files(&staging_dir) {
+            eprintln!("could not clear capture staging during shutdown: {error}");
+        }
     }
     state
         .lifecycle
