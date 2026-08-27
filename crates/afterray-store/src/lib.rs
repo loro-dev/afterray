@@ -59,9 +59,9 @@ pub mod search_index;
 mod slot;
 
 pub use gop::{
-    GopCommitFrame, GopCommitRequest, GopFrameRow, GopPackJob, GopSegmentRecord, MIN_PACK_FRAMES,
-    PackCandidate, PackPolicy, PackStatusCounts, first_packable_run, fold_pack_runs,
-    packable_frame_count,
+    GopCommitFrame, GopCommitRequest, GopFrameRow, GopMergeRequest, GopPackJob, GopRewriteRequest,
+    GopSegmentRecord, MIN_PACK_FRAMES, PackCandidate, PackPolicy, PackStatusCounts,
+    first_packable_run, fold_pack_runs, packable_frame_count,
 };
 pub use jpeg::jpeg_pixel_size;
 pub use memory::{
@@ -95,9 +95,9 @@ pub use slot::{
 mod readonly;
 pub use readonly::{ReadOnlyVault, SharedReadOnlyVault};
 
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 29;
 
-// @dec:size-driven-retention — docs/decisions/active/architecture/2026-08-20-size-driven-retention.md
+// @dec:tiered-evidence-retention — docs/decisions/active/architecture/2026-08-27-tiered-evidence-retention.md
 /// How long a runtime marker in the event stream lives.
 ///
 /// This is **not** content retention. A `signal_gap` row records that the
@@ -132,6 +132,18 @@ pub const SIGNAL_MARKER_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
 /// away acts that could have been kept. `afterrayd`'s sweeper freezes first and
 /// deletes only once the whole expiring window is frozen.
 pub const RAW_EVENT_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// What one age-retention pass removed while keeping the timeline rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvidenceExpiryReport {
+    pub moments_stripped: u64,
+    pub gop_segments_removed: u64,
+    pub audio_segments_removed: u64,
+    pub edge_snapshots_removed: u64,
+    pub artifact_bytes_removed: u64,
+}
 
 /// One coalesced input observation, as the vault holds it.
 ///
@@ -444,6 +456,8 @@ pub enum StoreError {
     GopNotFound(String),
     #[error("gop commit raced with retention")]
     GopStale,
+    #[error("gop frame count exceeds the database integer range")]
+    GopFrameCountOverflow,
     #[error("moment not found: {0}")]
     MomentNotFound(String),
     #[error("{0} ms is not an offered summary slot length")]
@@ -825,6 +839,10 @@ pub struct Vault {
     /// so filmstrip scrubbing can decrypt many JPEGs in parallel.
     artifact_io: RwLock<()>,
     max_storage_bytes: AtomicU64,
+    /// `0` keeps the historical size-only behavior. A positive value strips
+    /// raw evidence older than this many wall-clock days while retaining the
+    /// moment row that gives the timeline its shape.
+    evidence_retention_days: AtomicU64,
     /// How long a summary slot has been at each point in this vault's life,
     /// oldest first. Persisted, because a card already written must keep the
     /// shape it was summarised at however often the user changes the setting.
@@ -1100,6 +1118,7 @@ impl Vault {
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: RwLock::new(()),
             max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
+            evidence_retention_days: AtomicU64::new(0),
             summary_slot_segments: RwLock::new(summary_slot_segments),
         })
     }
@@ -1131,6 +1150,7 @@ impl Vault {
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: RwLock::new(()),
             max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
+            evidence_retention_days: AtomicU64::new(0),
             summary_slot_segments: RwLock::new(summary_slot_segments),
         };
         let _ = vault.rollback_orphan_gops();
@@ -1149,6 +1169,26 @@ impl Vault {
         let previous = self.max_storage_bytes.swap(bytes, Ordering::Relaxed);
         if let Err(error) = self.enforce_retention() {
             self.max_storage_bytes.store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn evidence_retention_days(&self) -> Option<u32> {
+        u32::try_from(self.evidence_retention_days.load(Ordering::Relaxed))
+            .ok()
+            .filter(|days| *days > 0)
+    }
+
+    /// Enables or disables the raw-evidence age horizon and applies it before
+    /// returning. Timeline metadata is never removed by this path.
+    pub fn set_evidence_retention_days(&self, days: Option<u32>) -> Result<(), StoreError> {
+        let days = days.map_or(0, u64::from);
+        let previous = self.evidence_retention_days.swap(days, Ordering::Relaxed);
+        if let Err(error) = self.enforce_retention() {
+            self.evidence_retention_days
+                .store(previous, Ordering::Relaxed);
             return Err(error);
         }
         Ok(())
@@ -4985,7 +5025,153 @@ impl Vault {
         )?)
     }
 
-    // @dec:size-driven-retention — docs/decisions/active/architecture/2026-08-20-size-driven-retention.md
+    #[allow(clippy::too_many_lines)]
+    /// Removes raw evidence strictly older than `cutoff_ms`, preserving the
+    /// `moments` rows and their derived text so the timeline can still travel
+    /// through the gap. A GOP or audio segment that straddles the cutoff is
+    /// retained until the whole segment is older; current segments are short,
+    /// so the boundary can lag by at most one segment rather than exposing a
+    /// partly deleted encrypted object.
+    pub fn expire_evidence_before(
+        &self,
+        cutoff_ms: i64,
+    ) -> Result<EvidenceExpiryReport, StoreError> {
+        self.flush_card_cache();
+        let _artifact_guard = self.artifact_io.write().unwrap();
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+
+        let moment_artifacts: Vec<String> = {
+            let mut statement = transaction.prepare(
+                "SELECT artifact_id FROM (
+                   SELECT image_artifact_id AS artifact_id FROM moments
+                    WHERE captured_at_ms < ?1 AND image_artifact_id IS NOT NULL
+                   UNION ALL
+                   SELECT accessibility_artifact_id FROM moments
+                    WHERE captured_at_ms < ?1 AND accessibility_artifact_id IS NOT NULL
+                   UNION ALL
+                   SELECT thumbnail_artifact_id FROM moments
+                    WHERE captured_at_ms < ?1 AND thumbnail_artifact_id IS NOT NULL
+                 )",
+            )?;
+            statement
+                .query_map([cutoff_ms], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut moments_stripped = transaction.execute(
+            "UPDATE moments
+                SET image_artifact_id = NULL,
+                    accessibility_artifact_id = NULL,
+                    thumbnail_artifact_id = NULL,
+                    still_origin = 'expired'
+              WHERE captured_at_ms < ?1
+                AND (image_artifact_id IS NOT NULL
+                  OR accessibility_artifact_id IS NOT NULL
+                  OR thumbnail_artifact_id IS NOT NULL)",
+            [cutoff_ms],
+        )?;
+
+        let gop_segments: Vec<(String, String)> = {
+            let mut statement = transaction.prepare(
+                "SELECT id, artifact_id FROM gop_segments
+                  WHERE status IN ('writing', 'ready') AND ended_at_ms < ?1",
+            )?;
+            statement
+                .query_map([cutoff_ms], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (segment_id, _) in &gop_segments {
+            moments_stripped = moments_stripped.saturating_add(transaction.execute(
+                "UPDATE moments
+                    SET gop_segment_id = NULL, gop_index = NULL, still_origin = 'expired'
+                  WHERE gop_segment_id = ?1",
+                [segment_id],
+            )?);
+            transaction.execute(
+                "UPDATE gop_pack_jobs SET segment_id = NULL WHERE segment_id = ?1",
+                [segment_id],
+            )?;
+            transaction.execute("DELETE FROM gop_frames WHERE segment_id = ?1", [segment_id])?;
+            transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [segment_id])?;
+        }
+
+        let audio_segments: Vec<(String, String)> = {
+            let mut statement = transaction.prepare(
+                "SELECT id, audio_artifact_id FROM audio_segments WHERE ended_at_ms < ?1",
+            )?;
+            statement
+                .query_map([cutoff_ms], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (segment_id, _) in &audio_segments {
+            transaction.execute(
+                "DELETE FROM evidence_fts WHERE evidence_id IN
+                 (SELECT id FROM text_evidence WHERE audio_segment_id = ?1)",
+                [segment_id],
+            )?;
+            transaction.execute("DELETE FROM audio_segments WHERE id = ?1", [segment_id])?;
+        }
+
+        let edge_snapshots: Vec<(String, String)> = {
+            let mut statement = transaction
+                .prepare("SELECT id, artifact_id FROM edge_snapshots WHERE captured_at_ms < ?1")?;
+            statement
+                .query_map([cutoff_ms], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, _) in &edge_snapshots {
+            transaction.execute("DELETE FROM edge_snapshots WHERE id = ?1", [id])?;
+        }
+
+        let mut artifact_ids = moment_artifacts;
+        artifact_ids.extend(
+            gop_segments
+                .iter()
+                .map(|(_, artifact_id)| artifact_id.clone()),
+        );
+        artifact_ids.extend(
+            audio_segments
+                .iter()
+                .map(|(_, artifact_id)| artifact_id.clone()),
+        );
+        artifact_ids.extend(
+            edge_snapshots
+                .iter()
+                .map(|(_, artifact_id)| artifact_id.clone()),
+        );
+        let mut artifact_bytes_removed = 0_u64;
+        for artifact_id in &artifact_ids {
+            let bytes: Option<i64> = transaction
+                .query_row(
+                    "SELECT byte_length FROM artifacts WHERE id = ?1",
+                    [artifact_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            artifact_bytes_removed = artifact_bytes_removed.saturating_add(
+                bytes
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(0),
+            );
+            transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        for artifact_id in artifact_ids {
+            let _ = fs::remove_file(self.artifact_path(&artifact_id));
+        }
+
+        Ok(EvidenceExpiryReport {
+            moments_stripped: u64::try_from(moments_stripped).unwrap_or(u64::MAX),
+            gop_segments_removed: u64::try_from(gop_segments.len()).unwrap_or(u64::MAX),
+            audio_segments_removed: u64::try_from(audio_segments.len()).unwrap_or(u64::MAX),
+            edge_snapshots_removed: u64::try_from(edge_snapshots.len()).unwrap_or(u64::MAX),
+            artifact_bytes_removed,
+        })
+    }
+
+    // @dec:tiered-evidence-retention — docs/decisions/active/architecture/2026-08-27-tiered-evidence-retention.md
+    #[allow(clippy::too_many_lines)]
     fn enforce_retention(&self) -> Result<(), StoreError> {
         self.flush_card_cache();
         // Before the size sweep, and outside its early return: a marker's
@@ -5000,11 +5186,17 @@ impl Vault {
                 .unwrap_or_default(),
         )
         .unwrap_or(i64::MAX);
+        if let Some(days) = self.evidence_retention_days() {
+            let horizon_ms =
+                i64::try_from(u64::from(days).saturating_mul(DAY_MS)).unwrap_or(i64::MAX);
+            self.expire_evidence_before(now_ms.saturating_sub(horizon_ms))?;
+        }
         if let Err(error) = self.prune_signal_gaps(now_ms) {
             eprintln!("signal marker retention failed: {error}");
         }
         loop {
             let max = i64::try_from(self.storage_limit_bytes()).unwrap_or(i64::MAX);
+            let preserve_timeline = self.evidence_retention_days().is_some();
             let mut connection = self.connection.lock().unwrap();
             let used = Self::artifact_bytes(&connection)?;
             let excess = used.saturating_sub(max).max(0);
@@ -5044,6 +5236,10 @@ impl Vault {
                        LEFT JOIN gop_segments gop ON gop.id = m.gop_segment_id
                        LEFT JOIN artifacts gop_artifact ON gop_artifact.id = gop.artifact_id
                       WHERE m.is_favorite = 0
+                        AND (?3 = 0 OR image.id IS NOT NULL
+                          OR accessibility.id IS NOT NULL
+                          OR thumbnail.id IS NOT NULL
+                          OR m.gop_segment_id IS NOT NULL)
                         AND (
                           image.id IS NOT NULL
                           OR accessibility.id IS NOT NULL
@@ -5059,7 +5255,11 @@ impl Vault {
                 )?;
                 statement
                     .query_map(
-                        params![ARTIFACT_FILE_OVERHEAD_BYTES, RETENTION_BATCH_SIZE],
+                        params![
+                            ARTIFACT_FILE_OVERHEAD_BYTES,
+                            RETENTION_BATCH_SIZE,
+                            i64::from(preserve_timeline)
+                        ],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -5093,13 +5293,27 @@ impl Vault {
             for (moment_id, artifact_id, accessibility_artifact_id, thumbnail_artifact_id) in
                 &candidates
             {
-                transaction.execute(
-                    "DELETE FROM evidence_fts WHERE evidence_id IN
-                     (SELECT id FROM text_evidence WHERE moment_id = ?1)",
-                    [moment_id],
-                )?;
                 transaction.execute("DELETE FROM gop_frames WHERE moment_id = ?1", [moment_id])?;
-                transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
+                if preserve_timeline {
+                    transaction.execute(
+                        "UPDATE moments
+                            SET image_artifact_id = NULL,
+                                accessibility_artifact_id = NULL,
+                                thumbnail_artifact_id = NULL,
+                                gop_segment_id = NULL,
+                                gop_index = NULL,
+                                still_origin = 'expired'
+                          WHERE id = ?1",
+                        [moment_id],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM evidence_fts WHERE evidence_id IN
+                         (SELECT id FROM text_evidence WHERE moment_id = ?1)",
+                        [moment_id],
+                    )?;
+                    transaction.execute("DELETE FROM moments WHERE id = ?1", [moment_id])?;
+                }
                 for artifact_id in [
                     artifact_id,
                     accessibility_artifact_id,
@@ -5130,22 +5344,49 @@ impl Vault {
                     gop_artifact_ids.push(artifact_id.clone());
                 }
             }
-            let audio_candidates = {
+            let audio_reclaim_target = excess.saturating_sub(estimated_reclaim);
+            let audio_candidate_pool = if audio_reclaim_target > 0 {
                 let mut statement = transaction.prepare(
-                    "SELECT audio.id, audio.audio_artifact_id
+                    "SELECT audio.id, audio.audio_artifact_id,
+                            COALESCE(artifact.byte_length + ?3, 0)
                        FROM audio_segments audio
-                      WHERE NOT EXISTS (
+                       LEFT JOIN artifacts artifact ON artifact.id = audio.audio_artifact_id
+                      WHERE ?1 = 1 OR NOT EXISTS (
                         SELECT 1 FROM moments m
                          WHERE m.session_id = audio.session_id
                            AND m.captured_at_ms BETWEEN audio.started_at_ms AND audio.ended_at_ms
-                      )",
+                      )
+                      ORDER BY audio.ended_at_ms, audio.id
+                      LIMIT ?2",
                 )?;
                 statement
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
+                    .query_map(
+                        params![
+                            i64::from(preserve_timeline),
+                            RETENTION_BATCH_SIZE,
+                            ARTIFACT_FILE_OVERHEAD_BYTES
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )?
                     .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
             };
+            let mut audio_candidates = Vec::new();
+            let mut estimated_audio_reclaim = 0_i64;
+            for (segment_id, artifact_id, bytes) in audio_candidate_pool {
+                audio_candidates.push((segment_id, artifact_id));
+                estimated_audio_reclaim = estimated_audio_reclaim.saturating_add(bytes.max(0));
+                if bytes <= 0 || estimated_audio_reclaim >= audio_reclaim_target {
+                    break;
+                }
+            }
             for (segment_id, artifact_id) in &audio_candidates {
                 transaction.execute(
                     "DELETE FROM evidence_fts WHERE evidence_id IN
@@ -5478,6 +5719,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     migrate_schema_26(connection)?;
     migrate_schema_27(connection, from_version)?;
     migrate_schema_28(connection)?;
+    migrate_schema_29(connection)?;
     migrate_artifact_columns(connection)?;
     connection.execute("UPDATE schema_meta SET version = ?1", [SCHEMA_VERSION])?;
     Ok(())
@@ -6262,6 +6504,29 @@ fn migrate_schema_28(connection: &Connection) -> Result<(), StoreError> {
            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
            last_success_ms INTEGER NOT NULL
          );",
+    )?;
+    Ok(())
+}
+
+/// Records the AV1 constant quantizer used for each segment. Existing GOPs
+/// were all produced at the historical default (100), which gives the aging
+/// worker a deterministic starting point after migration.
+fn migrate_schema_29(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(gop_segments)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if !existing.iter().any(|held| held == "quality_quantizer") {
+        connection.execute(
+            "ALTER TABLE gop_segments
+             ADD COLUMN quality_quantizer INTEGER NOT NULL DEFAULT 100",
+            [],
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS gop_segments_quality_age
+           ON gop_segments(status, ended_at_ms, quality_quantizer);",
     )?;
     Ok(())
 }
@@ -8900,6 +9165,225 @@ mod tests {
     }
 
     #[test]
+    fn age_retention_strips_raw_evidence_and_keeps_timeline_metadata() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let old = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"old-screen")
+            .unwrap();
+        vault.set_favorite(&old.id, true).unwrap();
+        vault.set_thumbnail(&old.id, b"old-thumb").unwrap();
+        vault
+            .attach_accessibility_snapshot(
+                &session.id,
+                1_000,
+                "application/json",
+                br#"{"root":{"role":"AXWindow"}}"#,
+                Some("Notes"),
+                Some("com.apple.Notes"),
+            )
+            .unwrap()
+            .unwrap();
+        vault
+            .insert_text_evidence(
+                &session.id,
+                Some(&old.id),
+                None,
+                "ocr",
+                "derived text stays searchable",
+                1_000,
+                None,
+                "test",
+                None,
+            )
+            .unwrap();
+        vault
+            .insert_edge_snapshot(1_100, br#"{"tree":"old"}"#)
+            .unwrap();
+        vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                500,
+                1_500,
+                "audio/mp4",
+                b"old-audio",
+            )
+            .unwrap();
+        let fresh = vault
+            .insert_moment(&session.id, 3_000, "image/jpeg", b"fresh-screen")
+            .unwrap();
+
+        let report = vault.expire_evidence_before(2_000).unwrap();
+        assert!(report.moments_stripped >= 1);
+        assert_eq!(report.audio_segments_removed, 1);
+        assert_eq!(report.edge_snapshots_removed, 1);
+
+        let moments = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(moments.len(), 2, "the timeline row must not be deleted");
+        let expired = moments.iter().find(|moment| moment.id == old.id).unwrap();
+        assert!(expired.is_favorite, "favorites keep their marker metadata");
+        assert_eq!(expired.still_origin, "expired");
+        assert!(expired.image_artifact_id.is_none());
+        assert!(expired.accessibility_artifact_id.is_none());
+        assert_eq!(
+            expired.ocr_text.as_deref(),
+            Some("derived text stays searchable")
+        );
+        assert!(vault.audio_segments_sync(&session.id).unwrap().is_empty());
+        assert!(vault.edge_snapshots_between(0, 2_000).unwrap().is_empty());
+
+        let kept = moments.iter().find(|moment| moment.id == fresh.id).unwrap();
+        assert!(kept.image_artifact_id.is_some());
+    }
+
+    #[test]
+    fn age_retention_removes_a_gop_before_its_ready_transition() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(100).unwrap();
+        let moment = vault
+            .insert_moment(&session.id, 1_000, "image/jpeg", b"old-screen")
+            .unwrap();
+        let moment_ids = vec![moment.id.clone()];
+        let frames = vec![GopCommitFrame {
+            index: 0,
+            is_keyframe: true,
+            byte_offset: 44,
+            byte_length: 8,
+            content_hash: [7; 32],
+        }];
+        let segment_id = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &moment_ids,
+                ivf: b"writing-gop",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "test",
+                width: 32,
+                height: 16,
+                keyint: 1,
+                quality_quantizer: 100,
+                started_at_ms: 1_000,
+                ended_at_ms: 1_000,
+                content_hash: "writing",
+                frames: &frames,
+            })
+            .unwrap();
+        let artifact_id: String = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT artifact_id FROM gop_segments WHERE id = ?1 AND status = 'writing'",
+                [&segment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let report = vault.expire_evidence_before(2_000).unwrap();
+
+        assert_eq!(report.gop_segments_removed, 1);
+        assert!(matches!(
+            vault.gop_segment(&segment_id),
+            Err(StoreError::GopNotFound(_))
+        ));
+        assert!(vault.mark_gop_ready(&segment_id).is_err());
+        assert!(!vault.artifact_path(&artifact_id).exists());
+        let expired = vault.moments_sync(&session.id).unwrap().remove(0);
+        assert_eq!(expired.still_origin, "expired");
+        assert!(expired.image_artifact_id.is_none());
+        assert!(expired.gop.is_none());
+    }
+
+    #[test]
+    fn size_ceiling_removes_only_enough_audio_to_reach_the_limit() {
+        let (_directory, vault) = test_vault(10);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let session = vault.create_session_sync(now).unwrap();
+        let first = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                now,
+                now + 1_000,
+                "audio/mp4",
+                &[1; 256],
+            )
+            .unwrap();
+        let second = vault
+            .insert_audio_segment(
+                &session.id,
+                AudioTrack::System,
+                now + 1_001,
+                now + 2_000,
+                "audio/mp4",
+                &[2; 256],
+            )
+            .unwrap();
+        vault.set_evidence_retention_days(Some(30)).unwrap();
+        let used = vault.storage_usage_bytes().unwrap();
+
+        vault.set_storage_limit_bytes(used - 1).unwrap();
+
+        let remaining = vault.audio_segments_sync(&session.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, second.id);
+        assert_ne!(remaining[0].id, first.id);
+    }
+
+    #[test]
+    fn size_ceiling_preserves_timeline_rows_while_age_mode_is_enabled() {
+        let (_directory, vault) = test_vault(10);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let session = vault.create_session_sync(now).unwrap();
+        for index in 0..4 {
+            let moment = vault
+                .insert_moment(
+                    &session.id,
+                    now + index,
+                    "image/jpeg",
+                    &[u8::try_from(index).unwrap(); 128],
+                )
+                .unwrap();
+            vault
+                .insert_text_evidence(
+                    &session.id,
+                    Some(&moment.id),
+                    None,
+                    "ocr",
+                    "derived",
+                    now + index,
+                    None,
+                    "test",
+                    None,
+                )
+                .unwrap();
+        }
+        vault.set_evidence_retention_days(Some(30)).unwrap();
+        vault.set_storage_limit_bytes(100).unwrap();
+
+        let moments = vault.moments_sync(&session.id).unwrap();
+        assert_eq!(moments.len(), 4, "the byte ceiling deleted timeline rows");
+        assert!(
+            moments
+                .iter()
+                .all(|moment| moment.image_artifact_id.is_none())
+        );
+        assert!(
+            moments
+                .iter()
+                .all(|moment| moment.ocr_text.as_deref() == Some("derived"))
+        );
+        assert!(vault.storage_usage_bytes().unwrap() <= 100);
+    }
+
+    #[test]
     fn lowering_storage_limit_prunes_immediately() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
@@ -9029,6 +9513,7 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 12,
+                quality_quantizer: 100,
                 started_at_ms: 1,
                 ended_at_ms: 2,
                 content_hash: "shared",
@@ -9046,6 +9531,242 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert!(remaining.iter().any(|moment| moment.id == second.id));
         assert!(vault.storage_usage_bytes().unwrap() > vault.storage_limit_bytes());
+    }
+
+    #[test]
+    fn rewrite_gop_atomically_swaps_payload_and_quality_metadata() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let first = vault
+            .insert_moment(&session.id, 1, "image/jpeg", b"one")
+            .unwrap();
+        let second = vault
+            .insert_moment(&session.id, 2, "image/jpeg", b"two")
+            .unwrap();
+        let moment_ids = vec![first.id, second.id];
+        let original_frames = vec![
+            GopCommitFrame {
+                index: 0,
+                is_keyframe: true,
+                byte_offset: 0,
+                byte_length: 4,
+                content_hash: [1; 32],
+            },
+            GopCommitFrame {
+                index: 1,
+                is_keyframe: false,
+                byte_offset: 4,
+                byte_length: 4,
+                content_hash: [2; 32],
+            },
+        ];
+        let segment_id = vault
+            .commit_gop(GopCommitRequest {
+                moment_ids: &moment_ids,
+                ivf: b"old-gop",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "old",
+                width: 32,
+                height: 16,
+                keyint: 12,
+                quality_quantizer: 100,
+                started_at_ms: 1,
+                ended_at_ms: 2,
+                content_hash: "old",
+                frames: &original_frames,
+            })
+            .unwrap();
+        vault.mark_gop_ready(&segment_id).unwrap();
+        let original_artifact = vault.gop_segment(&segment_id).unwrap().artifact_id;
+
+        let rewritten_frames = vec![
+            GopCommitFrame {
+                index: 0,
+                is_keyframe: true,
+                byte_offset: 0,
+                byte_length: 3,
+                content_hash: [3; 32],
+            },
+            GopCommitFrame {
+                index: 1,
+                is_keyframe: false,
+                byte_offset: 3,
+                byte_length: 4,
+                content_hash: [4; 32],
+            },
+        ];
+        vault
+            .rewrite_gop(GopRewriteRequest {
+                segment_id: &segment_id,
+                moment_ids: &moment_ids,
+                ivf: b"new-gop",
+                encoder: "rav1e",
+                encoder_version: "new",
+                quality_quantizer: 180,
+                content_hash: "new",
+                frames: &rewritten_frames,
+            })
+            .unwrap();
+
+        let rewritten = vault.gop_segment(&segment_id).unwrap();
+        assert_eq!(rewritten.quality_quantizer, 180);
+        assert_ne!(rewritten.artifact_id, original_artifact);
+        assert_eq!(
+            vault.read_gop_artifact(&segment_id).unwrap().bytes,
+            b"new-gop"
+        );
+        assert!(vault.read_artifact(&original_artifact).is_err());
+        assert_eq!(
+            vault.live_gop_frames(&segment_id).unwrap()[1].byte_offset,
+            3
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn merge_gops_atomically_rebinds_moments_jobs_and_artifacts() {
+        let (_directory, vault) = test_vault(10);
+        let session = vault.create_session_sync(1).unwrap();
+        let mut all_moment_ids = Vec::new();
+        let mut source_ids = Vec::new();
+        let mut source_artifact_ids = Vec::new();
+        let mut job_ids = Vec::new();
+
+        for group in 0_u8..2 {
+            let mut moment_ids = Vec::new();
+            for offset in 0..2 {
+                let captured_at_ms = 1_000 + i64::from(group * 2 + offset) * 10_000;
+                let moment = vault
+                    .insert_moment(&session.id, captured_at_ms, "image/jpeg", b"still")
+                    .unwrap();
+                moment_ids.push(moment.id.clone());
+                all_moment_ids.push(moment.id);
+            }
+            let frames = (0..2)
+                .map(|index| GopCommitFrame {
+                    index,
+                    is_keyframe: index == 0,
+                    byte_offset: u32::from(index) * 8,
+                    byte_length: 8,
+                    content_hash: [group + 1; 32],
+                })
+                .collect::<Vec<_>>();
+            let segment_id = vault
+                .commit_gop(GopCommitRequest {
+                    moment_ids: &moment_ids,
+                    ivf: if group == 0 { b"old-a" } else { b"old-b" },
+                    codec: "av01",
+                    encoder: "rav1e",
+                    encoder_version: "old",
+                    width: 32,
+                    height: 16,
+                    keyint: 2,
+                    quality_quantizer: if group == 0 { 100 } else { 140 },
+                    started_at_ms: 1_000 + i64::from(group * 2) * 10_000,
+                    ended_at_ms: 11_000 + i64::from(group * 2) * 10_000,
+                    content_hash: "old",
+                    frames: &frames,
+                })
+                .unwrap();
+            vault.mark_gop_ready(&segment_id).unwrap();
+            source_artifact_ids.push(vault.gop_segment(&segment_id).unwrap().artifact_id);
+            let job_id = vault.insert_pack_job(50_000, "{}").unwrap();
+            vault
+                .finish_pack_job(&job_id, 50_001, Some(&segment_id), None)
+                .unwrap();
+            job_ids.push(job_id);
+            source_ids.push(segment_id);
+        }
+
+        let sources = vault
+            .next_gop_merge_candidate()
+            .unwrap()
+            .expect("two compatible short GOPs");
+        assert_eq!(
+            sources
+                .iter()
+                .map(|segment| &segment.id)
+                .collect::<Vec<_>>(),
+            source_ids.iter().collect::<Vec<_>>()
+        );
+        let (preview_source, total_bytes, degradable_bytes) = vault
+            .gop_quality_preview_candidate(180)
+            .unwrap()
+            .expect("preview source");
+        assert_eq!(preview_source.quality_quantizer, 100);
+        assert_eq!(degradable_bytes, total_bytes);
+        let merged_frames = (0..4)
+            .map(|index| GopCommitFrame {
+                index,
+                is_keyframe: index == 0,
+                byte_offset: u32::from(index) * 7,
+                byte_length: 7,
+                content_hash: [9; 32],
+            })
+            .collect::<Vec<_>>();
+        let merged_id = vault
+            .merge_gops(GopMergeRequest {
+                source_segments: &sources,
+                moment_ids: &all_moment_ids,
+                ivf: b"merged-gop",
+                codec: "av01",
+                encoder: "rav1e",
+                encoder_version: "new",
+                width: 32,
+                height: 16,
+                keyint: 4,
+                quality_quantizer: 180,
+                started_at_ms: 1_000,
+                ended_at_ms: 31_000,
+                content_hash: "merged",
+                frames: &merged_frames,
+            })
+            .unwrap();
+
+        let merged = vault.gop_segment(&merged_id).unwrap();
+        assert_eq!(merged.frame_count, 4);
+        assert_eq!(merged.quality_quantizer, 180);
+        let (_, total_bytes, degradable_bytes) = vault
+            .gop_quality_preview_candidate(180)
+            .unwrap()
+            .expect("merged preview source");
+        assert!(total_bytes > 0);
+        assert_eq!(degradable_bytes, 0);
+        assert_eq!(
+            vault.read_gop_artifact(&merged_id).unwrap().bytes,
+            b"merged-gop"
+        );
+        assert_eq!(
+            vault
+                .live_gop_frames(&merged_id)
+                .unwrap()
+                .into_iter()
+                .map(|frame| frame.moment_id)
+                .collect::<Vec<_>>(),
+            all_moment_ids
+        );
+        for source_id in source_ids {
+            assert!(matches!(
+                vault.gop_segment(&source_id),
+                Err(StoreError::GopNotFound(_))
+            ));
+        }
+        for artifact_id in source_artifact_ids {
+            assert!(vault.read_artifact(&artifact_id).is_err());
+        }
+        let rewired_jobs: i64 = vault
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM gop_pack_jobs
+                  WHERE id IN (?1, ?2) AND segment_id = ?3",
+                params![job_ids[0], job_ids[1], merged_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rewired_jobs, 2);
     }
 
     #[test]
@@ -9573,6 +10294,7 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 12,
+                quality_quantizer: 100,
                 started_at_ms: 0,
                 ended_at_ms: 50_000,
                 content_hash: "abc",
@@ -9627,6 +10349,7 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 12,
+                quality_quantizer: 100,
                 started_at_ms: 0,
                 ended_at_ms: 20_000,
                 content_hash: "abc",
@@ -9675,6 +10398,7 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 1,
+                quality_quantizer: 100,
                 started_at_ms: 10_000,
                 ended_at_ms: 10_000,
                 content_hash: "abc",
@@ -9731,6 +10455,7 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 12,
+                quality_quantizer: 100,
                 started_at_ms: 0,
                 ended_at_ms: 10_000,
                 content_hash: "abc",
@@ -9825,6 +10550,7 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 1,
+                quality_quantizer: 100,
                 started_at_ms: 1_000,
                 ended_at_ms: 1_000,
                 content_hash: "abc",
@@ -9882,6 +10608,7 @@ mod tests {
                 width: 32,
                 height: 16,
                 keyint: 12,
+                quality_quantizer: 100,
                 started_at_ms: 10_000,
                 ended_at_ms: 20_000,
                 content_hash: "abc",

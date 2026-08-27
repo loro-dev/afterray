@@ -8,6 +8,7 @@ Targets of the **root** `Package.swift` (built with plain `swift build`):
 
 - [AfterRay/](AfterRay/AGENTS.md) — shipped app (`afterray-app` product): menu bar, overlay panel, daemon supervision, onboarding, Sparkle updates
 - [AfterRayNativeModelWorker/](AfterRayNativeModelWorker/AGENTS.md) — one-shot Vision OCR worker (`afterray-native-model-worker`)
+- [AfterRayGopDecoder/](AfterRayGopDecoder/AGENTS.md) — one-shot VideoToolbox AV1 → I420 helper for atomic cold-GOP quality aging
 - [AfterRayMlxVlmWorker/](AfterRayMlxVlmWorker/AGENTS.md) — persistent MLX VLM worker executable (`afterray-mlx-vlm-worker`); all logic is in the `AfterRayMlxVlmWorkerCore` target under `swift/`
 - [AfterRayVisualLab/](AfterRayVisualLab/AGENTS.md) — interactive mock-data UI harness (`afterray-visual-lab`)
 - [AfterRayVisualSnapshots/](AfterRayVisualSnapshots/AGENTS.md) — offscreen PNG snapshot tool (`afterray-visual-snapshots`)

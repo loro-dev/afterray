@@ -8,9 +8,10 @@ Anchors:
 Supersedes: —
 Superseded-by: —
 
-Narrows [size-driven retention](../architecture/2026-08-20-size-driven-retention.md), which
-holds for every other kind of captured content. That record still stands; this
-one takes one stream out from under it.
+This privacy deadline remains independent of the broader
+[tiered evidence-retention policy](../architecture/2026-08-27-tiered-evidence-retention.md).
+Raw input content always expires after 48 hours, even when raw screenshots and
+audio have a longer horizon or no age horizon.
 
 ## Problem
 

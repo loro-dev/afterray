@@ -211,6 +211,27 @@ extension AfterRayCopy {
         public var diskShare: (String, String) -> String
         public var memoryLimit: String
         public var memoryLimitSubtitle: String
+        public var evidenceRetention: String
+        public var evidenceRetentionSubtitle: String
+        public var evidenceRetentionConfirmTitle: String
+        public var evidenceRetentionConfirmMessage: (UInt32) -> String
+        public var deleteOldEvidence: String
+        public var keepAllEvidence: String
+        public var keepSevenDays: String
+        public var keepThirtyDays: String
+        public var customDays: String
+        public var days: String
+        public var ageArchivedImages: String
+        public var ageArchivedImagesSubtitle: String
+        public var worstArchiveQuality: String
+        public var moreDetail: String
+        public var smallerFiles: String
+        public var archiveQualityTiers: (Int) -> String
+        public var saveAndPreview: String
+        public var worstQualityPreview: String
+        public var previewQualityRoute: (Int, Int) -> String
+        public var previewMeasured: (String, String) -> String
+        public var previewProjected: (String, String) -> String
         public var memoryLocation: String
         public var memoryLocationSubtitle: String
         public var changeMemoryLocation: String

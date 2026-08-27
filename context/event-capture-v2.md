@@ -66,23 +66,19 @@ vocabulary without modelling it: the fields readers filter on have columns, the
 rest travel together, and the next field the shim invents costs a mapping line
 in `afterrayd`'s `input_event_row` instead of a migration.
 
-**Retention is unified.** The 48h channel that used to take the whole table now
-takes only `signal_gap` markers (`prune_signal_gaps`,
-`SIGNAL_MARKER_RETENTION_MS`): a marker is bookkeeping about the recorder, and
-its whole meaning is a deadline. Everything else — observations and the R3 trees
-in `edge_snapshots` — is captured content and expires inside
-`enforce_retention`'s oldest-first sweep, measured against the **retention
-horizon**: the oldest frame the vault still holds
-(`prune_input_events_before` / `prune_edge_snapshots_before`). What the user did
-in a stretch survives exactly as long as what was on screen during it.
+**Raw input has its own privacy clock.** `input_events` content and `signal_gap`
+markers expire after 48 hours. Before input content goes, its shape is frozen
+into `slot_summaries.acts_json`. R3 `edge_snapshots` follow the configured raw
+evidence horizon: when K-day retention is enabled, old trees disappear with old
+screens and audio while the lightweight timeline rows remain. Without an age
+horizon, the emergency byte sweep owns their lifetime.
 
 Two decisions the plan left open, made here:
 
-- **The horizon is the oldest surviving moment**, mirroring how orphaned audio
-  is swept — content whose surrounding frames are gone has nothing left to
-  attach to. It is not a second clock; under the size limit, which is the normal
-  state, nothing expires at all, exactly like the frames.
-- **No frames left means no sweep.** "Everything is older than nothing" would
+- **The size-sweep horizon is the oldest surviving moment**, mirroring how orphaned audio
+  is swept when age retention is disabled — content whose surrounding frames
+  are gone has nothing left to attach to.
+- **No frames left means no size sweep.** "Everything is older than nothing" would
   take live events off a vault that had merely never captured a frame, so the
   unknown edge is skipped rather than guessed. The cost is that edge-tree
   artifacts on a frameless vault are not reclaimable by retention; `delete_history`

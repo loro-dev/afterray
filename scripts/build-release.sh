@@ -293,6 +293,10 @@ swift build \
   --package-path "$repo_root" \
   --configuration release \
   --product afterray-mlx-vlm-worker
+swift build \
+  --package-path "$repo_root" \
+  --configuration release \
+  --product afterray-gop-decoder
 mlx_asr_package="$repo_root/apps/AfterRayMlxAsrWorker"
 swift build \
   --package-path "$mlx_asr_package" \
@@ -306,6 +310,7 @@ model_worker_bin="$repo_root/target/release/afterray-model-worker"
 app_bin="$repo_root/.build/release/afterray-app"
 native_model_worker_bin="$repo_root/.build/release/afterray-native-model-worker"
 mlx_worker_bin="$repo_root/.build/release/afterray-mlx-vlm-worker"
+gop_decoder_bin="$repo_root/.build/release/afterray-gop-decoder"
 mlx_metallib="$repo_root/.build/release/mlx.metallib"
 mlx_asr_bin_dir="$(swift build --package-path "$mlx_asr_package" --configuration release --show-bin-path)"
 mlx_asr_worker_bin="$mlx_asr_bin_dir/afterray-mlx-asr-worker"
@@ -319,6 +324,7 @@ source_binaries=(
   "$capture_bin"
   "$native_model_worker_bin"
   "$mlx_worker_bin"
+  "$gop_decoder_bin"
   "$mlx_asr_worker_bin"
 )
 for binary in "${source_binaries[@]}"; do
@@ -355,6 +361,8 @@ install -m 0755 "$native_model_worker_bin" \
   "$app_bundle/Contents/Helpers/afterray-native-model-worker"
 install -m 0755 "$mlx_worker_bin" \
   "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
+install -m 0755 "$gop_decoder_bin" \
+  "$app_bundle/Contents/Helpers/afterray-gop-decoder"
 install -m 0644 "$mlx_metallib" \
   "$app_bundle/Contents/Helpers/mlx.metallib"
 install -m 0755 "$mlx_asr_worker_bin" \
@@ -406,6 +414,7 @@ bundle_binaries=(
   "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
   "$app_bundle/Contents/Helpers/afterray-native-model-worker"
   "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
+  "$app_bundle/Contents/Helpers/afterray-gop-decoder"
   "$app_bundle/Contents/Helpers/asr/afterray-mlx-asr-worker"
 )
 nested_runtime_code=(

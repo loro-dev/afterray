@@ -50,11 +50,16 @@ fn rgb_to_i420(rgb: &[u8], src_width: u32, width: u32, height: u32, yuv: &mut [u
             let g = i32::from(rgb[src + 1]);
             let b = i32::from(rgb[src + 2]);
             y_plane[row * width + col] =
-                ((66 * r + 129 * g + 25 * b + 128) >> 8).saturating_add(16) as u8;
+                u8::try_from(((66 * r + 129 * g + 25 * b + 128) >> 8).saturating_add(16))
+                    .expect("BT.601 luma stays in the limited-range u8 interval");
             if row % 2 == 0 && col % 2 == 0 {
                 let uv = (row / 2) * uv_w + col / 2;
-                u_plane[uv] = ((-38 * r - 74 * g + 112 * b + 128) >> 8).saturating_add(128) as u8;
-                v_plane[uv] = ((112 * r - 94 * g - 18 * b + 128) >> 8).saturating_add(128) as u8;
+                u_plane[uv] =
+                    u8::try_from(((-38 * r - 74 * g + 112 * b + 128) >> 8).saturating_add(128))
+                        .expect("BT.601 blue chroma stays in the limited-range u8 interval");
+                v_plane[uv] =
+                    u8::try_from(((112 * r - 94 * g - 18 * b + 128) >> 8).saturating_add(128))
+                        .expect("BT.601 red chroma stays in the limited-range u8 interval");
             }
         }
     }

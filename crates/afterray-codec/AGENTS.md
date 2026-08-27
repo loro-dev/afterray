@@ -1,6 +1,6 @@
 # crates/afterray-codec — encode-only AV1
 
-Still-frame GOP encoding for cold storage: JPEG stills → tightly packed 8-bit I420 → closed AV1 GOP (rav1e) → IVF container. **Encode-only: nothing in this repo's Rust can decode AV1** — clients decode GOP frames themselves (see `scripts/prove-av1-decode.swift`). Used by `afterrayd`'s GOP packer; never linked into the capture shim.
+Still-frame GOP encoding for cold storage: JPEG stills → tightly packed 8-bit I420 → closed AV1 GOP (rav1e) → IVF container. **Encode-only: nothing in this repo's Rust can decode AV1** — clients and the signed `apps/AfterRayGopDecoder` Swift helper use VideoToolbox. Used by `afterrayd`'s GOP packer; never linked into the capture shim.
 
 ## Key anchors
 

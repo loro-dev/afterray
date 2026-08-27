@@ -7,10 +7,10 @@
 //! 1. Reads the peer audit token (`LOCAL_PEERTOKEN`).
 //! 2. Requires a valid `dev.afterray.app` signature.
 //! 3. Trusts a matching **Team ID** (Apple Development / Developer ID), or
-//!    the **cdhash of the AfterRay process that spawned this daemon**.
+//!    the **cdhash of the `AfterRay` process that spawned this daemon**.
 //!
 //! A fresh ad-hoc signature has a different cdhash, so it cannot satisfy
-//! the pin. Ad-hoc daemons started from a shell have no AfterRay parent
+//! the pin. Ad-hoc daemons started from a shell have no `AfterRay` parent
 //! and grant no privileged clients.
 
 /// Bundle identifier stamped on AfterRay.app.

@@ -234,6 +234,11 @@ final class DaemonSupervisor {
             bundledName: "asr/afterray-mlx-asr-worker",
             developmentPath: "apps/AfterRayMlxAsrWorker/.build/release/afterray-mlx-asr-worker"
         ).path
+        environment["AFTERRAY_GOP_DECODER"] = try resolveExecutable(
+            environmentKey: "AFTERRAY_GOP_DECODER",
+            bundledName: "afterray-gop-decoder",
+            developmentPath: ".build/release/afterray-gop-decoder"
+        ).path
         environment["AFTERRAY_MODEL_DIR"] = modelDirectory.path
         if let hostBuild = Self.hostBuild {
             environment["AFTERRAY_HOST_BUILD"] = hostBuild

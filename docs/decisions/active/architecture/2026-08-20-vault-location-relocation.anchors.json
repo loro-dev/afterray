@@ -4,5 +4,5 @@
   "apps/AfterRay/Sources/AfterRayDataDirectory.swift::static func prepareInterruptedMigration(": "sha256:e3d5a0b4ffcf0cd6",
   "apps/AfterRay/Sources/AfterRaySettings.swift::enum AfterRayPreferences {": "sha256:431c301830043f40",
   "apps/AfterRay/Sources/DaemonSupervisor.swift::func relocateDataDirectory(to selectedDirectory: URL, migrateExistingData: Bool) async throws {": "sha256:5c2aa97ed5364ba9",
-  "apps/AfterRay/Sources/DaemonSupervisor.swift::private func recoverIfNeeded(allowingDataRelocation: Bool) async throws -> Bool {": "sha256:02996ae799c81fed"
+  "apps/AfterRay/Sources/DaemonSupervisor.swift::private func recoverIfNeeded(allowingDataRelocation: Bool) async throws -> Bool {": "sha256:c3dccf453f7b3fcb"
 }

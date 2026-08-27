@@ -37,7 +37,9 @@ pub const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 100_000_000_000;
 /// adds model-aligned transcript cues for time-accurate playback highlighting.
 /// 19 adds the durable audio duration behind an ASR backlog, so the work panel
 /// can say how much recorded time remains rather than an opaque segment count.
-pub const PROTOCOL_VERSION: u32 = 19;
+/// 20 adds the optional raw-evidence age horizon and old-GOP quality controls.
+/// 21 adds a measured worst-quality GOP preview and projected archive size.
+pub const PROTOCOL_VERSION: u32 = 21;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +114,11 @@ pub enum Request {
     PackStatus,
     GopShow {
         segment_id: String,
+    },
+    /// Re-encodes one representative GOP without storing it, returning a
+    /// poster frame plus measured source/preview sizes.
+    GopQualityPreview {
+        quantizer: u16,
     },
     FavoriteSet {
         moment_id: String,
@@ -263,6 +270,15 @@ pub enum Request {
         summary_language: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_limit_bytes: Option<u64>,
+        /// `0` restores size-only retention; positive values keep timeline
+        /// metadata but strip raw evidence older than this many days.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retention_days: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gop_quality_aging: Option<bool>,
+        /// Worst AV1 constant quantizer. Higher is smaller and less detailed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gop_worst_quantizer: Option<u16>,
         /// Wall-clock minutes one summary covers, from now on. Must be one of
         /// `AppSettings::summary_slot_minutes_options`; slots already
         /// summarised keep the length they were written at.
@@ -848,6 +864,14 @@ pub struct AppSettings {
     pub capture_interval_seconds: u64,
     #[serde(default = "default_storage_limit_bytes")]
     pub storage_limit_bytes: u64,
+    /// `None` means size-only retention. A value keeps moment metadata but
+    /// strips its raw screen/AX/audio evidence after this many days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+    #[serde(default = "default_true")]
+    pub gop_quality_aging: bool,
+    #[serde(default = "default_gop_worst_quantizer")]
+    pub gop_worst_quantizer: u16,
     /// Wall-clock minutes one summary card covers. Changing it governs future
     /// slots only — a day already summarised keeps the shape it was read at.
     #[serde(default = "default_summary_slot_minutes")]
@@ -956,6 +980,10 @@ fn default_language() -> String {
 
 const fn default_storage_limit_bytes() -> u64 {
     DEFAULT_STORAGE_LIMIT_BYTES
+}
+
+const fn default_gop_worst_quantizer() -> u16 {
+    180
 }
 
 /// How many wall-clock minutes one summary covers unless the user says
@@ -1237,10 +1265,16 @@ pub struct GopSegmentView {
     pub height: u32,
     pub frame_count: u16,
     pub keyint: u16,
+    #[serde(default = "default_gop_base_quantizer")]
+    pub quality_quantizer: u16,
     pub started_at_ms: i64,
     pub ended_at_ms: i64,
     pub status: String,
     pub frames: Vec<GopFrameView>,
+}
+
+const fn default_gop_base_quantizer() -> u16 {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1300,6 +1334,20 @@ pub struct ArtifactMeta {
     pub gop_index: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyframe_index: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gop_quality_preview: Option<GopQualityPreviewSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GopQualityPreviewSummary {
+    pub quantizer: u16,
+    pub source_quantizer: u16,
+    pub preview_quantizer: u16,
+    pub sampled_at_ms: i64,
+    pub source_byte_length: u64,
+    pub preview_byte_length: u64,
+    pub total_gop_byte_length: u64,
+    pub estimated_worst_gop_byte_length: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1325,6 +1373,7 @@ impl ArtifactPayload {
             codec: None,
             gop_index: None,
             keyframe_index: None,
+            gop_quality_preview: None,
         }
     }
 
@@ -1768,6 +1817,9 @@ mod tests {
                 ui_language: None,
                 summary_language: None,
                 storage_limit_bytes: None,
+                retention_days: None,
+                gop_quality_aging: None,
+                gop_worst_quantizer: None,
                 summary_slot_minutes: None,
                 excluded_bundle_ids: None,
                 excluded_domains: None,
@@ -1787,6 +1839,9 @@ mod tests {
                 ui_language: None,
                 summary_language: None,
                 storage_limit_bytes: None,
+                retention_days: None,
+                gop_quality_aging: None,
+                gop_worst_quantizer: None,
                 summary_slot_minutes: None,
                 excluded_bundle_ids: None,
                 excluded_domains: None,
@@ -1846,6 +1901,9 @@ mod tests {
             ui_language: None,
             summary_language: None,
             storage_limit_bytes: Some(250_000_000_000),
+            retention_days: None,
+            gop_quality_aging: None,
+            gop_worst_quantizer: None,
             summary_slot_minutes: None,
             excluded_bundle_ids: None,
             excluded_domains: None,
@@ -1870,6 +1928,9 @@ mod tests {
             ui_language: None,
             summary_language: None,
             storage_limit_bytes: None,
+            retention_days: None,
+            gop_quality_aging: None,
+            gop_worst_quantizer: None,
             summary_slot_minutes: Some(30),
             excluded_bundle_ids: None,
             excluded_domains: None,
@@ -1907,6 +1968,9 @@ mod tests {
             ui_language: None,
             summary_language: None,
             storage_limit_bytes: None,
+            retention_days: None,
+            gop_quality_aging: None,
+            gop_worst_quantizer: None,
             summary_slot_minutes: None,
             excluded_bundle_ids: None,
             excluded_domains: None,
@@ -2376,5 +2440,14 @@ mod tests {
         assert_eq!(meta.id, "a1");
         assert_eq!(meta.content_type, "image/jpeg");
         assert_eq!(meta.byte_length, 6);
+        assert!(meta.gop_quality_preview.is_none());
+    }
+
+    #[test]
+    fn gop_quality_preview_request_wire_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&Request::GopQualityPreview { quantizer: 205 }).unwrap(),
+            r#"{"type":"gop_quality_preview","quantizer":205}"#
+        );
     }
 }

@@ -78,6 +78,9 @@ fn encode_closed_gop(
     enc.still_picture = frames.len() == 1;
     enc.low_latency = true;
     enc.time_base = Rational { num: 1, den: 1 };
+    enc.level_idx = Some(
+        av1_level_idx(width, height).ok_or(CodecError::UnsupportedAv1Level { width, height })?,
+    );
     enc.set_key_frame_interval(u64::from(keyint), u64::from(keyint));
 
     let cfg = Config::new().with_encoder_config(enc).with_threads(1);
@@ -165,6 +168,29 @@ fn i420_len(width: u32, height: u32) -> usize {
     y + y / 2
 }
 
+/// Return the smallest defined AV1 level whose picture-size limits contain the frame.
+///
+/// rav1e's `None` default writes the unconstrained sentinel (level index 31).
+/// `VideoToolbox` inspects the sequence header carried in `av1C` and rejects that
+/// sentinel, so archived GOPs always use a concrete level.
+fn av1_level_idx(width: u32, height: u32) -> Option<u8> {
+    const LEVELS: [(u8, u64, u32, u32); 7] = [
+        (0, 147_456, 2_048, 1_152),
+        (1, 278_784, 2_816, 1_584),
+        (4, 665_856, 4_352, 2_448),
+        (5, 1_065_024, 5_504, 3_096),
+        (8, 2_359_296, 6_144, 3_456),
+        (12, 8_912_896, 8_192, 4_352),
+        (16, 35_651_584, 16_384, 8_704),
+    ];
+    let pixels = u64::from(width) * u64::from(height);
+    LEVELS
+        .iter()
+        .find_map(|&(index, max_pixels, max_width, max_height)| {
+            (pixels <= max_pixels && width <= max_width && height <= max_height).then_some(index)
+        })
+}
+
 fn fill_i420(frame: &mut Frame<u8>, width: u32, height: u32, yuv: &[u8]) {
     let width = width as usize;
     let height = height as usize;
@@ -176,5 +202,19 @@ fn fill_i420(frame: &mut Frame<u8>, width: u32, height: u32, yuv: &[u8]) {
     frame.planes[2].copy_from_raw_u8(&yuv[y_size + uv_size..], uv_w, 1);
     for plane in &mut frame.planes {
         plane.pad(width, height);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::av1_level_idx;
+
+    #[test]
+    fn selects_the_smallest_defined_av1_level_for_the_frame() {
+        assert_eq!(av1_level_idx(64, 64), Some(0));
+        assert_eq!(av1_level_idx(640, 480), Some(4));
+        assert_eq!(av1_level_idx(3_456, 2_234), Some(12));
+        assert_eq!(av1_level_idx(6_016, 3_384), Some(16));
+        assert_eq!(av1_level_idx(8_192, 8_192), None);
     }
 }

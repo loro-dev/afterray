@@ -264,7 +264,7 @@ second background step clears the recovery manifest or `afterrayd` can start.
 | `AFTERRAY_SOCKET` | Unix socket shared by clients and daemon | Runner-generated temporary path |
 | `AFTERRAY_CAPTURE_INTERVAL_SECONDS` | Screenshot interval | `10` |
 | `AFTERRAY_GOP_ARCHIVE` | Pack cold stills into closed-GOP AV1 | `1` |
-| `AFTERRAY_GOP_KEYINT` | Max frames per closed GOP (`6` `12` `20` `24` `30`) | `30` |
+| `AFTERRAY_GOP_KEYINT` | Frames per closed GOP (only `30`; older smaller overrides fall back to `30`) | `30` |
 | `AFTERRAY_MODEL_WORKER` | Rust inference worker | Bundled `afterray-model-worker` |
 | `AFTERRAY_MODEL_DIR` | Weight directory | `.afterray/models` |
 | `AFTERRAY_ASR_MODEL` | Qwen3-ASR MLX snapshot directory | `$AFTERRAY_MODEL_DIR/Qwen3-ASR-1.7B-MLX-4bit` |

@@ -1,0 +1,7 @@
+{
+  "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
+  "crates/afterray-store/src/gop.rs::pub const MIN_PACK_FRAMES: usize = 30;": "sha256:d54c5e81878e7383",
+  "crates/afterray-store/src/lib.rs::fn enforce_retention(&self) -> Result<(), StoreError> {": "sha256:41f92bb123533c6d",
+  "crates/afterray-store/src/lib.rs::pub const SIGNAL_MARKER_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;": "sha256:54a24dca62d018ae",
+  "crates/afterrayd/src/gop_packer.rs::pub fn quality_quantizer(age_ms: i64, enabled: bool, worst_quantizer: u16) -> usize {": "sha256:e0e1eb7bf1d0abb6"
+}

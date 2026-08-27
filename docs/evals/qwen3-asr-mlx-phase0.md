@@ -7,7 +7,8 @@ This file may hold evaluation **method** and **aggregate non-identifying
 numbers**. It must never contain vault audio, transcripts, app titles, paths
 that identify a user, or model output text. See [AGENTS.md](AGENTS.md).
 
-Parent plan: [qwen3-asr-mlx-integration-plan.md](../qwen3-asr-mlx-integration-plan.md).
+The parent proposal is no longer present; this file survives only as its
+method record and is not an active implementation plan.
 
 ## What this phase has to answer
 

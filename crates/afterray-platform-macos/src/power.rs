@@ -25,7 +25,7 @@ mod macos {
         fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
     }
 
-    /// Drop this thread to background QoS so rav1e cannot starve ScreenCaptureKit.
+    /// Drop this thread to background `QoS` so rav1e cannot starve `ScreenCaptureKit`.
     pub fn apply_background_qos() {
         const QOS_CLASS_BACKGROUND: u32 = 0x09;
         unsafe extern "C" {

@@ -14,7 +14,7 @@
 >
 > 其余推翻项：
 > - V0-R001「V0 使用固定采样策略，不做键鼠活动触发」→ 输入事件现在会把截图拉到前面来，节流下限 `EVENT_CAPTURE_MIN_INTERVAL_MS`，`crates/afterrayd/src/main.rs:1447`；调用点 `crates/afterrayd/src/main.rs:2424`
-> - V0-R003 的按 Moment 数量删除（`maxUnstarredMoments`）→ 改为按字节：`enforce_retention`，`crates/afterray-store/src/lib.rs:4724`，上限默认 100 GB（`DEFAULT_STORAGE_LIMIT_BYTES`，`crates/afterray-protocol/src/lib.rs:14`）。`maxUnstarredMoments` 这个符号在代码里任何地方都不存在。理由见 [docs/decisions/active/architecture/2026-08-20-size-driven-retention.md](decisions/active/architecture/2026-08-20-size-driven-retention.md)
+> - V0-R003 的按 Moment 数量删除（`maxUnstarredMoments`）→ 改为按字节：`enforce_retention`，`crates/afterray-store/src/lib.rs:4724`，上限默认 100 GB（`DEFAULT_STORAGE_LIMIT_BYTES`，`crates/afterray-protocol/src/lib.rs:14`）。`maxUnstarredMoments` 这个符号在代码里任何地方都不存在。当前规则见 [tiered evidence retention](decisions/active/architecture/2026-08-27-tiered-evidence-retention.md)
 > - V0-R002 / §5「V0 不实现 blob pack」「V0 不做 pack」→ 冷帧的闭合 GOP AV1 打包已上线，`commit_gop`，`crates/afterray-store/src/gop.rs:386`
 > - §5「schema 只支持 V0……不承诺 migration」→ `migrate` 串了 20 个编号迁移步骤（`crates/afterray-store/src/lib.rs:5126`），`SCHEMA_VERSION = 26`（`crates/afterray-store/src/lib.rs:97`）
 > - §3「明确不做」中实际已经上线的：Accessibility Tree（同上）；Developer ID / Notarization / 自动更新（`scripts/build-release.sh:118` 起的发布链路，Sparkle 配置在 `apps/AfterRay/Resources/Info.plist:37`）；第三方 Agent 集成（`crates/afterray-cli/src/main.rs:15` 的只读 CLI + `skills/afterray/SKILL.md`）；内置 Agent harness（`crates/afterray-harness/`、`crates/afterray-agent/`）；多模型选择（LLM 路由 `crates/afterray-models/src/remote.rs:502`）；Settings UI（`swift/AfterRayRecall/Sources/AfterRaySettingsChrome.swift:816` 所在的设置页）

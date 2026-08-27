@@ -26,6 +26,10 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     @Published public var isControllingDownload = false
     @Published public var isUpdatingAudio = false
     @Published public var isUpdatingStorageLimit = false
+    @Published public var isUpdatingRetention = false
+    @Published public var isUpdatingGopQuality = false
+    @Published public var isLoadingGopPreview = false
+    @Published public var gopQualityPreview: GopQualityPreview?
     @Published public var isRelocatingMemory = false
     @Published public var relocationDestinationPath: String?
     @Published public var isUpdatingSummarySlot = false
@@ -156,6 +160,30 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
         settings = replacing(current, storageLimitBytes: bytes)
         isUpdatingStorageLimit = false
         message = "Preview memory limit updated."
+    }
+
+    public func setRetentionDays(_ days: UInt32?) async {
+        guard let current = settings else { return }
+        isUpdatingRetention = true
+        settings = replacing(current, retentionDays: days, replaceRetention: true)
+        isUpdatingRetention = false
+    }
+
+    public func setGopQualityAging(_ enabled: Bool) async {
+        guard let current = settings else { return }
+        isUpdatingGopQuality = true
+        settings = replacing(current, gopQualityAging: enabled)
+        isUpdatingGopQuality = false
+    }
+
+    public func previewGopQuality(quantizer: UInt16) async {
+        guard let current = settings else { return }
+        isUpdatingGopQuality = true
+        isLoadingGopPreview = true
+        settings = replacing(current, gopWorstQuantizer: quantizer)
+        try? await Task.sleep(for: .milliseconds(180))
+        isLoadingGopPreview = false
+        isUpdatingGopQuality = false
     }
 
     public func chooseMemoryLocation() {
@@ -527,6 +555,10 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
     private func replacing(
         _ current: AppSettings,
         storageLimitBytes: UInt64? = nil,
+        retentionDays: UInt32? = nil,
+        replaceRetention: Bool = false,
+        gopQualityAging: Bool? = nil,
+        gopWorstQuantizer: UInt16? = nil,
         summarySlotMinutes: UInt32? = nil,
         uiLanguage: String? = nil,
         summaryLanguage: String? = nil
@@ -537,6 +569,9 @@ public final class SettingsPreviewModel: ObservableObject, AfterRaySettingsModel
             recordAudio: current.recordAudio,
             captureIntervalSeconds: current.captureIntervalSeconds,
             storageLimitBytes: storageLimitBytes ?? current.storageLimitBytes,
+            retentionDays: replaceRetention ? retentionDays : current.retentionDays,
+            gopQualityAging: gopQualityAging ?? current.gopQualityAging,
+            gopWorstQuantizer: gopWorstQuantizer ?? current.gopWorstQuantizer,
             summarySlotMinutes: summarySlotMinutes ?? current.summarySlotMinutes,
             summarySlotMinutesOptions: current.summarySlotMinutesOptions,
             excludedBundleIds: current.excludedBundleIds,
