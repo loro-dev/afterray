@@ -55,19 +55,23 @@ final class AfterRayControlModelTests: XCTestCase {
         XCTAssertEqual(commands, ["stop"])
     }
 
-    func testToggleDoesNotStayDisabledByAStaleStoppingState() async {
+    func testToggleFailedStartDoesNotLeaveAnOptimisticWaitingState() async {
         let daemon = ControlDaemon()
-        await daemon.setRecordingState(.stopping)
         let model = AfterRayControlModel(daemon: daemon)
         await model.refreshStatus()
 
-        await daemon.setRecordingState(.idle)
-        let changed = await model.toggleRecording()
+        await daemon.setStartShouldFail(true)
+        let failed = await model.toggleRecording()
+        XCTAssertFalse(failed)
+        XCTAssertFalse(model.isCaptureSessionActive)
+        XCTAssertEqual(model.message, "start exploded")
 
-        XCTAssertTrue(changed)
+        await daemon.setStartShouldFail(false)
+        let retried = await model.toggleRecording()
+        XCTAssertTrue(retried)
         XCTAssertTrue(model.isRecording)
         let commands = await daemon.recordCommands
-        XCTAssertEqual(commands, ["start"])
+        XCTAssertEqual(commands, ["start", "start"])
     }
 
     func testWaitingIsNotRecordingButSessionIsActive() async {
@@ -204,6 +208,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
     var lastAskQuestion: String?
     var modelMissing = false
     var askShouldFail = false
+    var startShouldFail = false
 
     func setModelMissing(_ value: Bool) {
         modelMissing = value
@@ -211,6 +216,10 @@ private actor ControlDaemon: AfterRayDaemonServing {
 
     func setAskShouldFail(_ value: Bool) {
         askShouldFail = value
+    }
+
+    func setStartShouldFail(_ value: Bool) {
+        startShouldFail = value
     }
 
     func setRecordingState(_ value: DaemonRecordingState) {
@@ -229,6 +238,9 @@ private actor ControlDaemon: AfterRayDaemonServing {
 
     func recordStart() async throws -> RecordStartResult {
         recordCommands.append("start")
+        if startShouldFail {
+            throw DaemonClientError.rejected("start exploded")
+        }
         recordingState = .recording
         return RecordStartResult(sessionId: "s1")
     }
