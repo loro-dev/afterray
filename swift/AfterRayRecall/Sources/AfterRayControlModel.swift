@@ -29,7 +29,7 @@ public final class AfterRayControlModel: ObservableObject {
         }
     }
     public var canToggleRecording: Bool {
-        !isChangingRecording && status?.recordingState != .stopping
+        !isChangingRecording
     }
 
     public func refreshStatus() async {
@@ -64,6 +64,7 @@ public final class AfterRayControlModel: ObservableObject {
         } catch {
             AfterRayLog.error("ensureRecording: \(error.localizedDescription)")
             message = error.localizedDescription
+            await restoreStatusPreservingMessage()
             return false
         }
     }
@@ -74,11 +75,20 @@ public final class AfterRayControlModel: ObservableObject {
         isChangingRecording = true
         defer { isChangingRecording = false }
         do {
+            // Menu and overlay share this model. Refresh before choosing the
+            // command so a stale local snapshot cannot send stop (or start)
+            // twice and leave capture paused.
+            status = try await daemon.status()
             if isCaptureSessionActive {
                 _ = try await daemon.recordStop(reason: "pause")
             } else {
                 markWaitingOptimistically()
-                _ = try await daemon.recordStart()
+                do {
+                    _ = try await daemon.recordStart()
+                } catch {
+                    await restoreStatusPreservingMessage()
+                    throw error
+                }
             }
             status = try await daemon.status()
             message = nil
@@ -191,8 +201,19 @@ public final class AfterRayControlModel: ObservableObject {
                 protocolVersion: status.protocolVersion,
                 schemaVersion: status.schemaVersion,
                 recordingState: .waiting,
-                activeSessionId: status.activeSessionId
+                activeSessionId: status.activeSessionId,
+                hostBuild: status.hostBuild,
+                cliEvidenceUntilMs: status.cliEvidenceUntilMs
             )
+        }
+    }
+
+    /// `refreshStatus()` would clear `message`. A failed start has already
+    /// recorded the error; we only want the daemon's real recording state back
+    /// so the next click does not treat optimistic `.waiting` as a live session.
+    private func restoreStatusPreservingMessage() async {
+        if let latest = try? await daemon.status() {
+            status = latest
         }
     }
 }

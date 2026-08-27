@@ -20,6 +20,60 @@ final class AfterRayControlModelTests: XCTestCase {
         XCTAssertEqual(commands, ["start", "stop"])
     }
 
+    func testToggleRefreshesStaleRecordingStateBeforeChoosingTheCommand() async {
+        let daemon = ControlDaemon()
+        await daemon.setRecordingState(.recording)
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+
+        // Capture was stopped elsewhere after this model last refreshed. The
+        // next click must start from the daemon's idle state, not issue stop a
+        // second time from the stale local snapshot.
+        await daemon.setRecordingState(.idle)
+        let changed = await model.toggleRecording()
+
+        XCTAssertTrue(changed)
+        XCTAssertTrue(model.isRecording)
+        let commands = await daemon.recordCommands
+        XCTAssertEqual(commands, ["start"])
+    }
+
+    func testToggleRefreshesStaleIdleStateBeforeChoosingTheCommand() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+
+        // The inverse race matters too: capture started from another surface,
+        // so the stale idle model must stop that live session instead of
+        // sending a duplicate start.
+        await daemon.setRecordingState(.recording)
+        let changed = await model.toggleRecording()
+
+        XCTAssertTrue(changed)
+        XCTAssertFalse(model.isRecording)
+        let commands = await daemon.recordCommands
+        XCTAssertEqual(commands, ["stop"])
+    }
+
+    func testToggleFailedStartDoesNotLeaveAnOptimisticWaitingState() async {
+        let daemon = ControlDaemon()
+        let model = AfterRayControlModel(daemon: daemon)
+        await model.refreshStatus()
+
+        await daemon.setStartShouldFail(true)
+        let failed = await model.toggleRecording()
+        XCTAssertFalse(failed)
+        XCTAssertFalse(model.isCaptureSessionActive)
+        XCTAssertEqual(model.message, "start exploded")
+
+        await daemon.setStartShouldFail(false)
+        let retried = await model.toggleRecording()
+        XCTAssertTrue(retried)
+        XCTAssertTrue(model.isRecording)
+        let commands = await daemon.recordCommands
+        XCTAssertEqual(commands, ["start", "start"])
+    }
+
     func testWaitingIsNotRecordingButSessionIsActive() async {
         let daemon = ControlDaemon()
         await daemon.setRecordingState(.waiting)
@@ -154,6 +208,7 @@ private actor ControlDaemon: AfterRayDaemonServing {
     var lastAskQuestion: String?
     var modelMissing = false
     var askShouldFail = false
+    var startShouldFail = false
 
     func setModelMissing(_ value: Bool) {
         modelMissing = value
@@ -161,6 +216,10 @@ private actor ControlDaemon: AfterRayDaemonServing {
 
     func setAskShouldFail(_ value: Bool) {
         askShouldFail = value
+    }
+
+    func setStartShouldFail(_ value: Bool) {
+        startShouldFail = value
     }
 
     func setRecordingState(_ value: DaemonRecordingState) {
@@ -179,6 +238,9 @@ private actor ControlDaemon: AfterRayDaemonServing {
 
     func recordStart() async throws -> RecordStartResult {
         recordCommands.append("start")
+        if startShouldFail {
+            throw DaemonClientError.rejected("start exploded")
+        }
         recordingState = .recording
         return RecordStartResult(sessionId: "s1")
     }
