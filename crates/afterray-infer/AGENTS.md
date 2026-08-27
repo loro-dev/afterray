@@ -9,7 +9,7 @@ In-process ASR (Qwen3-ASR via Candle/Metal), transcript forced alignment (Qwen3-
 - `src/asr.rs:19 transcribe` — Qwen3-ASR via `qwen3-asr`/Candle Metal; prepares the generated tokenizer through `afterray-models` before decoding audio, and reports preparation/load failures as non-retryable missing-model errors.
 - `src/align.rs` — Qwen3 forced alignment via `qwen-asr`; normalizes the official language set and groups character/word timings into bounded sentence-sized cues.
 - `src/embed.rs:19 embed_text` — nomic GGUF via llama-cpp-2, 2048-token batch, L2-normalized output.
-- `src/audio.rs:15 load_mono_16k` — Symphonia decode + rubato resample to mono 16 kHz f32 before ASR.
+- `src/audio.rs:15 load_mono_16k` — Symphonia decode + rubato resample to mono 16 kHz f32 before ASR/align. Output length is the source wall-clock duration at 16 kHz; Qwen3 timestamps are sample-count based.
 
 ## Watch out
 

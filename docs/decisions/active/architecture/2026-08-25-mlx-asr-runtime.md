@@ -25,10 +25,12 @@ be mistaken for idle. The daemon reclaims the helper after 120 seconds without
 a completed request; the next ASR job starts and verifies a fresh process. It
 never contacts Hugging Face or writes a cache at inference time.
 
-Before generation, the helper decodes the capture file as mono and resamples it
-to 16 kHz, matching the Qwen3 ASR input contract and the previous Candle worker.
-Capture files commonly use 48 kHz; passing those samples through unchanged would
-make the model interpret them at the wrong speed and pitch.
+Before generation, the helper downmixes the capture file to mono and resamples
+it to 16 kHz in streaming chunks, then snaps the PCM length to the source
+wall-clock duration. Qwen3 ASR derives duration from sample count at 16 kHz, so
+a 48 kHz clip passed through unchanged is heard three times too long, and a
+one-shot converter that drops its tail is heard as a fragment. The Candle
+aligner shares the same 16 kHz duration contract.
 
 The helper remains separate from the Qwen3.5 VLM package because its dependency
 graph has its own MLX runtime version. Forced alignment remains a distinct CPU

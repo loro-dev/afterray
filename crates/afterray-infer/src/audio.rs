@@ -73,6 +73,8 @@ pub fn load_mono_16k(path: &Path) -> Result<Vec<f32>, AdapterError> {
     resample_to_16k(&mono, sample_rate)
 }
 
+const TARGET_SAMPLE_RATE: u32 = 16_000;
+
 fn downmix_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return samples.to_vec();
@@ -84,35 +86,97 @@ fn downmix_mono(samples: &[f32], channels: usize) -> Vec<f32> {
 }
 
 fn resample_to_16k(samples: &[f32], sample_rate: u32) -> Result<Vec<f32>, AdapterError> {
-    if sample_rate == 16_000 {
+    if sample_rate == TARGET_SAMPLE_RATE {
         return Ok(samples.to_vec());
     }
-    let mut resampler = FastFixedIn::<f32>::new(
-        f64::from(16_000) / f64::from(sample_rate),
-        1.0,
-        PolynomialDegree::Septic,
-        1024,
-        1,
-    )
-    .map_err(|error| AdapterError::InvalidOutput(format!("resampler failed: {error}")))?;
-    let mut output = Vec::new();
+    if sample_rate == 0 {
+        return Err(AdapterError::InvalidOutput(
+            "audio track sample rate is zero".into(),
+        ));
+    }
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Qwen3 ASR (and the aligner) derive duration from sample count at 16 kHz.
+    // The output length must therefore be the source wall-clock duration, not
+    // whatever the resampler emitted after padding its last 1024-frame chunk.
+    let ratio = f64::from(TARGET_SAMPLE_RATE) / f64::from(sample_rate);
+    let expected = resampled_frame_count(samples.len(), sample_rate);
+    let mut resampler = FastFixedIn::<f32>::new(ratio, 1.0, PolynomialDegree::Septic, 1024, 1)
+        .map_err(|error| AdapterError::InvalidOutput(format!("resampler failed: {error}")))?;
+    let delay = resampler.output_delay();
+    let mut output = Vec::with_capacity(expected.saturating_add(delay).saturating_add(1024));
     let mut offset = 0;
-    while offset + 1024 <= samples.len() {
-        let chunk = &samples[offset..offset + 1024];
-        let chunk_out = resampler
-            .process(&[chunk], None)
-            .map_err(|error| AdapterError::InvalidOutput(format!("resample failed: {error}")))?;
+    while offset < samples.len() {
+        let needed = resampler.input_frames_next();
+        let remaining = samples.len() - offset;
+        let chunk_out = if remaining >= needed {
+            let chunk = &samples[offset..offset + needed];
+            offset += needed;
+            resampler
+                .process(&[chunk], None)
+                .map_err(|error| AdapterError::InvalidOutput(format!("resample failed: {error}")))?
+        } else {
+            let tail = &samples[offset..];
+            offset = samples.len();
+            let channels: [&[f32]; 1] = [tail];
+            resampler
+                .process_partial(Some(&channels), None)
+                .map_err(|error| AdapterError::InvalidOutput(format!("resample failed: {error}")))?
+        };
         output.extend_from_slice(&chunk_out[0]);
-        offset += 1024;
     }
-    if offset < samples.len() {
-        let mut tail = samples[offset..].to_vec();
-        tail.resize(1024, 0.0);
-        let tail_out = resampler
-            .process(&[&tail], None)
+    while output.len() < expected.saturating_add(delay) {
+        let flushed = resampler
+            .process_partial::<&[f32]>(None, None)
             .map_err(|error| AdapterError::InvalidOutput(format!("resample failed: {error}")))?;
-        let keep = tail_out[0].len() * (samples.len() - offset) / 1024;
-        output.extend_from_slice(&tail_out[0][..keep.min(tail_out[0].len())]);
+        if flushed[0].is_empty() {
+            break;
+        }
+        output.extend_from_slice(&flushed[0]);
     }
-    Ok(output)
+    let start = delay.min(output.len());
+    let end = start.saturating_add(expected).min(output.len());
+    let mut trimmed = output[start..end].to_vec();
+    if trimmed.len() < expected {
+        trimmed.resize(expected, 0.0);
+    }
+    Ok(trimmed)
+}
+
+fn resampled_frame_count(frames: usize, sample_rate: u32) -> usize {
+    let frames = u64::try_from(frames).unwrap_or(u64::MAX);
+    let scaled = frames.saturating_mul(u64::from(TARGET_SAMPLE_RATE)) / u64::from(sample_rate);
+    usize::try_from(scaled).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resample_to_16k, resampled_frame_count, TARGET_SAMPLE_RATE};
+
+    #[test]
+    fn resample_48k_keeps_wall_clock_duration() {
+        let samples = vec![0.25_f32; 48_000];
+        let resampled = resample_to_16k(&samples, 48_000).expect("48 kHz clip should resample");
+        assert_eq!(
+            resampled.len(),
+            16_000,
+            "a one-second 48 kHz clip must remain one second at 16 kHz"
+        );
+    }
+
+    #[test]
+    fn resample_preserves_duration_for_unaligned_lengths() {
+        let frames = 48_000 + 17;
+        let samples = vec![0.25_f32; frames];
+        let resampled = resample_to_16k(&samples, 48_000).expect("unaligned clip should resample");
+        assert_eq!(resampled.len(), resampled_frame_count(frames, 48_000));
+    }
+
+    #[test]
+    fn already_16k_is_unchanged() {
+        let samples: Vec<f32> = (0..1_600).map(|index| index as f32).collect();
+        let resampled = resample_to_16k(&samples, TARGET_SAMPLE_RATE).expect("identity resample");
+        assert_eq!(resampled, samples);
+    }
 }
