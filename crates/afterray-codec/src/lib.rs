@@ -1,4 +1,4 @@
-//! Closed-GOP AV1 encoder for the AfterRay cold archive.
+//! Closed-GOP AV1 encoder for the `AfterRay` cold archive.
 //!
 //! The packer feeds 8-bit I420 frames and persists IVF bytes. This crate is
 //! **not** linked into the capture shim.
@@ -87,6 +87,8 @@ pub enum CodecError {
     GopTooLong(usize),
     #[error("invalid I420 dimensions {width}x{height} (need even, >= 16)")]
     InvalidDimensions { width: u32, height: u32 },
+    #[error("I420 dimensions {width}x{height} exceed the largest defined AV1 level")]
+    UnsupportedAv1Level { width: u32, height: u32 },
     #[error("frame {index} is {width}x{height}, expected {expected_width}x{expected_height}")]
     MismatchedDimensions {
         index: usize,

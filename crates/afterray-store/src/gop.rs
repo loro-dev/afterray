@@ -4,13 +4,15 @@ use crate::{StoreError, Vault};
 use afterray_protocol::{GopFrameView, GopSegmentView};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 pub const IDLE_GAP_MS: i64 = 30_000;
-/// rav1e closed GOP only pays for itself with P-frames. A 1-frame "GOP" is a
-/// still-picture encode (~3s, ~30% of JPEG) and is skipped by the packer.
-pub const MIN_PACK_FRAMES: usize = 2;
+// @dec:tiered-evidence-retention — docs/decisions/active/architecture/2026-08-27-tiered-evidence-retention.md
+/// Do not let a caught-up packer emit short GOPs. At the default 10-second
+/// capture interval, thirty frames is about five minutes of evidence and
+/// amortizes keyframe, IVF, row, and encrypted-file overhead.
+pub const MIN_PACK_FRAMES: usize = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackPolicy {
@@ -68,6 +70,7 @@ pub struct GopCommitRequest<'a> {
     pub width: u32,
     pub height: u32,
     pub keyint: u16,
+    pub quality_quantizer: u16,
     pub started_at_ms: i64,
     pub ended_at_ms: i64,
     pub content_hash: &'a str,
@@ -84,6 +87,7 @@ pub struct GopSegmentRecord {
     pub height: u32,
     pub frame_count: u16,
     pub keyint: u16,
+    pub quality_quantizer: u16,
     pub started_at_ms: i64,
     pub ended_at_ms: i64,
     pub status: String,
@@ -93,9 +97,40 @@ pub struct GopSegmentRecord {
 pub struct GopFrameRow {
     pub index: u16,
     pub moment_id: String,
+    pub captured_at_ms: i64,
     pub is_keyframe: bool,
     pub byte_offset: u32,
     pub byte_length: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GopRewriteRequest<'a> {
+    pub segment_id: &'a str,
+    pub moment_ids: &'a [String],
+    pub ivf: &'a [u8],
+    pub encoder: &'a str,
+    pub encoder_version: &'a str,
+    pub quality_quantizer: u16,
+    pub content_hash: &'a str,
+    pub frames: &'a [GopCommitFrame],
+}
+
+#[derive(Debug, Clone)]
+pub struct GopMergeRequest<'a> {
+    pub source_segments: &'a [GopSegmentRecord],
+    pub moment_ids: &'a [String],
+    pub ivf: &'a [u8],
+    pub codec: &'a str,
+    pub encoder: &'a str,
+    pub encoder_version: &'a str,
+    pub width: u32,
+    pub height: u32,
+    pub keyint: u16,
+    pub quality_quantizer: u16,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub content_hash: &'a str,
+    pub frames: &'a [GopCommitFrame],
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,10 +171,7 @@ pub fn fold_pack_runs(candidates: &[PackCandidate], keyint: u16) -> Vec<Vec<Pack
     let mut last_wall_ms: Option<i64> = None;
     for candidate in candidates {
         if let Some(previous_ms) = last_wall_ms
-            && candidate
-                .captured_at_ms
-                .saturating_sub(previous_ms)
-                > IDLE_GAP_MS
+            && candidate.captured_at_ms.saturating_sub(previous_ms) > IDLE_GAP_MS
         {
             closed.extend(drain_open_runs(&mut open));
         }
@@ -157,8 +189,9 @@ pub fn fold_pack_runs(candidates: &[PackCandidate], keyint: u16) -> Vec<Vec<Pack
     closed
 }
 
-/// Oldest runnable GOP: skip 1-frame leftovers so they can join a later
-/// same-size neighbour instead of becoming still-picture IVF.
+/// Oldest runnable GOP: leave short runs as stills until thirty compatible
+/// frames are available instead of paying one keyframe and encrypted file per
+/// small island.
 #[must_use]
 pub fn first_packable_run(runs: Vec<Vec<PackCandidate>>) -> Option<Vec<PackCandidate>> {
     runs.into_iter().find(|run| run.len() >= MIN_PACK_FRAMES)
@@ -175,9 +208,7 @@ pub fn packable_frame_count(candidates: &[PackCandidate], keyint: u16) -> usize 
         .sum()
 }
 
-fn drain_open_runs(
-    open: &mut HashMap<(u32, u32), Vec<PackCandidate>>,
-) -> Vec<Vec<PackCandidate>> {
+fn drain_open_runs(open: &mut HashMap<(u32, u32), Vec<PackCandidate>>) -> Vec<Vec<PackCandidate>> {
     open.drain()
         .map(|(_, run)| run)
         .filter(|run| !run.is_empty())
@@ -297,15 +328,13 @@ impl Vault {
         let cutoff = now_ms.saturating_sub(policy.hot_window_ms);
         let ocr_cutoff = now_ms.saturating_sub(policy.ocr_grace_ms);
         let floor = i64::try_from(policy.hot_min_stills).unwrap_or(i64::MAX);
-        let mut statement = connection.prepare(
-            &format!(
-                "SELECT m.id, m.captured_at_ms, m.image_artifact_id,
+        let mut statement = connection.prepare(&format!(
+            "SELECT m.id, m.captured_at_ms, m.image_artifact_id,
                         m.bundle_identifier, m.application_name, m.width, m.height
                    FROM moments m
                   WHERE {PACK_CANDIDATE_PREDICATE}
                   ORDER BY m.captured_at_ms ASC, m.id ASC"
-            ),
-        )?;
+        ))?;
         let rows = statement.query_map(params![cutoff, floor, ocr_cutoff], |row| {
             Ok(PackCandidate {
                 id: row.get(0)?,
@@ -390,6 +419,8 @@ impl Vault {
         let _artifact_guard = self.artifact_io.write().unwrap();
         let staged = self.stage_artifact_unlocked("video/x-ivf; codec=av01", request.ivf)?;
         let segment_id = Uuid::now_v7().to_string();
+        let frame_count =
+            i64::try_from(request.frames.len()).map_err(|_| StoreError::GopFrameCountOverflow)?;
         let result = (|| {
             let mut connection = self.connection.lock().unwrap();
             let transaction = connection.transaction()?;
@@ -422,8 +453,8 @@ impl Vault {
                 "INSERT INTO gop_segments (
                      id, artifact_id, codec, encoder, encoder_version,
                      width, height, frame_count, keyint, started_at_ms, ended_at_ms,
-                     status, content_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'writing', ?12)",
+                     status, content_hash, quality_quantizer
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'writing', ?12, ?13)",
                 params![
                     segment_id,
                     staged.id,
@@ -432,11 +463,12 @@ impl Vault {
                     request.encoder_version,
                     i64::from(request.width),
                     i64::from(request.height),
-                    request.frames.len() as i64,
+                    frame_count,
                     i64::from(request.keyint),
                     request.started_at_ms,
                     request.ended_at_ms,
                     request.content_hash,
+                    i64::from(request.quality_quantizer),
                 ],
             )?;
             for (moment_id, frame) in request.moment_ids.iter().zip(request.frames.iter()) {
@@ -458,11 +490,12 @@ impl Vault {
             }
             let mut claimed = 0_usize;
             for (index, moment_id) in request.moment_ids.iter().enumerate() {
+                let index = i64::try_from(index).map_err(|_| StoreError::GopFrameCountOverflow)?;
                 claimed += transaction.execute(
                     "UPDATE moments
                         SET gop_segment_id = ?1, gop_index = ?2
                       WHERE id = ?3 AND gop_segment_id IS NULL",
-                    params![segment_id, index as i64, moment_id],
+                    params![segment_id, index, moment_id],
                 )?;
             }
             if claimed != request.moment_ids.len() {
@@ -476,6 +509,435 @@ impl Vault {
             return Err(error);
         }
         Ok(segment_id)
+    }
+
+    /// Atomically swaps one ready GOP for a lower-quality encode with the same
+    /// ordered moments. The new encrypted file is staged first; readers see
+    /// either the complete old metadata or the complete new metadata, never a
+    /// half-rewritten frame table.
+    pub fn rewrite_gop(&self, request: GopRewriteRequest<'_>) -> Result<(), StoreError> {
+        if request.moment_ids.is_empty() || request.frames.len() != request.moment_ids.len() {
+            return Err(StoreError::GopStale);
+        }
+        let _artifact_guard = self.artifact_io.write().unwrap();
+        let staged = self.stage_artifact_unlocked("video/x-ivf; codec=av01", request.ivf)?;
+        let result = (|| {
+            let mut connection = self.connection.lock().unwrap();
+            let transaction = connection.transaction()?;
+            let old_artifact_id: String = transaction
+                .query_row(
+                    "SELECT artifact_id FROM gop_segments
+                      WHERE id = ?1 AND status = 'ready'",
+                    [request.segment_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::GopNotFound(request.segment_id.to_owned()))?;
+            let current_moments: Vec<String> = {
+                let mut statement = transaction.prepare(
+                    "SELECT moment_id FROM gop_frames
+                      WHERE segment_id = ?1 ORDER BY frame_index",
+                )?;
+                statement
+                    .query_map([request.segment_id], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if current_moments != request.moment_ids {
+                return Err(StoreError::GopStale);
+            }
+            transaction.execute(
+                "INSERT INTO artifacts (
+                     id, content_type, byte_length, format_version, wrapped_key, wrapping_nonce
+                 ) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                params![
+                    staged.id,
+                    staged.content_type,
+                    staged.byte_length,
+                    staged.wrapped_dek,
+                    staged.wrapping_nonce,
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM gop_frames WHERE segment_id = ?1",
+                [request.segment_id],
+            )?;
+            for (moment_id, frame) in request.moment_ids.iter().zip(request.frames.iter()) {
+                transaction.execute(
+                    "INSERT INTO gop_frames (
+                         segment_id, frame_index, moment_id, is_keyframe,
+                         byte_offset, byte_length, content_hash
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        request.segment_id,
+                        i64::from(frame.index),
+                        moment_id,
+                        i64::from(frame.is_keyframe),
+                        i64::from(frame.byte_offset),
+                        i64::from(frame.byte_length),
+                        hex_hash(&frame.content_hash),
+                    ],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE gop_segments
+                    SET artifact_id = ?2,
+                        encoder = ?3,
+                        encoder_version = ?4,
+                        frame_count = ?5,
+                        keyint = ?6,
+                        content_hash = ?7,
+                        quality_quantizer = ?8
+                  WHERE id = ?1",
+                params![
+                    request.segment_id,
+                    staged.id,
+                    request.encoder,
+                    request.encoder_version,
+                    i64::try_from(request.frames.len()).unwrap_or(i64::MAX),
+                    i64::try_from(request.frames.len()).unwrap_or(i64::MAX),
+                    request.content_hash,
+                    i64::from(request.quality_quantizer),
+                ],
+            )?;
+            transaction.execute("DELETE FROM artifacts WHERE id = ?1", [&old_artifact_id])?;
+            transaction.commit()?;
+            Ok(old_artifact_id)
+        })();
+        let old_artifact_id = match result {
+            Ok(id) => id,
+            Err(error) => {
+                self.discard_staged_artifact(&staged.id);
+                return Err(error);
+            }
+        };
+        let _ = std::fs::remove_file(self.artifact_path(&old_artifact_id));
+        Ok(())
+    }
+
+    /// Atomically replaces consecutive compatible GOPs with one closed GOP.
+    /// The caller must have decoded and re-encoded the exact ordered moments;
+    /// artifact ids provide the compare-and-swap token against a concurrent
+    /// quality rewrite or retention sweep.
+    #[allow(clippy::too_many_lines)]
+    pub fn merge_gops(&self, request: GopMergeRequest<'_>) -> Result<String, StoreError> {
+        if request.source_segments.len() < 2
+            || request.moment_ids.is_empty()
+            || request.frames.len() != request.moment_ids.len()
+            || request.frames.len() > MIN_PACK_FRAMES
+        {
+            return Err(StoreError::GopStale);
+        }
+        let source_ids = request
+            .source_segments
+            .iter()
+            .map(|segment| segment.id.as_str())
+            .collect::<HashSet<_>>();
+        if source_ids.len() != request.source_segments.len()
+            || request
+                .source_segments
+                .iter()
+                .map(|segment| usize::from(segment.frame_count))
+                .sum::<usize>()
+                != request.moment_ids.len()
+            || request.source_segments.iter().any(|segment| {
+                segment.codec != request.codec
+                    || segment.width != request.width
+                    || segment.height != request.height
+                    || segment.quality_quantizer > request.quality_quantizer
+                    || segment.status != "ready"
+            })
+            || request
+                .source_segments
+                .windows(2)
+                .any(|pair| !gop_segments_are_contiguous(&pair[0], &pair[1]))
+            || request
+                .source_segments
+                .first()
+                .is_none_or(|segment| segment.started_at_ms != request.started_at_ms)
+            || request
+                .source_segments
+                .last()
+                .is_none_or(|segment| segment.ended_at_ms != request.ended_at_ms)
+        {
+            return Err(StoreError::GopStale);
+        }
+
+        let _artifact_guard = self.artifact_io.write().unwrap();
+        let staged = self.stage_artifact_unlocked("video/x-ivf; codec=av01", request.ivf)?;
+        let segment_id = Uuid::now_v7().to_string();
+        let result = (|| {
+            let mut connection = self.connection.lock().unwrap();
+            let transaction = connection.transaction()?;
+            let mut old_artifact_ids = Vec::with_capacity(request.source_segments.len());
+            let mut current_moments = Vec::with_capacity(request.moment_ids.len());
+
+            for source in request.source_segments {
+                let current: Option<(String, String, i64, i64, i64)> = transaction
+                    .query_row(
+                        "SELECT artifact_id, codec, width, height, quality_quantizer
+                           FROM gop_segments
+                          WHERE id = ?1 AND status = 'ready'",
+                        [&source.id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((artifact_id, codec, width, height, quality_quantizer)) = current else {
+                    return Err(StoreError::GopStale);
+                };
+                if artifact_id != source.artifact_id
+                    || codec != source.codec
+                    || width != i64::from(source.width)
+                    || height != i64::from(source.height)
+                    || quality_quantizer != i64::from(source.quality_quantizer)
+                {
+                    return Err(StoreError::GopStale);
+                }
+                let rows: Vec<String> = {
+                    let mut statement = transaction.prepare(
+                        "SELECT moment_id FROM gop_frames
+                          WHERE segment_id = ?1 ORDER BY frame_index",
+                    )?;
+                    statement
+                        .query_map([&source.id], |row| row.get(0))?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                if rows.len() != usize::from(source.frame_count) {
+                    return Err(StoreError::GopStale);
+                }
+                current_moments.extend(
+                    rows.into_iter()
+                        .map(|moment_id| (moment_id, source.id.clone())),
+                );
+                old_artifact_ids.push(artifact_id);
+            }
+            if current_moments
+                .iter()
+                .map(|(moment_id, _)| moment_id)
+                .ne(request.moment_ids.iter())
+            {
+                return Err(StoreError::GopStale);
+            }
+
+            transaction.execute(
+                "INSERT INTO artifacts (
+                     id, content_type, byte_length, format_version, wrapped_key, wrapping_nonce
+                 ) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                params![
+                    staged.id,
+                    staged.content_type,
+                    staged.byte_length,
+                    staged.wrapped_dek,
+                    staged.wrapping_nonce,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO gop_segments (
+                     id, artifact_id, codec, encoder, encoder_version,
+                     width, height, frame_count, keyint, started_at_ms, ended_at_ms,
+                     status, content_hash, quality_quantizer
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'ready', ?12, ?13)",
+                params![
+                    segment_id,
+                    staged.id,
+                    request.codec,
+                    request.encoder,
+                    request.encoder_version,
+                    i64::from(request.width),
+                    i64::from(request.height),
+                    i64::try_from(request.frames.len()).unwrap_or(i64::MAX),
+                    i64::from(request.keyint),
+                    request.started_at_ms,
+                    request.ended_at_ms,
+                    request.content_hash,
+                    i64::from(request.quality_quantizer),
+                ],
+            )?;
+            for source in request.source_segments {
+                transaction
+                    .execute("DELETE FROM gop_frames WHERE segment_id = ?1", [&source.id])?;
+            }
+            for (moment_id, frame) in request.moment_ids.iter().zip(request.frames.iter()) {
+                transaction.execute(
+                    "INSERT INTO gop_frames (
+                         segment_id, frame_index, moment_id, is_keyframe,
+                         byte_offset, byte_length, content_hash
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        segment_id,
+                        i64::from(frame.index),
+                        moment_id,
+                        i64::from(frame.is_keyframe),
+                        i64::from(frame.byte_offset),
+                        i64::from(frame.byte_length),
+                        hex_hash(&frame.content_hash),
+                    ],
+                )?;
+            }
+            for (index, (moment_id, old_segment_id)) in current_moments.iter().enumerate() {
+                let changed = transaction.execute(
+                    "UPDATE moments
+                        SET gop_segment_id = ?1, gop_index = ?2
+                      WHERE id = ?3 AND gop_segment_id = ?4",
+                    params![
+                        segment_id,
+                        i64::try_from(index).unwrap_or(i64::MAX),
+                        moment_id,
+                        old_segment_id
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::GopStale);
+                }
+            }
+            for source in request.source_segments {
+                transaction.execute(
+                    "UPDATE gop_pack_jobs SET segment_id = ?1 WHERE segment_id = ?2",
+                    params![segment_id, source.id],
+                )?;
+                transaction.execute("DELETE FROM gop_segments WHERE id = ?1", [&source.id])?;
+            }
+            for artifact_id in &old_artifact_ids {
+                transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+            }
+            transaction.commit()?;
+            Ok(old_artifact_ids)
+        })();
+        let old_artifact_ids = match result {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.discard_staged_artifact(&staged.id);
+                return Err(error);
+            }
+        };
+        for artifact_id in old_artifact_ids {
+            let _ = std::fs::remove_file(self.artifact_path(&artifact_id));
+        }
+        Ok(segment_id)
+    }
+
+    /// Oldest run of consecutive, same-resolution AV1 segments that can be
+    /// collapsed into one GOP without exceeding thirty frames. Source quality
+    /// may differ because compact selects a single no-better output tier.
+    pub fn next_gop_merge_candidate(&self) -> Result<Option<Vec<GopSegmentRecord>>, StoreError> {
+        let connection = self.readers.get();
+        let cutoff: Option<i64> = connection.query_row(
+            "SELECT MIN(started_at_ms) FROM gop_segments
+              WHERE status = 'ready' AND codec = 'av01'
+                AND frame_count > 0 AND frame_count < ?1",
+            [i64::try_from(MIN_PACK_FRAMES).unwrap_or(i64::MAX)],
+            |row| row.get(0),
+        )?;
+        let Some(cutoff) = cutoff else {
+            return Ok(None);
+        };
+        let mut statement = connection.prepare(
+            "SELECT id, artifact_id, codec, encoder, width, height,
+                    frame_count, keyint, quality_quantizer,
+                    started_at_ms, ended_at_ms, status
+               FROM gop_segments
+              WHERE status = 'ready' AND ended_at_ms >= ?1
+              ORDER BY started_at_ms ASC, ended_at_ms ASC, id ASC",
+        )?;
+        let segments = statement
+            .query_map([cutoff], map_gop_segment)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(first_mergeable_gop_group(&segments, MIN_PACK_FRAMES))
+    }
+
+    pub fn next_gop_quality_candidate(
+        &self,
+        now_ms: i64,
+        first_quantizer: u16,
+        second_quantizer: u16,
+        worst_quantizer: u16,
+    ) -> Result<Option<GopSegmentRecord>, StoreError> {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let seven_days = now_ms.saturating_sub(7 * DAY_MS);
+        let fourteen_days = now_ms.saturating_sub(14 * DAY_MS);
+        let twenty_eight_days = now_ms.saturating_sub(28 * DAY_MS);
+        let id: Option<String> = self
+            .readers
+            .get()
+            .query_row(
+                "SELECT id FROM gop_segments
+                  WHERE status = 'ready'
+                    AND quality_quantizer < CASE
+                      WHEN ended_at_ms < ?1 THEN ?4
+                      WHEN ended_at_ms < ?2 THEN ?3
+                      WHEN ended_at_ms < ?5 THEN ?6
+                      ELSE quality_quantizer
+                    END
+                  ORDER BY ended_at_ms ASC, id ASC
+                  LIMIT 1",
+                params![
+                    twenty_eight_days,
+                    fourteen_days,
+                    second_quantizer,
+                    worst_quantizer,
+                    seven_days,
+                    first_quantizer,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        id.map(|id| self.gop_segment(&id)).transpose()
+    }
+
+    /// A representative ready GOP, the total encrypted-payload byte count, and
+    /// the bytes that would still be degraded at `target_quantizer`.
+    ///
+    /// Prefer the best available source quality, then the largest segment, so
+    /// the preview does not add another generation of loss to an already-aged
+    /// sample when an original-quality GOP is available.
+    pub fn gop_quality_preview_candidate(
+        &self,
+        target_quantizer: u16,
+    ) -> Result<Option<(GopSegmentRecord, u64, u64)>, StoreError> {
+        let connection = self.readers.get();
+        let (total, degradable): (i64, i64) = connection.query_row(
+            "SELECT COALESCE(SUM(a.byte_length), 0),
+                    COALESCE(SUM(CASE WHEN gs.quality_quantizer < ?1
+                                      THEN a.byte_length ELSE 0 END), 0)
+               FROM gop_segments gs
+               JOIN artifacts a ON a.id = gs.artifact_id
+              WHERE gs.status = 'ready'",
+            [i64::from(target_quantizer)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let id = connection
+            .query_row(
+                "SELECT gs.id
+                   FROM gop_segments gs
+                   JOIN artifacts a ON a.id = gs.artifact_id
+                  WHERE gs.status = 'ready'
+                  ORDER BY CASE WHEN gs.quality_quantizer < ?1 THEN 0 ELSE 1 END,
+                           gs.quality_quantizer ASC,
+                           a.byte_length DESC,
+                           gs.ended_at_ms DESC
+                  LIMIT 1",
+                [i64::from(target_quantizer)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        drop(connection);
+        id.map(|id| {
+            self.gop_segment(&id).map(|segment| {
+                (
+                    segment,
+                    u64::try_from(total).unwrap_or(0),
+                    u64::try_from(degradable).unwrap_or(0),
+                )
+            })
+        })
+        .transpose()
     }
 
     pub fn mark_gop_ready(&self, segment_id: &str) -> Result<(), StoreError> {
@@ -502,24 +964,11 @@ impl Vault {
             .get()
             .query_row(
                 "SELECT id, artifact_id, codec, encoder, width, height,
-                        frame_count, keyint, started_at_ms, ended_at_ms, status
+                        frame_count, keyint, quality_quantizer,
+                        started_at_ms, ended_at_ms, status
                    FROM gop_segments WHERE id = ?1 AND status = ?2",
                 params![segment_id, status],
-                |row| {
-                    Ok(GopSegmentRecord {
-                        id: row.get(0)?,
-                        artifact_id: row.get(1)?,
-                        codec: row.get(2)?,
-                        encoder: row.get(3)?,
-                        width: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
-                        height: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
-                        frame_count: u16::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
-                        keyint: u16::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
-                        started_at_ms: row.get(8)?,
-                        ended_at_ms: row.get(9)?,
-                        status: row.get(10)?,
-                    })
-                },
+                map_gop_segment,
             )
             .optional()?
             .ok_or_else(|| StoreError::GopNotFound(segment_id.to_owned()))
@@ -528,16 +977,20 @@ impl Vault {
     pub fn live_gop_frames(&self, segment_id: &str) -> Result<Vec<GopFrameRow>, StoreError> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "SELECT frame_index, moment_id, is_keyframe, byte_offset, byte_length
-               FROM gop_frames WHERE segment_id = ?1 ORDER BY frame_index",
+            "SELECT gf.frame_index, gf.moment_id, m.captured_at_ms,
+                    gf.is_keyframe, gf.byte_offset, gf.byte_length
+               FROM gop_frames gf
+               JOIN moments m ON m.id = gf.moment_id
+              WHERE gf.segment_id = ?1 ORDER BY gf.frame_index",
         )?;
         let rows = statement.query_map([segment_id], |row| {
             Ok(GopFrameRow {
                 index: u16::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
                 moment_id: row.get(1)?,
-                is_keyframe: row.get::<_, i64>(2)? != 0,
-                byte_offset: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
-                byte_length: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                captured_at_ms: row.get(2)?,
+                is_keyframe: row.get::<_, i64>(3)? != 0,
+                byte_offset: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                byte_length: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -555,6 +1008,7 @@ impl Vault {
             height: segment.height,
             frame_count: segment.frame_count,
             keyint: segment.keyint,
+            quality_quantizer: segment.quality_quantizer,
             started_at_ms: segment.started_at_ms,
             ended_at_ms: segment.ended_at_ms,
             status: segment.status,
@@ -685,6 +1139,87 @@ fn count_where(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+fn map_gop_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<GopSegmentRecord> {
+    Ok(GopSegmentRecord {
+        id: row.get(0)?,
+        artifact_id: row.get(1)?,
+        codec: row.get(2)?,
+        encoder: row.get(3)?,
+        width: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+        height: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+        frame_count: u16::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+        keyint: u16::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+        quality_quantizer: u16::try_from(row.get::<_, i64>(8)?).unwrap_or(100),
+        started_at_ms: row.get(9)?,
+        ended_at_ms: row.get(10)?,
+        status: row.get(11)?,
+    })
+}
+
+fn gop_segments_are_contiguous(left: &GopSegmentRecord, right: &GopSegmentRecord) -> bool {
+    left.codec == "av01"
+        && right.codec == left.codec
+        && right.width == left.width
+        && right.height == left.height
+        && right.started_at_ms >= left.ended_at_ms
+        && right.started_at_ms.saturating_sub(left.ended_at_ms) <= IDLE_GAP_MS
+}
+
+fn first_mergeable_gop_group(
+    segments: &[GopSegmentRecord],
+    max_frames: usize,
+) -> Option<Vec<GopSegmentRecord>> {
+    if max_frames < 2 {
+        return None;
+    }
+    let mut open: HashMap<(u32, u32), Vec<GopSegmentRecord>> = HashMap::new();
+    let mut candidates = Vec::new();
+
+    for segment in segments {
+        let key = (segment.width, segment.height);
+        let eligible = segment.codec == "av01"
+            && segment.status == "ready"
+            && segment.frame_count > 0
+            && usize::from(segment.frame_count) < max_frames;
+        if let Some(mut group) = open.remove(&key) {
+            let frame_count = group
+                .iter()
+                .map(|item| usize::from(item.frame_count))
+                .sum::<usize>();
+            let can_append = eligible
+                && group
+                    .last()
+                    .is_some_and(|previous| gop_segments_are_contiguous(previous, segment))
+                && frame_count.saturating_add(usize::from(segment.frame_count)) <= max_frames;
+            if can_append {
+                group.push(segment.clone());
+                if frame_count + usize::from(segment.frame_count) == max_frames {
+                    candidates.push(group);
+                } else {
+                    open.insert(key, group);
+                }
+                continue;
+            }
+            if group.len() >= 2 {
+                candidates.push(group);
+            }
+        }
+        if eligible {
+            open.insert(key, vec![segment.clone()]);
+        }
+    }
+    candidates.extend(open.into_values().filter(|group| group.len() >= 2));
+    candidates.into_iter().min_by(|left, right| {
+        let left = left
+            .first()
+            .map(|segment| (segment.started_at_ms, segment.id.as_str()));
+        let right = right
+            .first()
+            .map(|segment| (segment.started_at_ms, segment.id.as_str()));
+        left.cmp(&right)
+    })
+}
+
 fn hex_hash(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(64);
@@ -707,6 +1242,28 @@ mod tests {
             application_name: Some(app.to_owned()),
             width: 64,
             height: 64,
+        }
+    }
+
+    fn segment(
+        id: &str,
+        frame_count: u16,
+        started_at_ms: i64,
+        quality_quantizer: u16,
+    ) -> GopSegmentRecord {
+        GopSegmentRecord {
+            id: id.to_owned(),
+            artifact_id: format!("artifact-{id}"),
+            codec: "av01".to_owned(),
+            encoder: "rav1e".to_owned(),
+            width: 64,
+            height: 64,
+            frame_count,
+            keyint: frame_count,
+            quality_quantizer,
+            started_at_ms,
+            ended_at_ms: started_at_ms + i64::from(frame_count.saturating_sub(1)) * 10_000,
+            status: "ready".to_owned(),
         }
     }
 
@@ -795,7 +1352,7 @@ mod tests {
     #[test]
     fn fold_interleaved_resolutions_into_two_long_runs() {
         // Dual-monitor desk: capture follows the focused window's display.
-        let frames: Vec<_> = (0..12)
+        let frames: Vec<_> = (0..60)
             .map(|index| {
                 let mut frame = candidate(
                     &format!("m{index}"),
@@ -815,15 +1372,15 @@ mod tests {
             .collect();
         let runs = fold_pack_runs(&frames, 30);
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].len(), 6);
-        assert_eq!(runs[1].len(), 6);
+        assert_eq!(runs[0].len(), 30);
+        assert_eq!(runs[1].len(), 30);
         assert!(runs[0].iter().all(|frame| frame.width == 3456));
         assert!(runs[1].iter().all(|frame| frame.width == 3840));
         assert_eq!(
             first_packable_run(runs.clone())
                 .expect("both runs packable")
                 .len(),
-            6
+            30
         );
     }
 
@@ -867,27 +1424,26 @@ mod tests {
     }
 
     #[test]
-    fn first_packable_run_skips_one_frame_islands() {
-        let frames = [
-            {
-                let mut alone = candidate("alone", 0, "Code", "code");
-                alone.width = 3456;
-                alone.height = 2234;
-                alone
-            },
-            candidate("a", 10_000, "Chrome", "chrome"),
-            candidate("b", 20_000, "Chrome", "chrome"),
-        ];
+    fn first_packable_run_skips_short_islands() {
+        let mut frames = vec![{
+            let mut alone = candidate("alone", 0, "Code", "code");
+            alone.width = 3456;
+            alone.height = 2234;
+            alone
+        }];
+        frames.extend((0..MIN_PACK_FRAMES).map(|index| {
+            candidate(
+                &format!("chrome-{index}"),
+                10_000 + i64::try_from(index).unwrap_or(0) * 10_000,
+                "Chrome",
+                "chrome",
+            )
+        }));
         let runs = fold_pack_runs(&frames, 30);
         let packable = first_packable_run(runs).expect("chrome run");
-        assert_eq!(
-            packable
-                .iter()
-                .map(|frame| frame.id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b"]
-        );
-        assert_eq!(packable_frame_count(&frames, 30), 2);
+        assert_eq!(packable.len(), MIN_PACK_FRAMES);
+        assert!(packable.iter().all(|frame| frame.id.starts_with("chrome-")));
+        assert_eq!(packable_frame_count(&frames, 30), MIN_PACK_FRAMES);
     }
 
     #[test]
@@ -896,5 +1452,51 @@ mod tests {
         alone.width = 3456;
         alone.height = 2234;
         assert_eq!(packable_frame_count(&[alone], 30), 0);
+    }
+
+    #[test]
+    fn merge_group_fills_to_thirty_without_crossing_resolution_streams() {
+        let first = segment("a", 12, 0, 100);
+        let mut other_display = segment("other", 30, 10_000, 100);
+        other_display.width = 96;
+        let second = segment("b", 8, first.ended_at_ms + 10_000, 100);
+        let third = segment("c", 10, second.ended_at_ms + 10_000, 100);
+        let group =
+            first_mergeable_gop_group(&[first, other_display, second, third], MIN_PACK_FRAMES)
+                .expect("compatible GOPs");
+        assert_eq!(
+            group
+                .iter()
+                .map(|segment| segment.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            group
+                .iter()
+                .map(|segment| usize::from(segment.frame_count))
+                .sum::<usize>(),
+            MIN_PACK_FRAMES
+        );
+    }
+
+    #[test]
+    fn merge_group_normalizes_quality_without_crossing_idle_boundaries() {
+        let first = segment("a", 10, 0, 100);
+        let different_quality = segment("b", 10, first.ended_at_ms + 10_000, 140);
+        let after_quality = segment("c", 10, different_quality.ended_at_ms + 10_000, 100);
+        let after_idle = segment("d", 10, after_quality.ended_at_ms + IDLE_GAP_MS + 1, 100);
+        let group = first_mergeable_gop_group(
+            &[first, different_quality, after_quality, after_idle],
+            MIN_PACK_FRAMES,
+        );
+        assert_eq!(
+            group
+                .unwrap()
+                .iter()
+                .map(|segment| segment.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
     }
 }

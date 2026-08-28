@@ -1,5 +1,5 @@
 {
   "//": "Hash of the code each anchor governs, as of the last time a human confirmed this decision still describes it. Re-record: node scripts/docs-gate/main.ts --write",
   "crates/afterray-store/src/lib.rs::pub fn open_read_only(": "sha256:6c2a4ef531c11d54",
-  "crates/afterrayd/src/main.rs::async fn async_main() -> anyhow::Result<()> {": "sha256:47c901b517eff49a"
+  "crates/afterrayd/src/main.rs::async fn async_main() -> anyhow::Result<()> {": "sha256:473f47094f678698"
 }

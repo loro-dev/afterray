@@ -37,7 +37,7 @@ Every record opens with exactly this shape, then a blank line:
 Status: active
 Area: store
 Anchors:
-- crates/afterray-store/src/lib.rs @dec:size-driven-retention
+- crates/afterray-store/src/lib.rs @dec:tiered-evidence-retention
 Supersedes: —
 Superseded-by: —
 ```
@@ -81,7 +81,7 @@ Moving between lifecycles means rewriting the body to the destination's skeleton
 The decision names the code, and the code names the decision:
 
 ```rust
-// @dec:size-driven-retention — docs/decisions/active/architecture/2026-08-20-size-driven-retention.md
+// @dec:tiered-evidence-retention — docs/decisions/active/architecture/2026-08-27-tiered-evidence-retention.md
 /// How long a runtime marker in the event stream lives.
 pub const SIGNAL_MARKER_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
 ```

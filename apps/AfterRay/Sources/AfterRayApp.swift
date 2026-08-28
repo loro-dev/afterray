@@ -154,6 +154,7 @@ private final class AfterRayAppDelegate: NSObject, NSApplicationDelegate {
             RecallOverlayController.shared.stop()
             AfterRayServices.shared.compute.stopWatching()
             AfterRaySettingsController.shared.model.pauseDownloadMonitoring()
+            AfterRaySettingsController.shared.model.clearSensitiveState()
             AfterRayServices.shared.chat.clearSensitiveState()
             DaemonSupervisor.shared.beginTermination()
         }) {
@@ -1613,6 +1614,7 @@ private struct AfterRayRootView: View {
             history.clearSensitiveState()
             control.clearSensitiveState()
             chat.clearSensitiveState()
+            AfterRaySettingsController.shared.model.clearSensitiveState()
             ChatWindowController.shared.close()
             clearRecallDecodedImageCache()
             RecallThumbnailCache.shared.clearSensitiveData()

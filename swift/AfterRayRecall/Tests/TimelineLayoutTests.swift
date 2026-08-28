@@ -357,6 +357,18 @@ final class TimelineLayoutTests: XCTestCase {
         )
     }
 
+    func testExpiredTimelineMomentRequestsNoPixels() {
+        let expired = RecallMoment(
+            id: "expired",
+            sessionId: "s",
+            capturedAtMs: 0,
+            stillOrigin: "expired"
+        )
+
+        XCTAssertNil(RecallStillRequestPolicy.artifactID(for: expired, isMoving: true))
+        XCTAssertNil(RecallStillRequestPolicy.artifactID(for: expired, isMoving: false))
+    }
+
     func testMovingArtifactFollowsTheTransientPlayheadWithoutTheRootSelection() {
         let moments = [
             RecallMoment(id: "a", sessionId: "s", capturedAtMs: 0, imageArtifactId: "still-a"),

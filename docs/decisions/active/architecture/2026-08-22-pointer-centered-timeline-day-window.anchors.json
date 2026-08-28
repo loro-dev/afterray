@@ -5,7 +5,7 @@
   "crates/afterray-store/src/lib.rs::fn query_moment_index(": "sha256:5946b854a8b6afc7",
   "crates/afterray-store/src/lib.rs::pub fn timeline_range_sync(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Moment>, StoreError> {": "sha256:b0913bf7603f939b",
   "swift/AfterRayRecall/Sources/DaemonClient.swift::public func timeline(fromMs: Int64, toMs: Int64) async throws -> [RecallMoment] {": "sha256:cf10b96f6d5eea5f",
-  "swift/AfterRayRecall/Sources/DaemonClient.swift::public static let protocolVersion = 19": "sha256:efaf0844cdc3551b",
+  "swift/AfterRayRecall/Sources/DaemonClient.swift::public static let protocolVersion = 21": "sha256:c50436e8c922a40d",
   "swift/AfterRayRecall/Sources/RecallStore.swift::public func loadTimeline(": "sha256:897ef618471ef41c",
   "swift/AfterRayRecall/Sources/RecallView.swift::public var onApproachTimelineEdge: ((TimelineExtendDirection, Int64) async -> Bool)?": "sha256:1f4f97125192b379",
   "swift/AfterRayRecall/Sources/TimelineLayout.swift::public struct TimelineDayCoverage: Equatable, Sendable {": "sha256:8d6377c169eddd51"

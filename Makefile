@@ -12,6 +12,7 @@ check-i18n:
 	./scripts/check-i18n.sh
 
 test: docs-sync
+	swift build --product afterray-gop-decoder
 	cargo test --workspace
 	swift test
 	swift test --package-path apps/AfterRayCaptureShim
@@ -23,6 +24,7 @@ test: docs-sync
 # gate; this is what the PR checklist in AGENTS.md means.
 verify: docs-sync
 	cargo clippy --workspace --all-targets -- -D warnings
+	swift build --product afterray-gop-decoder
 	cargo test --workspace
 	swift test
 	swift test --package-path apps/AfterRayCaptureShim
@@ -52,6 +54,7 @@ test-repeat:
 build: capture-shim
 	cargo build --workspace
 	swift build --product afterray-app
+	swift build --product afterray-gop-decoder
 
 capture-shim:
 	swift build --package-path apps/AfterRayCaptureShim --product AfterRayCaptureShim

@@ -1,7 +1,7 @@
 # 输入事件与 T1 acts 重组计划
 
 > **Status (updated 2026-08-20): historical plan. The code is the authority.**
-> Current behavior: [context/acts-join.md](../context/acts-join.md)（join、engaged scope、run 切分、R3 边沿帧、物化）与 [context/event-capture-v2.md](../context/event-capture-v2.md)（输入词汇表、secure 护栏、截图落点）；保留期是 [「The vault expires by size, never by age」](decisions/active/architecture/2026-08-20-size-driven-retention.md)。
+> Current behavior: [context/acts-join.md](../context/acts-join.md)（join、engaged scope、run 切分、R3 边沿帧、物化）与 [context/event-capture-v2.md](../context/event-capture-v2.md)（输入词汇表、secure 护栏、截图落点）；保留期见 [tiered evidence retention](decisions/active/architecture/2026-08-27-tiered-evidence-retention.md)。
 >
 > Superseded by the code on these points — the body below still states the original intent:
 > - 「明确不做」表的**事件驱动截图**已落地：`event_capture_is_due` 把输入批次抬成一次截图请求，节流取 `max(10s, 心跳间隔)`，`crates/afterrayd/src/main.rs:1463`（调用点 `:2424`）。它援引的理由（「事件 48h 删、帧长存」）所依赖的分头保留期不存在

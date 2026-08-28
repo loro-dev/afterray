@@ -7,6 +7,30 @@ import QuartzCore
 import SwiftUI
 import VideoToolbox
 
+/// A daemon-produced JPEG or AV1 poster, without exposing timeline renderer
+/// internals to the settings app target.
+public struct RecallArtifactPreview: View {
+    private let data: Data
+    @State private var frame: RecallDisplayFrame?
+
+    public init(data: Data) {
+        self.data = data
+    }
+
+    public var body: some View {
+        ArtifactYUVView(frame: frame)
+            .task(id: data) {
+                frame = nil
+                let previewData = data
+                let decoded = await Task.detached(priority: .userInitiated) {
+                    RecallFrameDecoder.decode(previewData)
+                }.value
+                guard !Task.isCancelled else { return }
+                frame = decoded
+            }
+    }
+}
+
 final class ArtifactViewAttachment {
     weak var view: ArtifactLayerView?
 }
@@ -255,7 +279,7 @@ enum RecallSampleBuffer {
     }
 }
 
-final class RecallDisplayFrame: NSObject {
+final class RecallDisplayFrame: NSObject, @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer?
     let fallbackImage: CGImage?
 
@@ -620,15 +644,16 @@ private func parseIVF(_ data: Data) -> ParsedIVF? {
 
 private func makeAv1C(from firstFrame: Data) -> Data? {
     let obus = parseOBUs(firstFrame)
-    guard let seq = obus.first(where: { $0.type == 1 }) else { return nil }
-    let payload = [UInt8](seq.payload)
-    guard let first = payload.first else { return nil }
+    guard let seq = obus.first(where: { $0.type == 1 }),
+          let first = seq.payload.first
+    else { return nil }
     let profile = first >> 5
-    var av1c = Data()
-    av1c.append(0x81)
-    av1c.append((profile << 5) | 0x00)
-    av1c.append(0x0C)
-    av1c.append(0x00)
+    var av1c = Data([
+        0x81,
+        profile << 5,
+        0x0C,
+        0x00,
+    ])
     av1c.append(seq.raw)
     return av1c
 }

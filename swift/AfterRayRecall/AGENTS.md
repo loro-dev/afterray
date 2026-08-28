@@ -25,7 +25,7 @@ SwiftUI library holding everything cross-app: the recall surface, Unix-socket da
 ## Invariants
 
 - The UI never opens the database or reads encryption keys (`docs/development.md:112-113`) — everything arrives via `UnixSocketDaemonClient`.
-- `protocolVersion` stays in lockstep with `PROTOCOL_VERSION: u32 = 18`. Timeline ranges omit OCR/cues; detail RPCs fill the selected row. Search motion selects loaded lean rows only; cold hits open once after 500ms quiet.
+- `protocolVersion` stays in lockstep with `PROTOCOL_VERSION: u32 = 21`. Timeline ranges omit OCR/cues; detail RPCs fill the selected row. Search motion selects loaded lean rows only; cold hits open once after 500ms quiet.
 - Compute policy is the daemon's: the Info popover's numbers come from `ComputeThresholds` on the wire and whether "Start now" appears comes from `ComputeGate.can_run_now`. Never re-derive either in Swift — the explanation and the button must not be able to drift from the gate that decides. A row shows `max(pending, backlog)` as remaining, because the queue count is a subset of the vault count.
 - One duration formatter (`ComputeFormat.duration`) and one byte formatter (`AfterRayStorageSnapshot.byteCount`) across the panel, matching `human_duration` in the daemon log — the same pass must not read as two different numbers in two places.
 - The dashboard shows a task's **lane** (GPU/CPU), never a per-task GPU percentage — macOS publishes no per-process GPU accounting. CPU/memory come from the worker's pid and are absent, not zero, when there is no child process.

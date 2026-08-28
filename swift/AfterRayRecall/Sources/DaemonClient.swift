@@ -135,6 +135,7 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
     func shutdown() async throws -> DaemonShutdownResult
     func modelLibrary() async throws -> ModelLibrary
     func settings() async throws -> AppSettings
+    func gopQualityPreview(quantizer: UInt16) async throws -> GopQualityPreview
     func updateSettings(
         recordAudio: Bool?,
         excludedBundleIds: [String]?,
@@ -144,6 +145,9 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
         llmModel: String?,
         llmApiKey: String?,
         storageLimitBytes: UInt64?,
+        retentionDays: UInt32?,
+        gopQualityAging: Bool?,
+        gopWorstQuantizer: UInt16?,
         summarySlotMinutes: UInt32?,
         uiLanguage: String?,
         summaryLanguage: String?,
@@ -174,6 +178,10 @@ public protocol AfterRayDaemonServing: RecallDaemonServing, AfterRayChatServing 
 }
 
 public extension AfterRayDaemonServing {
+    func gopQualityPreview(quantizer _: UInt16) async throws -> GopQualityPreview {
+        throw DaemonClientError.rejected("GOP quality preview is not available")
+    }
+
     func setCapturePaused(paused _: Bool, reason _: String?) async throws -> CapturePauseResult {
         throw DaemonClientError.rejected("capture pause is not available")
     }
@@ -216,6 +224,9 @@ public extension AfterRayDaemonServing {
             llmModel: nil,
             llmApiKey: nil,
             storageLimitBytes: nil,
+            retentionDays: nil,
+            gopQualityAging: nil,
+            gopWorstQuantizer: nil,
             summarySlotMinutes: nil,
             uiLanguage: nil,
             summaryLanguage: nil,
@@ -228,7 +239,7 @@ public extension AfterRayDaemonServing {
 // @dec:daemon-owns-the-vault — docs/decisions/active/architecture/2026-08-20-daemon-owns-the-vault.md
 public actor UnixSocketDaemonClient: AfterRayDaemonServing {
     // @dec:pointer-centered-timeline-day-window — docs/decisions/active/architecture/2026-08-22-pointer-centered-timeline-day-window.md
-    public static let protocolVersion = 19
+    public static let protocolVersion = 21
     /// Shutdown is a handoff, not a normal query. A wedged daemon must not hold
     /// application termination behind the ordinary 30-second unary deadline.
     public static let shutdownReceiveTimeout: TimeInterval = 1.5
@@ -332,6 +343,9 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         llmModel: String? = nil,
         llmApiKey: String? = nil,
         storageLimitBytes: UInt64? = nil,
+        retentionDays: UInt32? = nil,
+        gopQualityAging: Bool? = nil,
+        gopWorstQuantizer: UInt16? = nil,
         summarySlotMinutes: UInt32? = nil,
         uiLanguage: String? = nil,
         summaryLanguage: String? = nil,
@@ -348,6 +362,9 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
                 llmModel: llmModel,
                 llmApiKey: llmApiKey,
                 storageLimitBytes: storageLimitBytes,
+                retentionDays: retentionDays,
+                gopQualityAging: gopQualityAging,
+                gopWorstQuantizer: gopWorstQuantizer,
                 summarySlotMinutes: summarySlotMinutes,
                 uiLanguage: uiLanguage,
                 summaryLanguage: summaryLanguage,
@@ -553,6 +570,26 @@ public actor UnixSocketDaemonClient: AfterRayDaemonServing {
         )
     }
 
+    public func gopQualityPreview(quantizer: UInt16) async throws -> GopQualityPreview {
+        let encoder = JSONEncoder()
+        var payload = try encoder.encode(
+            WireRequest(type: "gop_quality_preview", quantizer: quantizer)
+        )
+        payload.append(0x0A)
+        let path = socketPath
+        return try await Task.detached(priority: .userInitiated) {
+            let (artifact, meta) = try UnixLineTransport.exchangeArtifactWithMeta(
+                path: path,
+                payload: payload,
+                receiveTimeout: 120
+            )
+            guard let summary = meta.gopQualityPreview else {
+                throw DaemonClientError.invalidResponse
+            }
+            return GopQualityPreview(summary: summary, artifact: artifact)
+        }.value
+    }
+
     public func evidenceOcr(momentID: String) async throws -> OcrEvidence {
         try await request(
             WireRequest(type: "evidence_ocr", momentID: momentID),
@@ -655,6 +692,10 @@ struct WireRequest: Encodable, Equatable {
     var llmModel: String?
     var llmApiKey: String?
     var storageLimitBytes: UInt64?
+    var retentionDays: UInt32?
+    var gopQualityAging: Bool?
+    var gopWorstQuantizer: UInt16?
+    var quantizer: UInt16?
     var summarySlotMinutes: UInt32?
     var uiLanguage: String?
     var summaryLanguage: String?
@@ -700,6 +741,10 @@ struct WireRequest: Encodable, Equatable {
         case llmModel = "llm_model"
         case llmApiKey = "llm_api_key"
         case storageLimitBytes = "storage_limit_bytes"
+        case retentionDays = "retention_days"
+        case gopQualityAging = "gop_quality_aging"
+        case gopWorstQuantizer = "gop_worst_quantizer"
+        case quantizer
         case summarySlotMinutes = "summary_slot_minutes"
         case uiLanguage = "ui_language"
         case summaryLanguage = "summary_language"
@@ -749,6 +794,10 @@ struct WireRequest: Encodable, Equatable {
         try container.encodeIfPresent(llmModel, forKey: .llmModel)
         try container.encodeIfPresent(llmApiKey, forKey: .llmApiKey)
         try container.encodeIfPresent(storageLimitBytes, forKey: .storageLimitBytes)
+        try container.encodeIfPresent(retentionDays, forKey: .retentionDays)
+        try container.encodeIfPresent(gopQualityAging, forKey: .gopQualityAging)
+        try container.encodeIfPresent(gopWorstQuantizer, forKey: .gopWorstQuantizer)
+        try container.encodeIfPresent(quantizer, forKey: .quantizer)
         try container.encodeIfPresent(summarySlotMinutes, forKey: .summarySlotMinutes)
         try container.encodeIfPresent(uiLanguage, forKey: .uiLanguage)
         try container.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
@@ -826,11 +875,27 @@ enum UnixLineTransport {
         return try readLine(descriptor: descriptor)
     }
 
-    static func exchangeArtifact(path: String, payload: Data) throws -> ArtifactPayload {
+    static func exchangeArtifact(
+        path: String,
+        payload: Data,
+        receiveTimeout: TimeInterval = unaryReceiveTimeout
+    ) throws -> ArtifactPayload {
+        try exchangeArtifactWithMeta(
+            path: path,
+            payload: payload,
+            receiveTimeout: receiveTimeout
+        ).0
+    }
+
+    static func exchangeArtifactWithMeta(
+        path: String,
+        payload: Data,
+        receiveTimeout: TimeInterval = unaryReceiveTimeout
+    ) throws -> (ArtifactPayload, ArtifactMeta) {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw posixError("open socket") }
         defer { Darwin.close(descriptor) }
-        try applyReceiveTimeout(descriptor: descriptor, seconds: unaryReceiveTimeout)
+        try applyReceiveTimeout(descriptor: descriptor, seconds: receiveTimeout)
         try connect(descriptor: descriptor, path: path)
         try writeAll(descriptor: descriptor, payload: payload)
 
@@ -850,7 +915,7 @@ enum UnixLineTransport {
             count: meta.byteLength,
             prefix: framed.leftover
         )
-        return ArtifactPayload(id: meta.id, contentType: meta.contentType, bytes: bytes)
+        return (ArtifactPayload(id: meta.id, contentType: meta.contentType, bytes: bytes), meta)
     }
 
     static func stream(

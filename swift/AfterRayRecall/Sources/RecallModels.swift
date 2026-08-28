@@ -339,11 +339,45 @@ public struct ArtifactMeta: Decodable, Equatable, Sendable {
     public let id: String
     public let contentType: String
     public let byteLength: Int
+    public let gopQualityPreview: GopQualityPreviewSummary?
 
     enum CodingKeys: String, CodingKey {
         case id
         case contentType = "content_type"
         case byteLength = "byte_length"
+        case gopQualityPreview = "gop_quality_preview"
+    }
+}
+
+public struct GopQualityPreviewSummary: Decodable, Equatable, Sendable {
+    public let quantizer: UInt16
+    public let sourceQuantizer: UInt16
+    public let previewQuantizer: UInt16
+    public let sampledAtMs: Int64
+    public let sourceByteLength: UInt64
+    public let previewByteLength: UInt64
+    public let totalGopByteLength: UInt64
+    public let estimatedWorstGopByteLength: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case quantizer
+        case sourceQuantizer = "source_quantizer"
+        case previewQuantizer = "preview_quantizer"
+        case sampledAtMs = "sampled_at_ms"
+        case sourceByteLength = "source_byte_length"
+        case previewByteLength = "preview_byte_length"
+        case totalGopByteLength = "total_gop_byte_length"
+        case estimatedWorstGopByteLength = "estimated_worst_gop_byte_length"
+    }
+}
+
+public struct GopQualityPreview: Equatable, Sendable {
+    public let summary: GopQualityPreviewSummary
+    public let artifact: ArtifactPayload
+
+    public init(summary: GopQualityPreviewSummary, artifact: ArtifactPayload) {
+        self.summary = summary
+        self.artifact = artifact
     }
 }
 
@@ -751,6 +785,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public let recordAudio: Bool
     public let captureIntervalSeconds: UInt64
     public let storageLimitBytes: UInt64
+    /// Nil keeps size-only retention. A value strips raw evidence after K
+    /// days while preserving the timeline row and derived metadata.
+    public let retentionDays: UInt32?
+    public let gopQualityAging: Bool
+    public let gopWorstQuantizer: UInt16
     /// Wall-clock minutes one summary card covers. Changing it governs future
     /// summaries only; days already summarised keep the shape they were read at.
     public let summarySlotMinutes: UInt32
@@ -780,6 +819,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         recordAudio: Bool,
         captureIntervalSeconds: UInt64,
         storageLimitBytes: UInt64 = Self.defaultStorageLimitBytes,
+        retentionDays: UInt32? = nil,
+        gopQualityAging: Bool = false,
+        gopWorstQuantizer: UInt16 = 180,
         summarySlotMinutes: UInt32 = Self.defaultSummarySlotMinutes,
         summarySlotMinutesOptions: [UInt32] = [],
         excludedBundleIds: [String] = [],
@@ -800,6 +842,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.recordAudio = recordAudio
         self.captureIntervalSeconds = captureIntervalSeconds
         self.storageLimitBytes = storageLimitBytes
+        self.retentionDays = retentionDays
+        self.gopQualityAging = gopQualityAging
+        self.gopWorstQuantizer = gopWorstQuantizer
         self.summarySlotMinutes = summarySlotMinutes
         self.summarySlotMinutesOptions = summarySlotMinutesOptions
         self.excludedBundleIds = excludedBundleIds
@@ -822,6 +867,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case recordAudio = "record_audio"
         case captureIntervalSeconds = "capture_interval_seconds"
         case storageLimitBytes = "storage_limit_bytes"
+        case retentionDays = "retention_days"
+        case gopQualityAging = "gop_quality_aging"
+        case gopWorstQuantizer = "gop_worst_quantizer"
         case summarySlotMinutes = "summary_slot_minutes"
         case summarySlotMinutesOptions = "summary_slot_minutes_options"
         case excludedBundleIds = "excluded_bundle_ids"
@@ -846,6 +894,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         captureIntervalSeconds = try container.decode(UInt64.self, forKey: .captureIntervalSeconds)
         storageLimitBytes = try container.decodeIfPresent(UInt64.self, forKey: .storageLimitBytes)
             ?? Self.defaultStorageLimitBytes
+        retentionDays = try container.decodeIfPresent(UInt32.self, forKey: .retentionDays)
+        gopQualityAging = try container.decodeIfPresent(Bool.self, forKey: .gopQualityAging) ?? false
+        gopWorstQuantizer = try container.decodeIfPresent(UInt16.self, forKey: .gopWorstQuantizer) ?? 180
         summarySlotMinutes = try container.decodeIfPresent(UInt32.self, forKey: .summarySlotMinutes)
             ?? Self.defaultSummarySlotMinutes
         summarySlotMinutesOptions = try container.decodeIfPresent(

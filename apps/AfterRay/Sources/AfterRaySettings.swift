@@ -199,6 +199,10 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     @Published var isControllingDownload = false
     @Published var isUpdatingAudio = false
     @Published var isUpdatingStorageLimit = false
+    @Published var isUpdatingRetention = false
+    @Published var isUpdatingGopQuality = false
+    @Published var isLoadingGopPreview = false
+    @Published var gopQualityPreview: GopQualityPreview?
     @Published var isRelocatingMemory = false
     @Published private(set) var relocationDestinationPath: String?
     @Published var isUpdatingSummarySlot = false
@@ -229,6 +233,7 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
     )
     private var modelDownloadMonitor: Task<Void, Never>?
     private var downloadRateSample: (packID: String, bytes: UInt64, at: Date)?
+    private var gopPreviewGeneration: UInt64 = 0
     private var copy: AfterRayCopy { AfterRayLocalization.shared.copy }
 
     var recordAudio: Bool { settings?.recordAudio ?? AfterRayPreferences.recordAudio }
@@ -603,6 +608,79 @@ final class AfterRaySettingsModel: ObservableObject, AfterRaySettingsModeling {
         } catch {
             message = error.localizedDescription
         }
+    }
+
+    func setRetentionDays(_ days: UInt32?) async {
+        guard days != settings?.retentionDays else { return }
+        isUpdatingRetention = true
+        defer { isUpdatingRetention = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: nil,
+                retentionDays: days ?? 0
+            )
+            storage = await measureStorage()
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func setGopQualityAging(_ enabled: Bool) async {
+        guard enabled != settings?.gopQualityAging else { return }
+        isUpdatingGopQuality = true
+        defer { isUpdatingGopQuality = false }
+        do {
+            settings = try await UnixSocketDaemonClient(
+                socketPath: DaemonSupervisor.shared.socketPath
+            ).updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: nil,
+                gopQualityAging: enabled
+            )
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func previewGopQuality(quantizer: UInt16) async {
+        let quantizer = min(max(quantizer, 120), 240)
+        gopPreviewGeneration &+= 1
+        let generation = gopPreviewGeneration
+        isUpdatingGopQuality = true
+        isLoadingGopPreview = true
+        defer {
+            if generation == gopPreviewGeneration {
+                isUpdatingGopQuality = false
+                isLoadingGopPreview = false
+            }
+        }
+        do {
+            let daemon = UnixSocketDaemonClient(socketPath: DaemonSupervisor.shared.socketPath)
+            settings = try await daemon.updateSettings(
+                recordAudio: nil,
+                excludedBundleIds: nil,
+                excludedDomains: nil,
+                gopWorstQuantizer: quantizer
+            )
+            let preview = try await daemon.gopQualityPreview(quantizer: quantizer)
+            guard generation == gopPreviewGeneration else { return }
+            gopQualityPreview = preview
+        } catch {
+            guard generation == gopPreviewGeneration else { return }
+            message = error.localizedDescription
+        }
+    }
+
+    func clearSensitiveState() {
+        gopPreviewGeneration &+= 1
+        gopQualityPreview = nil
+        isLoadingGopPreview = false
+        isUpdatingGopQuality = false
     }
 
     func chooseMemoryLocation() {

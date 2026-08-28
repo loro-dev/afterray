@@ -58,6 +58,7 @@ model_worker="$repo_root/target/release/afterray-model-worker"
 app_bin="$repo_root/.build/debug/afterray-app"
 native_model_worker="$repo_root/.build/release/afterray-native-model-worker"
 mlx_model_worker="$repo_root/.build/release/afterray-mlx-vlm-worker"
+gop_decoder="$repo_root/.build/release/afterray-gop-decoder"
 mlx_metallib="$repo_root/.build/release/mlx.metallib"
 mlx_asr_package="$repo_root/apps/AfterRayMlxAsrWorker"
 app_bundle="$repo_root/.afterray-dev/AfterRay.app"
@@ -142,6 +143,10 @@ swift build \
   --configuration release \
   --product afterray-mlx-vlm-worker
 swift build \
+  --package-path "$repo_root" \
+  --configuration release \
+  --product afterray-gop-decoder
+swift build \
   --package-path "$mlx_asr_package" \
   --configuration release \
   --product afterray-mlx-asr-worker
@@ -180,6 +185,7 @@ cp "$cli_bin" "$app_bundle/Contents/Helpers/afterray"
 cp "$capture_shim" "$app_bundle/Contents/Helpers/AfterRayCaptureShim"
 cp "$native_model_worker" "$app_bundle/Contents/Helpers/afterray-native-model-worker"
 cp "$mlx_model_worker" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
+cp "$gop_decoder" "$app_bundle/Contents/Helpers/afterray-gop-decoder"
 cp "$mlx_metallib" "$app_bundle/Contents/Helpers/mlx.metallib"
 mkdir -p "$app_bundle/Contents/Helpers/asr"
 cp "$mlx_asr_worker" "$app_bundle/Contents/Helpers/asr/afterray-mlx-asr-worker"
@@ -228,6 +234,7 @@ codesign \
   "$app_bundle/Contents/Helpers/AfterRayCaptureShim" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-native-model-worker" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker" >/dev/null
+codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/afterray-gop-decoder" >/dev/null
 codesign --force --sign "$codesign_identity" "$app_bundle/Contents/Helpers/asr/afterray-mlx-asr-worker" >/dev/null
 codesign --force --options runtime --sign "$codesign_identity" "$app_bundle/Contents/Helpers/asr/mlx.metallib" >/dev/null
 codesign \
@@ -295,6 +302,7 @@ else
 fi
 export AFTERRAY_CAPTURE_SHIM="$capture_shim"
 export AFTERRAY_NATIVE_MODEL_WORKER="$native_model_worker"
+export AFTERRAY_GOP_DECODER="$gop_decoder"
 export AFTERRAY_GOP_ARCHIVE="${AFTERRAY_GOP_ARCHIVE:-1}"
 export AFTERRAY_GOP_REQUIRE_AC="${AFTERRAY_GOP_REQUIRE_AC:-0}"
 export AFTERRAY_GOP_KEYINT="${AFTERRAY_GOP_KEYINT:-30}"
@@ -322,6 +330,7 @@ if [[ "$mode" == 'app' ]]; then
   export AFTERRAY_NATIVE_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-native-model-worker"
   export AFTERRAY_MLX_WORKER="$app_bundle/Contents/Helpers/afterray-mlx-vlm-worker"
   export AFTERRAY_MODEL_WORKER="$app_bundle/Contents/Helpers/afterray-model-worker"
+  export AFTERRAY_GOP_DECODER="$app_bundle/Contents/Helpers/afterray-gop-decoder"
   printf '%s\n' \
     '==> Opening AfterRay.app through LaunchServices' \
     'The app will request Screen Recording, Microphone, and Accessibility access.' \
@@ -339,6 +348,7 @@ if [[ "$mode" == 'app' ]]; then
     AFTERRAY_NATIVE_MODEL_WORKER
     AFTERRAY_MLX_WORKER
     AFTERRAY_MODEL_WORKER
+    AFTERRAY_GOP_DECODER
     AFTERRAY_ASR_MODEL
     AFTERRAY_EMBEDDING_MODEL
     AFTERRAY_GOP_ARCHIVE

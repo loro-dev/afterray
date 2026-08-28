@@ -15,6 +15,7 @@ mod macos {
     }
 
     /// BCP-47 tags, most preferred first: `["en-CN", "zh-Hans-CN"]`.
+    #[must_use]
     pub fn preferred_languages() -> Vec<String> {
         unsafe {
             let raw = CFLocaleCopyPreferredLanguages();

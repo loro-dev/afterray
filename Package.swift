@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "AfterRayMockData", targets: ["AfterRayMockData"]),
         .executable(name: "afterray-app", targets: ["AfterRayApp"]),
         .executable(name: "afterray-native-model-worker", targets: ["AfterRayNativeModelWorker"]),
+        .executable(name: "afterray-gop-decoder", targets: ["AfterRayGopDecoder"]),
         .executable(name: "afterray-mlx-vlm-worker", targets: ["AfterRayMlxVlmWorker"]),
         .executable(name: "afterray-visual-lab", targets: ["AfterRayVisualLab"]),
         .executable(name: "afterray-visual-snapshots", targets: ["AfterRayVisualSnapshots"]),
@@ -74,6 +75,10 @@ let package = Package(
         .executableTarget(
             name: "AfterRayNativeModelWorker",
             path: "apps/AfterRayNativeModelWorker/Sources"
+        ),
+        .executableTarget(
+            name: "AfterRayGopDecoder",
+            path: "apps/AfterRayGopDecoder/Sources"
         ),
         .target(
             name: "AfterRayMlxVlmWorkerCore",

@@ -1,7 +1,7 @@
 # 事件驱动采集 v2 计划
 
 > **Status (updated 2026-08-20): historical plan. The code is the authority.**
-> Current behavior: [context/event-capture-v2.md](../context/event-capture-v2.md)（tree_text、diff 链、输入词汇表、secure 护栏、截图落点）与 [context/acts-join.md](../context/acts-join.md)（两条事实流如何 join）；保留期是 [「The vault expires by size, never by age」](decisions/active/architecture/2026-08-20-size-driven-retention.md)。
+> Current behavior: [context/event-capture-v2.md](../context/event-capture-v2.md)（tree_text、diff 链、输入词汇表、secure 护栏、截图落点）与 [context/acts-join.md](../context/acts-join.md)（两条事实流如何 join）；保留期见 [tiered evidence retention](decisions/active/architecture/2026-08-27-tiered-evidence-retention.md)。
 >
 > Superseded by the code on these points — the body below still states the original intent:
 > - §5「废除 `PROMPT_LINES_BUDGET_CHARS` 固定常量」→ 常量健在，且是时长缩放的基线与下限；模型窗口只作上限，`crates/afterray-store/src/slot.rs:153`

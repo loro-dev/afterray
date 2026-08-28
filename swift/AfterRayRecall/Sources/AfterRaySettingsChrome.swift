@@ -18,6 +18,10 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     var isControllingDownload: Bool { get }
     var isUpdatingAudio: Bool { get }
     var isUpdatingStorageLimit: Bool { get }
+    var isUpdatingRetention: Bool { get }
+    var isUpdatingGopQuality: Bool { get }
+    var isLoadingGopPreview: Bool { get }
+    var gopQualityPreview: GopQualityPreview? { get }
     var isRelocatingMemory: Bool { get }
     var relocationDestinationPath: String? { get }
     var isUpdatingSummarySlot: Bool { get }
@@ -56,6 +60,9 @@ public protocol AfterRaySettingsModeling: ObservableObject {
     func refresh() async
     func setRecordAudio(_ enabled: Bool) async
     func setStorageLimitBytes(_ bytes: UInt64) async
+    func setRetentionDays(_ days: UInt32?) async
+    func setGopQualityAging(_ enabled: Bool) async
+    func previewGopQuality(quantizer: UInt16) async
     func chooseMemoryLocation()
     func confirmMemoryLocation(migrateExistingData: Bool)
     func cancelMemoryLocationChange()
@@ -385,6 +392,18 @@ public enum AfterRaySettingsStyle: Sendable {
 }
 
 public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
+    private enum RetentionChoice: String, CaseIterable {
+        case unlimited
+        case seven
+        case thirty
+        case custom
+    }
+
+    private struct RetentionChange: Identifiable {
+        let days: UInt32
+        var id: UInt32 { days }
+    }
+
     @ObservedObject var model: Model
     @ObservedObject private var hotKeys = RecallHotKeyStore.shared
     @ObservedObject private var localization = AfterRayLocalization.shared
@@ -397,6 +416,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
     @State private var domainDraft = ""
     @State private var customEndpointDraft = ""
     @State private var isEditingCustomEndpoint = false
+    @State private var retentionChoice = RetentionChoice.unlimited
+    @State private var customRetentionDays: UInt32 = 90
+    @State private var pendingRetentionChange: RetentionChange?
+    @State private var worstQuantizer = 180.0
     @FocusState private var domainFieldFocused: Bool
 
     var style: AfterRaySettingsStyle = .card
@@ -459,6 +482,7 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
         .afterRayLocalized()
         .task {
             await model.refresh()
+            syncStorageControls()
             if page == .models {
                 await model.probeLlm()
             }
@@ -478,6 +502,27 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
             }
         } message: {
             Text(copy.settings.moveMemoriesMessage(model.relocationDestinationPath ?? ""))
+        }
+        .alert(item: $pendingRetentionChange) { change in
+            Alert(
+                title: Text(copy.settings.evidenceRetentionConfirmTitle),
+                message: Text(copy.settings.evidenceRetentionConfirmMessage(change.days)),
+                primaryButton: .destructive(Text(copy.settings.deleteOldEvidence)) {
+                    Task {
+                        await model.setRetentionDays(change.days)
+                        syncStorageControls()
+                    }
+                },
+                secondaryButton: .cancel {
+                    syncStorageControls()
+                }
+            )
+        }
+        .onChange(of: model.settings?.retentionDays) { _, _ in
+            syncStorageControls()
+        }
+        .onChange(of: model.settings?.gopWorstQuantizer) { _, value in
+            if let value { worstQuantizer = Double(value) }
         }
         .onChange(of: model.developerOptionsEnabled) { _, enabled in
             if !enabled, page == .developer {
@@ -872,6 +917,10 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     .disabled(model.isUpdatingStorageLimit)
                 }
                 SettingsSeparator()
+                evidenceRetentionControls
+                SettingsSeparator()
+                gopQualityControls
+                SettingsSeparator()
                 SettingsRow(
                     title: copy.settings.memoryLocation,
                     subtitle: copy.settings.memoryLocationSubtitle
@@ -891,6 +940,181 @@ public struct AfterRaySettingsView<Model: AfterRaySettingsModeling>: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    private var evidenceRetentionControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(copy.settings.evidenceRetention)
+                        .font(.settingsRowTitle)
+                        .foregroundStyle(SettingsPalette.label)
+                    Text(copy.settings.evidenceRetentionSubtitle)
+                        .font(.settingsRowSubtitle)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 16)
+                if model.isUpdatingRetention {
+                    ProgressView().controlSize(.small)
+                }
+                Picker(copy.settings.evidenceRetention, selection: $retentionChoice) {
+                    Text(copy.settings.keepAllEvidence).tag(RetentionChoice.unlimited)
+                    Text(copy.settings.keepSevenDays).tag(RetentionChoice.seven)
+                    Text(copy.settings.keepThirtyDays).tag(RetentionChoice.thirty)
+                    Text(copy.settings.customDays).tag(RetentionChoice.custom)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 142)
+                .disabled(model.isUpdatingRetention)
+                .onChange(of: retentionChoice) { _, choice in
+                    chooseRetention(choice)
+                }
+            }
+            if retentionChoice == .custom {
+                HStack(spacing: 8) {
+                    Spacer()
+                    TextField(
+                        copy.settings.customDays,
+                        value: $customRetentionDays,
+                        format: .number
+                    )
+                    .settingsFieldStyle()
+                    .frame(width: 74)
+                    Text(copy.settings.days)
+                        .font(.settingsRowSubtitle)
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                    Button(copy.settings.apply) {
+                        let days = min(max(customRetentionDays, 1), 3_650)
+                        customRetentionDays = days
+                        pendingRetentionChange = RetentionChange(days: days)
+                    }
+                    .buttonStyle(SettingsButtonStyle())
+                    .disabled(model.isUpdatingRetention)
+                }
+            }
+        }
+    }
+
+    private var gopQualityControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SettingsRow(
+                title: copy.settings.ageArchivedImages,
+                subtitle: copy.settings.ageArchivedImagesSubtitle
+            ) {
+                Toggle(copy.settings.ageArchivedImages, isOn: Binding(
+                    get: { model.settings?.gopQualityAging ?? false },
+                    set: { enabled in Task { await model.setGopQualityAging(enabled) } }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .disabled(model.isUpdatingGopQuality)
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Text(copy.settings.worstArchiveQuality)
+                        .font(.settingsRowTitle)
+                        .foregroundStyle(SettingsPalette.label)
+                    Spacer()
+                    Text("Q\(Int(worstQuantizer))")
+                        .font(.system(.caption, design: .monospaced, weight: .medium))
+                        .foregroundStyle(SettingsPalette.secondaryLabel)
+                }
+                Slider(value: $worstQuantizer, in: 120...240, step: 5)
+                    .disabled(model.isUpdatingGopQuality || model.settings?.gopQualityAging == false)
+                    .accessibilityLabel(copy.settings.worstArchiveQuality)
+                    .accessibilityValue("Q\(Int(worstQuantizer))")
+                HStack {
+                    Text(copy.settings.moreDetail)
+                    Spacer()
+                    Text(copy.settings.smallerFiles)
+                }
+                .font(.settingsCaption)
+                .foregroundStyle(SettingsPalette.tertiaryLabel)
+                Text(copy.settings.archiveQualityTiers(Int(worstQuantizer)))
+                    .font(.settingsRowSubtitle)
+                    .foregroundStyle(SettingsPalette.secondaryLabel)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    Task { await model.previewGopQuality(quantizer: UInt16(worstQuantizer)) }
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.isLoadingGopPreview { ProgressView().controlSize(.mini) }
+                        Text(copy.settings.saveAndPreview)
+                    }
+                }
+                .buttonStyle(SettingsButtonStyle())
+                .disabled(model.isLoadingGopPreview)
+            }
+            if let preview = model.gopQualityPreview {
+                HStack(alignment: .top, spacing: 12) {
+                    RecallArtifactPreview(data: preview.artifact.bytes)
+                        .frame(width: 220, height: 124)
+                        .background(.black.opacity(0.45))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(copy.settings.worstQualityPreview)
+                            .font(.settingsRowTitle)
+                            .foregroundStyle(SettingsPalette.label)
+                        Text(copy.settings.previewQualityRoute(
+                            Int(preview.summary.sourceQuantizer),
+                            Int(preview.summary.previewQuantizer)
+                        ))
+                        Text(copy.settings.previewMeasured(
+                            AfterRayStorageSnapshot.byteCount(preview.summary.sourceByteLength),
+                            AfterRayStorageSnapshot.byteCount(preview.summary.previewByteLength)
+                        ))
+                        Text(copy.settings.previewProjected(
+                            AfterRayStorageSnapshot.byteCount(preview.summary.totalGopByteLength),
+                            AfterRayStorageSnapshot.byteCount(
+                                preview.summary.estimatedWorstGopByteLength
+                            )
+                        ))
+                    }
+                    .font(.settingsRowSubtitle)
+                    .foregroundStyle(SettingsPalette.secondaryLabel)
+                }
+            }
+        }
+    }
+
+    private func chooseRetention(_ choice: RetentionChoice) {
+        let selectedDays: UInt32? = switch choice {
+        case .unlimited: nil
+        case .seven: 7
+        case .thirty: 30
+        case .custom: model.settings?.retentionDays
+        }
+        guard selectedDays != model.settings?.retentionDays else { return }
+        switch choice {
+        case .unlimited:
+            Task {
+                await model.setRetentionDays(nil)
+                syncStorageControls()
+            }
+        case .seven:
+            pendingRetentionChange = RetentionChange(days: 7)
+        case .thirty:
+            pendingRetentionChange = RetentionChange(days: 30)
+        case .custom:
+            break
+        }
+    }
+
+    private func syncStorageControls() {
+        worstQuantizer = Double(model.settings?.gopWorstQuantizer ?? 180)
+        switch model.settings?.retentionDays {
+        case nil:
+            retentionChoice = .unlimited
+        case 7:
+            retentionChoice = .seven
+        case 30:
+            retentionChoice = .thirty
+        case let days?:
+            customRetentionDays = days
+            retentionChoice = .custom
         }
     }
 

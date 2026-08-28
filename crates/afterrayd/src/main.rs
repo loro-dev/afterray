@@ -197,6 +197,7 @@ async fn async_main() -> anyhow::Result<()> {
         )
     };
     vault_config.max_storage_bytes = persisted.storage_limit_bytes;
+    vault_config.evidence_retention_days = persisted.retention_days;
     afterray_models::set_huggingface_endpoint(Some(persisted.model_download_endpoint.clone()));
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
@@ -257,6 +258,7 @@ async fn async_main() -> anyhow::Result<()> {
     let packer = Arc::new(gop_packer::GopPacker::new(
         gop_packer::GopPackerConfig::from_env(),
     ));
+    packer.set_quality_policy(persisted.gop_quality_aging, persisted.gop_worst_quantizer);
     // AFTERRAY_GPU_PROBE=0 skips the machine-GPU check on summaries; without
     // a probe the gate would only ever answer "unavailable", which is a hold.
     let gpu_probe_enabled = std::env::var("AFTERRAY_GPU_PROBE").as_deref() != Ok("0");
@@ -908,6 +910,12 @@ struct PersistedSettings {
     record_audio: bool,
     #[serde(default = "default_storage_limit_bytes")]
     storage_limit_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_days: Option<u32>,
+    #[serde(default)]
+    gop_quality_aging: bool,
+    #[serde(default = "default_gop_worst_quantizer")]
+    gop_worst_quantizer: u16,
     #[serde(default = "default_excluded_bundle_ids")]
     excluded_bundle_ids: Vec<String>,
     #[serde(default)]
@@ -974,11 +982,18 @@ const fn default_storage_limit_bytes() -> u64 {
     DEFAULT_STORAGE_LIMIT_BYTES
 }
 
+const fn default_gop_worst_quantizer() -> u16 {
+    180
+}
+
 impl Default for PersistedSettings {
     fn default() -> Self {
         Self {
             record_audio: true,
             storage_limit_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
+            retention_days: None,
+            gop_quality_aging: false,
+            gop_worst_quantizer: default_gop_worst_quantizer(),
             excluded_bundle_ids: default_excluded_bundle_ids(),
             excluded_domains: Vec::new(),
             llm_provider: LlmProvider::MlxLocal,
@@ -1105,6 +1120,13 @@ async fn handle_authorized_request(
             .await;
             write_artifact_response(write, result).await?;
         }
+        Request::GopQualityPreview { quantizer } => {
+            let result = run_store(state, move |s| {
+                gop_packer::quality_preview(&s.store, quantizer)
+            })
+            .await;
+            write_gop_quality_preview_response(write, result).await?;
+        }
         Request::ChatStream {
             conversation_id,
             message,
@@ -1179,6 +1201,40 @@ async fn write_artifact_response(
         Ok(payload) => {
             write.write_all(&payload.header_line()?).await?;
             write.write_all(&payload.bytes).await?;
+        }
+        Err(error) => {
+            write_json_response(write, &Response::failure(error.to_string())).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_gop_quality_preview_response(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    result: Result<Option<gop_packer::GopQualityPreview>, anyhow::Error>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(Some(preview)) => {
+            let meta = afterray_protocol::ArtifactMeta {
+                id: preview.payload.id.clone(),
+                content_type: preview.payload.content_type.clone(),
+                byte_length: u64::try_from(preview.payload.bytes.len()).unwrap_or(u64::MAX),
+                codec: Some("av01".to_owned()),
+                gop_index: Some(0),
+                keyframe_index: Some(0),
+                gop_quality_preview: Some(preview.summary),
+            };
+            let mut header = serde_json::to_vec(&Response::success(meta))?;
+            header.push(b'\n');
+            write.write_all(&header).await?;
+            write.write_all(&preview.payload.bytes).await?;
+        }
+        Ok(None) => {
+            write_json_response(
+                write,
+                &Response::failure("No archived GOP is available to preview yet."),
+            )
+            .await?;
         }
         Err(error) => {
             write_json_response(write, &Response::failure(error.to_string())).await?;
@@ -1300,6 +1356,7 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
         Request::ReadArtifact { .. }
         | Request::ReadGopSegment { .. }
         | Request::ReadGopFrame { .. }
+        | Request::GopQualityPreview { .. }
         | Request::ReadThumbnail { .. } => Response::failure(
             "artifact reads are framed as a JSON header plus raw bytes and are handled separately",
         ),
@@ -1558,6 +1615,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
             ui_language,
             summary_language,
             storage_limit_bytes,
+            retention_days,
+            gop_quality_aging,
+            gop_worst_quantizer,
             summary_slot_minutes,
             excluded_bundle_ids,
             excluded_domains,
@@ -1575,6 +1635,9 @@ async fn dispatch(request: Request, state: &Arc<AppState>) -> Response {
                     ui_language,
                     summary_language,
                     storage_limit_bytes,
+                    retention_days,
+                    gop_quality_aging,
+                    gop_worst_quantizer,
                     summary_slot_minutes,
                     excluded_bundle_ids,
                     excluded_domains,
@@ -2026,6 +2089,9 @@ fn current_settings(state: &AppState) -> AppSettings {
         record_audio: state.capture.record_audio(),
         capture_interval_seconds: state.capture_interval.as_secs(),
         storage_limit_bytes: state.store.storage_limit_bytes(),
+        retention_days: state.store.evidence_retention_days(),
+        gop_quality_aging: state.packer.quality_aging(),
+        gop_worst_quantizer: state.packer.worst_quantizer(),
         // Read from the vault, not `settings.json`: the geometry history lives
         // beside the cards it describes, so there is one source of truth even
         // if the two files ever disagree.
@@ -2123,6 +2189,9 @@ fn persisted_settings(state: &AppState) -> PersistedSettings {
     PersistedSettings {
         record_audio: state.capture.record_audio(),
         storage_limit_bytes: state.store.storage_limit_bytes(),
+        retention_days: state.store.evidence_retention_days(),
+        gop_quality_aging: state.packer.quality_aging(),
+        gop_worst_quantizer: state.packer.worst_quantizer(),
         excluded_bundle_ids: state
             .excluded_bundle_ids
             .lock()
@@ -2164,6 +2233,9 @@ struct SettingsPatch {
     ui_language: Option<String>,
     summary_language: Option<String>,
     storage_limit_bytes: Option<u64>,
+    retention_days: Option<u32>,
+    gop_quality_aging: Option<bool>,
+    gop_worst_quantizer: Option<u16>,
     summary_slot_minutes: Option<u32>,
     excluded_bundle_ids: Option<Vec<String>>,
     excluded_domains: Option<Vec<String>>,
@@ -2181,6 +2253,9 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         ui_language,
         summary_language,
         storage_limit_bytes,
+        retention_days,
+        gop_quality_aging,
+        gop_worst_quantizer,
         summary_slot_minutes,
         excluded_bundle_ids,
         excluded_domains,
@@ -2245,12 +2320,52 @@ async fn update_settings(state: &Arc<AppState>, patch: SettingsPatch) -> Respons
         if let Err(error) = save_persisted_settings(&state.data_dir, &pending) {
             return Response::failure(format!("could not save storage limit: {error}"));
         }
-        if let Err(error) = state.store.set_storage_limit_bytes(bytes) {
+        let applied = run_store(state, move |state| {
+            state.store.set_storage_limit_bytes(bytes)
+        })
+        .await;
+        if let Err(error) = applied {
             let mut rollback = persisted_settings(state);
             rollback.storage_limit_bytes = previous;
             let _ = save_persisted_settings(&state.data_dir, &rollback);
             return Response::failure(format!("could not apply storage limit: {error}"));
         }
+    }
+    if let Some(days) = retention_days {
+        if days > 3_650 {
+            return Response::failure("retention days must be between 1 and 3650, or 0 to disable");
+        }
+        let next = (days > 0).then_some(days);
+        let previous = state.store.evidence_retention_days();
+        let mut pending = persisted_settings(state);
+        pending.retention_days = next;
+        if let Err(error) = save_persisted_settings(&state.data_dir, &pending) {
+            return Response::failure(format!("could not save retention days: {error}"));
+        }
+        let applied = run_store(state, move |state| {
+            state.store.set_evidence_retention_days(next)
+        })
+        .await;
+        if let Err(error) = applied {
+            let mut rollback = persisted_settings(state);
+            rollback.retention_days = previous;
+            let _ = save_persisted_settings(&state.data_dir, &rollback);
+            return Response::failure(format!("could not apply retention days: {error}"));
+        }
+    }
+    if gop_quality_aging.is_some() || gop_worst_quantizer.is_some() {
+        let enabled = gop_quality_aging.unwrap_or_else(|| state.packer.quality_aging());
+        let quantizer = gop_worst_quantizer.unwrap_or_else(|| state.packer.worst_quantizer());
+        if !(120..=240).contains(&quantizer) {
+            return Response::failure("old GOP worst quality must be between 120 and 240");
+        }
+        let mut pending = persisted_settings(state);
+        pending.gop_quality_aging = enabled;
+        pending.gop_worst_quantizer = quantizer;
+        if let Err(error) = save_persisted_settings(&state.data_dir, &pending) {
+            return Response::failure(format!("could not save GOP quality policy: {error}"));
+        }
+        state.packer.set_quality_policy(enabled, quantizer);
     }
     if let Some(minutes) = summary_slot_minutes {
         let duration_ms = i64::from(minutes).saturating_mul(60_000);
@@ -7442,6 +7557,7 @@ mod tests {
         let settings: PersistedSettings =
             serde_json::from_str(r#"{"record_audio":false}"#).unwrap();
         assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+        assert!(!settings.gop_quality_aging);
     }
 
     fn test_vault() -> (tempfile::TempDir, Vault) {
@@ -7502,8 +7618,8 @@ mod tests {
     #[test]
     fn packing_thumbnails_every_still_before_dropping_it() {
         let (jpegs, _) = load_e2e_jpegs();
-        if jpegs.len() < 2 {
-            eprintln!("skip: no JPEG fixtures and ffmpeg unavailable");
+        if jpegs.len() < afterray_store::MIN_PACK_FRAMES {
+            eprintln!("skip: fewer than 30 JPEG fixtures or ffmpeg unavailable");
             return;
         }
         let (_directory, vault) = test_vault();
@@ -7522,7 +7638,7 @@ mod tests {
                 hot_window_ms: 0,
                 hot_min_stills: 0,
                 ocr_grace_ms: 0,
-                keyint: 6,
+                keyint: 30,
             },
         });
         packer
@@ -7729,12 +7845,10 @@ mod tests {
     /// The two sources are not interchangeable. Sampled captures are what the
     /// archive actually holds — a near-static screen with a small change per
     /// frame, which is the whole reason a closed GOP pays. The ffmpeg fallback
-    /// is four 64×64 solid-colour frames so the test can run at all on a
+    /// is thirty 64×64 solid-colour frames so the test can run at all on a
     /// machine without the sample directory, and it cannot carry a compression
-    /// claim: measured here, 32 bytes of IVF file header plus 12 per frame are
-    /// 37% of the 218-byte output, against JPEGs that are themselves mostly
-    /// JFIF and quantisation tables. What the ratio reports there is container
-    /// overhead, not the codec.
+    /// claim: tiny solid-colour JPEGs and IVF are both mostly container and
+    /// table overhead, not a representative screen-codec workload.
     fn load_e2e_jpegs() -> (Vec<Vec<u8>>, bool) {
         let dir = std::path::Path::new("/tmp/afterray-gop-sim/frames/Lody");
         if dir.is_dir() {
@@ -7745,15 +7859,10 @@ mod tests {
                 .filter(|path| path.extension().is_some_and(|ext| ext == "jpg"))
                 .collect();
             files.sort();
-            let take = if std::env::var("AFTERRAY_GOP_E2E_FULL").is_ok() {
-                12
-            } else {
-                4
-            };
             return (
                 files
                     .into_iter()
-                    .take(take)
+                    .take(afterray_store::MIN_PACK_FRAMES)
                     .map(|path| std::fs::read(path).unwrap())
                     .collect(),
                 true,
@@ -7761,7 +7870,7 @@ mod tests {
         }
         let scratch = tempfile::tempdir().unwrap();
         let mut frames = Vec::new();
-        for index in 0..4 {
+        for index in 0..afterray_store::MIN_PACK_FRAMES {
             let path = scratch.path().join(format!("{index}.jpg"));
             let status = std::process::Command::new("ffmpeg")
                 .args([
@@ -7770,7 +7879,7 @@ mod tests {
                     "lavfi",
                     "-i",
                     &format!(
-                        "color=c=red:s=64x64:d=1,drawbox=c=white:t=fill:enable='gte(t\\,{index})'"
+                        "color=c=red:s=640x480:d=1,drawbox=c=white:t=fill:enable='gte(t\\,{index})'"
                     ),
                     "-frames:v",
                     "1",
@@ -7790,8 +7899,8 @@ mod tests {
     #[test]
     fn packer_encodes_closed_gop_and_serves_poster() {
         let (jpegs, from_real_captures) = load_e2e_jpegs();
-        if jpegs.len() < 2 {
-            eprintln!("skip packer e2e: no JPEG fixtures and ffmpeg unavailable");
+        if jpegs.len() < afterray_store::MIN_PACK_FRAMES {
+            eprintln!("skip packer e2e: fewer than 30 JPEG fixtures or ffmpeg unavailable");
             return;
         }
         let (_directory, vault) = test_vault();
@@ -7824,7 +7933,7 @@ mod tests {
                 hot_window_ms: 0,
                 hot_min_stills: 0,
                 ocr_grace_ms: 0,
-                keyint: if jpegs.len() >= 12 { 12 } else { 6 },
+                keyint: 30,
             },
         });
         let segment = packer
@@ -7839,7 +7948,6 @@ mod tests {
         assert!(payload.bytes.starts_with(b"DKIF"));
         let parsed = afterray_codec::parse_ivf(&payload.bytes).unwrap();
         assert_eq!(parsed.frames.len(), view.frames.len());
-        let _ = std::fs::write("/tmp/afterray-gop-e2e.ivf", &payload.bytes);
         let ratio = payload.bytes.len() as f64 / jpeg_bytes as f64;
         eprintln!(
             "gop e2e: {} frames jpeg={} ivf={} ratio={:.4} ({:.1}x)",
@@ -7864,7 +7972,7 @@ mod tests {
         } else {
             assert!(
                 ratio < 1.0,
-                "even four toy frames must not grow when packed, got {:.1}%",
+                "even thirty toy frames must not grow when packed, got {:.1}%",
                 ratio * 100.0
             );
         }
@@ -7883,6 +7991,134 @@ mod tests {
                 .unwrap();
         let poster_ivf = afterray_codec::parse_ivf(&poster.bytes).unwrap();
         assert_eq!(poster_ivf.frames.len(), 1);
+
+        match gop_packer::quality_preview(&vault, 180) {
+            Ok(Some(preview)) => {
+                assert_eq!(preview.summary.quantizer, 180);
+                assert_eq!(preview.summary.source_quantizer, 100);
+                assert_eq!(preview.summary.preview_quantizer, 180);
+                assert!(preview.summary.source_byte_length > 0);
+                assert!(preview.summary.preview_byte_length > 0);
+                assert_eq!(
+                    afterray_codec::parse_ivf(&preview.payload.bytes)
+                        .unwrap()
+                        .frames
+                        .len(),
+                    1
+                );
+            }
+            Ok(None) => panic!("packed GOP should be available for quality preview"),
+            Err(error) => panic!("GOP quality preview failed: {error}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn compact_reencodes_two_short_gops_as_one() {
+        use afterray_codec::{Av1Encoder as _, GopFrameInput, Rav1eEncoder, i420_len};
+
+        let (_directory, vault) = test_vault();
+        let session = vault.create_session_sync(1).unwrap();
+        let mut source_ids = Vec::new();
+        let mut moment_ids = Vec::new();
+
+        for group in 0..2 {
+            let mut group_ids = Vec::new();
+            let mut planes = Vec::new();
+            for offset in 0..2 {
+                let captured_at_ms = 1_000 + i64::from(group * 2 + offset) * 10_000;
+                let moment = vault
+                    .insert_moment(&session.id, captured_at_ms, "image/jpeg", b"source-still")
+                    .unwrap();
+                let (width, height) = (640, 480);
+                let mut yuv = vec![128_u8; i420_len(width, height)];
+                yuv[..usize::try_from(width * height).unwrap()]
+                    .fill(48 + u8::try_from(group * 20 + offset * 5).unwrap());
+                group_ids.push((moment.id.clone(), captured_at_ms, width, height));
+                moment_ids.push(moment.id);
+                planes.push(yuv);
+            }
+            let inputs = group_ids
+                .iter()
+                .zip(planes.iter())
+                .map(
+                    |((moment_id, captured_at_ms, width, height), yuv)| GopFrameInput {
+                        moment_id,
+                        captured_at_ms: *captured_at_ms,
+                        width: *width,
+                        height: *height,
+                        yuv,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let encoded = Rav1eEncoder::default().encode_closed_gop(&inputs).unwrap();
+            let frames = encoded
+                .frames
+                .iter()
+                .map(|frame| afterray_store::GopCommitFrame {
+                    index: frame.index,
+                    is_keyframe: frame.is_keyframe,
+                    byte_offset: frame.byte_offset,
+                    byte_length: frame.byte_length,
+                    content_hash: frame.content_hash,
+                })
+                .collect::<Vec<_>>();
+            let ids = group_ids
+                .iter()
+                .map(|(moment_id, ..)| moment_id.clone())
+                .collect::<Vec<_>>();
+            let source_id = vault
+                .commit_gop(afterray_store::GopCommitRequest {
+                    moment_ids: &ids,
+                    ivf: &encoded.ivf,
+                    codec: encoded.codec,
+                    encoder: &encoded.encoder,
+                    encoder_version: &encoded.encoder_version,
+                    width: encoded.width,
+                    height: encoded.height,
+                    keyint: encoded.keyint,
+                    quality_quantizer: if group == 0 { 100 } else { 140 },
+                    started_at_ms: inputs[0].captured_at_ms,
+                    ended_at_ms: inputs[1].captured_at_ms,
+                    content_hash: "source",
+                    frames: &frames,
+                })
+                .unwrap();
+            vault.mark_gop_ready(&source_id).unwrap();
+            vault.drop_unpinned_stills(&source_id).unwrap();
+            source_ids.push(source_id);
+        }
+
+        let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
+            archive: true,
+            policy: afterray_store::PackPolicy {
+                hot_window_ms: 0,
+                hot_min_stills: 0,
+                ocr_grace_ms: 0,
+                keyint: 30,
+            },
+        });
+        packer.set_quality_policy(true, 180);
+        let merged_id = match packer.pack_one(&vault, 28 * 24 * 60 * 60 * 1_000 + 50_000) {
+            Ok(Some(segment_id)) => segment_id,
+            result => panic!("GOP merge failed: {result:?}"),
+        };
+        let merged = vault.gop_segment(&merged_id).unwrap();
+        assert_eq!(merged.frame_count, 4);
+        assert_eq!(merged.quality_quantizer, 180);
+        assert_eq!(
+            vault
+                .live_gop_frames(&merged_id)
+                .unwrap()
+                .into_iter()
+                .map(|frame| frame.moment_id)
+                .collect::<Vec<_>>(),
+            moment_ids
+        );
+        assert!(source_ids.into_iter().all(|source_id| matches!(
+            vault.gop_segment(&source_id),
+            Err(StoreError::GopNotFound(_))
+        )));
     }
 
     fn tiny_jpeg() -> Option<Vec<u8>> {
@@ -7910,7 +8146,7 @@ mod tests {
     }
 
     #[test]
-    fn packer_encodes_a_single_cold_still() {
+    fn packer_leaves_a_single_cold_still_until_neighbours_arrive() {
         let Some(jpeg) = tiny_jpeg() else {
             eprintln!("skip single-frame pack: ffmpeg unavailable");
             return;
@@ -7939,18 +8175,13 @@ mod tests {
                 hot_window_ms: 0,
                 hot_min_stills: 0,
                 ocr_grace_ms: 0,
-                keyint: 12,
+                keyint: 30,
             },
         });
-        let segment = packer
-            .pack_one(&vault, 10_000_000)
-            .unwrap()
-            .expect("n==1 cold tail should encode as a still GOP");
-        let view = vault.gop_segment_view(&segment).unwrap();
-        assert_eq!(view.frames.len(), 1);
+        assert!(packer.pack_one(&vault, 10_000_000).unwrap().is_none());
         let packed = vault.moments_sync(&session.id).unwrap();
-        assert!(packed[0].gop.is_some());
-        assert!(packed[0].image_artifact_id.is_none());
+        assert!(packed[0].gop.is_none());
+        assert!(packed[0].image_artifact_id.is_some());
     }
 
     fn live_socket() -> Option<std::path::PathBuf> {
@@ -8124,7 +8355,7 @@ mod tests {
                 dense.clear();
             }
             dense.push(moment);
-            if dense.len() >= max_segments.saturating_mul(12) {
+            if dense.len() >= max_segments.saturating_mul(afterray_store::MIN_PACK_FRAMES) {
                 break;
             }
         }
@@ -8181,7 +8412,7 @@ mod tests {
             hot_window_ms: 0,
             hot_min_stills: 0,
             ocr_grace_ms: 0,
-            keyint: 12,
+            keyint: 30,
         };
         let packer = gop_packer::GopPacker::new(gop_packer::GopPackerConfig {
             archive: true,
@@ -8194,7 +8425,7 @@ mod tests {
         for _ in 0..max_segments {
             let candidates = vault.list_pack_candidates(now, &policy).unwrap();
             let Some(run) =
-                afterray_store::first_packable_run(afterray_store::fold_pack_runs(&candidates, 12))
+                afterray_store::first_packable_run(afterray_store::fold_pack_runs(&candidates, 30))
             else {
                 break;
             };

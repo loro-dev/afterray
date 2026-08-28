@@ -278,6 +278,9 @@ final class DaemonWireTests: XCTestCase {
         XCTAssertFalse(settings.recordAudio)
         XCTAssertEqual(settings.captureIntervalSeconds, 10)
         XCTAssertEqual(settings.storageLimitBytes, AppSettings.defaultStorageLimitBytes)
+        XCTAssertNil(settings.retentionDays)
+        XCTAssertFalse(settings.gopQualityAging)
+        XCTAssertEqual(settings.gopWorstQuantizer, 180)
         XCTAssertTrue(settings.excludedBundleIds.isEmpty)
         XCTAssertTrue(settings.protectedBundleIds.isEmpty)
         XCTAssertEqual(settings.uiLanguage, AppSettings.defaultLanguage)
@@ -392,6 +395,29 @@ final class DaemonWireTests: XCTestCase {
         )
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(json["storage_limit_bytes"] as? UInt64, 250_000_000_000)
+    }
+
+    func testUpdateSettingsRequestIncludesEvidenceRetentionAndGopQuality() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(
+                type: "update_settings",
+                retentionDays: 7,
+                gopQualityAging: true,
+                gopWorstQuantizer: 200
+            )
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["retention_days"] as? UInt32, 7)
+        XCTAssertEqual(json["gop_quality_aging"] as? Bool, true)
+        XCTAssertEqual(json["gop_worst_quantizer"] as? UInt16, 200)
+    }
+
+    func testAppSettingsDecodesEvidenceRetentionAndGopQuality() throws {
+        let json = #"{"data_dir":"/tmp/data","model_dir":"/tmp/models","record_audio":true,"capture_interval_seconds":10,"retention_days":30,"gop_quality_aging":true,"gop_worst_quantizer":210}"#
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.retentionDays, 30)
+        XCTAssertTrue(settings.gopQualityAging)
+        XCTAssertEqual(settings.gopWorstQuantizer, 210)
     }
 
     func testAppSettingsDecodesStorageLimit() throws {
@@ -706,7 +732,16 @@ final class DaemonWireTests: XCTestCase {
 
     func testClientSpeaksTheCurrentProtocolVersion() throws {
         // Must move in lockstep with PROTOCOL_VERSION in afterray-protocol.
-        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 19)
+        XCTAssertEqual(UnixSocketDaemonClient.protocolVersion, 21)
+    }
+
+    func testGopQualityPreviewRequestMatchesRustShape() throws {
+        let data = try JSONEncoder().encode(
+            WireRequest(type: "gop_quality_preview", quantizer: 205)
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "gop_quality_preview")
+        XCTAssertEqual(json["quantizer"] as? Int, 205)
     }
 
     func testCaptureSetPausedRequestMatchesRustShape() throws {
