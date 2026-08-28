@@ -197,6 +197,7 @@ async fn async_main() -> anyhow::Result<()> {
         )
     };
     vault_config.max_storage_bytes = persisted.storage_limit_bytes;
+    vault_config.evidence_retention_days = persisted.retention_days;
     afterray_models::set_huggingface_endpoint(Some(persisted.model_download_endpoint.clone()));
     let llm_config = Arc::new(std::sync::Mutex::new(resolve_llm_config(&persisted)));
     let data_dir = vault_config.data_dir.clone();
@@ -206,7 +207,6 @@ async fn async_main() -> anyhow::Result<()> {
         Vault::open(vault_config, &MacOsKeychainProvider)?
     });
     if !read_only_inspection {
-        store.set_evidence_retention_days(persisted.retention_days)?;
         let repaired_sessions = store.close_orphaned_sessions_sync(now_ms())?;
         if repaired_sessions > 0 {
             eprintln!("closed {repaired_sessions} session(s) left open by an earlier daemon");

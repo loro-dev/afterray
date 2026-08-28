@@ -38,7 +38,9 @@ snapshots. A GOP or audio segment crossing the cutoff stays until its entire
 segment is older, so one encrypted object is never partly deleted. Favorites do
 not override this privacy/storage horizon. If the byte ceiling also fires while
 an age horizon is enabled, it may strip more raw evidence but may not delete the
-timeline rows.
+timeline rows. The daemon therefore passes both the byte ceiling and the age
+horizon through `VaultConfig`; the horizon must be present before `Vault::open`
+runs its first retention pass after migration and reconciliation.
 
 Archived AV1 GOPs use constant-quantizer quality tiers when quality aging is
 enabled. It is off by default, including for settings files written before the

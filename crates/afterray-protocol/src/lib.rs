@@ -868,7 +868,7 @@ pub struct AppSettings {
     /// strips its raw screen/AX/audio evidence after this many days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u32>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub gop_quality_aging: bool,
     #[serde(default = "default_gop_worst_quantizer")]
     pub gop_worst_quantizer: u16,
@@ -1876,6 +1876,10 @@ mod tests {
         assert!(settings.llm_model.is_empty());
         assert!(!settings.llm_api_key_set);
         assert_eq!(settings.storage_limit_bytes, DEFAULT_STORAGE_LIMIT_BYTES);
+        assert!(
+            !settings.gop_quality_aging,
+            "legacy settings must not enable irreversible quality aging"
+        );
         assert!(
             settings.model_download_endpoint.is_empty(),
             "no endpoint field means the official one"

@@ -810,6 +810,9 @@ fn decode_key(value: &[u8]) -> Result<VaultKey, StoreError> {
 pub struct VaultConfig {
     pub data_dir: PathBuf,
     pub max_storage_bytes: u64,
+    /// The raw-evidence horizon that must govern the first startup retention
+    /// pass. `None` keeps the historical size-only behavior.
+    pub evidence_retention_days: Option<u32>,
 }
 
 impl Default for VaultConfig {
@@ -817,6 +820,7 @@ impl Default for VaultConfig {
         Self {
             data_dir: default_data_dir(),
             max_storage_bytes: DEFAULT_STORAGE_LIMIT_BYTES,
+            evidence_retention_days: None,
         }
     }
 }
@@ -1118,7 +1122,9 @@ impl Vault {
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: RwLock::new(()),
             max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
-            evidence_retention_days: AtomicU64::new(0),
+            evidence_retention_days: AtomicU64::new(
+                config.evidence_retention_days.map_or(0, u64::from),
+            ),
             summary_slot_segments: RwLock::new(summary_slot_segments),
         })
     }
@@ -1150,7 +1156,9 @@ impl Vault {
             legacy_artifact_key: Mutex::new(Some(Zeroizing::new(*master_key))),
             artifact_io: RwLock::new(()),
             max_storage_bytes: AtomicU64::new(config.max_storage_bytes),
-            evidence_retention_days: AtomicU64::new(0),
+            evidence_retention_days: AtomicU64::new(
+                config.evidence_retention_days.map_or(0, u64::from),
+            ),
             summary_slot_segments: RwLock::new(summary_slot_segments),
         };
         let _ = vault.rollback_orphan_gops();
@@ -7842,6 +7850,7 @@ mod tests {
             VaultConfig {
                 data_dir: directory.path().to_path_buf(),
                 max_storage_bytes,
+                evidence_retention_days: None,
             },
             [7_u8; 32],
         )
@@ -9384,6 +9393,70 @@ mod tests {
     }
 
     #[test]
+    fn opening_with_age_retention_applies_policy_before_size_sweep() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        let key = [17_u8; 32];
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let old_at = now.saturating_sub(i64::try_from(31 * DAY_MS).unwrap());
+        let cutoff = now.saturating_sub(i64::try_from(30 * DAY_MS).unwrap());
+        let session_id;
+        let expired_id;
+        let favorite_id;
+        {
+            let vault = Vault::open_with_key(
+                VaultConfig {
+                    data_dir: data_dir.clone(),
+                    max_storage_bytes: 10_000,
+                    evidence_retention_days: Some(30),
+                },
+                key,
+            )
+            .unwrap();
+            let session = vault.create_session_sync(old_at).unwrap();
+            session_id = session.id.clone();
+            let expired = vault
+                .insert_moment(&session.id, old_at, "image/jpeg", &[1; 128])
+                .unwrap();
+            expired_id = expired.id;
+            vault.expire_evidence_before(cutoff).unwrap();
+            let favorite = vault
+                .insert_moment(&session.id, now, "image/jpeg", &[2; 2_048])
+                .unwrap();
+            favorite_id = favorite.id;
+            vault.set_favorite(&favorite_id, true).unwrap();
+        }
+
+        let reopened = Vault::open_with_key(
+            VaultConfig {
+                data_dir,
+                max_storage_bytes: 1,
+                evidence_retention_days: Some(30),
+            },
+            key,
+        )
+        .unwrap();
+
+        let moments = reopened.moments_sync(&session_id).unwrap();
+        assert_eq!(moments.len(), 2, "startup deleted a timeline-only row");
+        let expired = moments.iter().find(|moment| moment.id == expired_id).unwrap();
+        assert_eq!(expired.still_origin, "expired");
+        assert!(expired.image_artifact_id.is_none());
+        let favorite = moments
+            .iter()
+            .find(|moment| moment.id == favorite_id)
+            .unwrap();
+        assert!(favorite.image_artifact_id.is_some());
+        assert!(reopened.storage_usage_bytes().unwrap() > 1);
+    }
+
+    #[test]
     fn lowering_storage_limit_prunes_immediately() {
         let (_directory, vault) = test_vault(10);
         let session = vault.create_session_sync(1).unwrap();
@@ -9420,6 +9493,7 @@ mod tests {
             VaultConfig {
                 data_dir: data_dir.clone(),
                 max_storage_bytes: 10_000,
+                evidence_retention_days: None,
             },
             [7_u8; 32],
         )
@@ -9440,6 +9514,7 @@ mod tests {
             VaultConfig {
                 data_dir,
                 max_storage_bytes: 100,
+                evidence_retention_days: None,
             },
             [7_u8; 32],
         )
@@ -9985,6 +10060,7 @@ mod tests {
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
             max_storage_bytes: 10_000_000_000,
+            evidence_retention_days: None,
         };
 
         {
@@ -10023,6 +10099,7 @@ mod tests {
         let config = VaultConfig {
             data_dir: directory.path().to_path_buf(),
             max_storage_bytes: 10_000_000_000,
+            evidence_retention_days: None,
         };
 
         {
